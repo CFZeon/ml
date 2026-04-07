@@ -232,7 +232,8 @@ def _daily_archive_url(symbol, interval, day):
 
 def _fetch_daily_range(symbol, interval, period, session):
     frames = []
-    for day in pd.date_range(period.start, period.end, freq="1D", inclusive="left"):
+    available_end = min(period.end, pd.Timestamp.now(tz="UTC").normalize())
+    for day in pd.date_range(period.start, available_end, freq="1D", inclusive="left"):
         frame = _download_archive(_daily_archive_url(symbol, interval, day), session)
         if frame is not None and not frame.empty:
             frames.append(frame)
