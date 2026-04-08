@@ -82,8 +82,15 @@ def main():
     stationarity = pipeline.check_stationarity()
     raw_stat = stationarity["close"]
     fd_stat = stationarity["close_fracdiff"]
+    screening = stationarity["feature_screening"]["summary"]
     print(f"  close stationary?  {raw_stat['stationary']}  (p={raw_stat['p_value']})")
     print(f"  frac-diff close?   {fd_stat['stationary']}  (p={fd_stat['p_value']})")
+    print(
+        f"  screened features: {screening['screened_feature_count']}/{screening['total_features']}  "
+        f"transformed={screening['transformed_features']}  dropped={screening['dropped_features']}"
+    )
+    if screening["transform_usage"]:
+        print(f"  transforms used : {screening['transform_usage']}")
 
     print(f"\n{sep}\nStep 4 · Regime detection\n{sep}")
     regime_result = pipeline.detect_regimes()
@@ -111,6 +118,16 @@ def main():
     for metric in training["fold_metrics"]:
         print(f"  fold {metric['fold']}: acc={metric['accuracy']}  f1={metric['f1_macro']}")
     print(f"  avg acc={training['avg_accuracy']:.4f}  f1={training['avg_f1_macro']:.4f}")
+
+    block_diag = training["feature_block_diagnostics"]
+    if block_diag["summary"]:
+        print("  top feature blocks:")
+        for block in block_diag["summary"][:5]:
+            print(
+                f"    {block['block']}: f1_drop={block['avg_f1_drop']:.4f}  "
+                f"acc_drop={block['avg_accuracy_drop']:.4f}  "
+                f"native={block['avg_native_importance']:.4f}"
+            )
 
     print(f"\n{sep}\nStep 9 · Signals with meta-labeling and Kelly sizing\n{sep}")
     signal_result = pipeline.generate_signals()

@@ -22,7 +22,7 @@ def main():
             "features": {
                 "lags": [1, 3, 6],
                 "frac_diff_d": 0.4,
-                "schema_version": "indicator_aware_v1",
+                "schema_version": "indicator_aware_v2",
             },
             "regime": {"n_regimes": 2},
             "labels": {
@@ -61,7 +61,7 @@ def main():
 
     print(f"\n{sep}\nStep 3 · Rebuild pipeline with best config\n{sep}")
     features = pipeline.build_features()
-    pipeline.check_stationarity()
+    stationarity = pipeline.check_stationarity()
     pipeline.detect_regimes()
     pipeline.build_labels()
     pipeline.align_data()
@@ -70,9 +70,25 @@ def main():
     signals = pipeline.generate_signals()
     backtest = pipeline.run_backtest()
 
+    screening = stationarity["feature_screening"]["summary"]
     print(f"  feature count: {features.shape[1]}")
+    print(
+        f"  screened     : {screening['screened_feature_count']}/{screening['total_features']}  "
+        f"transformed={screening['transformed_features']}  dropped={screening['dropped_features']}"
+    )
+    if screening["transform_usage"]:
+        print(f"  transforms   : {screening['transform_usage']}")
     print(f"  avg accuracy : {training['avg_accuracy']:.4f}")
     print(f"  avg f1       : {training['avg_f1_macro']:.4f}")
+    block_diag = training["feature_block_diagnostics"]
+    if block_diag["summary"]:
+        print("  top blocks   :")
+        for block in block_diag["summary"][:5]:
+            print(
+                f"    {block['block']}: f1_drop={block['avg_f1_drop']:.4f}  "
+                f"acc_drop={block['avg_accuracy_drop']:.4f}  "
+                f"native={block['avg_native_importance']:.4f}"
+            )
     print(f"  long signals : {int((signals['signals'] == 1).sum())}")
     print(f"  short signals: {int((signals['signals'] == -1).sum())}")
     print(f"  net profit   : ${backtest['net_profit']:,.2f}")

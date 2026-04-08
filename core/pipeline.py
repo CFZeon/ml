@@ -8,7 +8,7 @@ import pandas as pd
 from .automl import run_automl_study
 from .backtest import kelly_fraction, run_backtest
 from .data import fetch_binance_vision
-from .features import build_features, check_stationarity
+from .features import build_feature_set, check_stationarity, screen_features_for_stationarity
 from .indicators import run_indicators
 from .labeling import (
     fixed_horizon_labels,
@@ -16,8 +16,10 @@ from .labeling import (
     triple_barrier_labels,
 )
 from .models import (
+    compute_feature_block_diagnostics,
     detect_regime,
     evaluate_model,
+    summarize_feature_block_diagnostics,
     train_meta_model,
     train_model,
     walk_forward_split,
@@ -154,7 +156,7 @@ class FeaturesStep(PipelineStep):
         data = pipeline.require("data")
         indicator_run = pipeline.state.get("indicator_run")
         config = pipeline.section("features")
-        features = build_features(
+        feature_set = build_feature_set(
             data,
             lags=config.get("lags"),
             frac_diff_d=config.get("frac_diff_d"),
@@ -162,14 +164,35 @@ class FeaturesStep(PipelineStep):
             rolling_window=config.get("rolling_window", 20),
             squeeze_quantile=config.get("squeeze_quantile", 0.2),
         )
+        features = feature_set.frame
+        feature_blocks = dict(feature_set.feature_blocks)
 
         for builder in config.get("builders", []):
             built = builder(pipeline, features.copy())
             if built is not None:
                 features = built
 
-        pipeline.state["features"] = features
-        return features
+            feature_blocks = {
+                column: feature_blocks.get(column, config.get("custom_block_name", "custom"))
+                for column in features.columns
+            }
+
+        screening_config = dict(pipeline.section("stationarity"))
+        screening_config.setdefault("enabled", True)
+        screening_config.setdefault("rolling_window", config.get("rolling_window", 20))
+        screening_config.setdefault("frac_diff_d", config.get("frac_diff_d"))
+        screening_result = screen_features_for_stationarity(
+            features,
+            feature_blocks=feature_blocks,
+            config=screening_config,
+        )
+
+        pipeline.state["raw_features"] = features
+        pipeline.state["feature_blocks_raw"] = feature_blocks
+        pipeline.state["feature_screening"] = screening_result.report
+        pipeline.state["feature_blocks"] = screening_result.feature_blocks
+        pipeline.state["features"] = screening_result.frame
+        return screening_result.frame
 
 
 class StationarityStep(PipelineStep):
@@ -185,6 +208,9 @@ class StationarityStep(PipelineStep):
             column = spec["column"]
             series = source[column]
             results[spec.get("name", column)] = check_stationarity(series.dropna())
+
+        if "feature_screening" in pipeline.state:
+            results["feature_screening"] = pipeline.state["feature_screening"]
 
         pipeline.state["stationarity"] = results
         return results
@@ -205,6 +231,9 @@ class RegimeStep(PipelineStep):
 
         pipeline.state["regime_features"] = regime_features
         pipeline.state["regimes"] = regimes
+        feature_blocks = dict(pipeline.state.get("feature_blocks", {}))
+        feature_blocks[config.get("column_name", "regime")] = "regime"
+        pipeline.state["feature_blocks"] = feature_blocks
         pipeline.state["features"] = aligned_features
         return {"regime_features": regime_features, "regimes": regimes}
 
@@ -288,8 +317,10 @@ class TrainModelsStep(PipelineStep):
         y = pipeline.require("y")
         weights = pipeline.require("sample_weights")
         config = pipeline.section("model")
+        feature_blocks = pipeline.state.get("feature_blocks", {})
 
         fold_metrics = []
+        fold_block_diagnostics = []
         last_model = None
         last_meta = None
         oos_predictions = []
@@ -320,6 +351,15 @@ class TrainModelsStep(PipelineStep):
             )
             metrics = evaluate_model(model, X_test, y_test)
             metrics["fold"] = fold
+            block_diagnostics = compute_feature_block_diagnostics(
+                model,
+                X_train,
+                X_test,
+                y_test,
+                feature_blocks=feature_blocks,
+                baseline_metrics=metrics,
+            )
+            fold_block_diagnostics.append(block_diagnostics)
 
             train_primary_preds = model.predict(X_train)
             test_primary_preds = pd.Series(model.predict(X_test), index=X_test.index)
@@ -342,6 +382,7 @@ class TrainModelsStep(PipelineStep):
         avg_f1 = sum(metric["f1_macro"] for metric in fold_metrics) / len(fold_metrics)
         oos_predictions = pd.concat(oos_predictions).sort_index()
         oos_meta_prob = pd.concat(oos_meta_prob).sort_index().reindex(oos_predictions.index)
+        feature_diagnostics = summarize_feature_block_diagnostics(fold_block_diagnostics)
         training = {
             "fold_metrics": fold_metrics,
             "avg_accuracy": avg_accuracy,
@@ -350,6 +391,7 @@ class TrainModelsStep(PipelineStep):
             "last_meta": last_meta,
             "oos_predictions": oos_predictions,
             "oos_meta_prob": oos_meta_prob,
+            "feature_block_diagnostics": feature_diagnostics,
         }
         pipeline.state["training"] = training
         return training

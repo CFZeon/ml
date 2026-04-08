@@ -163,6 +163,189 @@ def evaluate_model(model, X, y):
     return m
 
 
+def _resolve_estimator(model):
+    if isinstance(model, Pipeline):
+        return model.named_steps.get("model", model)
+    return model
+
+
+def get_feature_importance(model, feature_names):
+    """Return a feature-importance series when the estimator exposes one."""
+    estimator = _resolve_estimator(model)
+
+    if hasattr(estimator, "feature_importances_"):
+        values = np.asarray(estimator.feature_importances_, dtype=float)
+    elif hasattr(estimator, "coef_"):
+        values = np.abs(np.asarray(estimator.coef_, dtype=float))
+        if values.ndim > 1:
+            values = values.mean(axis=0)
+        values = values.ravel()
+    else:
+        return pd.Series(dtype=float)
+
+    if len(values) != len(feature_names):
+        return pd.Series(dtype=float)
+
+    return pd.Series(values, index=feature_names, dtype=float).sort_values(ascending=False)
+
+
+def compute_feature_block_diagnostics(model, X_train, X_test, y_test, feature_blocks, baseline_metrics=None):
+    """Measure feature-block contribution using native importance and OOS ablation."""
+    baseline_metrics = dict(baseline_metrics or evaluate_model(model, X_test, y_test))
+    feature_blocks = dict(feature_blocks or {})
+    native_importance = get_feature_importance(model, list(X_test.columns))
+    block_columns = {}
+
+    for column in X_test.columns:
+        block_name = feature_blocks.get(column, "unknown")
+        block_columns.setdefault(block_name, []).append(column)
+
+    train_medians = X_train.median(numeric_only=True)
+    blocks = []
+    for block_name, columns in sorted(block_columns.items()):
+        ablated_X = X_test.copy()
+        replacement = train_medians.reindex(columns).fillna(0.0).to_numpy()
+        ablated_X.loc[:, columns] = replacement
+        ablated_metrics = evaluate_model(model, ablated_X, y_test)
+
+        block_info = {
+            "block": block_name,
+            "feature_count": len(columns),
+            "native_importance": round(float(native_importance.reindex(columns).fillna(0.0).sum()), 6),
+            "accuracy_drop": round(
+                float(baseline_metrics.get("accuracy", 0.0) - ablated_metrics.get("accuracy", 0.0)),
+                6,
+            ),
+            "f1_drop": round(
+                float(baseline_metrics.get("f1_macro", 0.0) - ablated_metrics.get("f1_macro", 0.0)),
+                6,
+            ),
+            "log_loss_increase": None,
+        }
+        if "log_loss" in baseline_metrics and "log_loss" in ablated_metrics:
+            block_info["log_loss_increase"] = round(
+                float(ablated_metrics["log_loss"] - baseline_metrics["log_loss"]),
+                6,
+            )
+        blocks.append(block_info)
+
+    blocks.sort(
+        key=lambda item: (
+            item.get("f1_drop", 0.0),
+            item.get("accuracy_drop", 0.0),
+            item.get("native_importance", 0.0),
+        ),
+        reverse=True,
+    )
+
+    top_features = []
+    if not native_importance.empty:
+        for feature, importance in native_importance.head(10).items():
+            top_features.append(
+                {
+                    "feature": feature,
+                    "block": feature_blocks.get(feature, "unknown"),
+                    "native_importance": round(float(importance), 6),
+                }
+            )
+
+    return {
+        "baseline_metrics": baseline_metrics,
+        "blocks": blocks,
+        "top_features": top_features,
+    }
+
+
+def summarize_feature_block_diagnostics(fold_diagnostics):
+    """Aggregate block diagnostics across walk-forward folds."""
+    if not fold_diagnostics:
+        return {"summary": [], "top_features": [], "folds": []}
+
+    block_totals = {}
+    feature_totals = {}
+    for fold_index, diagnostics in enumerate(fold_diagnostics):
+        for block_info in diagnostics.get("blocks", []):
+            block_name = block_info["block"]
+            summary = block_totals.setdefault(
+                block_name,
+                {
+                    "block": block_name,
+                    "feature_count": block_info["feature_count"],
+                    "folds": 0,
+                    "native_importance": [],
+                    "accuracy_drop": [],
+                    "f1_drop": [],
+                    "log_loss_increase": [],
+                },
+            )
+            summary["feature_count"] = max(summary["feature_count"], block_info["feature_count"])
+            summary["folds"] += 1
+            summary["native_importance"].append(block_info.get("native_importance", 0.0))
+            summary["accuracy_drop"].append(block_info.get("accuracy_drop", 0.0))
+            summary["f1_drop"].append(block_info.get("f1_drop", 0.0))
+            if block_info.get("log_loss_increase") is not None:
+                summary["log_loss_increase"].append(block_info["log_loss_increase"])
+
+        for feature_info in diagnostics.get("top_features", []):
+            feature_name = feature_info["feature"]
+            feature_total = feature_totals.setdefault(
+                feature_name,
+                {
+                    "feature": feature_name,
+                    "block": feature_info["block"],
+                    "native_importance": [],
+                },
+            )
+            feature_total["native_importance"].append(feature_info["native_importance"])
+
+    summary_rows = []
+    for block_name, totals in block_totals.items():
+        summary_rows.append(
+            {
+                "block": block_name,
+                "feature_count": totals["feature_count"],
+                "folds": totals["folds"],
+                "avg_native_importance": round(float(np.mean(totals["native_importance"])), 6),
+                "avg_accuracy_drop": round(float(np.mean(totals["accuracy_drop"])), 6),
+                "avg_f1_drop": round(float(np.mean(totals["f1_drop"])), 6),
+                "avg_log_loss_increase": (
+                    round(float(np.mean(totals["log_loss_increase"])), 6)
+                    if totals["log_loss_increase"]
+                    else None
+                ),
+            }
+        )
+
+    summary_rows.sort(
+        key=lambda item: (
+            item.get("avg_f1_drop", 0.0),
+            item.get("avg_accuracy_drop", 0.0),
+            item.get("avg_native_importance", 0.0),
+        ),
+        reverse=True,
+    )
+
+    top_features = []
+    for feature_name, totals in sorted(
+        feature_totals.items(),
+        key=lambda item: np.mean(item[1]["native_importance"]),
+        reverse=True,
+    )[:10]:
+        top_features.append(
+            {
+                "feature": feature_name,
+                "block": totals["block"],
+                "avg_native_importance": round(float(np.mean(totals["native_importance"])), 6),
+            }
+        )
+
+    return {
+        "summary": summary_rows,
+        "top_features": top_features,
+        "folds": fold_diagnostics,
+    }
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Regime detection  (simple KMeans – swap for HMM/ADWIN later)
 # ───────────────────────────────────────────────────────────────────────────

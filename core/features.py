@@ -8,12 +8,27 @@ from statsmodels.tsa.stattools import adfuller
 
 
 BASE_COLUMNS = {"open", "high", "low", "close", "volume", "quote_volume", "trades"}
+DEFAULT_STATIONARITY_TRANSFORM_ORDER = ("log_diff", "pct_change", "diff", "zscore", "frac_diff")
 
 
 @dataclass
 class FeatureBlock:
     frame: pd.DataFrame
     laggable_columns: list[str]
+    block_name: str
+
+
+@dataclass
+class BuiltFeatureSet:
+    frame: pd.DataFrame
+    feature_blocks: dict[str, str]
+
+
+@dataclass
+class FeatureScreeningResult:
+    frame: pd.DataFrame
+    feature_blocks: dict[str, str]
+    report: dict
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +62,12 @@ def fractional_diff(series, d, threshold=1e-5):
     for i in range(width - 1, len(values)):
         out[i] = weights @ values[i - width + 1: i + 1]
 
-    return pd.Series(out, index=series.index, name="close_fracdiff")
+    series_name = getattr(series, "name", None)
+    if series_name:
+        output_name = f"{series_name}_fracdiff"
+    else:
+        output_name = "fracdiff"
+    return pd.Series(out, index=series.index, name=output_name)
 
 
 # ---------------------------------------------------------------------------
@@ -59,14 +79,45 @@ def check_stationarity(series, significance=0.05):
 
     Returns dict with keys: stationary (bool), p_value, adf_stat.
     """
-    clean = series.dropna()
+    clean = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
+    unique_values = int(clean.nunique())
     if len(clean) < 20:
-        return {"stationary": False, "p_value": 1.0, "adf_stat": 0.0}
-    result = adfuller(clean, maxlag=min(20, len(clean) // 4))
+        return {
+            "stationary": False,
+            "p_value": 1.0,
+            "adf_stat": 0.0,
+            "observations": int(len(clean)),
+            "unique_values": unique_values,
+            "error": "too_short",
+        }
+    if unique_values <= 1:
+        return {
+            "stationary": False,
+            "p_value": 1.0,
+            "adf_stat": 0.0,
+            "observations": int(len(clean)),
+            "unique_values": unique_values,
+            "error": "constant",
+        }
+
+    try:
+        result = adfuller(clean, maxlag=min(20, len(clean) // 4))
+    except Exception as exc:
+        return {
+            "stationary": False,
+            "p_value": 1.0,
+            "adf_stat": 0.0,
+            "observations": int(len(clean)),
+            "unique_values": unique_values,
+            "error": type(exc).__name__,
+        }
+
     return {
         "stationary": bool(result[1] < significance),
         "p_value": round(float(result[1]), 6),
         "adf_stat": round(float(result[0]), 4),
+        "observations": int(len(clean)),
+        "unique_values": unique_values,
     }
 
 
@@ -90,9 +141,9 @@ def _cross_down(series, threshold=0.0):
     return ((series < threshold) & (series.shift(1) >= threshold)).astype(float)
 
 
-def _as_feature_block(frame, laggable_columns):
+def _as_feature_block(frame, laggable_columns, block_name):
     laggable = [column for column in laggable_columns if column in frame.columns]
-    return FeatureBlock(frame=frame, laggable_columns=laggable)
+    return FeatureBlock(frame=frame, laggable_columns=laggable, block_name=block_name)
 
 
 def _price_volume_features(df, rolling_window):
@@ -137,7 +188,7 @@ def _price_volume_features(df, rolling_window):
         "trades_change",
         "trades_zscore",
     ]
-    return _as_feature_block(frame, laggable)
+    return _as_feature_block(frame, laggable, block_name="price_volume")
 
 
 def _extract_rsi_features(result, df, rolling_window=20, **_):
@@ -171,7 +222,7 @@ def _extract_rsi_features(result, df, rolling_window=20, **_):
         f"{result.name}_oversold_dist",
         f"{result.name}_zscore",
     ]
-    return _as_feature_block(frame, laggable)
+    return _as_feature_block(frame, laggable, block_name=result.kind)
 
 
 def _extract_macd_features(result, df, rolling_window=20, **_):
@@ -209,7 +260,7 @@ def _extract_macd_features(result, df, rolling_window=20, **_):
         f"{result.name}_hist_slope",
         f"{result.name}_hist_zscore",
     ]
-    return _as_feature_block(frame, laggable)
+    return _as_feature_block(frame, laggable, block_name=result.kind)
 
 
 def _extract_bollinger_features(result, df, rolling_window=20, squeeze_quantile=0.2, **_):
@@ -247,7 +298,7 @@ def _extract_bollinger_features(result, df, rolling_window=20, squeeze_quantile=
         f"{result.name}_dist_upper_band",
         f"{result.name}_dist_lower_band",
     ]
-    return _as_feature_block(frame, laggable)
+    return _as_feature_block(frame, laggable, block_name=result.kind)
 
 
 def _extract_atr_features(result, df, rolling_window=20, **_):
@@ -277,7 +328,7 @@ def _extract_atr_features(result, df, rolling_window=20, **_):
         f"{result.name}_range_to_atr",
         f"{result.name}_abs_return_to_atr",
     ]
-    return _as_feature_block(frame, laggable)
+    return _as_feature_block(frame, laggable, block_name=result.kind)
 
 
 def _extract_fvg_features(result, df, **_):
@@ -337,7 +388,7 @@ def _extract_fvg_features(result, df, **_):
         f"{prefix}_distance_spread",
         f"{prefix}_size_spread",
     ]
-    return _as_feature_block(frame, laggable)
+    return _as_feature_block(frame, laggable, block_name=result.kind)
 
 
 def _extract_generic_indicator_features(result, df, rolling_window=20, **_):
@@ -355,7 +406,7 @@ def _extract_generic_indicator_features(result, df, rolling_window=20, **_):
         frame[zscore_name] = _rolling_zscore(series, rolling_window)
         laggable.extend([diff_name, zscore_name])
 
-    return _as_feature_block(frame, laggable)
+    return _as_feature_block(frame, laggable, block_name=getattr(result, "kind", "generic_indicator"))
 
 
 INDICATOR_FEATURE_EXTRACTORS = {
@@ -367,20 +418,314 @@ INDICATOR_FEATURE_EXTRACTORS = {
 }
 
 
-def _append_lags(features, laggable_columns, lags):
+def _append_lags(features, laggable_columns, lags, feature_blocks):
     if not lags:
-        return features
+        return features, dict(feature_blocks)
 
     laggable_columns = [column for column in dict.fromkeys(laggable_columns) if column in features.columns]
     lagged_columns = {}
+    updated_blocks = dict(feature_blocks)
     for column in laggable_columns:
         for lag in lags:
-            lagged_columns[f"{column}_lag{lag}"] = features[column].shift(lag)
+            lagged_name = f"{column}_lag{lag}"
+            lagged_columns[lagged_name] = features[column].shift(lag)
+            updated_blocks[lagged_name] = feature_blocks.get(column, "unknown")
 
     if not lagged_columns:
-        return features
+        return features, updated_blocks
 
-    return pd.concat([features, pd.DataFrame(lagged_columns, index=features.index)], axis=1)
+    lagged_frame = pd.DataFrame(lagged_columns, index=features.index)
+    return pd.concat([features, lagged_frame], axis=1), updated_blocks
+
+
+def _apply_stationarity_transform(series, transform_name, rolling_window, frac_diff_d, frac_diff_threshold):
+    clean = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
+    if clean.empty:
+        return None
+
+    if transform_name == "log_diff":
+        if (clean <= 0).any():
+            return None
+        return np.log(series).diff()
+
+    if transform_name == "pct_change":
+        if clean.abs().min() < 1e-12:
+            return None
+        return series.pct_change()
+
+    if transform_name == "diff":
+        return series.diff()
+
+    if transform_name == "zscore":
+        return _rolling_zscore(series, rolling_window)
+
+    if transform_name == "frac_diff":
+        if frac_diff_d is None:
+            return None
+        return fractional_diff(series, d=frac_diff_d, threshold=frac_diff_threshold)
+
+    raise ValueError(f"Unsupported stationarity transform {transform_name!r}")
+
+
+def screen_features_for_stationarity(features, feature_blocks=None, config=None):
+    """Screen each feature for stationarity and transform or drop when needed."""
+    config = dict(config or {})
+    if not config.get("enabled", True):
+        blocks = dict(feature_blocks or {})
+        summary = {
+            "enabled": False,
+            "total_features": int(features.shape[1]),
+            "screened_feature_count": int(features.shape[1]),
+            "stationary_as_is": 0,
+            "discrete_passthrough": 0,
+            "transformed_features": 0,
+            "dropped_features": 0,
+            "dropped_constant": 0,
+            "dropped_unrepaired": 0,
+            "transform_usage": {},
+            "block_feature_counts": {},
+        }
+        return FeatureScreeningResult(
+            frame=features.copy(),
+            feature_blocks=blocks,
+            report={"summary": summary, "features": {}, "transformed_features": [], "dropped_features": []},
+        )
+
+    significance = config.get("significance", 0.05)
+    transform_order = tuple(config.get("transform_order") or DEFAULT_STATIONARITY_TRANSFORM_ORDER)
+    rolling_window = int(config.get("rolling_window", 20))
+    frac_diff_d = config.get("frac_diff_d")
+    frac_diff_threshold = float(config.get("frac_diff_threshold", 1e-5))
+    discrete_max_unique = int(config.get("discrete_max_unique", 6))
+    drop_failed = bool(config.get("drop_failed", True))
+
+    screened_columns = {}
+    kept_blocks = {}
+    reports = {}
+    transform_usage = {}
+    transformed_features = []
+    dropped_features = []
+
+    summary = {
+        "enabled": True,
+        "total_features": int(features.shape[1]),
+        "screened_feature_count": 0,
+        "stationary_as_is": 0,
+        "discrete_passthrough": 0,
+        "transformed_features": 0,
+        "dropped_features": 0,
+        "dropped_constant": 0,
+        "dropped_unrepaired": 0,
+        "transform_usage": {},
+        "block_feature_counts": {},
+    }
+
+    feature_blocks = dict(feature_blocks or {})
+
+    for column in features.columns:
+        series = pd.Series(features[column]).replace([np.inf, -np.inf], np.nan)
+        clean = series.dropna()
+        unique_values = int(clean.nunique())
+        block_name = feature_blocks.get(column, "unknown")
+        report = {
+            "block": block_name,
+            "status": None,
+            "selected_transform": None,
+            "original": None,
+            "final": None,
+            "candidates": [],
+        }
+
+        if unique_values <= 1:
+            report["status"] = "dropped_constant"
+            report["original"] = {
+                "stationary": False,
+                "p_value": 1.0,
+                "adf_stat": 0.0,
+                "observations": int(len(clean)),
+                "unique_values": unique_values,
+                "error": "constant",
+            }
+            report["final"] = report["original"]
+            reports[column] = report
+            dropped_features.append(column)
+            summary["dropped_features"] += 1
+            summary["dropped_constant"] += 1
+            continue
+
+        if unique_values <= discrete_max_unique:
+            screened_columns[column] = series
+            kept_blocks[column] = block_name
+            report["status"] = "discrete_passthrough"
+            report["selected_transform"] = "passthrough"
+            report["final"] = {
+                "stationary": True,
+                "p_value": 0.0,
+                "adf_stat": 0.0,
+                "observations": int(len(clean)),
+                "unique_values": unique_values,
+                "note": "discrete_passthrough",
+            }
+            reports[column] = report
+            summary["discrete_passthrough"] += 1
+            continue
+
+        original = check_stationarity(series, significance=significance)
+        report["original"] = original
+        if original["stationary"]:
+            screened_columns[column] = series
+            kept_blocks[column] = block_name
+            report["status"] = "stationary"
+            report["selected_transform"] = "passthrough"
+            report["final"] = original
+            reports[column] = report
+            summary["stationary_as_is"] += 1
+            continue
+
+        selected_series = None
+        selected_stats = None
+        selected_transform = None
+
+        for transform_name in transform_order:
+            transformed = _apply_stationarity_transform(
+                series,
+                transform_name=transform_name,
+                rolling_window=rolling_window,
+                frac_diff_d=frac_diff_d,
+                frac_diff_threshold=frac_diff_threshold,
+            )
+            if transformed is None:
+                report["candidates"].append({"transform": transform_name, "applicable": False})
+                continue
+
+            stats = check_stationarity(transformed, significance=significance)
+            report["candidates"].append(
+                {
+                    "transform": transform_name,
+                    "applicable": True,
+                    "result": stats,
+                }
+            )
+            if stats["stationary"]:
+                selected_series = transformed
+                selected_stats = stats
+                selected_transform = transform_name
+                break
+
+        if selected_series is not None:
+            screened_columns[column] = selected_series
+            kept_blocks[column] = block_name
+            report["status"] = "transformed"
+            report["selected_transform"] = selected_transform
+            report["final"] = selected_stats
+            reports[column] = report
+            transformed_features.append(column)
+            summary["transformed_features"] += 1
+            transform_usage[selected_transform] = transform_usage.get(selected_transform, 0) + 1
+            continue
+
+        report["status"] = "failed_kept" if not drop_failed else "dropped_unrepaired"
+        report["selected_transform"] = None
+        report["final"] = report["candidates"][-1]["result"] if report["candidates"] else original
+        reports[column] = report
+
+        if drop_failed:
+            dropped_features.append(column)
+            summary["dropped_features"] += 1
+            summary["dropped_unrepaired"] += 1
+            continue
+
+        screened_columns[column] = series
+        kept_blocks[column] = block_name
+
+    screened = pd.DataFrame(screened_columns, index=features.index)
+    summary["screened_feature_count"] = int(screened.shape[1])
+    summary["transform_usage"] = dict(sorted(transform_usage.items()))
+    block_counts = pd.Series(list(kept_blocks.values()), dtype="object")
+    if not block_counts.empty:
+        summary["block_feature_counts"] = {
+            block: int(count)
+            for block, count in block_counts.value_counts().sort_index().items()
+        }
+
+    report = {
+        "summary": summary,
+        "features": reports,
+        "transformed_features": transformed_features,
+        "dropped_features": dropped_features,
+    }
+    return FeatureScreeningResult(frame=screened, feature_blocks=kept_blocks, report=report)
+
+
+def build_feature_set(
+    df,
+    lags=None,
+    frac_diff_d=None,
+    indicator_run=None,
+    rolling_window=20,
+    squeeze_quantile=0.2,
+):
+    """Build a feature frame and feature-block mapping."""
+    blocks = []
+    blocks.append(_price_volume_features(df, rolling_window=rolling_window))
+
+    if indicator_run is not None and getattr(indicator_run, "results", None):
+        for result in indicator_run.results:
+            extractor = INDICATOR_FEATURE_EXTRACTORS.get(result.kind, _extract_generic_indicator_features)
+            block = extractor(
+                result,
+                df,
+                rolling_window=rolling_window,
+                squeeze_quantile=squeeze_quantile,
+            )
+            if not block.frame.empty:
+                blocks.append(block)
+    else:
+        generic_result = type(
+            "GenericIndicatorResult",
+            (),
+            {
+                "kind": "generic_indicator",
+                "metadata": {
+                    "output_columns": [
+                        column for column in df.columns
+                        if column not in BASE_COLUMNS and pd.api.types.is_numeric_dtype(df[column])
+                    ]
+                },
+            },
+        )()
+        block = _extract_generic_indicator_features(
+            generic_result,
+            df,
+            rolling_window=rolling_window,
+        )
+        if not block.frame.empty:
+            blocks.append(block)
+
+    features = pd.DataFrame(index=df.index)
+    feature_blocks = {}
+    laggable_columns = []
+
+    for block in blocks:
+        if block.frame.empty:
+            continue
+        features = features.join(block.frame)
+        laggable_columns.extend(block.laggable_columns)
+        for column in block.frame.columns:
+            feature_blocks[column] = block.block_name
+
+    if frac_diff_d is not None:
+        features["close_fracdiff"] = fractional_diff(df["close"], d=frac_diff_d)
+        laggable_columns.append("close_fracdiff")
+        feature_blocks["close_fracdiff"] = "price_volume"
+
+    features, feature_blocks = _append_lags(
+        features,
+        laggable_columns=laggable_columns,
+        lags=lags,
+        feature_blocks=feature_blocks,
+    )
+    return BuiltFeatureSet(frame=features, feature_blocks=feature_blocks)
 
 
 # ---------------------------------------------------------------------------
@@ -422,47 +767,12 @@ def build_features(
     pd.DataFrame
         Feature matrix aligned to *df* index.
     """
-    base_block = _price_volume_features(df, rolling_window=rolling_window)
-    features = base_block.frame.copy()
-    laggable_columns = list(base_block.laggable_columns)
-
-    if indicator_run is not None and getattr(indicator_run, "results", None):
-        for result in indicator_run.results:
-            extractor = INDICATOR_FEATURE_EXTRACTORS.get(result.kind, _extract_generic_indicator_features)
-            block = extractor(
-                result,
-                df,
-                rolling_window=rolling_window,
-                squeeze_quantile=squeeze_quantile,
-            )
-            if not block.frame.empty:
-                features = features.join(block.frame)
-                laggable_columns.extend(block.laggable_columns)
-    else:
-        generic_result = type(
-            "GenericIndicatorResult",
-            (),
-            {
-                "metadata": {
-                    "output_columns": [
-                        column for column in df.columns
-                        if column not in BASE_COLUMNS and pd.api.types.is_numeric_dtype(df[column])
-                    ]
-                }
-            },
-        )()
-        block = _extract_generic_indicator_features(
-            generic_result,
-            df,
-            rolling_window=rolling_window,
-        )
-        if not block.frame.empty:
-            features = features.join(block.frame)
-            laggable_columns.extend(block.laggable_columns)
-
-    if frac_diff_d is not None:
-        features["close_fracdiff"] = fractional_diff(df["close"], d=frac_diff_d)
-        laggable_columns.append("close_fracdiff")
-
-    features = _append_lags(features, laggable_columns=laggable_columns, lags=lags)
-    return features
+    feature_set = build_feature_set(
+        df,
+        lags=lags,
+        frac_diff_d=frac_diff_d,
+        indicator_run=indicator_run,
+        rolling_window=rolling_window,
+        squeeze_quantile=squeeze_quantile,
+    )
+    return feature_set.frame
