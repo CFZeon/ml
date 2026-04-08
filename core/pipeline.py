@@ -1,7 +1,11 @@
 """Stepwise research pipeline abstraction for reusable model workflows."""
 
+import copy
+
+import numpy as np
 import pandas as pd
 
+from .automl import run_automl_study
 from .backtest import kelly_fraction, run_backtest
 from .data import fetch_binance_vision
 from .features import build_features, check_stationarity
@@ -38,6 +42,29 @@ def _default_stationarity_specs(pipeline):
     return specs
 
 
+def _positive_class_probability(model, X, positive_class=1):
+    probabilities = model.predict_proba(X)
+    classes = getattr(model, "classes_", None)
+
+    if classes is None and hasattr(model, "named_steps"):
+        estimator = model.named_steps.get("model")
+        classes = getattr(estimator, "classes_", None)
+
+    if probabilities.ndim == 1:
+        return probabilities
+
+    if probabilities.shape[1] == 1:
+        if classes is not None and len(classes) == 1 and classes[0] == positive_class:
+            return np.ones(len(X))
+        return np.zeros(len(X))
+
+    if classes is not None and positive_class in classes:
+        positive_index = list(classes).index(positive_class)
+        return probabilities[:, positive_index]
+
+    return probabilities[:, -1]
+
+
 class PipelineStep:
     name = "step"
 
@@ -65,6 +92,59 @@ class IndicatorsStep(PipelineStep):
         pipeline.state["indicator_run"] = indicator_run
         pipeline.state["data"] = indicator_run.frame
         return indicator_run
+
+
+class AutoMLStep(PipelineStep):
+    name = "run_automl"
+
+    def run(self, pipeline):
+        config = pipeline.section("automl")
+        if not config.get("enabled"):
+            return None
+
+        summary = run_automl_study(
+            pipeline,
+            pipeline_class=ResearchPipeline,
+            trial_step_classes=[
+                FeaturesStep,
+                RegimeStep,
+                LabelsStep,
+                AlignDataStep,
+                SampleWeightsStep,
+                TrainModelsStep,
+                SignalsStep,
+                BacktestStep,
+            ],
+        )
+
+        best_overrides = copy.deepcopy(summary.get("best_overrides", {}))
+        for section, values in best_overrides.items():
+            current = pipeline.config.get(section, {})
+            if isinstance(current, dict) and isinstance(values, dict):
+                merged = dict(current)
+                merged.update(values)
+                pipeline.config[section] = merged
+            else:
+                pipeline.config[section] = values
+
+        for key in [
+            "features",
+            "stationarity",
+            "regime_features",
+            "regimes",
+            "labels",
+            "X",
+            "y",
+            "labels_aligned",
+            "sample_weights",
+            "training",
+            "signals",
+            "backtest",
+        ]:
+            pipeline.state.pop(key, None)
+
+        pipeline.state["automl"] = summary
+        return summary
 
 
 class FeaturesStep(PipelineStep):
@@ -208,6 +288,8 @@ class TrainModelsStep(PipelineStep):
         fold_metrics = []
         last_model = None
         last_meta = None
+        oos_predictions = []
+        oos_meta_prob = []
 
         for fold, (train_idx, test_idx) in enumerate(
             walk_forward_split(
@@ -230,28 +312,40 @@ class TrainModelsStep(PipelineStep):
                 y_train,
                 sample_weight=w_train,
                 model_type=config.get("type", "rf"),
+                model_params=config.get("params"),
             )
             metrics = evaluate_model(model, X_test, y_test)
             metrics["fold"] = fold
 
-            primary_preds = model.predict(X_test)
-            meta_model = train_meta_model(primary_preds, X_test, y_test)
+            train_primary_preds = model.predict(X_train)
+            test_primary_preds = pd.Series(model.predict(X_test), index=X_test.index)
+            meta_model = train_meta_model(train_primary_preds, X_train, y_train, sample_weight=w_train)
+
+            X_meta_test = X_test.copy()
+            X_meta_test["primary_pred"] = test_primary_preds.values
+            meta_prob_test = pd.Series(_positive_class_probability(meta_model, X_meta_test), index=X_test.index)
 
             fold_metrics.append(metrics)
             last_model = model
             last_meta = meta_model
+            oos_predictions.append(test_primary_preds)
+            oos_meta_prob.append(meta_prob_test)
 
         if last_model is None or last_meta is None:
             raise RuntimeError("No walk-forward folds were generated; adjust split sizes.")
 
         avg_accuracy = sum(metric["accuracy"] for metric in fold_metrics) / len(fold_metrics)
         avg_f1 = sum(metric["f1_macro"] for metric in fold_metrics) / len(fold_metrics)
+        oos_predictions = pd.concat(oos_predictions).sort_index()
+        oos_meta_prob = pd.concat(oos_meta_prob).sort_index().reindex(oos_predictions.index)
         training = {
             "fold_metrics": fold_metrics,
             "avg_accuracy": avg_accuracy,
             "avg_f1_macro": avg_f1,
             "last_model": last_model,
             "last_meta": last_meta,
+            "oos_predictions": oos_predictions,
+            "oos_meta_prob": oos_meta_prob,
         }
         pipeline.state["training"] = training
         return training
@@ -261,29 +355,35 @@ class SignalsStep(PipelineStep):
     name = "generate_signals"
 
     def run(self, pipeline):
-        X = pipeline.require("X")
         training = pipeline.require("training")
         config = pipeline.section("signals")
 
-        model = training["last_model"]
-        meta_model = training["last_meta"]
-        predictions = model.predict(X)
+        prediction_series = training.get("oos_predictions")
+        meta_prob_series = training.get("oos_meta_prob")
+        if prediction_series is None or meta_prob_series is None:
+            X = pipeline.require("X")
+            model = training["last_model"]
+            meta_model = training["last_meta"]
+            predictions = pd.Series(model.predict(X), index=X.index)
+            X_meta = X.copy()
+            X_meta["primary_pred"] = predictions.values
+            meta_prob_series = pd.Series(_positive_class_probability(meta_model, X_meta), index=X.index)
+            prediction_series = predictions
 
-        X_meta = X.copy()
-        X_meta["primary_pred"] = predictions
-        meta_prob = meta_model.predict_proba(X_meta)[:, 1]
+        prediction_series = prediction_series.sort_index()
+        meta_prob_series = meta_prob_series.reindex(prediction_series.index)
 
-        continuous = pd.Series(0.0, index=X.index)
-        for position, prediction in enumerate(predictions):
+        continuous = pd.Series(0.0, index=prediction_series.index)
+        for timestamp, prediction in prediction_series.items():
             if prediction == 0:
                 continue
             size = kelly_fraction(
-                prob_win=meta_prob[position],
+                prob_win=meta_prob_series.loc[timestamp],
                 avg_win=config.get("avg_win", 0.02),
                 avg_loss=config.get("avg_loss", 0.02),
                 fraction=config.get("fraction", 0.5),
             )
-            continuous.iloc[position] = prediction * size
+            continuous.loc[timestamp] = prediction * size
 
         threshold = config.get("threshold", 0.05)
         signals = continuous.apply(
@@ -291,8 +391,8 @@ class SignalsStep(PipelineStep):
         )
 
         result = {
-            "predictions": pd.Series(predictions, index=X.index),
-            "meta_prob": pd.Series(meta_prob, index=X.index),
+            "predictions": prediction_series,
+            "meta_prob": meta_prob_series,
             "continuous_signals": continuous,
             "signals": signals,
         }
@@ -304,12 +404,11 @@ class BacktestStep(PipelineStep):
     name = "run_backtest"
 
     def run(self, pipeline):
-        X = pipeline.require("X")
         raw_data = pipeline.require("raw_data")
         signals = pipeline.require("signals")["signals"]
         config = pipeline.section("backtest")
         backtest = run_backtest(
-            close=raw_data["close"].loc[X.index],
+            close=raw_data["close"].loc[signals.index],
             signals=signals,
             equity=config.get("equity", 10_000.0),
             fee_rate=config.get("fee_rate", 0.001),
@@ -321,6 +420,7 @@ class BacktestStep(PipelineStep):
 DEFAULT_STEPS = [
     FetchDataStep,
     IndicatorsStep,
+    AutoMLStep,
     FeaturesStep,
     StationarityStep,
     RegimeStep,
@@ -365,6 +465,9 @@ class ResearchPipeline:
 
     def build_features(self):
         return self.run_step("build_features")
+
+    def run_automl(self):
+        return self.run_step("run_automl")
 
     def check_stationarity(self):
         return self.run_step("check_stationarity")

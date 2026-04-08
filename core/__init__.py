@@ -21,6 +21,7 @@ from .indicators import (
 )
 from .pipeline import (
     AlignDataStep,
+    AutoMLStep,
     BacktestStep,
     DEFAULT_STEPS,
     FetchDataStep,
@@ -43,6 +44,7 @@ from .labeling import (
     sequential_bootstrap,
 )
 from .models import (
+    build_model,
     walk_forward_split,
     train_model,
     train_meta_model,

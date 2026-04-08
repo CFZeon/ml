@@ -1,0 +1,100 @@
+"""Run a constrained Optuna-backed AutoML search on the research pipeline.
+
+Usage
+-----
+    python example_automl.py
+"""
+
+from core import ATR, BollingerBands, MACD, RSI, ResearchPipeline
+
+
+def main():
+    sep = "=" * 60
+    pipeline = ResearchPipeline(
+        {
+            "data": {
+                "symbol": "BTCUSDT",
+                "interval": "1h",
+                "start": "2024-01-01",
+                "end": "2026-01-01",
+            },
+            "indicators": [RSI(14), MACD(), BollingerBands(20), ATR(14)],
+            "features": {"lags": [1, 3, 6], "frac_diff_d": 0.4},
+            "regime": {"n_regimes": 2},
+            "labels": {
+                "kind": "triple_barrier",
+                "pt_sl": (2.0, 2.0),
+                "max_holding": 24,
+                "min_return": 0.001,
+                "volatility_window": 24,
+            },
+            "model": {"type": "rf", "n_splits": 3, "gap": 24},
+            "signals": {"avg_win": 0.02, "avg_loss": 0.02, "fraction": 0.5, "threshold": 0.05},
+            "backtest": {"equity": 10_000, "fee_rate": 0.001},
+            "automl": {
+                "enabled": True,
+                "n_trials": 8,
+                "objective": "composite",
+                "seed": 42,
+                "min_trades": 10,
+                "study_name": "BTCUSDT_1h_composite_oos_demo",
+            },
+        }
+    )
+
+    print(f"\n{sep}\nStep 1 · Fetching data and indicators\n{sep}")
+    pipeline.fetch_data()
+    pipeline.run_indicators()
+
+    print(f"\n{sep}\nStep 2 · AutoML search\n{sep}")
+    automl = pipeline.run_automl()
+    print(f"  study name : {automl['study_name']}")
+    print(f"  objective  : {automl['objective']}")
+    print(f"  trials     : {automl['trial_count']}")
+    print(f"  best value : {automl['best_value']:.4f}")
+    print(f"  best params: {automl['best_params']}")
+    print(f"  best bt    : {automl['best_backtest']}")
+
+    print(f"\n{sep}\nStep 3 · Rebuild pipeline with best config\n{sep}")
+    features = pipeline.build_features()
+    pipeline.check_stationarity()
+    pipeline.detect_regimes()
+    pipeline.build_labels()
+    pipeline.align_data()
+    pipeline.compute_sample_weights()
+    training = pipeline.train_models()
+    signals = pipeline.generate_signals()
+    backtest = pipeline.run_backtest()
+
+    print(f"  feature count: {features.shape[1]}")
+    print(f"  avg accuracy : {training['avg_accuracy']:.4f}")
+    print(f"  avg f1       : {training['avg_f1_macro']:.4f}")
+    print(f"  long signals : {int((signals['signals'] == 1).sum())}")
+    print(f"  short signals: {int((signals['signals'] == -1).sum())}")
+    print(f"  net profit   : ${backtest['net_profit']:,.2f}")
+    print(f"  sharpe ratio : {backtest['sharpe_ratio']}")
+    print(f"  max drawdown : {backtest['max_drawdown']:.2%}")
+    print(f"  start equity : ${backtest['starting_equity']:,.2f}")
+    print(f"  end equity   : ${backtest['ending_equity']:,.2f}")
+    print(f"  net profit   : ${backtest['net_profit']:,.2f} ({backtest['net_profit_pct']:.2%})")
+    print(f"  gross profit : ${backtest['gross_profit']:,.2f}")
+    print(f"  gross loss   : ${backtest['gross_loss']:,.2f}")
+    print(f"  fees paid    : ${backtest['fees_paid']:,.2f}")
+    print(f"  sharpe ratio : {backtest['sharpe_ratio']}")
+    print(f"  sortino      : {backtest['sortino_ratio']}")
+    print(f"  calmar       : {backtest['calmar_ratio']}")
+    print(f"  CAGR         : {backtest['cagr']:.2%}")
+    print(f"  volatility   : {backtest['annualized_volatility']:.2%}")
+    print(f"  max drawdown : {backtest['max_drawdown']:.2%} (${backtest['max_drawdown_amount']:,.2f})")
+    print(f"  dd duration  : {backtest['max_drawdown_duration_bars']} bars ({backtest['max_drawdown_duration']})")
+    print(f"  exposure     : {backtest['exposure_rate']:.2%}")
+    print(f"  profit factor: {backtest['profit_factor']}")
+    print(f"  expectancy   : ${backtest['expectancy']:,.2f} per active bar")
+    print(f"  avg win      : ${backtest['avg_win']:,.2f}")
+    print(f"  avg loss     : ${backtest['avg_loss']:,.2f}")
+    print(f"  trades       : {backtest['total_trades']}")
+    print(f"  win rate     : {backtest['win_rate']:.2%} (active bars)")
+
+
+if __name__ == "__main__":
+    main()

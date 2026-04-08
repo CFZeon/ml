@@ -9,6 +9,8 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, log_loss
 from sklearn.cluster import KMeans
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -50,18 +52,50 @@ def walk_forward_split(X, n_splits=3, train_size=None, test_size=None,
 # Model catalogue
 # ───────────────────────────────────────────────────────────────────────────
 
-_MODELS = {
-    "rf": lambda: RandomForestClassifier(
-        n_estimators=200, class_weight="balanced",
-        random_state=42, n_jobs=-1),
-    "gbm": lambda: GradientBoostingClassifier(
-        n_estimators=200, max_depth=4, random_state=42),
-    "logistic": lambda: LogisticRegression(
-        max_iter=1000, class_weight="balanced", random_state=42),
-}
+def build_model(model_type="rf", model_params=None):
+    """Create a configured model instance from type and parameter dict."""
+    model_params = dict(model_params or {})
+
+    if model_type == "rf":
+        return RandomForestClassifier(
+            n_estimators=int(model_params.get("n_estimators", 200)),
+            max_depth=model_params.get("max_depth"),
+            min_samples_leaf=int(model_params.get("min_samples_leaf", 1)),
+            class_weight=model_params.get("class_weight", "balanced"),
+            random_state=int(model_params.get("random_state", 42)),
+            n_jobs=int(model_params.get("n_jobs", -1)),
+        )
+
+    if model_type == "gbm":
+        return GradientBoostingClassifier(
+            n_estimators=int(model_params.get("n_estimators", 200)),
+            learning_rate=float(model_params.get("learning_rate", 0.1)),
+            max_depth=int(model_params.get("max_depth", 4)),
+            subsample=float(model_params.get("subsample", 1.0)),
+            min_samples_leaf=int(model_params.get("min_samples_leaf", 1)),
+            random_state=int(model_params.get("random_state", 42)),
+        )
+
+    if model_type == "logistic":
+        return Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                (
+                    "model",
+                    LogisticRegression(
+                        C=float(model_params.get("c", model_params.get("C", 1.0))),
+                        max_iter=int(model_params.get("max_iter", 1000)),
+                        class_weight=model_params.get("class_weight", "balanced"),
+                        random_state=int(model_params.get("random_state", 42)),
+                    ),
+                ),
+            ]
+        )
+
+    raise ValueError(f"Unknown model_type={model_type!r}. Choose from ['rf', 'gbm', 'logistic']")
 
 
-def train_model(X, y, sample_weight=None, model_type="rf"):
+def train_model(X, y, sample_weight=None, model_type="rf", model_params=None):
     """Train a classifier.
 
     Parameters
@@ -73,11 +107,16 @@ def train_model(X, y, sample_weight=None, model_type="rf"):
 
     Returns the fitted model.
     """
-    if model_type not in _MODELS:
-        raise ValueError(f"Unknown model_type={model_type!r}. Choose from {list(_MODELS)}")
-    model = _MODELS[model_type]()
+    model = build_model(model_type=model_type, model_params=model_params)
     sw = sample_weight.values if sample_weight is not None else None
-    model.fit(X, y, sample_weight=sw)
+    fit_kwargs = {}
+    if sw is not None:
+        fit_kwargs["sample_weight"] = sw
+        if isinstance(model, Pipeline):
+            fit_kwargs["model__sample_weight"] = sw
+            fit_kwargs.pop("sample_weight", None)
+
+    model.fit(X, y, **fit_kwargs)
     return model
 
 
