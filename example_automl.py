@@ -19,7 +19,11 @@ def main():
                 "end": "2026-01-01",
             },
             "indicators": [RSI(14), MACD(), BollingerBands(20), ATR(14)],
-            "features": {"lags": [1, 3, 6], "frac_diff_d": 0.4},
+            "features": {
+                "lags": [1, 3, 6],
+                "frac_diff_d": 0.4,
+                "schema_version": "indicator_aware_v1",
+            },
             "regime": {"n_regimes": 2},
             "labels": {
                 "kind": "triple_barrier",

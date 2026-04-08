@@ -152,11 +152,15 @@ class FeaturesStep(PipelineStep):
 
     def run(self, pipeline):
         data = pipeline.require("data")
+        indicator_run = pipeline.state.get("indicator_run")
         config = pipeline.section("features")
         features = build_features(
             data,
             lags=config.get("lags"),
             frac_diff_d=config.get("frac_diff_d"),
+            indicator_run=indicator_run,
+            rolling_window=config.get("rolling_window", 20),
+            squeeze_quantile=config.get("squeeze_quantile", 0.2),
         )
 
         for builder in config.get("builders", []):

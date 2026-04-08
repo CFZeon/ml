@@ -58,6 +58,18 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
 }
 
 
+def _resolve_study_name(base_config, automl_config):
+    data_config = base_config.get("data", {})
+    objective = automl_config.get("objective", "composite")
+    study_name = automl_config.get("study_name") or (
+        f"{data_config.get('symbol', 'symbol')}_{data_config.get('interval', 'interval')}_{objective}"
+    )
+    schema_version = base_config.get("features", {}).get("schema_version")
+    if schema_version and schema_version not in study_name:
+        return f"{study_name}_{schema_version}"
+    return study_name
+
+
 def _clone_value(value):
     if isinstance(value, tuple):
         return list(value)
@@ -123,11 +135,7 @@ def _build_study_storage_path(base_config, automl_config):
     if explicit:
         path = Path(explicit)
     else:
-        data_config = base_config.get("data", {})
-        objective = automl_config.get("objective", "composite")
-        study_name = automl_config.get("study_name") or (
-            f"{data_config.get('symbol', 'symbol')}_{data_config.get('interval', 'interval')}_{objective}"
-        )
+        study_name = _resolve_study_name(base_config, automl_config)
         path = Path(".cache") / "automl" / f"{study_name}.db"
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -280,7 +288,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
 
     storage_path = _build_study_storage_path(base_config, automl_config)
     storage_url = f"sqlite:///{storage_path.as_posix()}"
-    study_name = automl_config.get("study_name") or storage_path.stem
+    study_name = _resolve_study_name(base_config, automl_config)
     sampler = TPESampler(seed=automl_config.get("seed", 42))
 
     raw_data = base_pipeline.require("raw_data")
@@ -357,6 +365,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "study_name": study.study_name,
         "storage": str(storage_path),
         "objective": automl_config.get("objective", "composite"),
+        "feature_schema_version": base_config.get("features", {}).get("schema_version"),
         "best_value": study.best_value,
         "best_params": _json_ready(study.best_trial.params),
         "best_overrides": study.best_trial.user_attrs.get("overrides", {}),

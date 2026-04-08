@@ -5,30 +5,11 @@ Usage
     python example_fvg.py
 """
 
-import numpy as np
 import pandas as pd
 
 from core import (
     ResearchPipeline,
 )
-
-
-def add_fvg_features(pipeline, features):
-    data = pipeline.require("data")
-    features = features.copy()
-    features["fvg_gap_imbalance"] = (
-        data["fvg_main_bull_active_count"].fillna(0)
-        - data["fvg_main_bear_active_count"].fillna(0)
-    )
-    features["fvg_fill_imbalance"] = (
-        data["fvg_main_bull_fill_state"].fillna(0)
-        - data["fvg_main_bear_fill_state"].fillna(0)
-    )
-    features["fvg_distance_spread"] = (
-        data["fvg_main_bull_distance_pct"].fillna(0)
-        - data["fvg_main_bear_distance_pct"].fillna(0)
-    )
-    return features
 
 
 def build_fvg_regime_features(pipeline):
@@ -37,8 +18,8 @@ def build_fvg_regime_features(pipeline):
     return pd.DataFrame(
         {
             "vol_20": data["close"].pct_change().rolling(20).std(),
-            "fvg_gap_imbalance": features["fvg_gap_imbalance"],
-            "fvg_distance_spread": features["fvg_distance_spread"],
+            "fvg_gap_imbalance": features["fvg_main_gap_imbalance"],
+            "fvg_distance_spread": features["fvg_main_distance_spread"],
         }
     ).dropna()
 
@@ -61,7 +42,6 @@ def main():
             "features": {
                 "lags": [1, 3, 6],
                 "frac_diff_d": 0.4,
-                "builders": [add_fvg_features],
             },
             "regime": {"n_regimes": 2, "builder": build_fvg_regime_features},
             "labels": {
