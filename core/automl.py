@@ -52,8 +52,10 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
         },
     },
     "signals": {
-        "threshold": {"type": "categorical", "choices": [0.02, 0.05, 0.08, 0.12]},
+        "threshold": {"type": "categorical", "choices": [0.01, 0.02, 0.03, 0.05]},
         "fraction": {"type": "categorical", "choices": [0.25, 0.5, 0.75]},
+        "edge_threshold": {"type": "categorical", "choices": [0.03, 0.05, 0.08, 0.12]},
+        "meta_threshold": {"type": "categorical", "choices": [0.5, 0.55, 0.6, 0.65]},
     },
 }
 
@@ -265,7 +267,7 @@ def _sample_trial_overrides(trial, search_space):
     signal_space = search_space.get("signals", {})
     if signal_space:
         signal_overrides = {}
-        for key in ["threshold", "fraction"]:
+        for key in ["threshold", "fraction", "edge_threshold", "meta_threshold"]:
             if key in signal_space:
                 signal_overrides[key] = _sample_from_spec(trial, f"signals.{key}", signal_space[key])
         if signal_overrides:

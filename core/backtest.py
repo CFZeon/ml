@@ -101,25 +101,28 @@ def _max_drawdown_duration(equity_curve, peak):
 # ───────────────────────────────────────────────────────────────────────────
 
 def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001):
-    """Vectorised backtest on categorical signals.
+    """Vectorised backtest on categorical or fractional position signals.
 
     Parameters
     ----------
     close    : pd.Series  – price series (aligned with signals)
-    signals  : pd.Series  – +1 long, -1 short, 0 flat
+    signals  : pd.Series  – position weights in [-1, 1]
     equity   : float      – starting capital
     fee_rate : float      – one-way fee
 
     Returns dict with metrics and equity curve.
     """
+    close = pd.Series(close, copy=False).astype(float)
+    signal_series = pd.Series(signals, index=close.index).reindex(close.index).fillna(0.0).astype(float)
+    signal_series = signal_series.clip(-1.0, 1.0)
     returns = close.pct_change().fillna(0)
 
     # position acts on the NEXT bar
-    position = signals.shift(1).fillna(0)
+    position = signal_series.shift(1).fillna(0.0)
 
     # cost on every position change
-    trades = position.diff().fillna(0).abs()
-    costs = trades * fee_rate
+    turnover = position.diff().abs().fillna(position.abs())
+    costs = turnover * fee_rate
 
     strat_ret = position * returns - costs
     eq_curve = equity * (1 + strat_ret).cumprod()
@@ -142,9 +145,12 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001):
     max_dd = ((eq_curve - peak) / peak).min()
     max_dd_amount = abs((eq_curve - peak).min())
     max_dd_bars, max_dd_duration = _max_drawdown_duration(eq_curve, peak)
-    n_trades = int(trades.gt(0).sum()) // 2
-    active = strat_ret[position != 0]
-    active_pnl = pnl[position != 0]
+    sign_changed = np.sign(position) != np.sign(position.shift(1).fillna(0.0))
+    opened_trade = position.ne(0.0) & (position.shift(1).fillna(0.0).eq(0.0) | sign_changed)
+    n_trades = int(opened_trade.sum())
+    active_mask = position.abs() > 1e-12
+    active = strat_ret[active_mask]
+    active_pnl = pnl[active_mask]
     winners = active_pnl[active_pnl > 0]
     losers = active_pnl[active_pnl < 0]
     gross_profit = winners.sum()
@@ -156,6 +162,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001):
     expectancy_pct = active.mean() if len(active) > 0 else 0.0
     profit_factor = _safe_ratio(gross_profit, gross_loss)
     exposure_rate = float(position.ne(0).mean()) if len(position) > 0 else 0.0
+    avg_position_size = float(position.abs().mean()) if len(position) > 0 else 0.0
+    total_turnover = float(turnover.sum()) if len(turnover) > 0 else 0.0
 
     elapsed_years = 0.0
     if len(close.index) > 1:
@@ -183,6 +191,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001):
         "max_drawdown_duration": max_dd_duration,
         "max_drawdown_duration_bars": max_dd_bars,
         "exposure_rate": _round_metric(exposure_rate, 4),
+        "average_position_size": _round_metric(avg_position_size, 4),
+        "total_turnover": _round_metric(total_turnover, 4),
         "profit_factor": _round_metric(profit_factor, 2),
         "avg_win": _round_metric(avg_win, 2),
         "avg_loss": _round_metric(avg_loss, 2),

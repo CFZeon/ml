@@ -28,8 +28,15 @@ def main():
                 "min_return": 0.001,
                 "volatility_window": 24,
             },
-            "model": {"type": "rf", "n_splits": 3, "gap": 24},
-            "signals": {"avg_win": 0.02, "avg_loss": 0.02, "fraction": 0.5, "threshold": 0.05},
+            "model": {"type": "logistic", "n_splits": 3, "gap": 24},
+            "signals": {
+                "avg_win": 0.02,
+                "avg_loss": 0.02,
+                "fraction": 0.5,
+                "threshold": 0.01,
+                "edge_threshold": 0.05,
+                "meta_threshold": 0.55,
+            },
             "backtest": {"equity": 10_000, "fee_rate": 0.001},
         }
     )

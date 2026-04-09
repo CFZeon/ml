@@ -124,20 +124,102 @@ def train_model(X, y, sample_weight=None, model_type="rf", model_params=None):
 # Meta-labeling
 # ───────────────────────────────────────────────────────────────────────────
 
-def train_meta_model(primary_preds, X, y_true, sample_weight=None):
-    """Train a meta-labeling model.
+class ConstantProbabilityModel:
+    """Minimal classifier that returns a fixed positive-class probability."""
+
+    def __init__(self, positive_probability=0.5):
+        self.positive_probability = float(np.clip(positive_probability, 0.0, 1.0))
+        self.classes_ = np.array([0, 1])
+
+    def predict_proba(self, X):
+        count = len(X)
+        positive = np.full(count, self.positive_probability, dtype=float)
+        negative = 1.0 - positive
+        return np.column_stack([negative, positive])
+
+    def predict(self, X):
+        label = 1 if self.positive_probability >= 0.5 else 0
+        return np.full(len(X), label, dtype=int)
+
+
+def predict_probability_frame(model, X, ordered_classes=(-1, 0, 1)):
+    """Return aligned class probabilities for the requested class order."""
+    probabilities = model.predict_proba(X)
+    classes = getattr(model, "classes_", None)
+
+    if classes is None and isinstance(model, Pipeline):
+        estimator = model.named_steps.get("model")
+        classes = getattr(estimator, "classes_", None)
+
+    if classes is None:
+        raise ValueError("Model does not expose classes_ for probability alignment")
+
+    frame = pd.DataFrame(probabilities, index=X.index, columns=list(classes), dtype=float)
+    for class_label in ordered_classes:
+        if class_label not in frame.columns:
+            frame[class_label] = 0.0
+    return frame.loc[:, list(ordered_classes)]
+
+
+def build_meta_feature_frame(primary_preds, primary_probabilities):
+    """Build a compact, probability-aware meta-label feature frame."""
+    prediction_series = pd.Series(primary_preds, index=primary_probabilities.index)
+    probability_frame = primary_probabilities.copy()
+
+    meta = pd.DataFrame(index=probability_frame.index)
+    meta["primary_pred"] = prediction_series.astype(float)
+    meta["prob_short"] = probability_frame.get(-1, 0.0)
+    meta["prob_flat"] = probability_frame.get(0, 0.0)
+    meta["prob_long"] = probability_frame.get(1, 0.0)
+    meta["direction_edge"] = meta["prob_long"] - meta["prob_short"]
+
+    predicted_class_prob = []
+    for timestamp, prediction in prediction_series.items():
+        if prediction in probability_frame.columns:
+            predicted_class_prob.append(float(probability_frame.loc[timestamp, prediction]))
+        else:
+            predicted_class_prob.append(0.0)
+    meta["predicted_class_prob"] = predicted_class_prob
+    return meta
+
+
+def train_meta_model(primary_preds, primary_probabilities, y_true, sample_weight=None, model_params=None):
+    """Train a meta-labeling model on primary predictions and probabilities.
 
     The meta model learns *whether the primary prediction is correct* and
     outputs a probability used for bet sizing.
 
     y_meta = 1 if primary_pred == y_true, else 0.
     """
-    y_meta = (np.asarray(primary_preds) == np.asarray(y_true)).astype(int)
-    X_meta = X.copy()
-    X_meta["primary_pred"] = primary_preds
-    model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    model_params = dict(model_params or {})
+    prediction_series = pd.Series(primary_preds, index=y_true.index)
+    y_meta = (prediction_series == pd.Series(y_true, index=y_true.index)).astype(int)
+
     sw = sample_weight.values if sample_weight is not None else None
-    model.fit(X_meta, y_meta, sample_weight=sw)
+    if y_meta.nunique() < 2:
+        if sw is not None and sw.sum() > 0:
+            positive_rate = float(np.average(y_meta, weights=sw))
+        else:
+            positive_rate = float(y_meta.mean()) if len(y_meta) else 0.5
+        return ConstantProbabilityModel(positive_probability=positive_rate)
+
+    X_meta = build_meta_feature_frame(prediction_series, primary_probabilities)
+    model = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "model",
+                LogisticRegression(
+                    C=float(model_params.get("c", model_params.get("C", 1.0))),
+                    max_iter=int(model_params.get("max_iter", 1000)),
+                    class_weight=model_params.get("class_weight", "balanced"),
+                    random_state=int(model_params.get("random_state", 42)),
+                ),
+            ),
+        ]
+    )
+    fit_kwargs = {"model__sample_weight": sw} if sw is not None else {}
+    model.fit(X_meta, y_meta, **fit_kwargs)
     return model
 
 

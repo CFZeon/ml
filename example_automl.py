@@ -22,7 +22,7 @@ def main():
             "features": {
                 "lags": [1, 3, 6],
                 "frac_diff_d": 0.4,
-                "schema_version": "indicator_aware_v2",
+                "schema_version": "indicator_aware_v3",
             },
             "regime": {"n_regimes": 2},
             "labels": {
@@ -32,8 +32,15 @@ def main():
                 "min_return": 0.001,
                 "volatility_window": 24,
             },
-            "model": {"type": "rf", "n_splits": 3, "gap": 24},
-            "signals": {"avg_win": 0.02, "avg_loss": 0.02, "fraction": 0.5, "threshold": 0.05},
+            "model": {"type": "logistic", "n_splits": 3, "gap": 24},
+            "signals": {
+                "avg_win": 0.02,
+                "avg_loss": 0.02,
+                "fraction": 0.5,
+                "threshold": 0.01,
+                "edge_threshold": 0.05,
+                "meta_threshold": 0.55,
+            },
             "backtest": {"equity": 10_000, "fee_rate": 0.001},
             "automl": {
                 "enabled": True,

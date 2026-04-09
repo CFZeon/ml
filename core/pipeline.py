@@ -16,9 +16,12 @@ from .labeling import (
     triple_barrier_labels,
 )
 from .models import (
+    ConstantProbabilityModel,
+    build_meta_feature_frame,
     compute_feature_block_diagnostics,
     detect_regime,
     evaluate_model,
+    predict_probability_frame,
     summarize_feature_block_diagnostics,
     train_meta_model,
     train_model,
@@ -65,6 +68,82 @@ def _positive_class_probability(model, X, positive_class=1):
         return probabilities[:, positive_index]
 
     return probabilities[:, -1]
+
+
+def _resolve_signal_holding_bars(pipeline, signal_config):
+    configured = signal_config.get("holding_bars")
+    if configured is not None:
+        return max(1, int(configured))
+
+    label_config = pipeline.section("labels")
+    if label_config.get("kind") == "fixed_horizon":
+        return max(1, int(label_config.get("horizon", 1)))
+    return max(1, int(label_config.get("max_holding", 1)))
+
+
+def _apply_holding_period(event_weights, holding_bars):
+    weights = pd.Series(event_weights, copy=False).astype(float)
+    if holding_bars <= 1 or weights.empty:
+        return weights.clip(-1.0, 1.0)
+
+    held = pd.Series(0.0, index=weights.index)
+    for lag in range(holding_bars):
+        held = held.add(weights.shift(lag).fillna(0.0), fill_value=0.0)
+    return (held / float(holding_bars)).clip(-1.0, 1.0)
+
+
+def _train_inner_meta_model(X_train, y_train, sample_weights, model_config):
+    inner_predictions = []
+    inner_probabilities = []
+    inner_truth = []
+    inner_weights = []
+    min_train_rows = max(50, min(100, len(X_train) // 3))
+    min_test_rows = 20
+
+    for inner_train_idx, inner_test_idx in walk_forward_split(
+        X_train,
+        n_splits=model_config.get("meta_n_splits", max(2, min(3, model_config.get("n_splits", 3)))),
+        gap=model_config.get("gap", 0),
+        expanding=model_config.get("expanding", False),
+    ):
+        if len(inner_train_idx) < min_train_rows or len(inner_test_idx) < min_test_rows:
+            continue
+
+        X_inner_train = X_train.iloc[inner_train_idx]
+        y_inner_train = y_train.iloc[inner_train_idx]
+        w_inner_train = sample_weights.iloc[inner_train_idx]
+        X_inner_test = X_train.iloc[inner_test_idx]
+
+        inner_model = train_model(
+            X_inner_train,
+            y_inner_train,
+            sample_weight=w_inner_train,
+            model_type=model_config.get("type", "rf"),
+            model_params=model_config.get("params"),
+        )
+
+        inner_pred = pd.Series(inner_model.predict(X_inner_test), index=X_inner_test.index)
+        inner_prob = predict_probability_frame(inner_model, X_inner_test)
+        inner_predictions.append(inner_pred)
+        inner_probabilities.append(inner_prob)
+        inner_truth.append(y_train.iloc[inner_test_idx])
+        inner_weights.append(sample_weights.iloc[inner_test_idx])
+
+    if not inner_predictions:
+        return ConstantProbabilityModel(positive_probability=0.5)
+
+    meta_predictions = pd.concat(inner_predictions).sort_index()
+    meta_probabilities = pd.concat(inner_probabilities).sort_index()
+    meta_truth = pd.concat(inner_truth).sort_index().reindex(meta_predictions.index)
+    meta_weights = pd.concat(inner_weights).sort_index().reindex(meta_predictions.index).fillna(1.0)
+
+    return train_meta_model(
+        meta_predictions,
+        meta_probabilities,
+        meta_truth,
+        sample_weight=meta_weights,
+        model_params=model_config.get("meta_params"),
+    )
 
 
 class PipelineStep:
@@ -324,6 +403,7 @@ class TrainModelsStep(PipelineStep):
         last_model = None
         last_meta = None
         oos_predictions = []
+        oos_probabilities = []
         oos_meta_prob = []
 
         for fold, (train_idx, test_idx) in enumerate(
@@ -351,6 +431,7 @@ class TrainModelsStep(PipelineStep):
             )
             metrics = evaluate_model(model, X_test, y_test)
             metrics["fold"] = fold
+            test_primary_probs = predict_probability_frame(model, X_test)
             block_diagnostics = compute_feature_block_diagnostics(
                 model,
                 X_train,
@@ -361,18 +442,17 @@ class TrainModelsStep(PipelineStep):
             )
             fold_block_diagnostics.append(block_diagnostics)
 
-            train_primary_preds = model.predict(X_train)
             test_primary_preds = pd.Series(model.predict(X_test), index=X_test.index)
-            meta_model = train_meta_model(train_primary_preds, X_train, y_train, sample_weight=w_train)
+            meta_model = _train_inner_meta_model(X_train, y_train, w_train, config)
 
-            X_meta_test = X_test.copy()
-            X_meta_test["primary_pred"] = test_primary_preds.values
+            X_meta_test = build_meta_feature_frame(test_primary_preds, test_primary_probs)
             meta_prob_test = pd.Series(_positive_class_probability(meta_model, X_meta_test), index=X_test.index)
 
             fold_metrics.append(metrics)
             last_model = model
             last_meta = meta_model
             oos_predictions.append(test_primary_preds)
+            oos_probabilities.append(test_primary_probs)
             oos_meta_prob.append(meta_prob_test)
 
         if last_model is None or last_meta is None:
@@ -381,6 +461,7 @@ class TrainModelsStep(PipelineStep):
         avg_accuracy = sum(metric["accuracy"] for metric in fold_metrics) / len(fold_metrics)
         avg_f1 = sum(metric["f1_macro"] for metric in fold_metrics) / len(fold_metrics)
         oos_predictions = pd.concat(oos_predictions).sort_index()
+        oos_probabilities = pd.concat(oos_probabilities).sort_index().reindex(oos_predictions.index)
         oos_meta_prob = pd.concat(oos_meta_prob).sort_index().reindex(oos_predictions.index)
         feature_diagnostics = summarize_feature_block_diagnostics(fold_block_diagnostics)
         training = {
@@ -390,6 +471,7 @@ class TrainModelsStep(PipelineStep):
             "last_model": last_model,
             "last_meta": last_meta,
             "oos_predictions": oos_predictions,
+            "oos_probabilities": oos_probabilities,
             "oos_meta_prob": oos_meta_prob,
             "feature_block_diagnostics": feature_diagnostics,
         }
@@ -405,40 +487,53 @@ class SignalsStep(PipelineStep):
         config = pipeline.section("signals")
 
         prediction_series = training.get("oos_predictions")
+        probability_frame = training.get("oos_probabilities")
         meta_prob_series = training.get("oos_meta_prob")
-        if prediction_series is None or meta_prob_series is None:
+        if prediction_series is None or meta_prob_series is None or probability_frame is None:
             X = pipeline.require("X")
             model = training["last_model"]
             meta_model = training["last_meta"]
             predictions = pd.Series(model.predict(X), index=X.index)
-            X_meta = X.copy()
-            X_meta["primary_pred"] = predictions.values
+            probability_frame = predict_probability_frame(model, X)
+            X_meta = build_meta_feature_frame(predictions, probability_frame)
             meta_prob_series = pd.Series(_positive_class_probability(meta_model, X_meta), index=X.index)
             prediction_series = predictions
 
         prediction_series = prediction_series.sort_index()
+        probability_frame = probability_frame.reindex(prediction_series.index).fillna(0.0)
         meta_prob_series = meta_prob_series.reindex(prediction_series.index)
 
-        continuous = pd.Series(0.0, index=prediction_series.index)
-        for timestamp, prediction in prediction_series.items():
-            if prediction == 0:
-                continue
-            size = kelly_fraction(
-                prob_win=meta_prob_series.loc[timestamp],
+        direction = prediction_series.apply(lambda value: 1.0 if value > 0 else (-1.0 if value < 0 else 0.0))
+        direction_edge = probability_frame[1] - probability_frame[-1]
+        confidence = direction_edge.abs().clip(0.0, 1.0)
+        kelly_size = meta_prob_series.apply(
+            lambda prob: kelly_fraction(
+                prob_win=prob,
                 avg_win=config.get("avg_win", 0.02),
                 avg_loss=config.get("avg_loss", 0.02),
                 fraction=config.get("fraction", 0.5),
             )
-            continuous.loc[timestamp] = prediction * size
-
-        threshold = config.get("threshold", 0.05)
-        signals = continuous.apply(
-            lambda value: 1 if value > threshold else (-1 if value < -threshold else 0)
         )
+
+        event_signals = direction * kelly_size * confidence
+        event_signals = event_signals.where(direction.ne(0.0), 0.0)
+        event_signals = event_signals.where(confidence >= config.get("edge_threshold", 0.05), 0.0)
+        event_signals = event_signals.where(meta_prob_series >= config.get("meta_threshold", 0.55), 0.0)
+        event_signals = event_signals.where(event_signals.abs() >= config.get("threshold", 0.03), 0.0)
+
+        holding_bars = _resolve_signal_holding_bars(pipeline, config)
+        continuous = _apply_holding_period(event_signals, holding_bars)
+        signals = continuous.apply(lambda value: 1 if value > 1e-12 else (-1 if value < -1e-12 else 0))
 
         result = {
             "predictions": prediction_series,
+            "primary_probabilities": probability_frame,
             "meta_prob": meta_prob_series,
+            "direction_edge": direction_edge,
+            "confidence": confidence,
+            "kelly_size": kelly_size,
+            "event_signals": event_signals,
+            "holding_bars": holding_bars,
             "continuous_signals": continuous,
             "signals": signals,
         }
@@ -451,11 +546,12 @@ class BacktestStep(PipelineStep):
 
     def run(self, pipeline):
         raw_data = pipeline.require("raw_data")
-        signals = pipeline.require("signals")["signals"]
+        signal_state = pipeline.require("signals")
         config = pipeline.section("backtest")
+        positions = signal_state["continuous_signals"] if config.get("use_continuous_positions", True) else signal_state["signals"]
         backtest = run_backtest(
-            close=raw_data["close"].loc[signals.index],
-            signals=signals,
+            close=raw_data["close"].loc[positions.index],
+            signals=positions,
             equity=config.get("equity", 10_000.0),
             fee_rate=config.get("fee_rate", 0.001),
         )
