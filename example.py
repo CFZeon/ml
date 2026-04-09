@@ -16,7 +16,7 @@ def main():
                 "symbol": "BTCUSDT",
                 "interval": "1h",
                 "start": "2024-01-01",
-                "end": "2024-04-01",
+                "end": "2024-12-01",
             },
             "indicators": [RSI(14), MACD(), BollingerBands(20), ATR(14)],
             "features": {"lags": [1, 3, 6], "frac_diff_d": 0.4},
@@ -28,7 +28,7 @@ def main():
                 "min_return": 0.001,
                 "volatility_window": 24,
             },
-            "model": {"type": "logistic", "n_splits": 3, "gap": 24},
+            "model": {"type": "gbm", "n_splits": 3, "gap": 24},
             "signals": {
                 "avg_win": 0.02,
                 "avg_loss": 0.02,
@@ -91,6 +91,16 @@ def main():
     y = aligned["y"]
     labels_aligned = aligned["labels_aligned"]
     print(f"  samples={len(X)}  features={X.shape[1]}")
+
+    # ── 6b. Feature selection ─────────────────────────────────────────────
+    print(f"\n{SEP}\nStep 6b · Feature selection (mutual information)\n{SEP}")
+    selection = pipeline.select_features()
+    sel_report = selection.report
+    X = pipeline.state["X"]
+    print(f"  selected {sel_report['selected_features']}/{sel_report['input_features']} features")
+    if sel_report.get("top_mi_scores"):
+        top = list(sel_report["top_mi_scores"].items())[:5]
+        print(f"  top MI: {top}")
 
     # ── 7. Sample weights ─────────────────────────────────────────────────
     print(f"\n{SEP}\nStep 7 · Sample weights by uniqueness\n{SEP}")

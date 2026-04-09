@@ -320,6 +320,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 "detect_regimes",
                 "build_labels",
                 "align_data",
+                "select_features",
                 "compute_sample_weights",
                 "train_models",
                 "generate_signals",

@@ -52,7 +52,7 @@ def walk_forward_split(X, n_splits=3, train_size=None, test_size=None,
 # Model catalogue
 # ───────────────────────────────────────────────────────────────────────────
 
-def build_model(model_type="rf", model_params=None):
+def build_model(model_type="gbm", model_params=None):
     """Create a configured model instance from type and parameter dict."""
     model_params = dict(model_params or {})
 
@@ -95,7 +95,7 @@ def build_model(model_type="rf", model_params=None):
     raise ValueError(f"Unknown model_type={model_type!r}. Choose from ['rf', 'gbm', 'logistic']")
 
 
-def train_model(X, y, sample_weight=None, model_type="rf", model_params=None):
+def train_model(X, y, sample_weight=None, model_type="gbm", model_params=None):
     """Train a classifier.
 
     Parameters

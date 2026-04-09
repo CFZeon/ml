@@ -8,7 +8,7 @@ import pandas as pd
 from .automl import run_automl_study
 from .backtest import kelly_fraction, run_backtest
 from .data import fetch_binance_vision
-from .features import build_feature_set, check_stationarity, screen_features_for_stationarity
+from .features import build_feature_set, check_stationarity, screen_features_for_stationarity, select_features
 from .indicators import run_indicators
 from .labeling import (
     fixed_horizon_labels,
@@ -88,8 +88,9 @@ def _apply_holding_period(event_weights, holding_bars):
 
     held = pd.Series(0.0, index=weights.index)
     for lag in range(holding_bars):
-        held = held.add(weights.shift(lag).fillna(0.0), fill_value=0.0)
-    return (held / float(holding_bars)).clip(-1.0, 1.0)
+        shifted = weights.shift(lag).fillna(0.0)
+        held = held.where(held.abs() >= shifted.abs(), shifted)
+    return held.clip(-1.0, 1.0)
 
 
 def _train_inner_meta_model(X_train, y_train, sample_weights, model_config):
@@ -99,6 +100,7 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config):
     inner_weights = []
     min_train_rows = max(50, min(100, len(X_train) // 3))
     min_test_rows = 20
+    binary_primary = model_config.get("binary_primary", True)
 
     for inner_train_idx, inner_test_idx in walk_forward_split(
         X_train,
@@ -114,11 +116,19 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config):
         w_inner_train = sample_weights.iloc[inner_train_idx]
         X_inner_test = X_train.iloc[inner_test_idx]
 
+        if binary_primary:
+            binary_mask = y_inner_train.ne(0)
+            X_inner_train = X_inner_train.loc[binary_mask]
+            y_inner_train = y_inner_train.loc[binary_mask]
+            w_inner_train = w_inner_train.loc[binary_mask]
+            if len(X_inner_train) < min_train_rows:
+                continue
+
         inner_model = train_model(
             X_inner_train,
             y_inner_train,
             sample_weight=w_inner_train,
-            model_type=model_config.get("type", "rf"),
+            model_type=model_config.get("type", "gbm"),
             model_params=model_config.get("params"),
         )
 
@@ -191,6 +201,7 @@ class AutoMLStep(PipelineStep):
                 RegimeStep,
                 LabelsStep,
                 AlignDataStep,
+                FeatureSelectionStep,
                 SampleWeightsStep,
                 TrainModelsStep,
                 SignalsStep,
@@ -217,6 +228,7 @@ class AutoMLStep(PipelineStep):
             "X",
             "y",
             "labels_aligned",
+            "feature_selection",
             "sample_weights",
             "training",
             "signals",
@@ -377,6 +389,22 @@ class AlignDataStep(PipelineStep):
         return {"X": X, "y": y, "labels_aligned": labels_aligned}
 
 
+class FeatureSelectionStep(PipelineStep):
+    name = "select_features"
+
+    def run(self, pipeline):
+        X = pipeline.require("X")
+        y = pipeline.require("y")
+        feature_blocks = pipeline.state.get("feature_blocks", {})
+        config = pipeline.section("feature_selection")
+
+        result = select_features(X, y, feature_blocks=feature_blocks, config=config)
+        pipeline.state["X"] = result.frame.reindex(X.index).loc[X.index.intersection(result.frame.index)]
+        pipeline.state["feature_blocks"] = result.feature_blocks
+        pipeline.state["feature_selection"] = result.report
+        return result
+
+
 class SampleWeightsStep(PipelineStep):
     name = "compute_sample_weights"
 
@@ -397,6 +425,7 @@ class TrainModelsStep(PipelineStep):
         weights = pipeline.require("sample_weights")
         config = pipeline.section("model")
         feature_blocks = pipeline.state.get("feature_blocks", {})
+        binary_primary = config.get("binary_primary", True)
 
         fold_metrics = []
         fold_block_diagnostics = []
@@ -422,11 +451,20 @@ class TrainModelsStep(PipelineStep):
             y_test = y.iloc[test_idx]
             w_train = weights.iloc[train_idx]
 
+            X_train_primary = X_train
+            y_train_primary = y_train
+            w_train_primary = w_train
+            if binary_primary:
+                binary_mask = y_train.ne(0)
+                X_train_primary = X_train.loc[binary_mask]
+                y_train_primary = y_train.loc[binary_mask]
+                w_train_primary = w_train.loc[binary_mask]
+
             model = train_model(
-                X_train,
-                y_train,
-                sample_weight=w_train,
-                model_type=config.get("type", "rf"),
+                X_train_primary,
+                y_train_primary,
+                sample_weight=w_train_primary,
+                model_type=config.get("type", "gbm"),
                 model_params=config.get("params"),
             )
             metrics = evaluate_model(model, X_test, y_test)
@@ -434,7 +472,7 @@ class TrainModelsStep(PipelineStep):
             test_primary_probs = predict_probability_frame(model, X_test)
             block_diagnostics = compute_feature_block_diagnostics(
                 model,
-                X_train,
+                X_train_primary,
                 X_test,
                 y_test,
                 feature_blocks=feature_blocks,
@@ -464,6 +502,30 @@ class TrainModelsStep(PipelineStep):
         oos_probabilities = pd.concat(oos_probabilities).sort_index().reindex(oos_predictions.index)
         oos_meta_prob = pd.concat(oos_meta_prob).sort_index().reindex(oos_predictions.index)
         feature_diagnostics = summarize_feature_block_diagnostics(fold_block_diagnostics)
+
+        # Estimate avg_win / avg_loss from OOS label outcomes
+        oos_avg_win = None
+        oos_avg_loss = None
+        try:
+            labels_aligned = pipeline.require("labels_aligned")
+            raw_data = pipeline.require("raw_data")
+            close_all = raw_data["close"]
+            oos_labels = labels_aligned.loc[labels_aligned.index.intersection(oos_predictions.index)]
+            if not oos_labels.empty and "t1" in oos_labels.columns:
+                entry_prices = close_all.reindex(oos_labels.index)
+                exit_idx = pd.DatetimeIndex(oos_labels["t1"])
+                exit_prices = close_all.reindex(exit_idx)
+                realized_returns = (exit_prices.values - entry_prices.values) / entry_prices.values
+                realized_returns = pd.Series(realized_returns, index=oos_labels.index).dropna()
+                wins = realized_returns[realized_returns > 0]
+                losses = realized_returns[realized_returns < 0]
+                if len(wins) > 0:
+                    oos_avg_win = float(wins.mean())
+                if len(losses) > 0:
+                    oos_avg_loss = float(losses.abs().mean())
+        except Exception:
+            pass
+
         training = {
             "fold_metrics": fold_metrics,
             "avg_accuracy": avg_accuracy,
@@ -474,6 +536,8 @@ class TrainModelsStep(PipelineStep):
             "oos_probabilities": oos_probabilities,
             "oos_meta_prob": oos_meta_prob,
             "feature_block_diagnostics": feature_diagnostics,
+            "oos_avg_win": oos_avg_win,
+            "oos_avg_loss": oos_avg_loss,
         }
         pipeline.state["training"] = training
         return training
@@ -506,16 +570,24 @@ class SignalsStep(PipelineStep):
         direction = prediction_series.apply(lambda value: 1.0 if value > 0 else (-1.0 if value < 0 else 0.0))
         direction_edge = probability_frame[1] - probability_frame[-1]
         confidence = direction_edge.abs().clip(0.0, 1.0)
+
+        avg_win = config.get("avg_win", 0.02)
+        avg_loss = config.get("avg_loss", 0.02)
+        if training.get("oos_avg_win") is not None:
+            avg_win = training["oos_avg_win"]
+        if training.get("oos_avg_loss") is not None:
+            avg_loss = training["oos_avg_loss"]
+
         kelly_size = meta_prob_series.apply(
             lambda prob: kelly_fraction(
                 prob_win=prob,
-                avg_win=config.get("avg_win", 0.02),
-                avg_loss=config.get("avg_loss", 0.02),
+                avg_win=avg_win,
+                avg_loss=avg_loss,
                 fraction=config.get("fraction", 0.5),
             )
         )
 
-        event_signals = direction * kelly_size * confidence
+        event_signals = direction * kelly_size
         event_signals = event_signals.where(direction.ne(0.0), 0.0)
         event_signals = event_signals.where(confidence >= config.get("edge_threshold", 0.05), 0.0)
         event_signals = event_signals.where(meta_prob_series >= config.get("meta_threshold", 0.55), 0.0)
@@ -536,6 +608,8 @@ class SignalsStep(PipelineStep):
             "holding_bars": holding_bars,
             "continuous_signals": continuous,
             "signals": signals,
+            "avg_win_used": avg_win,
+            "avg_loss_used": avg_loss,
         }
         pipeline.state["signals"] = result
         return result
@@ -568,6 +642,7 @@ DEFAULT_STEPS = [
     RegimeStep,
     LabelsStep,
     AlignDataStep,
+    FeatureSelectionStep,
     SampleWeightsStep,
     TrainModelsStep,
     SignalsStep,
@@ -622,6 +697,9 @@ class ResearchPipeline:
 
     def align_data(self):
         return self.run_step("align_data")
+
+    def select_features(self):
+        return self.run_step("select_features")
 
     def compute_sample_weights(self):
         return self.run_step("compute_sample_weights")

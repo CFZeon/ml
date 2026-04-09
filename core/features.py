@@ -657,6 +657,91 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None)
     return FeatureScreeningResult(frame=screened, feature_blocks=kept_blocks, report=report)
 
 
+# ---------------------------------------------------------------------------
+# Feature selection (mutual information)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FeatureSelectionResult:
+    frame: pd.DataFrame
+    feature_blocks: dict[str, str]
+    report: dict
+
+
+def select_features(features, y, feature_blocks=None, config=None):
+    """Select top features by mutual information with the target.
+
+    Parameters
+    ----------
+    features : pd.DataFrame - feature matrix
+    y : pd.Series - target labels (aligned index)
+    feature_blocks : dict - column -> block name mapping
+    config : dict - selection config with keys:
+        enabled (bool, default True)
+        max_features (int or None) - hard cap on features to keep
+        min_mi_threshold (float, default 0.0) - drop features below this MI score
+
+    Returns FeatureSelectionResult with selected frame, blocks, and report.
+    """
+    from sklearn.feature_selection import mutual_info_classif
+
+    config = dict(config or {})
+    feature_blocks = dict(feature_blocks or {})
+
+    if not config.get("enabled", True):
+        return FeatureSelectionResult(
+            frame=features.copy(),
+            feature_blocks=dict(feature_blocks),
+            report={"enabled": False, "input_features": features.shape[1], "selected_features": features.shape[1]},
+        )
+
+    common = features.index.intersection(y.index)
+    X_aligned = features.loc[common].copy()
+    y_aligned = y.loc[common].copy()
+
+    clean_mask = X_aligned.notna().all(axis=1) & y_aligned.notna()
+    X_clean = X_aligned.loc[clean_mask]
+    y_clean = y_aligned.loc[clean_mask]
+
+    if X_clean.empty or len(X_clean) < 50:
+        return FeatureSelectionResult(
+            frame=features.copy(),
+            feature_blocks=dict(feature_blocks),
+            report={"enabled": True, "input_features": features.shape[1], "selected_features": features.shape[1],
+                    "error": "insufficient_clean_rows"},
+        )
+
+    X_filled = X_clean.fillna(0.0)
+    mi_scores = mutual_info_classif(X_filled, y_clean, random_state=42, n_neighbors=5)
+    mi_series = pd.Series(mi_scores, index=features.columns).sort_values(ascending=False)
+
+    max_features = config.get("max_features")
+    if max_features is None:
+        n_samples = len(X_clean)
+        max_features = max(10, min(n_samples // 10, features.shape[1]))
+
+    min_mi = config.get("min_mi_threshold", 0.0)
+    above_threshold = mi_series[mi_series > min_mi]
+    selected_columns = list(above_threshold.head(max_features).index)
+
+    if not selected_columns:
+        selected_columns = list(mi_series.head(max(5, max_features // 2)).index)
+
+    selected_blocks = {col: feature_blocks.get(col, "unknown") for col in selected_columns}
+    selected_frame = features[selected_columns].copy()
+
+    report = {
+        "enabled": True,
+        "input_features": int(features.shape[1]),
+        "selected_features": len(selected_columns),
+        "max_features_cap": max_features,
+        "min_mi_threshold": min_mi,
+        "top_mi_scores": {col: round(float(mi_series[col]), 6) for col in selected_columns[:20]},
+        "dropped_columns": [col for col in features.columns if col not in selected_columns],
+    }
+    return FeatureSelectionResult(frame=selected_frame, feature_blocks=selected_blocks, report=report)
+
+
 def build_feature_set(
     df,
     lags=None,

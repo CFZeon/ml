@@ -24,6 +24,7 @@ from .pipeline import (
     AutoMLStep,
     BacktestStep,
     DEFAULT_STEPS,
+    FeatureSelectionStep,
     FetchDataStep,
     FeaturesStep,
     IndicatorsStep,
@@ -42,6 +43,7 @@ from .features import (
     check_stationarity,
     fractional_diff,
     screen_features_for_stationarity,
+    select_features,
 )
 from .labeling import (
     triple_barrier_labels,

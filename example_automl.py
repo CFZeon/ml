@@ -32,7 +32,7 @@ def main():
                 "min_return": 0.001,
                 "volatility_window": 24,
             },
-            "model": {"type": "logistic", "n_splits": 3, "gap": 24},
+            "model": {"type": "gbm", "n_splits": 3, "gap": 24},
             "signals": {
                 "avg_win": 0.02,
                 "avg_loss": 0.02,
@@ -72,6 +72,7 @@ def main():
     pipeline.detect_regimes()
     pipeline.build_labels()
     pipeline.align_data()
+    pipeline.select_features()
     pipeline.compute_sample_weights()
     training = pipeline.train_models()
     signals = pipeline.generate_signals()
