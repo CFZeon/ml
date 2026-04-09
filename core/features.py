@@ -418,6 +418,105 @@ INDICATOR_FEATURE_EXTRACTORS = {
 }
 
 
+def _indicator_interaction_features(df, indicator_run, rolling_window=20):
+    if indicator_run is None or not getattr(indicator_run, "results", None):
+        return _as_feature_block(pd.DataFrame(index=df.index), [], block_name="indicator_interactions")
+
+    results_by_kind = {}
+    for result in indicator_run.results:
+        results_by_kind.setdefault(result.kind, []).append(result)
+
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    frame = pd.DataFrame(index=df.index)
+    laggable = []
+
+    rsi_result = results_by_kind.get("rsi", [None])[0]
+    macd_result = results_by_kind.get("macd", [None])[0]
+    bollinger_result = results_by_kind.get("bollinger", [None])[0]
+    atr_result = results_by_kind.get("atr", [None])[0]
+    fvg_result = results_by_kind.get("fvg", [None])[0]
+
+    rsi = None
+    line_pct = None
+    hist_pct = None
+    pctb = None
+    bandwidth = None
+    atr_pct = None
+
+    if rsi_result is not None:
+        rsi = df[rsi_result.name].astype(float)
+    if macd_result is not None:
+        line_pct = _safe_divide(df[f"{macd_result.name}_line"].astype(float), close)
+        hist_pct = _safe_divide(df[f"{macd_result.name}_hist"].astype(float), close)
+    if bollinger_result is not None:
+        pctb = df[f"{bollinger_result.name}_pctb"].astype(float)
+        bandwidth = df[f"{bollinger_result.name}_bw"].astype(float)
+    if atr_result is not None:
+        atr_pct = _safe_divide(df[atr_result.name].astype(float), close)
+
+    if rsi is not None and line_pct is not None and hist_pct is not None:
+        trend_up = (line_pct > 0) & (hist_pct > 0)
+        trend_down = (line_pct < 0) & (hist_pct < 0)
+        frame["trend_rsi_alignment"] = np.sign(line_pct.fillna(0.0)) * ((rsi - 50.0) / 50.0)
+        frame["bull_pullback_setup"] = (trend_up & rsi.between(40.0, 55.0)).astype(float)
+        frame["bear_rebound_setup"] = (trend_down & rsi.between(45.0, 60.0)).astype(float)
+        frame["momentum_exhaustion_score"] = hist_pct * ((rsi - 50.0) / 50.0)
+        laggable.extend(["trend_rsi_alignment", "momentum_exhaustion_score"])
+
+    if rsi is not None and pctb is not None and bandwidth is not None:
+        squeeze_threshold = bandwidth.rolling(rolling_window).quantile(0.2)
+        squeeze = bandwidth <= squeeze_threshold
+        frame["squeeze_rsi_breakout_bias"] = (pctb - 0.5) * ((rsi - 50.0) / 50.0)
+        frame["squeeze_oversold_long"] = (squeeze & (pctb < 0.2) & (rsi < 35.0)).astype(float)
+        frame["squeeze_overbought_short"] = (squeeze & (pctb > 0.8) & (rsi > 65.0)).astype(float)
+        laggable.append("squeeze_rsi_breakout_bias")
+
+    if atr_pct is not None:
+        atr_pct_safe = atr_pct.replace(0.0, np.nan)
+        frame["return_1_to_atr"] = close.pct_change(1) / atr_pct_safe
+        frame["return_5_to_atr"] = close.pct_change(5) / atr_pct_safe
+        frame["range_to_atr_interaction"] = _safe_divide(high - low, close * atr_pct_safe)
+        laggable.extend(["return_1_to_atr", "return_5_to_atr", "range_to_atr_interaction"])
+
+    if atr_pct is not None and line_pct is not None:
+        atr_pct_safe = atr_pct.replace(0.0, np.nan)
+        frame["trend_strength_to_atr"] = _safe_divide(line_pct.abs(), atr_pct_safe)
+        frame["hist_impulse_to_atr"] = _safe_divide(hist_pct, atr_pct_safe)
+        laggable.extend(["trend_strength_to_atr", "hist_impulse_to_atr"])
+
+    if fvg_result is not None:
+        prefix = fvg_result.name
+        bull_open = df[f"{prefix}_bull_fill_state"].astype(float).fillna(0.0) > 0.0
+        bear_open = df[f"{prefix}_bear_fill_state"].astype(float).fillna(0.0) > 0.0
+        gap_imbalance = (
+            df[f"{prefix}_bull_active_count"].astype(float).fillna(0.0)
+            - df[f"{prefix}_bear_active_count"].astype(float).fillna(0.0)
+        )
+        frame["fvg_gap_pressure"] = gap_imbalance
+        laggable.append("fvg_gap_pressure")
+
+        if line_pct is not None and hist_pct is not None:
+            trend_up = (line_pct > 0) & (hist_pct > 0)
+            trend_down = (line_pct < 0) & (hist_pct < 0)
+            frame["fvg_bull_trend_confluence"] = (bull_open & trend_up).astype(float)
+            frame["fvg_bear_trend_confluence"] = (bear_open & trend_down).astype(float)
+            frame["fvg_momentum_alignment"] = gap_imbalance * hist_pct.fillna(0.0)
+            laggable.append("fvg_momentum_alignment")
+
+        if atr_pct is not None:
+            atr_pct_safe = atr_pct.replace(0.0, np.nan)
+            size_spread = (
+                df[f"{prefix}_bull_size_pct"].astype(float).fillna(0.0)
+                - df[f"{prefix}_bear_size_pct"].astype(float).fillna(0.0)
+            )
+            frame["fvg_size_to_atr"] = _safe_divide(size_spread, atr_pct_safe)
+            laggable.append("fvg_size_to_atr")
+
+    return _as_feature_block(frame, laggable, block_name="indicator_interactions")
+
+
 def _append_lags(features, laggable_columns, lags, feature_blocks):
     if not lags:
         return features, dict(feature_blocks)
@@ -765,6 +864,14 @@ def build_feature_set(
             )
             if not block.frame.empty:
                 blocks.append(block)
+
+        interaction_block = _indicator_interaction_features(
+            df,
+            indicator_run=indicator_run,
+            rolling_window=rolling_window,
+        )
+        if not interaction_block.frame.empty:
+            blocks.append(interaction_block)
     else:
         generic_result = type(
             "GenericIndicatorResult",

@@ -142,6 +142,62 @@ class ConstantProbabilityModel:
         return np.full(len(X), label, dtype=int)
 
 
+class BinaryProbabilityCalibrator:
+    """Platt-style calibrator on top of a raw binary probability series."""
+
+    def __init__(self, model):
+        self.model = model
+
+    @staticmethod
+    def _build_features(probabilities):
+        probs = np.asarray(probabilities, dtype=float).reshape(-1)
+        probs = np.clip(probs, 1e-6, 1 - 1e-6)
+        logits = np.log(probs / (1.0 - probs))
+        return np.column_stack([probs, logits])
+
+    def predict_proba(self, probabilities):
+        features = self._build_features(probabilities)
+        return self.model.predict_proba(features)
+
+    def transform(self, probabilities):
+        return self.predict_proba(probabilities)[:, 1]
+
+
+def fit_binary_probability_calibrator(probabilities, y_true, sample_weight=None, model_params=None):
+    """Fit a Platt-style calibrator for binary probabilities."""
+    model_params = dict(model_params or {})
+    target = pd.Series(y_true).astype(int)
+    sw = sample_weight.values if isinstance(sample_weight, pd.Series) else sample_weight
+
+    if target.nunique() < 2:
+        if sw is not None and np.sum(sw) > 0:
+            positive_rate = float(np.average(target, weights=sw))
+        else:
+            positive_rate = float(target.mean()) if len(target) else 0.5
+        return ConstantProbabilityModel(positive_probability=positive_rate)
+
+    features = BinaryProbabilityCalibrator._build_features(probabilities)
+    model = LogisticRegression(
+        C=float(model_params.get("c", model_params.get("C", 1.0))),
+        max_iter=int(model_params.get("max_iter", 1000)),
+        class_weight=model_params.get("class_weight"),
+        random_state=int(model_params.get("random_state", 42)),
+    )
+    fit_kwargs = {"sample_weight": sw} if sw is not None else {}
+    model.fit(features, target, **fit_kwargs)
+    return BinaryProbabilityCalibrator(model)
+
+
+def apply_binary_probability_calibrator(calibrator, probabilities):
+    """Apply a previously fitted binary probability calibrator."""
+    values = np.asarray(probabilities, dtype=float).reshape(-1)
+    if calibrator is None:
+        return values
+    if hasattr(calibrator, "transform"):
+        return calibrator.transform(values)
+    return calibrator.predict_proba(values)[:, 1]
+
+
 def predict_probability_frame(model, X, ordered_classes=(-1, 0, 1)):
     """Return aligned class probabilities for the requested class order."""
     probabilities = model.predict_proba(X)

@@ -20,6 +20,13 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
             "choices": ["1,3,6", "1,2,4,8", "1,4,12", "1,6,12"],
         },
         "frac_diff_d": {"type": "float", "low": 0.2, "high": 0.8, "step": 0.2},
+        "rolling_window": {"type": "categorical", "choices": [14, 20, 28, 40]},
+        "squeeze_quantile": {"type": "categorical", "choices": [0.1, 0.15, 0.2, 0.25]},
+    },
+    "feature_selection": {
+        "enabled": {"type": "categorical", "choices": [True, False]},
+        "max_features": {"type": "categorical", "choices": [32, 48, 64, 96, 128]},
+        "min_mi_threshold": {"type": "categorical", "choices": [0.0, 0.0005, 0.001, 0.002]},
     },
     "labels": {
         "pt_mult": {"type": "float", "low": 1.0, "high": 3.0, "step": 0.5},
@@ -27,6 +34,7 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
         "max_holding": {"type": "categorical", "choices": [12, 24, 48]},
         "min_return": {"type": "categorical", "choices": [0.0, 0.0005, 0.001, 0.002]},
         "volatility_window": {"type": "categorical", "choices": [12, 24, 48]},
+        "barrier_tie_break": {"type": "categorical", "choices": ["sl", "pt"]},
     },
     "regime": {
         "n_regimes": {"type": "categorical", "choices": [2, 3, 4]},
@@ -34,6 +42,17 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
     "model": {
         "type": {"type": "categorical", "choices": ["rf", "gbm", "logistic"]},
         "gap": {"type": "categorical", "choices": [12, 24, 48]},
+        "validation_fraction": {"type": "categorical", "choices": [0.15, 0.2, 0.25, 0.3]},
+        "meta_n_splits": {"type": "categorical", "choices": [2, 3]},
+        "calibration_params": {
+            "c": {"type": "float", "low": 0.1, "high": 10.0, "log": True},
+        },
+        "meta_params": {
+            "c": {"type": "float", "low": 0.05, "high": 5.0, "log": True},
+        },
+        "meta_calibration_params": {
+            "c": {"type": "float", "low": 0.1, "high": 10.0, "log": True},
+        },
         "params": {
             "rf": {
                 "n_estimators": {"type": "categorical", "choices": [100, 200, 400]},
@@ -45,6 +64,7 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
                 "learning_rate": {"type": "float", "low": 0.03, "high": 0.2, "log": True},
                 "max_depth": {"type": "categorical", "choices": [2, 3, 4]},
                 "subsample": {"type": "categorical", "choices": [0.7, 0.85, 1.0]},
+                "min_samples_leaf": {"type": "categorical", "choices": [1, 3, 5, 10]},
             },
             "logistic": {
                 "c": {"type": "float", "low": 0.01, "high": 10.0, "log": True},
@@ -56,6 +76,7 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
         "fraction": {"type": "categorical", "choices": [0.25, 0.5, 0.75]},
         "edge_threshold": {"type": "categorical", "choices": [0.03, 0.05, 0.08, 0.12]},
         "meta_threshold": {"type": "categorical", "choices": [0.5, 0.55, 0.6, 0.65]},
+        "tuning_min_trades": {"type": "categorical", "choices": [3, 5, 8]},
     },
 }
 
@@ -130,6 +151,13 @@ def _sample_from_spec(trial, name, spec):
         return trial.suggest_categorical(name, choices)
 
     raise TypeError(f"Unsupported search spec for {name!r}: {spec!r}")
+
+
+def _sample_param_group(trial, prefix, group_space):
+    return {
+        key: _sample_from_spec(trial, f"{prefix}.{key}", spec)
+        for key, spec in (group_space or {}).items()
+    }
 
 
 def _build_study_storage_path(base_config, automl_config):
@@ -224,8 +252,24 @@ def _sample_trial_overrides(trial, search_space):
                 "features.frac_diff_d",
                 feature_space["frac_diff_d"],
             )
+        for key in ["rolling_window", "squeeze_quantile"]:
+            if key in feature_space:
+                feature_overrides[key] = _sample_from_spec(trial, f"features.{key}", feature_space[key])
         if feature_overrides:
             overrides["features"] = feature_overrides
+
+    selection_space = search_space.get("feature_selection", {})
+    if selection_space:
+        selection_overrides = {}
+        for key in ["enabled", "max_features", "min_mi_threshold"]:
+            if key in selection_space:
+                selection_overrides[key] = _sample_from_spec(
+                    trial,
+                    f"feature_selection.{key}",
+                    selection_space[key],
+                )
+        if selection_overrides:
+            overrides["feature_selection"] = selection_overrides
 
     label_space = search_space.get("labels", {})
     if label_space:
@@ -233,7 +277,7 @@ def _sample_trial_overrides(trial, search_space):
         pt_mult = _sample_from_spec(trial, "labels.pt_mult", label_space["pt_mult"])
         sl_mult = _sample_from_spec(trial, "labels.sl_mult", label_space["sl_mult"])
         label_overrides["pt_sl"] = (pt_mult, sl_mult)
-        for key in ["max_holding", "min_return", "volatility_window"]:
+        for key in ["max_holding", "min_return", "volatility_window", "barrier_tie_break"]:
             if key in label_space:
                 label_overrides[key] = _sample_from_spec(trial, f"labels.{key}", label_space[key])
         overrides["labels"] = label_overrides
@@ -256,6 +300,17 @@ def _sample_trial_overrides(trial, search_space):
         model_overrides = {"type": model_type}
         if "gap" in model_space:
             model_overrides["gap"] = _sample_from_spec(trial, "model.gap", model_space["gap"])
+        for key in ["validation_fraction", "meta_n_splits"]:
+            if key in model_space:
+                model_overrides[key] = _sample_from_spec(trial, f"model.{key}", model_space[key])
+        for key, prefix in [
+            ("calibration_params", "model.calibration_params"),
+            ("meta_params", "model.meta_params"),
+            ("meta_calibration_params", "model.meta_calibration_params"),
+        ]:
+            params = _sample_param_group(trial, prefix, model_space.get(key, {}))
+            if params:
+                model_overrides[key] = params
         model_params_space = model_space.get("params", {}).get(model_type, {})
         if model_params_space:
             model_overrides["params"] = {
@@ -267,7 +322,7 @@ def _sample_trial_overrides(trial, search_space):
     signal_space = search_space.get("signals", {})
     if signal_space:
         signal_overrides = {}
-        for key in ["threshold", "fraction", "edge_threshold", "meta_threshold"]:
+        for key in ["threshold", "fraction", "edge_threshold", "meta_threshold", "tuning_min_trades"]:
             if key in signal_space:
                 signal_overrides[key] = _sample_from_spec(trial, f"signals.{key}", signal_space[key])
         if signal_overrides:
@@ -295,6 +350,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
 
     raw_data = base_pipeline.require("raw_data")
     indicator_data = base_pipeline.require("data").copy()
+    indicator_run = base_pipeline.state.get("indicator_run")
 
     study = optuna.create_study(
         direction="maximize",
@@ -313,6 +369,8 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         candidate = pipeline_class(candidate_config, steps=trial_step_classes)
         candidate.state["raw_data"] = raw_data
         candidate.state["data"] = indicator_data.copy()
+        if indicator_run is not None:
+            candidate.state["indicator_run"] = indicator_run
 
         try:
             for step_name in [

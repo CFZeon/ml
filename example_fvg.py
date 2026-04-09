@@ -43,6 +43,7 @@ def main():
                 "lags": [1, 3, 6],
                 "frac_diff_d": 0.4,
             },
+            "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
             "regime": {"n_regimes": 2, "builder": build_fvg_regime_features},
             "labels": {
                 "kind": "triple_barrier",
@@ -120,10 +121,11 @@ def main():
     selection = pipeline.select_features()
     sel_report = selection.report
     X = pipeline.state["X"]
-    print(f"  selected {sel_report['selected_features']}/{sel_report['input_features']} features")
-    if sel_report.get("top_mi_scores"):
-        top = list(sel_report["top_mi_scores"].items())[:5]
-        print(f"  top MI: {top}")
+    print("  global preselection disabled; supervised MI filtering runs inside each walk-forward fold")
+    print(
+        f"  configured cap: {sel_report['max_features'] or 'auto'}  "
+        f"min_mi={sel_report['min_mi_threshold']}"
+    )
 
     print(f"\n{sep}\nStep 7 · Uniqueness weights\n{sep}")
     weights = pipeline.compute_sample_weights()
@@ -134,6 +136,7 @@ def main():
     for metric in training["fold_metrics"]:
         print(f"  fold {metric['fold']}: acc={metric['accuracy']}  f1={metric['f1_macro']}")
     print(f"  avg acc={training['avg_accuracy']:.4f}  f1={training['avg_f1_macro']:.4f}")
+    print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
 
     block_diag = training["feature_block_diagnostics"]
     if block_diag["summary"]:

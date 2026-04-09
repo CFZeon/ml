@@ -22,8 +22,11 @@ def main():
             "features": {
                 "lags": [1, 3, 6],
                 "frac_diff_d": 0.4,
-                "schema_version": "indicator_aware_v3",
+                "rolling_window": 20,
+                "squeeze_quantile": 0.2,
+                "schema_version": "indicator_aware_v4",
             },
+            "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
             "regime": {"n_regimes": 2},
             "labels": {
                 "kind": "triple_barrier",
@@ -31,8 +34,9 @@ def main():
                 "max_holding": 24,
                 "min_return": 0.001,
                 "volatility_window": 24,
+                "barrier_tie_break": "sl",
             },
-            "model": {"type": "gbm", "n_splits": 3, "gap": 24},
+            "model": {"type": "gbm", "n_splits": 3, "gap": 24, "validation_fraction": 0.2, "meta_n_splits": 2},
             "signals": {
                 "avg_win": 0.02,
                 "avg_loss": 0.02,
@@ -40,8 +44,9 @@ def main():
                 "threshold": 0.01,
                 "edge_threshold": 0.05,
                 "meta_threshold": 0.55,
+                "tuning_min_trades": 5,
             },
-            "backtest": {"equity": 10_000, "fee_rate": 0.001},
+            "backtest": {"equity": 10_000, "fee_rate": 0.001, "use_open_execution": True},
             "automl": {
                 "enabled": True,
                 "n_trials": 8,
@@ -86,6 +91,7 @@ def main():
     )
     if screening["transform_usage"]:
         print(f"  transforms   : {screening['transform_usage']}")
+    print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
     print(f"  avg accuracy : {training['avg_accuracy']:.4f}")
     print(f"  avg f1       : {training['avg_f1_macro']:.4f}")
     block_diag = training["feature_block_diagnostics"]

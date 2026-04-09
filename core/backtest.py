@@ -100,35 +100,43 @@ def _max_drawdown_duration(equity_curve, peak):
 # Backtest engine  (simple pandas – swap for VectorBT / NautilusTrader later)
 # ───────────────────────────────────────────────────────────────────────────
 
-def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001):
+def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=0.0, execution_prices=None):
     """Vectorised backtest on categorical or fractional position signals.
 
     Parameters
     ----------
-    close    : pd.Series  – price series (aligned with signals)
-    signals  : pd.Series  – position weights in [-1, 1]
-    equity   : float      – starting capital
-    fee_rate : float      – one-way fee
+    close            : pd.Series  – mark-to-market price series (aligned with signals)
+    signals          : pd.Series  – position weights in [-1, 1]
+    equity           : float      – starting capital
+    fee_rate         : float      – one-way fee
+    slippage_rate    : float      – one-way slippage estimate applied on turnover
+    execution_prices : pd.Series or None – optional execution price series, e.g. next-bar open
 
     Returns dict with metrics and equity curve.
     """
     close = pd.Series(close, copy=False).astype(float)
     signal_series = pd.Series(signals, index=close.index).reindex(close.index).fillna(0.0).astype(float)
     signal_series = signal_series.clip(-1.0, 1.0)
-    returns = close.pct_change().fillna(0)
+    execution_series = close
+    if execution_prices is not None:
+        execution_series = pd.Series(execution_prices, index=close.index).reindex(close.index).astype(float)
+    returns = execution_series.pct_change().fillna(0)
 
     # position acts on the NEXT bar
     position = signal_series.shift(1).fillna(0.0)
 
     # cost on every position change
     turnover = position.diff().abs().fillna(position.abs())
-    costs = turnover * fee_rate
+    fees = turnover * fee_rate
+    slippage = turnover * slippage_rate
+    costs = fees + slippage
 
     strat_ret = position * returns - costs
     eq_curve = equity * (1 + strat_ret).cumprod()
     prev_equity = eq_curve.shift(1).fillna(equity)
     pnl = eq_curve - prev_equity
-    fees_paid = (prev_equity * costs).sum()
+    fees_paid = (prev_equity * fees).sum()
+    slippage_paid = (prev_equity * slippage).sum()
 
     # ── metrics ──────────────────────────────────────────────────────────
     total_ret = eq_curve.iloc[-1] / equity - 1
@@ -180,6 +188,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001):
         "gross_profit": _round_metric(gross_profit, 2),
         "gross_loss": _round_metric(gross_loss, 2),
         "fees_paid": _round_metric(fees_paid, 2),
+        "slippage_paid": _round_metric(slippage_paid, 2),
         "total_return": _round_metric(total_ret, 4),
         "cagr": _round_metric(cagr, 4),
         "sharpe_ratio": _round_metric(sharpe, 2),
