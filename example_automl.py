@@ -24,7 +24,7 @@ def main():
                 "frac_diff_d": 0.4,
                 "rolling_window": 20,
                 "squeeze_quantile": 0.2,
-                "schema_version": "indicator_aware_v4",
+                "schema_version": "indicator_aware_v5_foldlocal",
             },
             "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
             "regime": {"n_regimes": 2},

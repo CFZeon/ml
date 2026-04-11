@@ -159,6 +159,13 @@ def sample_weights_by_uniqueness(labels, close):
     -------
     pd.Series – one weight per label, indexed like *labels*
     """
+    if labels is None or len(labels) == 0:
+        return pd.Series(dtype=float, name="sample_weight")
+
+    close = pd.Series(close, copy=False)
+    if close.empty:
+        return pd.Series(1.0, index=labels.index, name="sample_weight", dtype=float)
+
     mat = _indicator_matrix(labels, close.index)
     conc = mat.sum(axis=1).clip(min=1)
     weights = []

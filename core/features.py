@@ -566,9 +566,16 @@ def _apply_stationarity_transform(series, transform_name, rolling_window, frac_d
     raise ValueError(f"Unsupported stationarity transform {transform_name!r}")
 
 
-def screen_features_for_stationarity(features, feature_blocks=None, config=None):
-    """Screen each feature for stationarity and transform or drop when needed."""
+def screen_features_for_stationarity(features, feature_blocks=None, config=None, fit_features=None):
+    """Screen each feature for stationarity and transform or drop when needed.
+
+    When ``fit_features`` is supplied, transform selection is fitted on that
+    reference slice and then applied causally to ``features``. This is useful
+    for walk-forward validation where transform choice must be based on the
+    training window only.
+    """
     config = dict(config or {})
+    reference_features = features if fit_features is None else fit_features.reindex(columns=features.columns)
     if not config.get("enabled", True):
         blocks = dict(feature_blocks or {})
         summary = {
@@ -623,7 +630,8 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None)
 
     for column in features.columns:
         series = pd.Series(features[column]).replace([np.inf, -np.inf], np.nan)
-        clean = series.dropna()
+        reference_series = pd.Series(reference_features[column]).replace([np.inf, -np.inf], np.nan)
+        clean = reference_series.dropna()
         unique_values = int(clean.nunique())
         block_name = feature_blocks.get(column, "unknown")
         report = {
@@ -669,7 +677,7 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None)
             summary["discrete_passthrough"] += 1
             continue
 
-        original = check_stationarity(series, significance=significance)
+        original = check_stationarity(reference_series, significance=significance)
         report["original"] = original
         if original["stationary"]:
             screened_columns[column] = series
@@ -687,7 +695,7 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None)
 
         for transform_name in transform_order:
             transformed = _apply_stationarity_transform(
-                series,
+                reference_series,
                 transform_name=transform_name,
                 rolling_window=rolling_window,
                 frac_diff_d=frac_diff_d,
@@ -712,7 +720,13 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None)
                 break
 
         if selected_series is not None:
-            screened_columns[column] = selected_series
+            screened_columns[column] = _apply_stationarity_transform(
+                series,
+                transform_name=selected_transform,
+                rolling_window=rolling_window,
+                frac_diff_d=frac_diff_d,
+                frac_diff_threshold=frac_diff_threshold,
+            )
             kept_blocks[column] = block_name
             report["status"] = "transformed"
             report["selected_transform"] = selected_transform

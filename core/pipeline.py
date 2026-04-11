@@ -122,6 +122,82 @@ def _split_train_validation_window(X_train, y_train, sample_weights, model_confi
     )
 
 
+def _align_and_drop_invalid_rows(X, y, labels=None, sample_weights=None):
+    if X is None or y is None:
+        return X, y, labels, sample_weights
+
+    y_series = pd.Series(y, copy=False).reindex(X.index)
+    label_frame = labels.reindex(X.index) if labels is not None else None
+    weight_series = None
+    if sample_weights is not None:
+        weight_series = pd.Series(sample_weights, copy=False).reindex(X.index).astype(float)
+
+    mask = X.notna().all(axis=1) & y_series.notna()
+    if weight_series is not None:
+        mask &= weight_series.notna()
+
+    keep_index = X.index[mask]
+    X = X.loc[keep_index]
+    y_series = y_series.loc[keep_index]
+    if label_frame is not None:
+        label_frame = label_frame.loc[keep_index]
+    if weight_series is not None:
+        weight_series = weight_series.loc[keep_index]
+    return X, y_series, label_frame, weight_series
+
+
+def _purge_overlapping_training_rows(X, y, labels, cutoff_timestamp, sample_weights=None):
+    if cutoff_timestamp is None or labels is None or labels.empty or "t1" not in labels.columns:
+        return X, y, labels, sample_weights, 0
+
+    label_ends = pd.to_datetime(labels["t1"], errors="coerce")
+    keep_mask = label_ends.notna() & (label_ends < cutoff_timestamp)
+    removed = int((~keep_mask).sum())
+    if removed == 0:
+        return X, y, labels, sample_weights, 0
+
+    keep_index = labels.index[keep_mask]
+    X = X.loc[keep_index]
+    y = y.loc[keep_index]
+    labels = labels.loc[keep_index]
+    if sample_weights is not None:
+        sample_weights = pd.Series(sample_weights, copy=False).reindex(keep_index).astype(float)
+    return X, y, labels, sample_weights, removed
+
+
+def _close_window_for_labels(close, labels):
+    close = pd.Series(close, copy=False)
+    if labels is None or labels.empty or close.empty:
+        return close.iloc[0:0]
+
+    start = labels.index.min()
+    end = labels.index.max()
+    if "t1" in labels.columns and labels["t1"].notna().any():
+        end = max(end, pd.DatetimeIndex(labels["t1"].dropna()).max())
+    return close.loc[(close.index >= start) & (close.index <= end)]
+
+
+def _compute_fold_sample_weights(labels, close):
+    if labels is None or labels.empty:
+        return pd.Series(dtype=float, name="sample_weight")
+
+    close_window = _close_window_for_labels(close, labels)
+    if close_window.empty:
+        return pd.Series(1.0, index=labels.index, name="sample_weight", dtype=float)
+
+    weights = sample_weights_by_uniqueness(labels, close_window)
+    return weights.reindex(labels.index).fillna(1.0)
+
+
+def _resolve_stationarity_screening_config(pipeline):
+    features_config = pipeline.section("features")
+    screening_config = dict(pipeline.section("stationarity"))
+    screening_config.setdefault("enabled", True)
+    screening_config.setdefault("rolling_window", features_config.get("rolling_window", 20))
+    screening_config.setdefault("frac_diff_d", features_config.get("frac_diff_d"))
+    return screening_config
+
+
 def _estimate_outcome_stats(labels, close, default_win, default_loss):
     if labels is None or labels.empty:
         return float(default_win), float(default_loss)
@@ -386,7 +462,7 @@ def _tune_signal_parameters(validation_close, validation_execution_prices, predi
     return best
 
 
-def _train_inner_meta_model(X_train, y_train, sample_weights, model_config):
+def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None):
     inner_predictions = []
     inner_probabilities = []
     inner_truth = []
@@ -408,6 +484,18 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config):
         y_inner_train = y_train.iloc[inner_train_idx]
         w_inner_train = sample_weights.iloc[inner_train_idx]
         X_inner_test = X_train.iloc[inner_test_idx]
+        inner_labels_train = labels.iloc[inner_train_idx] if labels is not None else None
+
+        inner_test_start = X_inner_test.index[0] if len(X_inner_test) > 0 else None
+        X_inner_train, y_inner_train, inner_labels_train, w_inner_train, _ = _purge_overlapping_training_rows(
+            X_inner_train,
+            y_inner_train,
+            inner_labels_train,
+            cutoff_timestamp=inner_test_start,
+            sample_weights=w_inner_train,
+        )
+        if len(X_inner_train) < min_train_rows:
+            continue
 
         if binary_primary:
             binary_mask = y_inner_train.ne(0)
@@ -561,22 +649,21 @@ class FeaturesStep(PipelineStep):
                 for column in features.columns
             }
 
-        screening_config = dict(pipeline.section("stationarity"))
-        screening_config.setdefault("enabled", True)
-        screening_config.setdefault("rolling_window", config.get("rolling_window", 20))
-        screening_config.setdefault("frac_diff_d", config.get("frac_diff_d"))
         screening_result = screen_features_for_stationarity(
             features,
             feature_blocks=feature_blocks,
-            config=screening_config,
+            config=_resolve_stationarity_screening_config(pipeline),
         )
+        screening_report = copy.deepcopy(screening_result.report)
+        screening_report["mode"] = "global_preview_only"
+        screening_report.setdefault("summary", {})["mode"] = "global_preview_only"
 
         pipeline.state["raw_features"] = features
         pipeline.state["feature_blocks_raw"] = feature_blocks
-        pipeline.state["feature_screening"] = screening_result.report
-        pipeline.state["feature_blocks"] = screening_result.feature_blocks
-        pipeline.state["features"] = screening_result.frame
-        return screening_result.frame
+        pipeline.state["feature_screening"] = screening_report
+        pipeline.state["feature_blocks"] = feature_blocks
+        pipeline.state["features"] = features
+        return features
 
 
 class StationarityStep(PipelineStep):
@@ -731,7 +818,6 @@ class TrainModelsStep(PipelineStep):
     def run(self, pipeline):
         X = pipeline.require("X")
         y = pipeline.require("y")
-        weights = pipeline.require("sample_weights")
         labels_aligned = pipeline.require("labels_aligned")
         raw_data = pipeline.require("raw_data")
         config = pipeline.section("model")
@@ -739,6 +825,7 @@ class TrainModelsStep(PipelineStep):
         signal_config = pipeline.section("signals")
         backtest_config = pipeline.section("backtest")
         feature_blocks = pipeline.state.get("feature_blocks", {})
+        stationarity_config = _resolve_stationarity_screening_config(pipeline)
         binary_primary = config.get("binary_primary", True)
         holding_bars = _resolve_signal_holding_bars(pipeline, signal_config)
         default_avg_win = float(signal_config.get("avg_win", 0.02))
@@ -749,6 +836,8 @@ class TrainModelsStep(PipelineStep):
         fold_block_diagnostics = []
         fold_feature_selection = []
         fold_signal_tuning = []
+        fold_stationarity = []
+        fold_purging = []
         last_model = None
         last_meta = None
         last_primary_calibrator = None
@@ -782,20 +871,88 @@ class TrainModelsStep(PipelineStep):
                 expanding=config.get("expanding", False),
             )
         ):
-            X_train = X.iloc[train_idx]
-            X_test = X.iloc[test_idx]
-            y_train = y.iloc[train_idx]
-            y_test = y.iloc[test_idx]
-            w_train = weights.iloc[train_idx]
+            X_train_raw = X.iloc[train_idx]
+            X_test_raw = X.iloc[test_idx]
+            y_train_raw = y.iloc[train_idx]
+            y_test_raw = y.iloc[test_idx]
+            labels_train_raw = labels_aligned.iloc[train_idx]
+            labels_test_raw = labels_aligned.iloc[test_idx]
 
-            X_fit, y_fit, w_fit, X_val, y_val, w_val = _split_train_validation_window(
+            test_start = X_test_raw.index[0] if len(X_test_raw) > 0 else None
+            X_train, y_train, labels_train, _, outer_purged = _purge_overlapping_training_rows(
+                X_train_raw,
+                y_train_raw,
+                labels_train_raw,
+                cutoff_timestamp=test_start,
+            )
+            if X_train.empty:
+                continue
+
+            split_weights = pd.Series(1.0, index=X_train.index, name="sample_weight")
+            X_fit, y_fit, _, X_val, y_val, _ = _split_train_validation_window(
                 X_train,
                 y_train,
-                w_train,
+                split_weights,
                 config,
             )
+            labels_fit = labels_train.loc[X_fit.index]
+            labels_val = labels_train.loc[X_val.index].copy() if X_val is not None else None
 
-            fold_feature_blocks = dict(feature_blocks)
+            val_start = X_val.index[0] if X_val is not None and not X_val.empty else None
+            X_fit, y_fit, labels_fit, _, inner_purged = _purge_overlapping_training_rows(
+                X_fit,
+                y_fit,
+                labels_fit,
+                cutoff_timestamp=val_start,
+            )
+            if X_fit.empty:
+                continue
+
+            fold_window = pd.concat([X_train_raw, X_test_raw]).sort_index()
+            fold_screening = screen_features_for_stationarity(
+                fold_window,
+                feature_blocks=feature_blocks,
+                config=stationarity_config,
+                fit_features=X_fit,
+            )
+            fold_feature_blocks = dict(fold_screening.feature_blocks)
+            fold_stationarity.append(
+                {
+                    "fold": fold,
+                    "summary": fold_screening.report.get("summary", {}),
+                }
+            )
+
+            X_fit = fold_screening.frame.reindex(X_fit.index)
+            X_val = fold_screening.frame.reindex(X_val.index) if X_val is not None else None
+            X_test = fold_screening.frame.reindex(X_test_raw.index)
+
+            X_fit, y_fit, labels_fit, _ = _align_and_drop_invalid_rows(X_fit, y_fit, labels_fit)
+            if X_val is not None:
+                X_val, y_val, labels_val, _ = _align_and_drop_invalid_rows(X_val, y_val, labels_val)
+            X_test, y_test, labels_test, _ = _align_and_drop_invalid_rows(X_test, y_test_raw, labels_test_raw)
+
+            if X_fit.empty or X_test.empty:
+                continue
+            if X_val is not None and X_val.empty:
+                X_val, y_val, labels_val = None, None, None
+
+            w_fit = _compute_fold_sample_weights(labels_fit, close_all).reindex(X_fit.index).fillna(1.0)
+            w_val = None
+            if X_val is not None and labels_val is not None and not labels_val.empty:
+                w_val = _compute_fold_sample_weights(labels_val, close_all).reindex(X_val.index).fillna(1.0)
+
+            fold_purging.append(
+                {
+                    "fold": fold,
+                    "outer_purged_rows": int(outer_purged),
+                    "inner_purged_rows": int(inner_purged),
+                    "fit_rows": int(len(X_fit)),
+                    "validation_rows": int(len(X_val)) if X_val is not None else 0,
+                    "test_rows": int(len(X_test)),
+                }
+            )
+
             selected_columns = list(X_fit.columns)
             selection_result = None
             if selection_config.get("enabled", True):
@@ -810,7 +967,6 @@ class TrainModelsStep(PipelineStep):
                     fold_feature_blocks = selection_result.feature_blocks
 
             X_fit_model = X_fit.loc[:, selected_columns]
-            X_train_model = X_train.loc[:, selected_columns]
             X_test_model = X_test.loc[:, selected_columns]
             X_val_model = X_val.loc[:, selected_columns] if X_val is not None else None
 
@@ -849,10 +1005,10 @@ class TrainModelsStep(PipelineStep):
 
             primary_calibrator = None
             meta_calibrator = None
-            meta_model = _train_inner_meta_model(X_fit_model, y_fit, w_fit, config)
+            meta_model = _train_inner_meta_model(X_fit_model, y_fit, w_fit, config, labels=labels_fit)
 
             fold_avg_win, fold_avg_loss = _estimate_outcome_stats(
-                labels_aligned.loc[y_fit.index],
+                labels_fit,
                 close_all,
                 default_avg_win,
                 default_avg_loss,
@@ -1032,12 +1188,17 @@ class TrainModelsStep(PipelineStep):
             "oos_continuous_signals": oos_continuous_signals,
             "oos_signals": oos_signals,
             "feature_block_diagnostics": feature_diagnostics,
+            "stationarity": {
+                "mode": "fold_local",
+                "folds": fold_stationarity,
+            },
             "feature_selection": {
                 "enabled": bool(selection_config.get("enabled", True)),
                 "mode": "fold_local",
                 "avg_selected_features": round(float(np.mean([row["selected_features"] for row in fold_feature_selection])), 2),
                 "folds": fold_feature_selection,
             },
+            "purging": fold_purging,
             "signal_tuning": fold_signal_tuning,
             "oos_avg_win": oos_avg_win,
             "oos_avg_loss": oos_avg_loss,
