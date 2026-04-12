@@ -55,6 +55,7 @@ from .features import (
 from .labeling import (
     triple_barrier_labels,
     fixed_horizon_labels,
+    trend_scanning_labels,
     sample_weights_by_uniqueness,
     sequential_bootstrap,
 )

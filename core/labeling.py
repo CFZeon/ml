@@ -125,6 +125,123 @@ def fixed_horizon_labels(close, horizon=5, threshold=0.0, cost_rate=0.0):
     return result.dropna(subset=["t1"])
 
 
+def _linear_trend_t_value(values):
+    """Return the t-statistic and slope of a simple linear trend fit."""
+    y = np.asarray(values, dtype=float).reshape(-1)
+    if len(y) < 3 or np.isnan(y).any():
+        return 0.0, 0.0
+
+    x = np.arange(len(y), dtype=float)
+    x_centered = x - x.mean()
+    y_centered = y - y.mean()
+    denominator = float(np.dot(x_centered, x_centered))
+    if denominator <= 0:
+        return 0.0, 0.0
+
+    slope = float(np.dot(x_centered, y_centered) / denominator)
+    intercept = float(y.mean() - slope * x.mean())
+    residuals = y - (intercept + slope * x)
+    degrees_of_freedom = len(y) - 2
+    if degrees_of_freedom <= 0:
+        return 0.0, slope
+
+    sigma2 = float(np.dot(residuals, residuals) / degrees_of_freedom)
+    if sigma2 <= 0:
+        return 0.0, slope
+
+    slope_se = float(np.sqrt(sigma2 / denominator))
+    if slope_se <= 0:
+        return 0.0, slope
+
+    return float(slope / slope_se), slope
+
+
+def trend_scanning_labels(close, min_horizon=8, max_horizon=48, step=4,
+                          min_t_value=1.5, min_return=0.0, cost_rate=0.0,
+                          price_transform="log"):
+    """Label by the strongest forward trend over a range of horizons.
+
+    For each timestamp, fit simple linear trends over candidate forward windows and
+    select the horizon with the largest absolute t-statistic. This is typically
+    less noisy than forcing one fixed forecast horizon when trends evolve over
+    uneven durations.
+
+    Returns a DataFrame with columns:
+        label, t1, trend_t_value, trend_slope, trend_horizon, forward_return
+    label ∈ {-1, 0, +1}; 0 means the trend was not statistically/economically strong enough.
+    """
+    close = pd.Series(close, copy=False).astype(float)
+    min_horizon = max(2, int(min_horizon))
+    max_horizon = max(min_horizon, int(max_horizon))
+    step = max(1, int(step))
+    min_t_value = float(min_t_value)
+    min_return = float(min_return)
+    cost_rate = float(cost_rate)
+
+    if price_transform == "log":
+        transformed = np.log(close.where(close > 0))
+    elif price_transform == "price":
+        transformed = close.copy()
+    else:
+        raise ValueError(f"Unsupported price_transform={price_transform!r}")
+
+    rows = []
+    last_start = len(close) - min_horizon
+    for i in range(max(0, last_start)):
+        entry_price = float(close.iloc[i])
+        if not np.isfinite(entry_price) or entry_price <= 0:
+            continue
+
+        best = None
+        for horizon in range(min_horizon, max_horizon + 1, step):
+            end = i + horizon
+            if end >= len(close):
+                break
+
+            window = transformed.iloc[i: end + 1]
+            if window.isna().any():
+                continue
+
+            trend_t_value, slope = _linear_trend_t_value(window.to_numpy())
+            if best is None or abs(trend_t_value) > abs(best["trend_t_value"]):
+                exit_price = float(close.iloc[end])
+                best = {
+                    "t1": close.index[end],
+                    "trend_t_value": float(trend_t_value),
+                    "trend_slope": float(slope),
+                    "trend_horizon": int(horizon),
+                    "exit_price": exit_price,
+                    "forward_return": float((exit_price - entry_price) / entry_price),
+                }
+
+        if best is None:
+            continue
+
+        effective_move = max(abs(best["forward_return"]) - cost_rate, 0.0)
+        label = 0
+        if abs(best["trend_t_value"]) >= min_t_value and effective_move >= min_return:
+            label = 1 if best["trend_t_value"] > 0 else -1
+
+        rows.append(
+            {
+                "t0": close.index[i],
+                "t1": best["t1"],
+                "label": label,
+                "barrier": "trend_scan",
+                "entry_price": entry_price,
+                "exit_price": best["exit_price"],
+                "gross_return": best["forward_return"],
+                "forward_return": best["forward_return"],
+                "trend_t_value": best["trend_t_value"],
+                "trend_slope": best["trend_slope"],
+                "trend_horizon": best["trend_horizon"],
+                "cost_rate": cost_rate,
+            }
+        )
+
+    return pd.DataFrame(rows).set_index("t0")
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Sample weights & sequential bootstrap
 # ───────────────────────────────────────────────────────────────────────────

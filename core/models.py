@@ -507,18 +507,120 @@ def summarize_feature_block_diagnostics(fold_diagnostics):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Regime detection  (simple KMeans – swap for HMM/ADWIN later)
+# Regime detection  (KMeans or explicit trend/volatility/liquidity)
 # ───────────────────────────────────────────────────────────────────────────
 
-def detect_regime(features, n_regimes=2):
-    """Cluster rows into *n_regimes* regimes using KMeans.
+def _coalesce_regime_signal(features, include_terms, exclude_terms=None, fallback_column=None):
+    exclude_terms = tuple(term.lower() for term in (exclude_terms or ()))
+    selected_columns = []
+    for column in features.columns:
+        lower = column.lower()
+        if any(term in lower for term in include_terms) and not any(term in lower for term in exclude_terms):
+            selected_columns.append(column)
+
+    if not selected_columns and fallback_column is not None and fallback_column in features.columns:
+        selected_columns = [fallback_column]
+
+    if not selected_columns:
+        return pd.Series(0.0, index=features.index, dtype=float)
+
+    selected = features[selected_columns].apply(pd.to_numeric, errors="coerce")
+    standardized = (selected - selected.mean()) / selected.std().replace(0, 1)
+    return standardized.mean(axis=1).fillna(0.0)
+
+
+def _bucket_regime_signal(series, lower_quantile=0.33, upper_quantile=0.67, invert=False):
+    values = -pd.Series(series, copy=False) if invert else pd.Series(series, copy=False)
+    clean = values.dropna()
+    if clean.empty:
+        return pd.Series(0, index=values.index, dtype=int)
+
+    lower = float(clean.quantile(lower_quantile))
+    upper = float(clean.quantile(upper_quantile))
+    bucket = pd.Series(0, index=values.index, dtype=int)
+    bucket[values <= lower] = -1
+    bucket[values >= upper] = 1
+    return bucket
+
+
+def _detect_explicit_regime(features, config=None):
+    config = dict(config or {})
+    clean = features.dropna()
+    if clean.empty:
+        return pd.DataFrame(columns=["trend_regime", "volatility_regime", "liquidity_regime", "regime"])
+
+    trend_score = _coalesce_regime_signal(
+        clean,
+        include_terms=("trend", "ret_", "return", "momentum"),
+        exclude_terms=("vol", "volume", "liquid"),
+    )
+    volatility_score = _coalesce_regime_signal(
+        clean,
+        include_terms=("vol", "range", "atr", "dispersion"),
+        exclude_terms=("volume", "liquid"),
+    )
+    liquidity_score = _coalesce_regime_signal(
+        clean,
+        include_terms=("liquid", "volume", "turnover", "trade"),
+        exclude_terms=("illiquid",),
+    )
+    illiquidity_score = _coalesce_regime_signal(
+        clean,
+        include_terms=("illiquid", "amihud"),
+    )
+    liquidity_score = liquidity_score - illiquidity_score
+
+    lower_quantile = float(config.get("lower_quantile", 0.33))
+    upper_quantile = float(config.get("upper_quantile", 0.67))
+    liquidity_invert = bool(config.get("liquidity_invert", False))
+
+    trend_regime = _bucket_regime_signal(trend_score, lower_quantile=lower_quantile, upper_quantile=upper_quantile)
+    volatility_regime = _bucket_regime_signal(
+        volatility_score,
+        lower_quantile=lower_quantile,
+        upper_quantile=upper_quantile,
+    )
+    liquidity_regime = _bucket_regime_signal(
+        liquidity_score,
+        lower_quantile=lower_quantile,
+        upper_quantile=upper_quantile,
+        invert=liquidity_invert,
+    )
+
+    composite = (
+        (trend_regime + 1) * 9
+        + (volatility_regime + 1) * 3
+        + (liquidity_regime + 1)
+    ).astype(int)
+
+    return pd.DataFrame(
+        {
+            "trend_regime": trend_regime.astype(int),
+            "volatility_regime": volatility_regime.astype(int),
+            "liquidity_regime": liquidity_regime.astype(int),
+            "regime": composite,
+        },
+        index=clean.index,
+    )
+
+
+def detect_regime(features, n_regimes=2, method="kmeans", config=None):
+    """Detect regimes using KMeans or explicit rule-based buckets.
 
     Parameters
     ----------
-    features : pd.DataFrame – numeric columns (e.g. volatility, volume_trend)
+    features : pd.DataFrame – numeric columns describing regime state
+    n_regimes : int         – number of KMeans clusters when method="kmeans"
+    method : str            – "kmeans" or "explicit"
+    config : dict or None   – optional method-specific settings
 
-    Returns pd.Series of regime labels (ints), indexed like *features*.
+    Returns a pd.Series for KMeans mode or a pd.DataFrame with explicit regime
+    components for method="explicit".
     """
+    method = (method or "kmeans").lower()
+    if method == "explicit":
+        return _detect_explicit_regime(features, config=config)
+
     clean = features.dropna()
     normed = (clean - clean.mean()) / clean.std().replace(0, 1)
     km = KMeans(n_clusters=n_regimes, random_state=42, n_init=10)

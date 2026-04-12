@@ -21,6 +21,7 @@ from .indicators import run_indicators
 from .labeling import (
     fixed_horizon_labels,
     sample_weights_by_uniqueness,
+    trend_scanning_labels,
     triple_barrier_labels,
 )
 from .models import (
@@ -41,10 +42,19 @@ from .models import (
 
 def _default_regime_features(pipeline):
     data = pipeline.require("data")
+    returns = data["close"].pct_change()
+    quote_volume = data["quote_volume"] if "quote_volume" in data.columns else (data["close"] * data["volume"])
+    illiquidity = returns.abs() / quote_volume.replace(0, np.nan)
     return pd.DataFrame(
         {
+            "trend_20": data["close"].pct_change(20),
+            "trend_60": data["close"].pct_change(60),
             "vol_20": data["close"].pct_change().rolling(20).std(),
             "vol_60": data["close"].pct_change().rolling(60).std(),
+            "range_20": ((data["high"] - data["low"]) / data["close"]).rolling(20).mean(),
+            "liquidity_20": np.log1p(quote_volume).rolling(20).mean(),
+            "illiquidity_20": illiquidity.rolling(20).mean(),
+            "trades_20": (data["trades"].rolling(20).mean() if "trades" in data.columns else np.nan),
         }
     ).dropna()
 
@@ -771,15 +781,25 @@ class RegimeStep(PipelineStep):
         config = pipeline.section("regime")
         builder = config.get("builder") or _default_regime_features
         regime_features = builder(pipeline)
-        regimes = detect_regime(regime_features, n_regimes=config.get("n_regimes", 2))
+        regimes = detect_regime(
+            regime_features,
+            n_regimes=config.get("n_regimes", 2),
+            method=config.get("method", "kmeans"),
+            config=config,
+        )
 
         aligned_features = features.loc[regimes.index].copy()
-        aligned_features[config.get("column_name", "regime")] = regimes.values
+        feature_blocks = dict(pipeline.state.get("feature_blocks", {}))
+        if isinstance(regimes, pd.DataFrame):
+            aligned_features = aligned_features.join(regimes)
+            for column in regimes.columns:
+                feature_blocks[column] = "regime"
+        else:
+            aligned_features[config.get("column_name", "regime")] = regimes.values
+            feature_blocks[config.get("column_name", "regime")] = "regime"
 
         pipeline.state["regime_features"] = regime_features
         pipeline.state["regimes"] = regimes
-        feature_blocks = dict(pipeline.state.get("feature_blocks", {}))
-        feature_blocks[config.get("column_name", "regime")] = "regime"
         pipeline.state["feature_blocks"] = feature_blocks
         pipeline.state["features"] = aligned_features
         return {"regime_features": regime_features, "regimes": regimes}
@@ -825,6 +845,17 @@ class LabelsStep(PipelineStep):
                 horizon=config.get("horizon", 5),
                 threshold=config.get("threshold", 0.0),
                 cost_rate=float(cost_rate),
+            )
+        elif label_kind == "trend_scanning":
+            labels = trend_scanning_labels(
+                close=data["close"],
+                min_horizon=config.get("min_horizon", 8),
+                max_horizon=config.get("max_horizon", config.get("max_holding", 48)),
+                step=config.get("step", 4),
+                min_t_value=config.get("min_t_value", 1.5),
+                min_return=config.get("min_return", 0.0),
+                cost_rate=float(cost_rate),
+                price_transform=config.get("price_transform", "log"),
             )
         else:
             raise ValueError(f"Unsupported label kind={label_kind!r}")
