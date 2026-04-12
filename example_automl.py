@@ -17,6 +17,8 @@ def main():
                 "interval": "1h",
                 "start": "2024-01-01",
                 "end": "2026-01-01",
+                "futures_context": {"enabled": True, "include_recent_stats": True},
+                "cross_asset_context": {"symbols": ["ETHUSDT", "SOLUSDT", "BNBUSDT"]},
             },
             "indicators": [RSI(14), MACD(), BollingerBands(20), ATR(14)],
             "features": {
@@ -24,7 +26,8 @@ def main():
                 "frac_diff_d": 0.4,
                 "rolling_window": 20,
                 "squeeze_quantile": 0.2,
-                "schema_version": "indicator_aware_v5_foldlocal",
+                "context_timeframes": ["4h", "1d"],
+                "schema_version": "indicator_aware_v6_contextual",
             },
             "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
             "regime": {"n_regimes": 2},
@@ -46,7 +49,12 @@ def main():
                 "meta_threshold": 0.55,
                 "tuning_min_trades": 5,
             },
-            "backtest": {"equity": 10_000, "fee_rate": 0.001, "use_open_execution": True},
+            "backtest": {
+                "equity": 10_000,
+                "fee_rate": 0.001,
+                "use_open_execution": True,
+                "signal_delay_bars": 2,
+            },
             "automl": {
                 "enabled": True,
                 "n_trials": 8,
@@ -94,6 +102,12 @@ def main():
     print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
     print(f"  avg accuracy : {training['avg_accuracy']:.4f}")
     print(f"  avg f1       : {training['avg_f1_macro']:.4f}")
+    directional_accuracy = [metric.get("directional_accuracy") for metric in training["fold_metrics"] if metric.get("directional_accuracy") is not None]
+    directional_f1 = [metric.get("directional_f1_macro") for metric in training["fold_metrics"] if metric.get("directional_f1_macro") is not None]
+    if directional_accuracy:
+        print(f"  avg dir acc  : {sum(directional_accuracy) / len(directional_accuracy):.4f}")
+    if directional_f1:
+        print(f"  avg dir f1   : {sum(directional_f1) / len(directional_f1):.4f}")
     block_diag = training["feature_block_diagnostics"]
     if block_diag["summary"]:
         print("  top blocks   :")
@@ -122,12 +136,16 @@ def main():
     print(f"  max drawdown : {backtest['max_drawdown']:.2%} (${backtest['max_drawdown_amount']:,.2f})")
     print(f"  dd duration  : {backtest['max_drawdown_duration_bars']} bars ({backtest['max_drawdown_duration']})")
     print(f"  exposure     : {backtest['exposure_rate']:.2%}")
+    print(f"  signal delay : {backtest['signal_delay_bars']} bars")
     print(f"  profit factor: {backtest['profit_factor']}")
     print(f"  expectancy   : ${backtest['expectancy']:,.2f} per active bar")
     print(f"  avg win      : ${backtest['avg_win']:,.2f}")
     print(f"  avg loss     : ${backtest['avg_loss']:,.2f}")
     print(f"  trades       : {backtest['total_trades']}")
     print(f"  win rate     : {backtest['win_rate']:.2%} (active bars)")
+    print(f"  closed trades: {backtest['closed_trades']}")
+    print(f"  trade win rt : {backtest['trade_win_rate']:.2%}")
+    print(f"  trade pf     : {backtest['trade_profit_factor']}")
 
 
 if __name__ == "__main__":

@@ -17,9 +17,11 @@ def main():
                 "interval": "1h",
                 "start": "2024-01-01",
                 "end": "2024-12-01",
+                "futures_context": {"enabled": True, "include_recent_stats": True},
+                "cross_asset_context": {"symbols": ["ETHUSDT", "SOLUSDT", "BNBUSDT"]},
             },
             "indicators": [RSI(14), MACD(), BollingerBands(20), ATR(14)],
-            "features": {"lags": [1, 3, 6], "frac_diff_d": 0.4},
+            "features": {"lags": [1, 3, 6], "frac_diff_d": 0.4, "context_timeframes": ["4h", "1d"]},
             "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
             "regime": {"n_regimes": 2},
             "labels": {
@@ -38,7 +40,7 @@ def main():
                 "edge_threshold": 0.05,
                 "meta_threshold": 0.55,
             },
-            "backtest": {"equity": 10_000, "fee_rate": 0.001},
+            "backtest": {"equity": 10_000, "fee_rate": 0.001, "use_open_execution": True, "signal_delay_bars": 2},
         }
     )
 
@@ -115,6 +117,12 @@ def main():
     for metric in training["fold_metrics"]:
         print(f"  fold {metric['fold']}: acc={metric['accuracy']}  f1={metric['f1_macro']}")
     print(f"  avg  acc={training['avg_accuracy']:.4f}  f1={training['avg_f1_macro']:.4f}")
+    directional_accuracy = [metric.get("directional_accuracy") for metric in training["fold_metrics"] if metric.get("directional_accuracy") is not None]
+    directional_f1 = [metric.get("directional_f1_macro") for metric in training["fold_metrics"] if metric.get("directional_f1_macro") is not None]
+    if directional_accuracy:
+        print(f"  avg dir acc={sum(directional_accuracy) / len(directional_accuracy):.4f}")
+    if directional_f1:
+        print(f"  avg dir f1 ={sum(directional_f1) / len(directional_f1):.4f}")
     print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
 
     block_diag = training["feature_block_diagnostics"]
@@ -151,12 +159,15 @@ def main():
     print(f"  max drawdown : {bt['max_drawdown']:.2%} (${bt['max_drawdown_amount']:,.2f})")
     print(f"  dd duration  : {bt['max_drawdown_duration_bars']} bars ({bt['max_drawdown_duration']})")
     print(f"  exposure     : {bt['exposure_rate']:.2%}")
+    print(f"  signal delay : {bt['signal_delay_bars']} bars")
     print(f"  profit factor: {bt['profit_factor']}")
     print(f"  expectancy   : ${bt['expectancy']:,.2f} per active bar")
     print(f"  avg win      : ${bt['avg_win']:,.2f}")
     print(f"  avg loss     : ${bt['avg_loss']:,.2f}")
     print(f"  trades       : {bt['total_trades']}")
     print(f"  win rate     : {bt['win_rate']:.2%} (active bars)")
+    print(f"  closed trades: {bt['closed_trades']}")
+    print(f"  trade win rt : {bt['trade_win_rate']:.2%}")
 
     print(f"\n{SEP}\nPipeline complete.\n{SEP}")
 

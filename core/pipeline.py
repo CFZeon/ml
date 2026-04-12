@@ -8,6 +8,13 @@ import pandas as pd
 
 from .automl import run_automl_study
 from .backtest import kelly_fraction, run_backtest
+from .context import (
+    build_cross_asset_context_feature_block,
+    build_futures_context_feature_block,
+    build_multi_timeframe_context_feature_block,
+    fetch_binance_futures_context,
+    fetch_context_symbol_bars,
+)
 from .data import fetch_binance_vision
 from .features import build_feature_set, check_stationarity, screen_features_for_stationarity, select_features
 from .indicators import run_indicators
@@ -94,6 +101,26 @@ def _apply_holding_period(event_weights, holding_bars):
         shifted = weights.shift(lag).fillna(0.0)
         held = held.where(held.abs() >= shifted.abs(), shifted)
     return held.clip(-1.0, 1.0)
+
+
+def _join_feature_block(features, feature_blocks, block):
+    if block is None or block.frame.empty:
+        return features, dict(feature_blocks)
+
+    updated_blocks = dict(feature_blocks)
+    features = features.join(block.frame)
+    for column in block.frame.columns:
+        updated_blocks[column] = block.block_name
+    return features, updated_blocks
+
+
+def _resolve_signal_delay_bars(backtest_config):
+    configured = backtest_config.get("signal_delay_bars")
+    if configured is not None:
+        return max(0, int(configured))
+    if backtest_config.get("use_open_execution", True):
+        return 2
+    return 1
 
 
 def _split_train_validation_window(X_train, y_train, sample_weights, model_config):
@@ -399,6 +426,7 @@ def _tune_signal_parameters(validation_close, validation_execution_prices, predi
             equity=backtest_config.get("equity", 10_000.0),
             fee_rate=backtest_config.get("fee_rate", 0.001),
             slippage_rate=backtest_config.get("slippage_rate", 0.0),
+            signal_delay_bars=_resolve_signal_delay_bars(backtest_config),
             execution_prices=(
                 validation_execution_prices.loc[state["continuous_signals"].index]
                 if validation_execution_prices is not None
@@ -444,6 +472,7 @@ def _tune_signal_parameters(validation_close, validation_execution_prices, predi
             equity=backtest_config.get("equity", 10_000.0),
             fee_rate=backtest_config.get("fee_rate", 0.001),
             slippage_rate=backtest_config.get("slippage_rate", 0.0),
+            signal_delay_bars=_resolve_signal_delay_bars(backtest_config),
             execution_prices=(
                 validation_execution_prices.loc[state["continuous_signals"].index]
                 if validation_execution_prices is not None
@@ -548,10 +577,34 @@ class FetchDataStep(PipelineStep):
     name = "fetch_data"
 
     def run(self, pipeline):
-        config = pipeline.section("data")
+        config = dict(pipeline.section("data"))
+        futures_context_config = dict(config.pop("futures_context", {}) or {})
+        cross_asset_context_config = dict(config.pop("cross_asset_context", {}) or {})
+
         data = fetch_binance_vision(**config)
         pipeline.state["raw_data"] = data
         pipeline.state["data"] = data.copy()
+
+        if futures_context_config.get("enabled", True):
+            pipeline.state["futures_context"] = fetch_binance_futures_context(
+                symbol=config.get("symbol", "BTCUSDT"),
+                interval=config.get("interval", "1h"),
+                start=config.get("start", "2024-01-01"),
+                end=config.get("end", "2024-03-01"),
+                cache_dir=futures_context_config.get("cache_dir", config.get("cache_dir", ".cache")),
+                include_recent_stats=futures_context_config.get("include_recent_stats", True),
+            )
+
+        context_symbols = cross_asset_context_config.get("symbols") or []
+        if context_symbols:
+            pipeline.state["cross_asset_context"] = fetch_context_symbol_bars(
+                symbols=context_symbols,
+                interval=config.get("interval", "1h"),
+                start=config.get("start", "2024-01-01"),
+                end=config.get("end", "2024-03-01"),
+                cache_dir=cross_asset_context_config.get("cache_dir", config.get("cache_dir", ".cache")),
+            )
+
         return data
 
 
@@ -626,6 +679,7 @@ class FeaturesStep(PipelineStep):
 
     def run(self, pipeline):
         data = pipeline.require("data")
+        raw_data = pipeline.require("raw_data")
         indicator_run = pipeline.state.get("indicator_run")
         config = pipeline.section("features")
         feature_set = build_feature_set(
@@ -638,6 +692,28 @@ class FeaturesStep(PipelineStep):
         )
         features = feature_set.frame
         feature_blocks = dict(feature_set.feature_blocks)
+
+        futures_context_block = build_futures_context_feature_block(
+            raw_data,
+            pipeline.state.get("futures_context"),
+            rolling_window=config.get("rolling_window", 20),
+        )
+        features, feature_blocks = _join_feature_block(features, feature_blocks, futures_context_block)
+
+        cross_asset_context_block = build_cross_asset_context_feature_block(
+            raw_data,
+            pipeline.state.get("cross_asset_context"),
+            rolling_window=config.get("rolling_window", 20),
+        )
+        features, feature_blocks = _join_feature_block(features, feature_blocks, cross_asset_context_block)
+
+        multi_timeframe_block = build_multi_timeframe_context_feature_block(
+            raw_data,
+            base_interval=pipeline.section("data").get("interval", "1h"),
+            timeframes=config.get("context_timeframes"),
+            rolling_window=config.get("rolling_window", 20),
+        )
+        features, feature_blocks = _join_feature_block(features, feature_blocks, multi_timeframe_block)
 
         for builder in config.get("builders", []):
             built = builder(pipeline, features.copy())
@@ -1302,6 +1378,7 @@ class BacktestStep(PipelineStep):
             equity=config.get("equity", 10_000.0),
             fee_rate=config.get("fee_rate", 0.001),
             slippage_rate=config.get("slippage_rate", 0.0),
+            signal_delay_bars=_resolve_signal_delay_bars(config),
             execution_prices=(raw_data["open"].loc[positions.index] if config.get("use_open_execution", True) and "open" in raw_data.columns else None),
         )
         pipeline.state["backtest"] = backtest

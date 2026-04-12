@@ -4,6 +4,13 @@
 """
 
 from .data import fetch_binance_vision
+from .context import (
+    fetch_binance_futures_context,
+    fetch_context_symbol_bars,
+    build_futures_context_feature_block,
+    build_cross_asset_context_feature_block,
+    build_multi_timeframe_context_feature_block,
+)
 from .indicators import (
     Indicator,
     IndicatorResult,

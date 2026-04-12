@@ -96,11 +96,79 @@ def _max_drawdown_duration(equity_curve, peak):
     return max_bars, max_duration
 
 
+def _build_trade_ledger(strat_ret, position, execution_series):
+    trades = []
+    current_sign = 0.0
+    entry_time = None
+    entry_price = None
+    segment_returns = []
+    previous_timestamp = None
+
+    for timestamp in strat_ret.index:
+        sign_now = float(np.sign(position.loc[timestamp]))
+        if current_sign == 0.0:
+            if sign_now != 0.0:
+                current_sign = sign_now
+                entry_time = timestamp
+                entry_price = float(execution_series.loc[timestamp])
+                segment_returns = [float(strat_ret.loc[timestamp])]
+        elif sign_now == current_sign:
+            segment_returns.append(float(strat_ret.loc[timestamp]))
+        else:
+            if segment_returns:
+                trade_return = float(np.prod(1.0 + np.asarray(segment_returns, dtype=float)) - 1.0)
+                exit_time = previous_timestamp if previous_timestamp is not None else timestamp
+                exit_price = float(execution_series.loc[exit_time])
+                trades.append(
+                    {
+                        "entry_time": entry_time,
+                        "exit_time": exit_time,
+                        "direction": int(np.sign(current_sign)),
+                        "bars": int(len(segment_returns)),
+                        "entry_price": entry_price,
+                        "exit_price": exit_price,
+                        "return_pct": trade_return,
+                    }
+                )
+
+            if sign_now != 0.0:
+                current_sign = sign_now
+                entry_time = timestamp
+                entry_price = float(execution_series.loc[timestamp])
+                segment_returns = [float(strat_ret.loc[timestamp])]
+            else:
+                current_sign = 0.0
+                entry_time = None
+                entry_price = None
+                segment_returns = []
+
+        previous_timestamp = timestamp
+
+    if current_sign != 0.0 and segment_returns:
+        trade_return = float(np.prod(1.0 + np.asarray(segment_returns, dtype=float)) - 1.0)
+        exit_time = strat_ret.index[-1]
+        trades.append(
+            {
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "direction": int(np.sign(current_sign)),
+                "bars": int(len(segment_returns)),
+                "entry_price": entry_price,
+                "exit_price": float(execution_series.loc[exit_time]),
+                "return_pct": trade_return,
+            }
+        )
+
+    if not trades:
+        return pd.DataFrame(columns=["entry_time", "exit_time", "direction", "bars", "entry_price", "exit_price", "return_pct"])
+    return pd.DataFrame(trades)
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Backtest engine  (simple pandas – swap for VectorBT / NautilusTrader later)
 # ───────────────────────────────────────────────────────────────────────────
 
-def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=0.0, execution_prices=None):
+def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=0.0, execution_prices=None, signal_delay_bars=1):
     """Vectorised backtest on categorical or fractional position signals.
 
     Parameters
@@ -111,19 +179,21 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     fee_rate         : float      – one-way fee
     slippage_rate    : float      – one-way slippage estimate applied on turnover
     execution_prices : pd.Series or None – optional execution price series, e.g. next-bar open
+    signal_delay_bars: int        – bars to delay signal application before execution
 
     Returns dict with metrics and equity curve.
     """
     close = pd.Series(close, copy=False).astype(float)
     signal_series = pd.Series(signals, index=close.index).reindex(close.index).fillna(0.0).astype(float)
     signal_series = signal_series.clip(-1.0, 1.0)
+    signal_delay_bars = max(0, int(signal_delay_bars))
     execution_series = close
     if execution_prices is not None:
         execution_series = pd.Series(execution_prices, index=close.index).reindex(close.index).astype(float)
     returns = execution_series.pct_change().fillna(0)
 
-    # position acts on the NEXT bar
-    position = signal_series.shift(1).fillna(0.0)
+    # Signals derived from bar-level OHLC data must wait until the observation bar closes.
+    position = signal_series.shift(signal_delay_bars).fillna(0.0)
 
     # cost on every position change
     turnover = position.diff().abs().fillna(position.abs())
@@ -172,6 +242,14 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     exposure_rate = float(position.ne(0).mean()) if len(position) > 0 else 0.0
     avg_position_size = float(position.abs().mean()) if len(position) > 0 else 0.0
     total_turnover = float(turnover.sum()) if len(turnover) > 0 else 0.0
+    trade_ledger = _build_trade_ledger(strat_ret, position, execution_series)
+    trade_returns = trade_ledger["return_pct"] if not trade_ledger.empty else pd.Series(dtype=float)
+    trade_winners = trade_returns[trade_returns > 0]
+    trade_losers = trade_returns[trade_returns < 0]
+    trade_profit_factor = _safe_ratio(float(trade_winners.sum()), abs(float(trade_losers.sum())))
+    trade_win_rate = float(trade_returns.gt(0).mean()) if len(trade_returns) > 0 else 0.0
+    avg_trade_return_pct = float(trade_returns.mean()) if len(trade_returns) > 0 else 0.0
+    avg_trade_bars = float(trade_ledger["bars"].mean()) if not trade_ledger.empty else 0.0
 
     elapsed_years = 0.0
     if len(close.index) > 1:
@@ -201,6 +279,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         "max_drawdown_duration_bars": max_dd_bars,
         "exposure_rate": _round_metric(exposure_rate, 4),
         "average_position_size": _round_metric(avg_position_size, 4),
+        "signal_delay_bars": signal_delay_bars,
         "total_turnover": _round_metric(total_turnover, 4),
         "profit_factor": _round_metric(profit_factor, 2),
         "avg_win": _round_metric(avg_win, 2),
@@ -209,5 +288,12 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         "expectancy_pct": _round_metric(expectancy_pct, 6),
         "total_trades": n_trades,
         "win_rate": _round_metric(win_rate, 4),
+        "active_bar_win_rate": _round_metric(win_rate, 4),
+        "closed_trades": int(len(trade_ledger)),
+        "trade_win_rate": _round_metric(trade_win_rate, 4),
+        "avg_trade_return_pct": _round_metric(avg_trade_return_pct, 6),
+        "avg_trade_bars": _round_metric(avg_trade_bars, 2),
+        "trade_profit_factor": _round_metric(trade_profit_factor, 2),
+        "trade_ledger": trade_ledger,
         "equity_curve": eq_curve,
     }

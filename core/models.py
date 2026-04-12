@@ -286,14 +286,36 @@ def train_meta_model(primary_preds, primary_probabilities, y_true, sample_weight
 def evaluate_model(model, X, y):
     """Return dict of classification metrics."""
     preds = model.predict(X)
+    y_series = pd.Series(y, index=X.index if hasattr(X, "index") else None)
+    pred_series = pd.Series(preds, index=y_series.index)
     m = {
-        "accuracy": round(float(accuracy_score(y, preds)), 4),
-        "f1_macro": round(float(f1_score(y, preds, average="macro", zero_division=0)), 4),
+        "accuracy": round(float(accuracy_score(y_series, pred_series)), 4),
+        "f1_macro": round(float(f1_score(y_series, pred_series, average="macro", zero_division=0)), 4),
+        "prediction_coverage": round(float(pred_series.ne(0).mean()), 4),
+        "label_abstain_rate": round(float(y_series.eq(0).mean()), 4),
     }
+
+    directional_mask = y_series.ne(0)
+    if directional_mask.any():
+        m["directional_accuracy"] = round(
+            float(accuracy_score(y_series.loc[directional_mask], pred_series.loc[directional_mask])),
+            4,
+        )
+        m["directional_f1_macro"] = round(
+            float(
+                f1_score(
+                    y_series.loc[directional_mask],
+                    pred_series.loc[directional_mask],
+                    average="macro",
+                    zero_division=0,
+                )
+            ),
+            4,
+        )
     if hasattr(model, "predict_proba"):
         try:
             m["log_loss"] = round(
-                float(log_loss(y, model.predict_proba(X), labels=model.classes_)),
+                float(log_loss(y_series, model.predict_proba(X), labels=model.classes_)),
                 4,
             )
         except Exception:
