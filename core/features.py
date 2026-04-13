@@ -409,6 +409,25 @@ def _extract_generic_indicator_features(result, df, rolling_window=20, **_):
     return _as_feature_block(frame, laggable, block_name=getattr(result, "kind", "generic_indicator"))
 
 
+def _extract_exogenous_numeric_features(df, excluded_columns, rolling_window=20):
+    exogenous_columns = [
+        column for column in df.columns
+        if column not in excluded_columns and pd.api.types.is_numeric_dtype(df[column])
+    ]
+    if not exogenous_columns:
+        return _as_feature_block(pd.DataFrame(index=df.index), [], block_name="exogenous_context")
+
+    result = type(
+        "ExogenousContextResult",
+        (),
+        {
+            "kind": "exogenous_context",
+            "metadata": {"output_columns": exogenous_columns},
+        },
+    )()
+    return _extract_generic_indicator_features(result, df, rolling_window=rolling_window)
+
+
 INDICATOR_FEATURE_EXTRACTORS = {
     "rsi": _extract_rsi_features,
     "macd": _extract_macd_features,
@@ -868,7 +887,9 @@ def build_feature_set(
     blocks.append(_price_volume_features(df, rolling_window=rolling_window))
 
     if indicator_run is not None and getattr(indicator_run, "results", None):
+        indicator_output_columns = set()
         for result in indicator_run.results:
+            indicator_output_columns.update(result.metadata.get("output_columns", []))
             extractor = INDICATOR_FEATURE_EXTRACTORS.get(result.kind, _extract_generic_indicator_features)
             block = extractor(
                 result,
@@ -886,6 +907,14 @@ def build_feature_set(
         )
         if not interaction_block.frame.empty:
             blocks.append(interaction_block)
+
+        exogenous_block = _extract_exogenous_numeric_features(
+            df,
+            excluded_columns=BASE_COLUMNS | indicator_output_columns,
+            rolling_window=rolling_window,
+        )
+        if not exogenous_block.frame.empty:
+            blocks.append(exogenous_block)
     else:
         generic_result = type(
             "GenericIndicatorResult",

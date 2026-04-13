@@ -17,7 +17,16 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-_BASE = "https://data.binance.vision/data/spot"
+_VISION_BASES = {
+    "spot": "https://data.binance.vision/data/spot",
+    "um_futures": "https://data.binance.vision/data/futures/um",
+    "cm_futures": "https://data.binance.vision/data/futures/cm",
+}
+_REST_BASES = {
+    "spot": "https://api.binance.com",
+    "um_futures": "https://fapi.binance.com",
+    "cm_futures": "https://dapi.binance.com",
+}
 _INTERVAL_PATTERN = re.compile(r"^(\d+)(mo|[smhdw])$")
 
 _COLUMNS = [
@@ -28,6 +37,14 @@ _COLUMNS = [
 
 _FLOAT_COLUMNS = ["open", "high", "low", "close", "volume", "quote_volume"]
 _OUTPUT_COLUMNS = ["open", "high", "low", "close", "volume", "quote_volume", "trades"]
+
+
+@dataclass(frozen=True)
+class CustomDataset:
+    name: str
+    frame: pd.DataFrame
+    availability_column: str
+    source_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +60,29 @@ def _parse_bound(value):
     if timestamp.tzinfo is None:
         return timestamp.tz_localize("UTC")
     return timestamp.tz_convert("UTC")
+
+
+def _normalize_market(market="spot", futures_type=None):
+    normalized = (market or "spot").lower()
+    if normalized in {"spot", "cash"}:
+        return "spot"
+    if normalized in {"um", "usdm", "usdtm", "um_futures", "futures", "futures_um"}:
+        return "um_futures"
+    if normalized in {"cm", "coinm", "cm_futures", "futures_cm"}:
+        return "cm_futures"
+    if futures_type is not None:
+        return _normalize_market(f"{futures_type}_futures")
+    raise ValueError(f"Unsupported Binance market={market!r}")
+
+
+def _vision_base_url(market):
+    normalized = _normalize_market(market)
+    return _VISION_BASES[normalized]
+
+
+def _rest_base_url(market):
+    normalized = _normalize_market(market)
+    return _REST_BASES[normalized]
 
 
 def _parse_interval(interval):
@@ -124,10 +164,11 @@ def _iter_cache_periods(start, end, interval):
     yield from _iter_monthly_periods(start, end)
 
 
-def _cache_path(cache_dir, symbol, interval, period):
+def _cache_path(cache_dir, symbol, interval, period, market="spot"):
+    market_key = _normalize_market(market)
     return (
         Path(cache_dir)
-        / "spot"
+        / market_key
         / "klines"
         / symbol
         / interval
@@ -159,6 +200,8 @@ def _prepare_frame(frame):
         return pd.DataFrame(columns=_OUTPUT_COLUMNS)
 
     prepared = frame.copy()
+    if not prepared.empty and str(prepared.iloc[0]["open_time"]).lower() == "open_time":
+        prepared = prepared.iloc[1:].copy()
     prepared["open_time"] = pd.to_numeric(prepared["open_time"], errors="raise")
     prepared["timestamp"] = pd.to_datetime(
         prepared["open_time"],
@@ -216,41 +259,43 @@ def _download_archive(url, session):
     return _prepare_frame(raw)
 
 
-def _monthly_archive_url(symbol, interval, period):
+def _monthly_archive_url(symbol, interval, period, market="spot"):
+    base_url = _vision_base_url(market)
     return (
-        f"{_BASE}/monthly/klines/{symbol}/{interval}/"
+        f"{base_url}/monthly/klines/{symbol}/{interval}/"
         f"{symbol}-{interval}-{period.start:%Y-%m}.zip"
     )
 
 
-def _daily_archive_url(symbol, interval, day):
+def _daily_archive_url(symbol, interval, day, market="spot"):
+    base_url = _vision_base_url(market)
     return (
-        f"{_BASE}/daily/klines/{symbol}/{interval}/"
+        f"{base_url}/daily/klines/{symbol}/{interval}/"
         f"{symbol}-{interval}-{day:%Y-%m-%d}.zip"
     )
 
 
-def _fetch_daily_range(symbol, interval, period, session):
+def _fetch_daily_range(symbol, interval, period, session, market="spot"):
     frames = []
     available_end = min(period.end, pd.Timestamp.now(tz="UTC").normalize())
     for day in pd.date_range(period.start, available_end, freq="1D", inclusive="left"):
-        frame = _download_archive(_daily_archive_url(symbol, interval, day), session)
+        frame = _download_archive(_daily_archive_url(symbol, interval, day, market=market), session)
         if frame is not None and not frame.empty:
             frames.append(frame)
     return _merge_frames(frames)
 
 
-def _fetch_period(symbol, interval, period, session):
+def _fetch_period(symbol, interval, period, session, market="spot"):
     if not _uses_weekly_cache(interval):
-        monthly_frame = _download_archive(_monthly_archive_url(symbol, interval, period), session)
+        monthly_frame = _download_archive(_monthly_archive_url(symbol, interval, period, market=market), session)
         if monthly_frame is not None:
             return monthly_frame
 
-    return _fetch_daily_range(symbol, interval, period, session)
+    return _fetch_daily_range(symbol, interval, period, session, market=market)
 
 
-def _load_period(symbol, interval, period, request_start, request_end, cache_dir, session):
-    cache_file = _cache_path(cache_dir, symbol, interval, period) if cache_dir else None
+def _load_period(symbol, interval, period, request_start, request_end, cache_dir, session, market="spot"):
+    cache_file = _cache_path(cache_dir, symbol, interval, period, market=market) if cache_dir else None
     cached = _read_cache(cache_file) if cache_file is not None else None
     window_start, window_end = _period_window(period, request_start, request_end)
 
@@ -263,7 +308,7 @@ def _load_period(symbol, interval, period, request_start, request_end, cache_dir
         action = "Refreshing" if cached is not None and not cached.empty else "Building"
         print(f"  {action} {period.kind} cache {period.key}")
 
-    refreshed = _fetch_period(symbol, interval, period, session)
+    refreshed = _fetch_period(symbol, interval, period, session, market=market)
     merged = _merge_frames([cached, refreshed])
 
     if cache_file is not None:
@@ -277,8 +322,8 @@ def _load_period(symbol, interval, period, request_start, request_end, cache_dir
 
 def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
                          start="2024-01-01", end="2024-03-01",
-                         cache_dir=".cache"):
-    """Load spot klines from Binance Vision with periodized local cache files.
+                         cache_dir=".cache", market="spot", futures_type=None):
+    """Load spot or futures klines from Binance Vision with periodized local cache files.
 
     Parameters
     ----------
@@ -287,11 +332,15 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
     start, end : str – ISO timestamps interpreted as UTC, with end exclusive
     cache_dir : str or None – directory for caching; None disables caching
 
+    market : str – "spot", "um_futures", or "cm_futures"
+    futures_type : str or None – backward-compatible alias for futures family
+
     Returns
     -------
     pd.DataFrame with datetime UTC index and float columns:
         open, high, low, close, volume, quote_volume, trades
     """
+    market = _normalize_market(market, futures_type=futures_type)
     start_dt = _parse_bound(start)
     end_dt = _parse_bound(end)
     if end_dt <= start_dt:
@@ -301,7 +350,7 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
     with requests.Session() as session:
         for period in _iter_cache_periods(start_dt, end_dt, interval):
             period_frames.append(
-                _load_period(symbol, interval, period, start_dt, end_dt, cache_dir, session)
+                _load_period(symbol, interval, period, start_dt, end_dt, cache_dir, session, market=market)
             )
 
     df = _merge_frames(period_frames)
@@ -311,3 +360,193 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
         raise RuntimeError(f"No data fetched for {symbol} {interval} [{start}, {end})")
 
     return df
+
+
+def fetch_binance_bars(symbol="BTCUSDT", interval="1h",
+                       start="2024-01-01", end="2024-03-01",
+                       cache_dir=".cache", market="spot", futures_type=None):
+    """Unified market-data entrypoint for Binance Vision spot and futures bars."""
+    return fetch_binance_vision(
+        symbol=symbol,
+        interval=interval,
+        start=start,
+        end=end,
+        cache_dir=cache_dir,
+        market=market,
+        futures_type=futures_type,
+    )
+
+
+def _read_table(path, file_format=None):
+    resolved = Path(path)
+    suffix = (file_format or resolved.suffix.lstrip(".")).lower()
+    if suffix == "csv":
+        return pd.read_csv(resolved)
+    if suffix in {"parquet", "pq"}:
+        return pd.read_parquet(resolved)
+    if suffix == "json":
+        return pd.read_json(resolved)
+    raise ValueError(f"Unsupported custom data format={suffix!r} for path={path!r}")
+
+
+def _prefix_columns(columns, prefix):
+    if not prefix:
+        return columns
+    return {column: f"{prefix}_{column}" for column in columns}
+
+
+def load_custom_dataset(path=None, frame=None, name=None, file_format=None,
+                        timestamp_column="timestamp", availability_column=None,
+                        value_columns=None, prefix=None, start=None, end=None):
+    """Load a point-in-time safe custom dataset with explicit availability timestamps."""
+    if frame is None:
+        if path is None:
+            raise ValueError("Either path or frame must be provided for custom data")
+        raw = _read_table(path, file_format=file_format)
+    else:
+        raw = pd.DataFrame(frame).copy()
+
+    availability_column = availability_column or timestamp_column
+    if timestamp_column not in raw.columns:
+        raise ValueError(f"Custom data missing timestamp column {timestamp_column!r}")
+    if availability_column not in raw.columns:
+        raise ValueError(f"Custom data missing availability column {availability_column!r}")
+
+    dataset_name = name or (Path(path).stem if path is not None else "custom_data")
+    dataset_prefix = prefix or re.sub(r"[^a-z0-9]+", "_", dataset_name.lower()).strip("_")
+
+    prepared = raw.copy()
+    prepared[timestamp_column] = pd.to_datetime(prepared[timestamp_column], utc=True)
+    prepared[availability_column] = pd.to_datetime(prepared[availability_column], utc=True)
+    prepared = prepared.sort_values(availability_column)
+
+    if start is not None:
+        start_dt = _parse_bound(start)
+        prepared = prepared[prepared[availability_column] >= start_dt]
+    if end is not None:
+        end_dt = _parse_bound(end)
+        prepared = prepared[prepared[availability_column] < end_dt]
+
+    selected_value_columns = list(value_columns or [
+        column for column in prepared.columns
+        if column not in {timestamp_column, availability_column}
+    ])
+    rename_map = _prefix_columns(selected_value_columns, dataset_prefix)
+
+    selected = prepared[[timestamp_column, availability_column] + selected_value_columns].copy()
+    selected = selected.rename(columns={**rename_map, timestamp_column: "event_timestamp", availability_column: "available_at"})
+    return CustomDataset(
+        name=dataset_name,
+        frame=selected.reset_index(drop=True),
+        availability_column="available_at",
+        source_path=str(path) if path is not None else None,
+    )
+
+
+def _parse_optional_tolerance(value):
+    if value is None:
+        return None
+    return pd.Timedelta(value)
+
+
+def join_custom_dataset(base_frame, dataset, tolerance=None, allow_exact_matches=True):
+    """Point-in-time join a custom dataset onto market data using availability timestamps."""
+    base = pd.DataFrame(base_frame).copy()
+    if not isinstance(base.index, pd.DatetimeIndex):
+        raise ValueError("Base frame index must be a DatetimeIndex for point-in-time joins")
+    if dataset.frame.empty:
+        return base
+
+    anchor = pd.DataFrame({"decision_time": pd.DatetimeIndex(base.index)}).sort_values("decision_time")
+    custom = dataset.frame.sort_values(dataset.availability_column)
+    joined = pd.merge_asof(
+        anchor,
+        custom,
+        left_on="decision_time",
+        right_on=dataset.availability_column,
+        direction="backward",
+        allow_exact_matches=allow_exact_matches,
+        tolerance=_parse_optional_tolerance(tolerance),
+    )
+    joined = joined.set_index("decision_time")
+    joined.index.name = base.index.name
+    if dataset.availability_column in joined.columns:
+        joined = joined.drop(columns=[dataset.availability_column])
+    return base.join(joined)
+
+
+def join_custom_data(base_frame, datasets):
+    """Apply one or more point-in-time custom data joins to market data."""
+    joined = pd.DataFrame(base_frame).copy()
+    reports = []
+    for config in datasets or []:
+        dataset = load_custom_dataset(**config)
+        joined = join_custom_dataset(
+            joined,
+            dataset,
+            tolerance=config.get("tolerance"),
+            allow_exact_matches=config.get("allow_exact_matches", True),
+        )
+        joined_columns = [column for column in dataset.frame.columns if column not in {"event_timestamp"}]
+        coverage = float(joined[[column for column in joined_columns if column in joined.columns]].notna().all(axis=1).mean()) if joined_columns else 0.0
+        reports.append(
+            {
+                "name": dataset.name,
+                "source_path": dataset.source_path,
+                "joined_columns": [column for column in joined_columns if column in joined.columns],
+                "coverage": coverage,
+            }
+        )
+    return joined, reports
+
+
+def _symbol_filters_cache_path(cache_dir, market, symbol):
+    if cache_dir is None:
+        return None
+    return Path(cache_dir) / _normalize_market(market) / "symbol_filters" / f"{symbol}.pkl"
+
+
+def _parse_symbol_filters(payload):
+    filters = payload.get("filters", [])
+    parsed = {"symbol": payload.get("symbol")}
+    for item in filters:
+        filter_type = item.get("filterType")
+        if filter_type == "PRICE_FILTER":
+            parsed["tick_size"] = float(item.get("tickSize", 0.0))
+        elif filter_type in {"LOT_SIZE", "MARKET_LOT_SIZE"}:
+            parsed.setdefault("step_size", float(item.get("stepSize", 0.0)))
+            parsed.setdefault("min_qty", float(item.get("minQty", 0.0)))
+            parsed.setdefault("max_qty", float(item.get("maxQty", 0.0)))
+        elif filter_type == "MIN_NOTIONAL":
+            parsed["min_notional"] = float(item.get("minNotional", 0.0))
+        elif filter_type == "NOTIONAL":
+            parsed.setdefault("min_notional", float(item.get("minNotional", 0.0)))
+            parsed["max_notional"] = float(item.get("maxNotional", 0.0))
+    return parsed
+
+
+def fetch_binance_symbol_filters(symbol, market="spot", cache_dir=".cache"):
+    """Fetch Binance symbol execution filters for spot or futures markets."""
+    normalized_market = _normalize_market(market)
+    cache_path = _symbol_filters_cache_path(cache_dir, normalized_market, symbol)
+    cached = _read_cache(cache_path) if cache_path is not None else None
+    if cached is not None:
+        return cached
+
+    base_url = _rest_base_url(normalized_market)
+    endpoint = "/api/v3/exchangeInfo" if normalized_market == "spot" else (
+        "/fapi/v1/exchangeInfo" if normalized_market == "um_futures" else "/dapi/v1/exchangeInfo"
+    )
+
+    with requests.Session() as session:
+        response = session.get(f"{base_url}{endpoint}", params={"symbol": symbol}, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+
+    symbols = payload.get("symbols", [])
+    if not symbols:
+        raise RuntimeError(f"No exchangeInfo filters returned for {symbol} on {normalized_market}")
+    filters = _parse_symbol_filters(symbols[0])
+    if cache_path is not None:
+        _write_cache(cache_path, filters)
+    return filters

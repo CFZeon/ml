@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from .data import fetch_binance_vision, _interval_timedelta, _parse_bound, _parse_interval
+from .data import fetch_binance_bars, _interval_timedelta, _parse_bound, _parse_interval
 from .features import FeatureBlock
 
 
@@ -355,17 +355,18 @@ def fetch_binance_futures_context(symbol="BTCUSDT", interval="1h", start="2024-0
     return context
 
 
-def fetch_context_symbol_bars(symbols=None, interval="1h", start="2024-01-01", end="2024-03-01", cache_dir=".cache"):
+def fetch_context_symbol_bars(symbols=None, interval="1h", start="2024-01-01", end="2024-03-01", cache_dir=".cache", market="spot"):
     """Fetch a small set of spot symbols used as cross-asset market context."""
     symbol_list = list(symbols or _DEFAULT_CONTEXT_SYMBOLS)
     frames = {}
     for symbol in symbol_list:
-        frames[symbol] = fetch_binance_vision(
+        frames[symbol] = fetch_binance_bars(
             symbol=symbol,
             interval=interval,
             start=start,
             end=end,
             cache_dir=cache_dir,
+            market=market,
         )
     return frames
 

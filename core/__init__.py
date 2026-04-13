@@ -3,7 +3,14 @@
     from core import fetch_binance_vision, RSI, train_model, run_backtest
 """
 
-from .data import fetch_binance_vision
+from .data import (
+    fetch_binance_bars,
+    fetch_binance_symbol_filters,
+    fetch_binance_vision,
+    join_custom_data,
+    join_custom_dataset,
+    load_custom_dataset,
+)
 from .context import (
     fetch_binance_futures_context,
     fetch_context_symbol_bars,
@@ -60,6 +67,7 @@ from .labeling import (
     sequential_bootstrap,
 )
 from .models import (
+    build_trade_outcome_frame,
     build_model,
     walk_forward_split,
     train_model,

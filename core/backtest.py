@@ -3,6 +3,14 @@
 import numpy as np
 import pandas as pd
 
+try:  # pragma: no cover - optional dependency exercised in integration tests
+    import vectorbt as vbt
+    from vectorbt.portfolio.enums import Direction, SizeType
+except ImportError:  # pragma: no cover
+    vbt = None
+    Direction = None
+    SizeType = None
+
 
 _SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 
@@ -58,6 +66,60 @@ def _safe_ratio(numerator, denominator, default=0.0):
             return float("inf")
         return default
     return numerator / denominator
+
+
+def _round_down_to_step(values, step):
+    if step is None or step <= 0:
+        return values
+    return np.floor(values / step) * step
+
+
+def _normalize_price_series(price, tick_size=None):
+    series = pd.Series(price, copy=False).astype(float)
+    if tick_size is not None and tick_size > 0:
+        series = pd.Series(_round_down_to_step(series.to_numpy(), tick_size), index=series.index, dtype=float)
+    return series.replace(0.0, np.nan).ffill().bfill()
+
+
+def _normalize_position_targets(signals, leverage=1.0, allow_short=True):
+    target = pd.Series(signals, copy=False).astype(float).fillna(0.0) * float(leverage)
+    if allow_short:
+        return target.clip(-abs(float(leverage)), abs(float(leverage)))
+    return target.clip(0.0, abs(float(leverage)))
+
+
+def _vectorbt_trade_ledger(portfolio, index):
+    readable = portfolio.trades.records_readable
+    if readable.empty:
+        return pd.DataFrame(columns=["entry_time", "exit_time", "direction", "bars", "entry_price", "exit_price", "return_pct"])
+
+    entry_time = pd.to_datetime(readable["Entry Timestamp"], utc=True)
+    exit_time = pd.to_datetime(readable["Exit Timestamp"], utc=True)
+    entry_loc = index.get_indexer(entry_time)
+    exit_loc = index.get_indexer(exit_time)
+    bars = np.where((entry_loc >= 0) & (exit_loc >= 0), exit_loc - entry_loc + 1, np.nan)
+
+    ledger = pd.DataFrame(
+        {
+            "entry_time": entry_time,
+            "exit_time": exit_time,
+            "direction": readable["Direction"].map({"Long": 1, "Short": -1}).fillna(0).astype(int),
+            "bars": pd.Series(bars, dtype="float").fillna(0).astype(int),
+            "entry_price": pd.to_numeric(readable["Avg Entry Price"], errors="coerce"),
+            "exit_price": pd.to_numeric(readable["Avg Exit Price"], errors="coerce"),
+            "return_pct": pd.to_numeric(readable["Return"], errors="coerce"),
+        }
+    )
+    return ledger
+
+
+def _compute_funding_cash(position, funding_rates, equity_curve):
+    if funding_rates is None:
+        return pd.Series(0.0, index=position.index, dtype=float)
+
+    funding = pd.Series(funding_rates, index=position.index).reindex(position.index).fillna(0.0).astype(float)
+    prev_equity = equity_curve.shift(1).fillna(equity_curve.iloc[0])
+    return prev_equity * (-position.astype(float) * funding)
 
 
 def _max_drawdown_duration(equity_curve, peak):
@@ -164,53 +226,14 @@ def _build_trade_ledger(strat_ret, position, execution_series):
     return pd.DataFrame(trades)
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Backtest engine  (simple pandas – swap for VectorBT / NautilusTrader later)
-# ───────────────────────────────────────────────────────────────────────────
+def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equity,
+                        fees_paid, slippage_paid, signal_delay_bars, trade_ledger,
+                        funding_pnl=0.0, engine="pandas"):
+    prev_equity = equity_curve.shift(1).fillna(equity)
+    pnl = equity_curve - prev_equity
 
-def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=0.0, execution_prices=None, signal_delay_bars=1):
-    """Vectorised backtest on categorical or fractional position signals.
-
-    Parameters
-    ----------
-    close            : pd.Series  – mark-to-market price series (aligned with signals)
-    signals          : pd.Series  – position weights in [-1, 1]
-    equity           : float      – starting capital
-    fee_rate         : float      – one-way fee
-    slippage_rate    : float      – one-way slippage estimate applied on turnover
-    execution_prices : pd.Series or None – optional execution price series, e.g. next-bar open
-    signal_delay_bars: int        – bars to delay signal application before execution
-
-    Returns dict with metrics and equity curve.
-    """
-    close = pd.Series(close, copy=False).astype(float)
-    signal_series = pd.Series(signals, index=close.index).reindex(close.index).fillna(0.0).astype(float)
-    signal_series = signal_series.clip(-1.0, 1.0)
-    signal_delay_bars = max(0, int(signal_delay_bars))
-    execution_series = close
-    if execution_prices is not None:
-        execution_series = pd.Series(execution_prices, index=close.index).reindex(close.index).astype(float)
-    returns = execution_series.pct_change().fillna(0)
-
-    # Signals derived from bar-level OHLC data must wait until the observation bar closes.
-    position = signal_series.shift(signal_delay_bars).fillna(0.0)
-
-    # cost on every position change
-    turnover = position.diff().abs().fillna(position.abs())
-    fees = turnover * fee_rate
-    slippage = turnover * slippage_rate
-    costs = fees + slippage
-
-    strat_ret = position * returns - costs
-    eq_curve = equity * (1 + strat_ret).cumprod()
-    prev_equity = eq_curve.shift(1).fillna(equity)
-    pnl = eq_curve - prev_equity
-    fees_paid = (prev_equity * fees).sum()
-    slippage_paid = (prev_equity * slippage).sum()
-
-    # ── metrics ──────────────────────────────────────────────────────────
-    total_ret = eq_curve.iloc[-1] / equity - 1
-    periods_per_year = _infer_periods_per_year(close.index)
+    total_ret = equity_curve.iloc[-1] / equity - 1
+    periods_per_year = _infer_periods_per_year(equity_curve.index)
     annualization = np.sqrt(periods_per_year) if periods_per_year > 0 else 0.0
     volatility = strat_ret.std()
     sharpe = (strat_ret.mean() / volatility * annualization
@@ -219,10 +242,11 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     downside_vol = downside.std()
     sortino = (strat_ret.mean() / downside_vol * annualization
                if downside_vol > 0 and annualization > 0 else 0.0)
-    peak = eq_curve.cummax()
-    max_dd = ((eq_curve - peak) / peak).min()
-    max_dd_amount = abs((eq_curve - peak).min())
-    max_dd_bars, max_dd_duration = _max_drawdown_duration(eq_curve, peak)
+    peak = equity_curve.cummax()
+    max_dd = ((equity_curve - peak) / peak).min()
+    max_dd_amount = abs((equity_curve - peak).min())
+    max_dd_bars, max_dd_duration = _max_drawdown_duration(equity_curve, peak)
+
     sign_changed = np.sign(position) != np.sign(position.shift(1).fillna(0.0))
     opened_trade = position.ne(0.0) & (position.shift(1).fillna(0.0).eq(0.0) | sign_changed)
     n_trades = int(opened_trade.sum())
@@ -241,8 +265,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     profit_factor = _safe_ratio(gross_profit, gross_loss)
     exposure_rate = float(position.ne(0).mean()) if len(position) > 0 else 0.0
     avg_position_size = float(position.abs().mean()) if len(position) > 0 else 0.0
-    total_turnover = float(turnover.sum()) if len(turnover) > 0 else 0.0
-    trade_ledger = _build_trade_ledger(strat_ret, position, execution_series)
+    total_turnover = float(position.diff().abs().fillna(position.abs()).sum()) if len(position) > 0 else 0.0
+
     trade_returns = trade_ledger["return_pct"] if not trade_ledger.empty else pd.Series(dtype=float)
     trade_winners = trade_returns[trade_returns > 0]
     trade_losers = trade_returns[trade_returns < 0]
@@ -252,21 +276,28 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     avg_trade_bars = float(trade_ledger["bars"].mean()) if not trade_ledger.empty else 0.0
 
     elapsed_years = 0.0
-    if len(close.index) > 1:
-        elapsed_years = (close.index[-1] - close.index[0]).total_seconds() / _SECONDS_PER_YEAR
-    cagr = ((eq_curve.iloc[-1] / equity) ** (1 / elapsed_years) - 1
-            if elapsed_years > 0 and eq_curve.iloc[-1] > 0 else 0.0)
+    if len(equity_curve.index) > 1:
+        elapsed_years = (equity_curve.index[-1] - equity_curve.index[0]).total_seconds() / _SECONDS_PER_YEAR
+    cagr = ((equity_curve.iloc[-1] / equity) ** (1 / elapsed_years) - 1
+            if elapsed_years > 0 and equity_curve.iloc[-1] > 0 else 0.0)
     calmar = _safe_ratio(cagr, abs(max_dd))
 
+    funding_paid = max(-float(funding_pnl), 0.0)
+    funding_received = max(float(funding_pnl), 0.0)
+
     return {
+        "engine": engine,
         "starting_equity": _round_metric(equity, 2),
-        "ending_equity": _round_metric(eq_curve.iloc[-1], 2),
-        "net_profit": _round_metric(eq_curve.iloc[-1] - equity, 2),
+        "ending_equity": _round_metric(equity_curve.iloc[-1], 2),
+        "net_profit": _round_metric(equity_curve.iloc[-1] - equity, 2),
         "net_profit_pct": _round_metric(total_ret, 4),
         "gross_profit": _round_metric(gross_profit, 2),
         "gross_loss": _round_metric(gross_loss, 2),
         "fees_paid": _round_metric(fees_paid, 2),
         "slippage_paid": _round_metric(slippage_paid, 2),
+        "funding_pnl": _round_metric(funding_pnl, 2),
+        "funding_paid": _round_metric(funding_paid, 2),
+        "funding_received": _round_metric(funding_received, 2),
         "total_return": _round_metric(total_ret, 4),
         "cagr": _round_metric(cagr, 4),
         "sharpe_ratio": _round_metric(sharpe, 2),
@@ -295,5 +326,160 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         "avg_trade_bars": _round_metric(avg_trade_bars, 2),
         "trade_profit_factor": _round_metric(trade_profit_factor, 2),
         "trade_ledger": trade_ledger,
-        "equity_curve": eq_curve,
+        "equity_curve": equity_curve,
     }
+
+
+def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
+                           execution_prices, signal_delay_bars, allow_short,
+                           symbol_filters=None, funding_rates=None):
+    if vbt is None or Direction is None or SizeType is None:
+        raise ImportError("vectorbt is not installed")
+
+    symbol_filters = dict(symbol_filters or {})
+    tick_size = symbol_filters.get("tick_size")
+    step_size = symbol_filters.get("step_size")
+    max_size = symbol_filters.get("max_qty")
+    min_notional = symbol_filters.get("min_notional")
+
+    valuation_series = _normalize_price_series(close, tick_size=tick_size)
+    execution_series = _normalize_price_series(execution_prices if execution_prices is not None else close, tick_size=tick_size)
+    min_size = None
+    if min_notional is not None and float(min_notional) > 0:
+        min_size = (float(min_notional) / execution_series.replace(0.0, np.nan)).fillna(0.0)
+
+    portfolio = vbt.Portfolio.from_orders(
+        close=valuation_series,
+        size=position,
+        size_type=SizeType.TargetPercent,
+        direction=Direction.Both if allow_short else Direction.LongOnly,
+        price=execution_series,
+        fees=fee_rate,
+        slippage=slippage_rate,
+        min_size=min_size,
+        max_size=max_size,
+        size_granularity=step_size,
+        init_cash=equity,
+        freq=valuation_series.index.to_series().diff().median(),
+    )
+
+    base_equity = pd.Series(portfolio.value(), index=valuation_series.index, dtype=float)
+    funding_cash = _compute_funding_cash(position, funding_rates, base_equity)
+    adjusted_equity = base_equity + funding_cash.cumsum()
+    adjusted_returns = adjusted_equity.pct_change().fillna(0.0)
+    trade_ledger = _vectorbt_trade_ledger(portfolio, valuation_series.index)
+    fees_paid = float(portfolio.orders.records_readable["Fees"].sum()) if not portfolio.orders.records_readable.empty else 0.0
+    slippage_paid = float((adjusted_equity.shift(1).fillna(equity) * position.diff().abs().fillna(position.abs()) * slippage_rate).sum())
+
+    return _summarize_backtest(
+        equity_curve=adjusted_equity,
+        strat_ret=adjusted_returns,
+        position=position,
+        execution_series=execution_series,
+        equity=equity,
+        fees_paid=fees_paid,
+        slippage_paid=slippage_paid,
+        signal_delay_bars=signal_delay_bars,
+        trade_ledger=trade_ledger,
+        funding_pnl=float(funding_cash.sum()),
+        engine="vectorbt",
+    )
+
+
+def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
+                         execution_prices, signal_delay_bars, funding_rates=None):
+    valuation_series = pd.Series(close, copy=False).astype(float)
+    execution_series = valuation_series if execution_prices is None else pd.Series(execution_prices, index=valuation_series.index).reindex(valuation_series.index).astype(float)
+    returns = valuation_series.pct_change().fillna(0.0)
+    turnover = position.diff().abs().fillna(position.abs())
+    fees = turnover * fee_rate
+    slippage = turnover * slippage_rate
+    funding_returns = pd.Series(0.0, index=position.index, dtype=float)
+    if funding_rates is not None:
+        funding_returns = -position * pd.Series(funding_rates, index=position.index).reindex(position.index).fillna(0.0)
+
+    strat_ret = position * returns + funding_returns - fees - slippage
+    equity_curve = equity * (1.0 + strat_ret).cumprod()
+    trade_ledger = _build_trade_ledger(strat_ret, position, execution_series)
+    prev_equity = equity_curve.shift(1).fillna(equity)
+    return _summarize_backtest(
+        equity_curve=equity_curve,
+        strat_ret=strat_ret,
+        position=position,
+        execution_series=execution_series,
+        equity=equity,
+        fees_paid=float((prev_equity * fees).sum()),
+        slippage_paid=float((prev_equity * slippage).sum()),
+        signal_delay_bars=signal_delay_bars,
+        trade_ledger=trade_ledger,
+        funding_pnl=float((prev_equity * funding_returns).sum()),
+        engine="pandas",
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Backtest engine adapter  (VectorBT first, pandas fallback)
+# ───────────────────────────────────────────────────────────────────────────
+
+def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=0.0,
+                 execution_prices=None, signal_delay_bars=1, engine="vectorbt",
+                 market="spot", leverage=1.0, allow_short=None, symbol_filters=None,
+                 funding_rates=None):
+    """Run a backtest through the configured execution adapter.
+
+    Parameters
+    ----------
+    close            : pd.Series  – mark-to-market or valuation price series
+    signals          : pd.Series  – target portfolio weights before execution delay
+    equity           : float      – starting capital
+    fee_rate         : float      – one-way fee
+    slippage_rate    : float      – one-way slippage estimate applied on turnover
+    execution_prices : pd.Series or None – optional execution price series, e.g. next-bar open
+    signal_delay_bars: int        – bars to delay signal application before execution
+    engine           : str        – "vectorbt" (default) or "pandas"
+    market           : str        – "spot", "um_futures", or "cm_futures"
+    leverage         : float      – exposure multiplier applied to target weights
+    allow_short      : bool|None  – defaults to False for spot, True for futures
+    symbol_filters   : dict|None  – Binance execution filters (tick size, lot size, min notional)
+    funding_rates    : pd.Series|None – futures funding rates aligned to close index; applied on funding timestamps only
+
+    Returns dict with metrics and equity curve.
+    """
+    close = pd.Series(close, copy=False).astype(float)
+    signal_series = pd.Series(signals, index=close.index).reindex(close.index).fillna(0.0).astype(float)
+    signal_delay_bars = max(0, int(signal_delay_bars))
+    allow_short = (market or "spot") != "spot" if allow_short is None else bool(allow_short)
+    position = _normalize_position_targets(
+        signal_series.shift(signal_delay_bars).fillna(0.0),
+        leverage=leverage,
+        allow_short=allow_short,
+    )
+
+    selected_engine = (engine or "vectorbt").lower()
+    if selected_engine == "vectorbt":
+        try:
+            return _run_vectorbt_backtest(
+                close=close,
+                position=position,
+                equity=equity,
+                fee_rate=fee_rate,
+                slippage_rate=slippage_rate,
+                execution_prices=execution_prices,
+                signal_delay_bars=signal_delay_bars,
+                allow_short=allow_short,
+                symbol_filters=symbol_filters,
+                funding_rates=funding_rates,
+            )
+        except ImportError:
+            selected_engine = "pandas"
+
+    return _run_pandas_backtest(
+        close=close,
+        position=position,
+        equity=equity,
+        fee_rate=fee_rate,
+        slippage_rate=slippage_rate,
+        execution_prices=execution_prices,
+        signal_delay_bars=signal_delay_bars,
+        funding_rates=funding_rates,
+    )

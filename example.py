@@ -135,8 +135,8 @@ def main():
                 f"native={block['avg_native_importance']:.4f}"
             )
 
-    # ── 9. Signals + Kelly sizing ─────────────────────────────────────────
-    print(f"\n{SEP}\nStep 9 · Generating signals with Kelly sizing\n{SEP}")
+    # ── 9. Signals + profitability sizing ────────────────────────────────
+    print(f"\n{SEP}\nStep 9 · Generating signals with profitability-aware sizing\n{SEP}")
     signal_result = pipeline.generate_signals()
     sig_cat = signal_result["signals"]
     print(f"  long={int((sig_cat == 1).sum())}  short={int((sig_cat == -1).sum())}  "

@@ -15,7 +15,7 @@ from .context import (
     fetch_binance_futures_context,
     fetch_context_symbol_bars,
 )
-from .data import fetch_binance_vision
+from .data import fetch_binance_bars, fetch_binance_symbol_filters, join_custom_data
 from .features import build_feature_set, check_stationarity, screen_features_for_stationarity, select_features
 from .indicators import run_indicators
 from .labeling import (
@@ -26,6 +26,7 @@ from .labeling import (
 )
 from .models import (
     apply_binary_probability_calibrator,
+    build_trade_outcome_frame,
     ConstantProbabilityModel,
     build_meta_feature_frame,
     compute_feature_block_diagnostics,
@@ -133,6 +134,61 @@ def _resolve_signal_delay_bars(backtest_config):
     return 1
 
 
+def _resolve_backtest_market(pipeline):
+    return pipeline.section("data").get("market", "spot")
+
+
+def _resolve_backtest_valuation_close(pipeline, index):
+    raw_data = pipeline.require("raw_data")
+    backtest_config = pipeline.section("backtest")
+    valuation_series = raw_data["close"].reindex(index)
+
+    if backtest_config.get("valuation_price") == "mark":
+        futures_context = pipeline.state.get("futures_context") or {}
+        mark_frame = futures_context.get("mark_price")
+        if mark_frame is not None and not mark_frame.empty and "mark_close" in mark_frame.columns:
+            valuation_series = mark_frame["mark_close"].reindex(index).ffill().bfill()
+    return valuation_series
+
+
+def _resolve_backtest_execution_prices(pipeline, index):
+    raw_data = pipeline.require("raw_data")
+    backtest_config = pipeline.section("backtest")
+    if backtest_config.get("use_open_execution", True) and "open" in raw_data.columns:
+        return raw_data["open"].reindex(index)
+    return raw_data["close"].reindex(index)
+
+
+def _resolve_backtest_funding_rates(pipeline, index):
+    backtest_config = pipeline.section("backtest")
+    market = _resolve_backtest_market(pipeline)
+    if not backtest_config.get("apply_funding", market != "spot"):
+        return None
+
+    futures_context = pipeline.state.get("futures_context") or {}
+    funding_frame = futures_context.get("funding")
+    if funding_frame is None or funding_frame.empty or "funding_rate" not in funding_frame.columns:
+        return None
+    return funding_frame["funding_rate"].reindex(index).fillna(0.0)
+
+
+def _resolve_backtest_runtime_kwargs(pipeline, index):
+    backtest_config = pipeline.section("backtest")
+    market = _resolve_backtest_market(pipeline)
+    allow_short = backtest_config.get("allow_short")
+    if allow_short is None:
+        allow_short = market != "spot"
+
+    return {
+        "engine": backtest_config.get("engine", "vectorbt"),
+        "market": market,
+        "leverage": float(backtest_config.get("leverage", 1.0)),
+        "allow_short": bool(allow_short),
+        "symbol_filters": pipeline.state.get("symbol_filters"),
+        "funding_rates": _resolve_backtest_funding_rates(pipeline, index),
+    }
+
+
 def _split_train_validation_window(X_train, y_train, sample_weights, model_config):
     validation_size = model_config.get("validation_size")
     validation_fraction = float(model_config.get("validation_fraction", 0.2))
@@ -181,6 +237,23 @@ def _align_and_drop_invalid_rows(X, y, labels=None, sample_weights=None):
     if weight_series is not None:
         weight_series = weight_series.loc[keep_index]
     return X, y_series, label_frame, weight_series
+
+
+def _drop_all_nan_feature_columns(X, feature_blocks=None):
+    if X is None or X.empty:
+        return X, dict(feature_blocks or {}), []
+
+    all_nan_columns = [column for column in X.columns if X[column].notna().sum() == 0]
+    if not all_nan_columns:
+        return X, dict(feature_blocks or {}), []
+
+    filtered_X = X.drop(columns=all_nan_columns)
+    filtered_blocks = {
+        column: block_name
+        for column, block_name in dict(feature_blocks or {}).items()
+        if column in filtered_X.columns
+    }
+    return filtered_X, filtered_blocks, all_nan_columns
 
 
 def _purge_overlapping_training_rows(X, y, labels, cutoff_timestamp, sample_weights=None):
@@ -235,20 +308,15 @@ def _resolve_stationarity_screening_config(pipeline):
     return screening_config
 
 
-def _estimate_outcome_stats(labels, close, default_win, default_loss):
-    if labels is None or labels.empty:
+def _estimate_trade_outcome_stats(trade_outcomes, default_win, default_loss):
+    if trade_outcomes is None or trade_outcomes.empty or "net_trade_return" not in trade_outcomes.columns:
         return float(default_win), float(default_loss)
 
-    if "forward_return" in labels.columns:
-        realized_returns = pd.Series(labels["forward_return"], index=labels.index).dropna()
-    elif "t1" in labels.columns:
-        entry_prices = close.reindex(labels.index)
-        exit_prices = close.reindex(pd.DatetimeIndex(labels["t1"]))
-        realized_returns = pd.Series(
-            (exit_prices.values - entry_prices.values) / entry_prices.values,
-            index=labels.index,
-        ).dropna()
-    else:
+    realized_returns = pd.Series(trade_outcomes["net_trade_return"], index=trade_outcomes.index).dropna()
+    if "trade_taken" in trade_outcomes.columns:
+        trade_mask = trade_outcomes["trade_taken"].reindex(realized_returns.index).fillna(0).astype(bool)
+        realized_returns = realized_returns.loc[trade_mask]
+    if realized_returns.empty:
         return float(default_win), float(default_loss)
 
     wins = realized_returns[realized_returns > 0]
@@ -256,6 +324,40 @@ def _estimate_outcome_stats(labels, close, default_win, default_loss):
     avg_win = float(wins.mean()) if len(wins) > 0 else float(default_win)
     avg_loss = float(losses.abs().mean()) if len(losses) > 0 else float(default_loss)
     return avg_win, avg_loss
+
+
+def _estimate_trade_outcome_stats_from_labels(predictions, labels, default_win, default_loss):
+    trade_outcomes = build_trade_outcome_frame(predictions, labels)
+    return _estimate_trade_outcome_stats(trade_outcomes, default_win, default_loss)
+
+
+def _resolve_profitability_target(predictions, labels, y_true):
+    trade_outcomes = build_trade_outcome_frame(predictions, labels)
+    if not trade_outcomes.empty and "profitable" in trade_outcomes.columns:
+        profitable = trade_outcomes["profitable"].reindex(predictions.index).fillna(0).astype(int)
+        if profitable.nunique() >= 2:
+            return profitable
+    return (pd.Series(predictions, index=predictions.index) == pd.Series(y_true, index=predictions.index)).astype(int)
+
+
+def _position_size_from_profitability(probability, avg_win, avg_loss, signal_config):
+    fraction = float(signal_config.get("fraction", 0.5))
+    sizing_mode = signal_config.get("sizing_mode", "expected_utility")
+    utility_scale = max(float(avg_win), float(avg_loss), 1e-12)
+    expected_edge = float(probability) * float(avg_win) - (1.0 - float(probability)) * float(avg_loss)
+
+    if sizing_mode == "kelly":
+        size = kelly_fraction(
+            prob_win=probability,
+            avg_win=avg_win,
+            avg_loss=avg_loss,
+            fraction=fraction,
+        )
+    else:
+        size = max(0.0, expected_edge) / utility_scale
+        size = min(size, 1.0) * fraction
+
+    return size, expected_edge
 
 
 def _calibrate_binary_probability_series(probabilities, target, sample_weight=None, calibrator_config=None):
@@ -359,19 +461,27 @@ def _build_signal_state(prediction_series, probability_frame, meta_prob_series, 
     direction = prediction_series.apply(lambda value: 1.0 if value > 0 else (-1.0 if value < 0 else 0.0))
     direction_edge = probability_frame[1] - probability_frame[-1]
     confidence = direction_edge.abs().clip(0.0, 1.0)
-    kelly_size = meta_prob_series.apply(
-        lambda prob: kelly_fraction(
-            prob_win=prob,
-            avg_win=avg_win,
-            avg_loss=avg_loss,
-            fraction=signal_config.get("fraction", 0.5),
-        )
-    )
+    profitability_prob = meta_prob_series.clip(0.0, 1.0)
+    position_size = pd.Series(index=profitability_prob.index, dtype=float)
+    expected_trade_edge = pd.Series(index=profitability_prob.index, dtype=float)
+    for timestamp, probability in profitability_prob.items():
+        size, edge = _position_size_from_profitability(probability, avg_win, avg_loss, signal_config)
+        position_size.loc[timestamp] = size
+        expected_trade_edge.loc[timestamp] = edge
 
-    event_signals = direction * kelly_size
+    break_even_prob = float(avg_loss) / max(float(avg_win) + float(avg_loss), 1e-12)
+    profitability_threshold = signal_config.get("profitability_threshold")
+    if profitability_threshold is None:
+        if signal_config.get("sizing_mode", "expected_utility") == "kelly":
+            profitability_threshold = signal_config.get("meta_threshold", 0.55)
+        else:
+            profitability_threshold = break_even_prob
+
+    event_signals = direction * position_size
     event_signals = event_signals.where(direction.ne(0.0), 0.0)
     event_signals = event_signals.where(confidence >= signal_config.get("edge_threshold", 0.05), 0.0)
-    event_signals = event_signals.where(meta_prob_series >= signal_config.get("meta_threshold", 0.55), 0.0)
+    event_signals = event_signals.where(profitability_prob >= profitability_threshold, 0.0)
+    event_signals = event_signals.where(expected_trade_edge >= signal_config.get("expected_edge_threshold", 0.0), 0.0)
     event_signals = event_signals.where(event_signals.abs() >= signal_config.get("threshold", 0.03), 0.0)
 
     continuous = _apply_holding_period(event_signals, holding_bars)
@@ -379,10 +489,16 @@ def _build_signal_state(prediction_series, probability_frame, meta_prob_series, 
     return {
         "predictions": prediction_series,
         "primary_probabilities": probability_frame,
-        "meta_prob": meta_prob_series,
+        "meta_prob": profitability_prob,
+        "profitability_prob": profitability_prob,
         "direction_edge": direction_edge,
         "confidence": confidence,
-        "kelly_size": kelly_size,
+        "expected_trade_edge": expected_trade_edge,
+        "expected_trade_utility": expected_trade_edge,
+        "break_even_profit_prob": break_even_prob,
+        "profitability_threshold": float(profitability_threshold),
+        "position_size": position_size,
+        "kelly_size": position_size,
         "event_signals": event_signals,
         "holding_bars": holding_bars,
         "continuous_signals": continuous,
@@ -393,6 +509,7 @@ def _build_signal_state(prediction_series, probability_frame, meta_prob_series, 
             "threshold": float(signal_config.get("threshold", 0.03)),
             "edge_threshold": float(signal_config.get("edge_threshold", 0.05)),
             "meta_threshold": float(signal_config.get("meta_threshold", 0.55)),
+            "profitability_threshold": float(profitability_threshold),
             "fraction": float(signal_config.get("fraction", 0.5)),
         },
     }
@@ -418,7 +535,7 @@ def _score_signal_state(backtest, signal_config):
     return score
 
 
-def _tune_signal_parameters(validation_close, validation_execution_prices, prediction_series, probability_frame, meta_prob_series, signal_config, backtest_config, avg_win, avg_loss, holding_bars):
+def _tune_signal_parameters(validation_close, validation_execution_prices, prediction_series, probability_frame, meta_prob_series, signal_config, backtest_config, avg_win, avg_loss, holding_bars, backtest_runtime_kwargs=None):
     if validation_close is None or len(validation_close) < 25:
         default_config = dict(signal_config)
         state = _build_signal_state(
@@ -442,6 +559,7 @@ def _tune_signal_parameters(validation_close, validation_execution_prices, predi
                 if validation_execution_prices is not None
                 else None
             ),
+            **(backtest_runtime_kwargs or {}),
         ) if validation_close is not None else None
         return {
             "params": state["tuned_params"],
@@ -488,6 +606,7 @@ def _tune_signal_parameters(validation_close, validation_execution_prices, predi
                 if validation_execution_prices is not None
                 else None
             ),
+            **(backtest_runtime_kwargs or {}),
         )
         score = _score_signal_state(backtest, signal_config)
         if best is None or score > best["score"]:
@@ -505,6 +624,7 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
     inner_predictions = []
     inner_probabilities = []
     inner_truth = []
+    inner_label_frames = []
     inner_weights = []
     min_train_rows = max(50, min(100, len(X_train) // 3))
     min_test_rows = 20
@@ -557,6 +677,8 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
         inner_predictions.append(inner_pred)
         inner_probabilities.append(inner_prob)
         inner_truth.append(y_train.iloc[inner_test_idx])
+        if labels is not None:
+            inner_label_frames.append(labels.iloc[inner_test_idx])
         inner_weights.append(sample_weights.iloc[inner_test_idx])
 
     if not inner_predictions:
@@ -565,12 +687,16 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
     meta_predictions = pd.concat(inner_predictions).sort_index()
     meta_probabilities = pd.concat(inner_probabilities).sort_index()
     meta_truth = pd.concat(inner_truth).sort_index().reindex(meta_predictions.index)
+    meta_labels = None
+    if inner_label_frames:
+        meta_labels = pd.concat(inner_label_frames).sort_index().reindex(meta_predictions.index)
     meta_weights = pd.concat(inner_weights).sort_index().reindex(meta_predictions.index).fillna(1.0)
 
     return train_meta_model(
         meta_predictions,
         meta_probabilities,
         meta_truth,
+        labels=meta_labels,
         sample_weight=meta_weights,
         model_params=model_config.get("meta_params"),
     )
@@ -590,10 +716,29 @@ class FetchDataStep(PipelineStep):
         config = dict(pipeline.section("data"))
         futures_context_config = dict(config.pop("futures_context", {}) or {})
         cross_asset_context_config = dict(config.pop("cross_asset_context", {}) or {})
+        custom_data_config = list(config.pop("custom_data", []) or [])
 
-        data = fetch_binance_vision(**config)
-        pipeline.state["raw_data"] = data
+        market = config.get("market", "spot")
+        cache_dir = config.get("cache_dir", ".cache")
+
+        market_data = fetch_binance_bars(**config)
+        data = market_data.copy()
+        custom_data_report = []
+        if custom_data_config:
+            data, custom_data_report = join_custom_data(data, custom_data_config)
+
+        pipeline.state["raw_data"] = market_data
         pipeline.state["data"] = data.copy()
+        pipeline.state["custom_data_report"] = custom_data_report
+
+        try:
+            pipeline.state["symbol_filters"] = fetch_binance_symbol_filters(
+                symbol=config.get("symbol", "BTCUSDT"),
+                market=market,
+                cache_dir=cache_dir,
+            )
+        except Exception:
+            pipeline.state["symbol_filters"] = {}
 
         if futures_context_config.get("enabled", True):
             pipeline.state["futures_context"] = fetch_binance_futures_context(
@@ -601,7 +746,7 @@ class FetchDataStep(PipelineStep):
                 interval=config.get("interval", "1h"),
                 start=config.get("start", "2024-01-01"),
                 end=config.get("end", "2024-03-01"),
-                cache_dir=futures_context_config.get("cache_dir", config.get("cache_dir", ".cache")),
+                cache_dir=futures_context_config.get("cache_dir", cache_dir),
                 include_recent_stats=futures_context_config.get("include_recent_stats", True),
             )
 
@@ -612,7 +757,8 @@ class FetchDataStep(PipelineStep):
                 interval=config.get("interval", "1h"),
                 start=config.get("start", "2024-01-01"),
                 end=config.get("end", "2024-03-01"),
-                cache_dir=cross_asset_context_config.get("cache_dir", config.get("cache_dir", ".cache")),
+                cache_dir=cross_asset_context_config.get("cache_dir", cache_dir),
+                market=cross_asset_context_config.get("market", market),
             )
 
         return data
@@ -871,16 +1017,25 @@ class AlignDataStep(PipelineStep):
         features = pipeline.require("features")
         labels = pipeline.require("labels")
         label_column = pipeline.section("labels").get("label_column", "label")
+        feature_blocks = pipeline.state.get("feature_blocks", {})
 
         common = features.index.intersection(labels.index)
         X = features.loc[common].copy()
         y = labels.loc[common, label_column].copy()
         labels_aligned = labels.loc[common].copy()
 
+        X, feature_blocks, dropped_columns = _drop_all_nan_feature_columns(X, feature_blocks)
+
         mask = X.notna().all(axis=1) & y.notna()
         X = X.loc[mask]
         y = y.loc[mask]
         labels_aligned = labels_aligned.loc[mask]
+
+        pipeline.state["feature_blocks"] = feature_blocks
+        if dropped_columns:
+            report = dict(pipeline.state.get("feature_screening", {}))
+            report.setdefault("alignment", {})["dropped_all_nan_columns"] = dropped_columns
+            pipeline.state["feature_screening"] = report
 
         pipeline.state["X"] = X
         pipeline.state["y"] = y
@@ -964,6 +1119,7 @@ class TrainModelsStep(PipelineStep):
         oos_direction_edge = []
         oos_confidence = []
         oos_kelly_size = []
+        oos_expected_trade_edge = []
         oos_event_signals = []
         oos_continuous_signals = []
         oos_signals = []
@@ -1113,10 +1269,10 @@ class TrainModelsStep(PipelineStep):
             primary_calibrator = None
             meta_calibrator = None
             meta_model = _train_inner_meta_model(X_fit_model, y_fit, w_fit, config, labels=labels_fit)
-
-            fold_avg_win, fold_avg_loss = _estimate_outcome_stats(
+            fit_primary_preds = pd.Series(model.predict(X_fit_model), index=X_fit_model.index)
+            fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats_from_labels(
+                fit_primary_preds,
                 labels_fit,
-                close_all,
                 default_avg_win,
                 default_avg_loss,
             )
@@ -1139,16 +1295,24 @@ class TrainModelsStep(PipelineStep):
                     _positive_class_probability(meta_model, X_meta_val),
                     index=X_val_model.index,
                 )
+                val_profitability_target = _resolve_profitability_target(val_primary_preds, labels_val, y_val)
                 val_meta_prob, meta_calibrator = _calibrate_binary_probability_series(
                     val_meta_prob_raw,
-                    (val_primary_preds == y_val).astype(int),
+                    val_profitability_target,
                     sample_weight=w_val,
                     calibrator_config=config.get("meta_calibration_params"),
                 )
 
+                fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats_from_labels(
+                    val_primary_preds,
+                    labels_val,
+                    fold_avg_win,
+                    fold_avg_loss,
+                )
+
                 tuning = _tune_signal_parameters(
-                    validation_close=close_all.loc[X_val_model.index],
-                    validation_execution_prices=raw_data["open"].loc[X_val_model.index] if backtest_config.get("use_open_execution", True) and "open" in raw_data.columns else None,
+                    validation_close=_resolve_backtest_valuation_close(pipeline, X_val_model.index),
+                    validation_execution_prices=_resolve_backtest_execution_prices(pipeline, X_val_model.index),
                     prediction_series=val_primary_preds,
                     probability_frame=val_primary_probs,
                     meta_prob_series=val_meta_prob,
@@ -1157,6 +1321,7 @@ class TrainModelsStep(PipelineStep):
                     avg_win=fold_avg_win,
                     avg_loss=fold_avg_loss,
                     holding_bars=holding_bars,
+                    backtest_runtime_kwargs=_resolve_backtest_runtime_kwargs(pipeline, X_val_model.index),
                 )
                 if tuning is not None:
                     tuned_signal_params = dict(tuning["params"])
@@ -1230,6 +1395,7 @@ class TrainModelsStep(PipelineStep):
             oos_direction_edge.append(signal_state["direction_edge"])
             oos_confidence.append(signal_state["confidence"])
             oos_kelly_size.append(signal_state["kelly_size"])
+            oos_expected_trade_edge.append(signal_state["expected_trade_edge"])
             oos_event_signals.append(signal_state["event_signals"])
             oos_continuous_signals.append(signal_state["continuous_signals"])
             oos_signals.append(signal_state["signals"])
@@ -1245,6 +1411,7 @@ class TrainModelsStep(PipelineStep):
         oos_direction_edge = pd.concat(oos_direction_edge).sort_index().reindex(oos_predictions.index)
         oos_confidence = pd.concat(oos_confidence).sort_index().reindex(oos_predictions.index)
         oos_kelly_size = pd.concat(oos_kelly_size).sort_index().reindex(oos_predictions.index)
+        oos_expected_trade_edge = pd.concat(oos_expected_trade_edge).sort_index().reindex(oos_predictions.index)
         oos_event_signals = pd.concat(oos_event_signals).sort_index().reindex(oos_predictions.index)
         oos_continuous_signals = pd.concat(oos_continuous_signals).sort_index().reindex(oos_predictions.index)
         oos_signals = pd.concat(oos_signals).sort_index().reindex(oos_predictions.index)
@@ -1255,21 +1422,14 @@ class TrainModelsStep(PipelineStep):
         oos_avg_loss = None
         try:
             labels_aligned = pipeline.require("labels_aligned")
-            raw_data = pipeline.require("raw_data")
-            close_all = raw_data["close"]
             oos_labels = labels_aligned.loc[labels_aligned.index.intersection(oos_predictions.index)]
-            if not oos_labels.empty and "t1" in oos_labels.columns:
-                entry_prices = close_all.reindex(oos_labels.index)
-                exit_idx = pd.DatetimeIndex(oos_labels["t1"])
-                exit_prices = close_all.reindex(exit_idx)
-                realized_returns = (exit_prices.values - entry_prices.values) / entry_prices.values
-                realized_returns = pd.Series(realized_returns, index=oos_labels.index).dropna()
-                wins = realized_returns[realized_returns > 0]
-                losses = realized_returns[realized_returns < 0]
-                if len(wins) > 0:
-                    oos_avg_win = float(wins.mean())
-                if len(losses) > 0:
-                    oos_avg_loss = float(losses.abs().mean())
+            trade_outcomes = build_trade_outcome_frame(oos_predictions, oos_labels)
+            if not trade_outcomes.empty:
+                oos_avg_win, oos_avg_loss = _estimate_trade_outcome_stats(
+                    trade_outcomes,
+                    default_avg_win,
+                    default_avg_loss,
+                )
         except Exception:
             pass
 
@@ -1288,8 +1448,11 @@ class TrainModelsStep(PipelineStep):
             "oos_predictions": oos_predictions,
             "oos_probabilities": oos_probabilities,
             "oos_meta_prob": oos_meta_prob,
+            "oos_profitability_prob": oos_meta_prob,
             "oos_direction_edge": oos_direction_edge,
             "oos_confidence": oos_confidence,
+            "oos_expected_trade_edge": oos_expected_trade_edge,
+            "oos_position_size": oos_kelly_size,
             "oos_kelly_size": oos_kelly_size,
             "oos_event_signals": oos_event_signals,
             "oos_continuous_signals": oos_continuous_signals,
@@ -1322,12 +1485,35 @@ class SignalsStep(PipelineStep):
         config = pipeline.section("signals")
 
         if training.get("oos_continuous_signals") is not None:
+            break_even_prob = float(
+                training.get("last_avg_loss", config.get("avg_loss", 0.02))
+            ) / max(
+                float(training.get("last_avg_win", config.get("avg_win", 0.02)))
+                + float(training.get("last_avg_loss", config.get("avg_loss", 0.02))),
+                1e-12,
+            )
+            profitability_threshold = training.get("last_signal_params", {}).get("profitability_threshold")
+            if profitability_threshold is None:
+                if config.get("sizing_mode", "expected_utility") == "kelly":
+                    profitability_threshold = training.get("last_signal_params", {}).get(
+                        "meta_threshold",
+                        config.get("meta_threshold", 0.55),
+                    )
+                else:
+                    profitability_threshold = break_even_prob
+
             result = {
                 "predictions": training["oos_predictions"],
                 "primary_probabilities": training["oos_probabilities"],
                 "meta_prob": training["oos_meta_prob"],
+                "profitability_prob": training.get("oos_profitability_prob", training["oos_meta_prob"]),
                 "direction_edge": training["oos_direction_edge"],
                 "confidence": training["oos_confidence"],
+                "expected_trade_edge": training.get("oos_expected_trade_edge"),
+                "expected_trade_utility": training.get("oos_expected_trade_edge"),
+                "break_even_profit_prob": break_even_prob,
+                "profitability_threshold": float(profitability_threshold),
+                "position_size": training.get("oos_position_size", training["oos_kelly_size"]),
                 "kelly_size": training["oos_kelly_size"],
                 "event_signals": training["oos_event_signals"],
                 "holding_bars": _resolve_signal_holding_bars(pipeline, config),
@@ -1399,18 +1585,20 @@ class BacktestStep(PipelineStep):
     name = "run_backtest"
 
     def run(self, pipeline):
-        raw_data = pipeline.require("raw_data")
         signal_state = pipeline.require("signals")
         config = pipeline.section("backtest")
         positions = signal_state["continuous_signals"] if config.get("use_continuous_positions", True) else signal_state["signals"]
+        valuation_close = _resolve_backtest_valuation_close(pipeline, positions.index)
+        execution_prices = _resolve_backtest_execution_prices(pipeline, positions.index)
         backtest = run_backtest(
-            close=raw_data["close"].loc[positions.index],
+            close=valuation_close,
             signals=positions,
             equity=config.get("equity", 10_000.0),
             fee_rate=config.get("fee_rate", 0.001),
             slippage_rate=config.get("slippage_rate", 0.0),
             signal_delay_bars=_resolve_signal_delay_bars(config),
-            execution_prices=(raw_data["open"].loc[positions.index] if config.get("use_open_execution", True) and "open" in raw_data.columns else None),
+            execution_prices=execution_prices,
+            **_resolve_backtest_runtime_kwargs(pipeline, positions.index),
         )
         pipeline.state["backtest"] = backtest
         return backtest

@@ -239,17 +239,66 @@ def build_meta_feature_frame(primary_preds, primary_probabilities):
     return meta
 
 
-def train_meta_model(primary_preds, primary_probabilities, y_true, sample_weight=None, model_params=None):
+def build_trade_outcome_frame(primary_preds, labels):
+    """Build realized trade outcomes for a set of directional predictions.
+
+    The resulting frame is aligned to ``primary_preds`` and estimates the net
+    trade return implied by taking the predicted direction over the label event.
+    When label return columns are unavailable, an empty frame is returned.
+    """
+    prediction_series = pd.Series(primary_preds, copy=False)
+    if labels is None or prediction_series.empty:
+        return pd.DataFrame(index=prediction_series.index)
+
+    label_frame = labels.reindex(prediction_series.index).copy()
+    if label_frame.empty:
+        return pd.DataFrame(index=prediction_series.index)
+
+    return_column = None
+    for candidate in ["gross_return", "forward_return"]:
+        if candidate in label_frame.columns:
+            return_column = candidate
+            break
+
+    if return_column is None:
+        return pd.DataFrame(index=prediction_series.index)
+
+    trade_direction = prediction_series.apply(lambda value: 1.0 if value > 0 else (-1.0 if value < 0 else 0.0))
+    gross_return = pd.to_numeric(label_frame[return_column], errors="coerce")
+    cost_rate = pd.Series(0.0, index=prediction_series.index, dtype=float)
+    if "cost_rate" in label_frame.columns:
+        cost_rate = pd.to_numeric(label_frame["cost_rate"], errors="coerce").reindex(prediction_series.index).fillna(0.0)
+
+    gross_trade_return = trade_direction * gross_return
+    net_trade_return = (gross_trade_return - cost_rate).where(trade_direction.ne(0.0), 0.0)
+    profitable = (trade_direction.ne(0.0) & net_trade_return.gt(0.0)).astype(int)
+
+    return pd.DataFrame(
+        {
+            "trade_direction": trade_direction.astype(float),
+            "gross_trade_return": gross_trade_return.astype(float),
+            "net_trade_return": net_trade_return.astype(float),
+            "profitable": profitable.astype(int),
+            "trade_taken": trade_direction.ne(0.0).astype(int),
+        },
+        index=prediction_series.index,
+    )
+
+
+def train_meta_model(primary_preds, primary_probabilities, y_true, labels=None, sample_weight=None, model_params=None):
     """Train a meta-labeling model on primary predictions and probabilities.
 
-    The meta model learns *whether the primary prediction is correct* and
-    outputs a probability used for bet sizing.
-
-    y_meta = 1 if primary_pred == y_true, else 0.
+    The preferred target is trade profitability after costs, derived from the
+    realized label outcomes. If profitability data is unavailable, the model
+    falls back to raw directional correctness.
     """
     model_params = dict(model_params or {})
     prediction_series = pd.Series(primary_preds, index=y_true.index)
-    y_meta = (prediction_series == pd.Series(y_true, index=y_true.index)).astype(int)
+    trade_outcomes = build_trade_outcome_frame(prediction_series, labels)
+    if not trade_outcomes.empty and trade_outcomes["net_trade_return"].notna().any():
+        y_meta = trade_outcomes["profitable"].astype(int).reindex(prediction_series.index).fillna(0).astype(int)
+    else:
+        y_meta = (prediction_series == pd.Series(y_true, index=y_true.index)).astype(int)
 
     sw = sample_weight.values if sample_weight is not None else None
     if y_meta.nunique() < 2:
