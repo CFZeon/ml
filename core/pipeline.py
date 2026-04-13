@@ -26,7 +26,7 @@ from .labeling import (
 )
 from .models import (
     apply_binary_probability_calibrator,
-    build_trade_outcome_frame,
+    build_execution_outcome_frame,
     ConstantProbabilityModel,
     build_meta_feature_frame,
     compute_feature_block_diagnostics,
@@ -308,6 +308,63 @@ def _resolve_stationarity_screening_config(pipeline):
     return screening_config
 
 
+def _coerce_regime_frame(regimes, column_name="regime"):
+    if isinstance(regimes, pd.DataFrame):
+        return regimes.copy()
+    return pd.DataFrame({column_name: pd.Series(regimes, copy=False)})
+
+
+def _build_regime_feature_source(pipeline):
+    regime_features = pipeline.state.get("regime_features")
+    if regime_features is not None:
+        return regime_features
+
+    config = pipeline.section("regime")
+    builder = config.get("builder") or _default_regime_features
+    regime_features = builder(pipeline)
+    pipeline.state["regime_features"] = regime_features
+    return regime_features
+
+
+def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
+    config = pipeline.section("regime")
+    if not config.get("enabled", True):
+        return pd.DataFrame(index=index), {}
+
+    regime_features = _build_regime_feature_source(pipeline)
+    if regime_features is None or regime_features.empty:
+        return pd.DataFrame(index=index), {}
+
+    regime_window = regime_features.reindex(index)
+    fit_features = regime_features.reindex(fit_index) if fit_index is not None else None
+    regimes = detect_regime(
+        regime_window,
+        n_regimes=config.get("n_regimes", 2),
+        method=config.get("method", "kmeans"),
+        config=config,
+        fit_features=fit_features,
+    )
+    frame = _coerce_regime_frame(regimes, column_name=config.get("column_name", "regime")).reindex(index)
+    return frame, {column: "regime" for column in frame.columns}
+
+
+def _build_execution_trade_outcomes(pipeline, predictions, holding_bars, cutoff_timestamp=None):
+    raw_data = pipeline.require("raw_data")
+    backtest_config = pipeline.section("backtest")
+    full_index = raw_data.index
+    return build_execution_outcome_frame(
+        predictions,
+        valuation_prices=_resolve_backtest_valuation_close(pipeline, full_index),
+        execution_prices=_resolve_backtest_execution_prices(pipeline, full_index),
+        holding_bars=holding_bars,
+        signal_delay_bars=_resolve_signal_delay_bars(backtest_config),
+        fee_rate=float(backtest_config.get("fee_rate", 0.0)),
+        slippage_rate=float(backtest_config.get("slippage_rate", 0.0)),
+        funding_rates=_resolve_backtest_funding_rates(pipeline, full_index),
+        cutoff_timestamp=cutoff_timestamp,
+    )
+
+
 def _estimate_trade_outcome_stats(trade_outcomes, default_win, default_loss):
     if trade_outcomes is None or trade_outcomes.empty or "net_trade_return" not in trade_outcomes.columns:
         return float(default_win), float(default_loss)
@@ -326,17 +383,17 @@ def _estimate_trade_outcome_stats(trade_outcomes, default_win, default_loss):
     return avg_win, avg_loss
 
 
-def _estimate_trade_outcome_stats_from_labels(predictions, labels, default_win, default_loss):
-    trade_outcomes = build_trade_outcome_frame(predictions, labels)
-    return _estimate_trade_outcome_stats(trade_outcomes, default_win, default_loss)
-
-
-def _resolve_profitability_target(predictions, labels, y_true):
-    trade_outcomes = build_trade_outcome_frame(predictions, labels)
-    if not trade_outcomes.empty and "profitable" in trade_outcomes.columns:
-        profitable = trade_outcomes["profitable"].reindex(predictions.index).fillna(0).astype(int)
-        if profitable.nunique() >= 2:
+def _resolve_profitability_target(predictions, y_true, trade_outcomes=None, labels=None):
+    if trade_outcomes is not None and not trade_outcomes.empty and "profitable" in trade_outcomes.columns:
+        profitable = pd.to_numeric(trade_outcomes["profitable"].reindex(predictions.index), errors="coerce")
+        if profitable.dropna().nunique() >= 2:
             return profitable
+    if labels is not None:
+        trade_outcomes = build_trade_outcome_frame(predictions, labels)
+        if not trade_outcomes.empty and "profitable" in trade_outcomes.columns:
+            profitable = trade_outcomes["profitable"].reindex(predictions.index).fillna(0).astype(int)
+            if profitable.nunique() >= 2:
+                return profitable
     return (pd.Series(predictions, index=predictions.index) == pd.Series(y_true, index=predictions.index)).astype(int)
 
 
@@ -620,7 +677,7 @@ def _tune_signal_parameters(validation_close, validation_execution_prices, predi
     return best
 
 
-def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None):
+def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None, trade_outcome_builder=None):
     inner_predictions = []
     inner_probabilities = []
     inner_truth = []
@@ -691,12 +748,14 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
     if inner_label_frames:
         meta_labels = pd.concat(inner_label_frames).sort_index().reindex(meta_predictions.index)
     meta_weights = pd.concat(inner_weights).sort_index().reindex(meta_predictions.index).fillna(1.0)
+    meta_trade_outcomes = trade_outcome_builder(meta_predictions) if trade_outcome_builder is not None else None
 
     return train_meta_model(
         meta_predictions,
         meta_probabilities,
         meta_truth,
         labels=meta_labels,
+        trade_outcomes=meta_trade_outcomes,
         sample_weight=meta_weights,
         model_params=model_config.get("meta_params"),
     )
@@ -923,7 +982,6 @@ class RegimeStep(PipelineStep):
     name = "detect_regimes"
 
     def run(self, pipeline):
-        features = pipeline.require("features")
         config = pipeline.section("regime")
         builder = config.get("builder") or _default_regime_features
         regime_features = builder(pipeline)
@@ -934,21 +992,18 @@ class RegimeStep(PipelineStep):
             config=config,
         )
 
-        aligned_features = features.loc[regimes.index].copy()
-        feature_blocks = dict(pipeline.state.get("feature_blocks", {}))
-        if isinstance(regimes, pd.DataFrame):
-            aligned_features = aligned_features.join(regimes)
-            for column in regimes.columns:
-                feature_blocks[column] = "regime"
-        else:
-            aligned_features[config.get("column_name", "regime")] = regimes.values
-            feature_blocks[config.get("column_name", "regime")] = "regime"
-
         pipeline.state["regime_features"] = regime_features
         pipeline.state["regimes"] = regimes
-        pipeline.state["feature_blocks"] = feature_blocks
-        pipeline.state["features"] = aligned_features
-        return {"regime_features": regime_features, "regimes": regimes}
+        pipeline.state["regime_detection"] = {
+            "mode": "global_preview_only",
+            "method": config.get("method", "kmeans"),
+            "columns": list(regimes.columns) if isinstance(regimes, pd.DataFrame) else [config.get("column_name", "regime")],
+        }
+        return {
+            "regime_features": regime_features,
+            "regimes": regimes,
+            "mode": "global_preview_only",
+        }
 
 
 class LabelsStep(PipelineStep):
@@ -1100,11 +1155,13 @@ class TrainModelsStep(PipelineStep):
         fold_signal_tuning = []
         fold_stationarity = []
         fold_purging = []
+        fold_regime = []
         last_model = None
         last_meta = None
         last_primary_calibrator = None
         last_meta_calibrator = None
         last_selected_columns = list(X.columns)
+        last_regime_fit_index = X.index[:0]
         last_signal_params = {
             "threshold": float(signal_config.get("threshold", 0.03)),
             "edge_threshold": float(signal_config.get("edge_threshold", 0.05)),
@@ -1123,6 +1180,7 @@ class TrainModelsStep(PipelineStep):
         oos_event_signals = []
         oos_continuous_signals = []
         oos_signals = []
+        oos_trade_outcomes = []
 
         for fold, (train_idx, test_idx) in enumerate(
             walk_forward_split(
@@ -1186,9 +1244,27 @@ class TrainModelsStep(PipelineStep):
                 }
             )
 
-            X_fit = fold_screening.frame.reindex(X_fit.index)
-            X_val = fold_screening.frame.reindex(X_val.index) if X_val is not None else None
-            X_test = fold_screening.frame.reindex(X_test_raw.index)
+            fold_frame = fold_screening.frame
+            regime_frame, regime_feature_blocks = _build_fold_local_regime_frame(
+                pipeline,
+                fold_window.index,
+                fit_index=X_fit.index,
+            )
+            if not regime_frame.empty:
+                fold_frame = fold_frame.join(regime_frame)
+                fold_feature_blocks.update(regime_feature_blocks)
+            fold_regime.append(
+                {
+                    "fold": fold,
+                    "mode": "fold_local",
+                    "columns": list(regime_frame.columns),
+                    "available_rows": int(regime_frame.dropna(how="all").shape[0]),
+                }
+            )
+
+            X_fit = fold_frame.reindex(X_fit.index)
+            X_val = fold_frame.reindex(X_val.index) if X_val is not None else None
+            X_test = fold_frame.reindex(X_test_raw.index)
 
             X_fit, y_fit, labels_fit, _ = _align_and_drop_invalid_rows(X_fit, y_fit, labels_fit)
             if X_val is not None:
@@ -1268,11 +1344,28 @@ class TrainModelsStep(PipelineStep):
 
             primary_calibrator = None
             meta_calibrator = None
-            meta_model = _train_inner_meta_model(X_fit_model, y_fit, w_fit, config, labels=labels_fit)
+            fit_trade_outcomes = _build_execution_trade_outcomes(
+                pipeline,
+                pd.Series(model.predict(X_fit_model), index=X_fit_model.index),
+                holding_bars=holding_bars,
+                cutoff_timestamp=X_fit_model.index[-1],
+            )
+            meta_model = _train_inner_meta_model(
+                X_fit_model,
+                y_fit,
+                w_fit,
+                config,
+                labels=labels_fit,
+                trade_outcome_builder=lambda predictions, cutoff_timestamp=X_train.index[-1]: _build_execution_trade_outcomes(
+                    pipeline,
+                    predictions,
+                    holding_bars=holding_bars,
+                    cutoff_timestamp=cutoff_timestamp,
+                ),
+            )
             fit_primary_preds = pd.Series(model.predict(X_fit_model), index=X_fit_model.index)
-            fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats_from_labels(
-                fit_primary_preds,
-                labels_fit,
+            fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats(
+                fit_trade_outcomes,
                 default_avg_win,
                 default_avg_loss,
             )
@@ -1295,7 +1388,18 @@ class TrainModelsStep(PipelineStep):
                     _positive_class_probability(meta_model, X_meta_val),
                     index=X_val_model.index,
                 )
-                val_profitability_target = _resolve_profitability_target(val_primary_preds, labels_val, y_val)
+                val_trade_outcomes = _build_execution_trade_outcomes(
+                    pipeline,
+                    val_primary_preds,
+                    holding_bars=holding_bars,
+                    cutoff_timestamp=X_val_model.index[-1],
+                )
+                val_profitability_target = _resolve_profitability_target(
+                    val_primary_preds,
+                    y_val,
+                    trade_outcomes=val_trade_outcomes,
+                    labels=labels_val,
+                )
                 val_meta_prob, meta_calibrator = _calibrate_binary_probability_series(
                     val_meta_prob_raw,
                     val_profitability_target,
@@ -1303,9 +1407,8 @@ class TrainModelsStep(PipelineStep):
                     calibrator_config=config.get("meta_calibration_params"),
                 )
 
-                fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats_from_labels(
-                    val_primary_preds,
-                    labels_val,
+                fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats(
+                    val_trade_outcomes,
                     fold_avg_win,
                     fold_avg_loss,
                 )
@@ -1386,6 +1489,7 @@ class TrainModelsStep(PipelineStep):
             last_primary_calibrator = primary_calibrator
             last_meta_calibrator = meta_calibrator
             last_selected_columns = list(selected_columns)
+            last_regime_fit_index = X_fit.index.copy()
             last_signal_params = dict(tuned_signal_params)
             last_avg_win = fold_avg_win
             last_avg_loss = fold_avg_loss
@@ -1399,6 +1503,14 @@ class TrainModelsStep(PipelineStep):
             oos_event_signals.append(signal_state["event_signals"])
             oos_continuous_signals.append(signal_state["continuous_signals"])
             oos_signals.append(signal_state["signals"])
+            oos_trade_outcomes.append(
+                _build_execution_trade_outcomes(
+                    pipeline,
+                    test_primary_preds,
+                    holding_bars=holding_bars,
+                    cutoff_timestamp=X_test_model.index[-1],
+                )
+            )
 
         if last_model is None or last_meta is None:
             raise RuntimeError("No walk-forward folds were generated; adjust split sizes.")
@@ -1417,13 +1529,11 @@ class TrainModelsStep(PipelineStep):
         oos_signals = pd.concat(oos_signals).sort_index().reindex(oos_predictions.index)
         feature_diagnostics = summarize_feature_block_diagnostics(fold_block_diagnostics)
 
-        # Estimate avg_win / avg_loss from OOS label outcomes
+        # Estimate avg_win / avg_loss from OOS execution-aligned trade outcomes
         oos_avg_win = None
         oos_avg_loss = None
         try:
-            labels_aligned = pipeline.require("labels_aligned")
-            oos_labels = labels_aligned.loc[labels_aligned.index.intersection(oos_predictions.index)]
-            trade_outcomes = build_trade_outcome_frame(oos_predictions, oos_labels)
+            trade_outcomes = pd.concat(oos_trade_outcomes).sort_index() if oos_trade_outcomes else pd.DataFrame()
             if not trade_outcomes.empty:
                 oos_avg_win, oos_avg_loss = _estimate_trade_outcome_stats(
                     trade_outcomes,
@@ -1442,6 +1552,7 @@ class TrainModelsStep(PipelineStep):
             "last_primary_calibrator": last_primary_calibrator,
             "last_meta_calibrator": last_meta_calibrator,
             "last_selected_columns": last_selected_columns,
+            "last_regime_fit_index": last_regime_fit_index,
             "last_signal_params": last_signal_params,
             "last_avg_win": last_avg_win,
             "last_avg_loss": last_avg_loss,
@@ -1458,6 +1569,10 @@ class TrainModelsStep(PipelineStep):
             "oos_continuous_signals": oos_continuous_signals,
             "oos_signals": oos_signals,
             "feature_block_diagnostics": feature_diagnostics,
+            "regime": {
+                "mode": "fold_local",
+                "folds": fold_regime,
+            },
             "stationarity": {
                 "mode": "fold_local",
                 "folds": fold_stationarity,
@@ -1533,6 +1648,15 @@ class SignalsStep(PipelineStep):
         if prediction_series is None or meta_prob_series is None or probability_frame is None:
             X = pipeline.require("X")
             selected_columns = training.get("last_selected_columns") or list(X.columns)
+            missing_columns = [column for column in selected_columns if column not in X.columns]
+            if missing_columns:
+                regime_frame, _ = _build_fold_local_regime_frame(
+                    pipeline,
+                    X.index,
+                    fit_index=training.get("last_regime_fit_index"),
+                )
+                if not regime_frame.empty:
+                    X = X.join(regime_frame)
             X_model = X.loc[:, selected_columns]
             model = training["last_model"]
             meta_model = training["last_meta"]

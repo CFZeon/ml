@@ -179,7 +179,7 @@ class DerivativesContextPipelineTest(unittest.TestCase):
 
         aligned = pipeline.align_data()
         self.assertGreater(len(aligned["X"]), 50)
-        self.assertIn("regime", aligned["X"].columns)
+        self.assertNotIn("regime", aligned["X"].columns)
         self.assertNotIn("close_fracdiff", aligned["X"].columns)
         self.assertNotIn("close_fracdiff_lag1", aligned["X"].columns)
         self.assertNotIn("close_fracdiff_lag3", aligned["X"].columns)

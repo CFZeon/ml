@@ -167,10 +167,13 @@ def fit_binary_probability_calibrator(probabilities, y_true, sample_weight=None,
     """Fit a Platt-style calibrator for binary probabilities."""
     model_params = dict(model_params or {})
     target = pd.Series(y_true).astype(int)
-    sw = sample_weight.values if isinstance(sample_weight, pd.Series) else sample_weight
+    sw = None
+    if sample_weight is not None:
+        raw_weights = sample_weight.values if isinstance(sample_weight, pd.Series) else sample_weight
+        sw = np.asarray(raw_weights, dtype=float)
 
     if target.nunique() < 2:
-        if sw is not None and np.sum(sw) > 0:
+        if sw is not None and float(sw.sum()) > 0.0:
             positive_rate = float(np.average(target, weights=sw))
         else:
             positive_rate = float(target.mean()) if len(target) else 0.5
@@ -285,22 +288,140 @@ def build_trade_outcome_frame(primary_preds, labels):
     )
 
 
-def train_meta_model(primary_preds, primary_probabilities, y_true, labels=None, sample_weight=None, model_params=None):
+def build_execution_outcome_frame(primary_preds, valuation_prices, execution_prices=None,
+                                  holding_bars=1, signal_delay_bars=1,
+                                  fee_rate=0.0, slippage_rate=0.0,
+                                  funding_rates=None, cutoff_timestamp=None):
+    """Build execution-aligned trade outcomes for a directional prediction series.
+
+    Outcomes are computed using the same delayed, bar-by-bar return semantics as
+    the backtest adapter rather than label-specific barrier returns. This keeps
+    profitability targets and Kelly inputs aligned to executed strategy PnL.
+    """
+    prediction_series = pd.Series(primary_preds, copy=False)
+    if prediction_series.empty:
+        return pd.DataFrame(index=prediction_series.index)
+
+    valuation_series = pd.Series(valuation_prices, copy=False).astype(float)
+    if execution_prices is None:
+        execution_series = valuation_series
+    else:
+        execution_series = pd.Series(execution_prices, copy=False).reindex(valuation_series.index).astype(float)
+
+    funding_series = None
+    if funding_rates is not None:
+        funding_series = pd.Series(funding_rates, copy=False).reindex(valuation_series.index).fillna(0.0).astype(float)
+
+    holding_bars = max(1, int(holding_bars))
+    signal_delay_bars = max(0, int(signal_delay_bars))
+    cutoff = pd.Timestamp(cutoff_timestamp) if cutoff_timestamp is not None else None
+    valuation_returns = valuation_series.pct_change().fillna(0.0)
+    round_trip_cost = 2.0 * (float(fee_rate) + float(slippage_rate))
+
+    rows = []
+    index_positions = valuation_series.index.get_indexer(prediction_series.index)
+    for timestamp, prediction, base_loc in zip(
+        prediction_series.index,
+        prediction_series.to_numpy(),
+        index_positions,
+    ):
+        direction = 1.0 if prediction > 0 else (-1.0 if prediction < 0 else 0.0)
+        row = {
+            "trade_direction": float(direction),
+            "entry_time": pd.NaT,
+            "exit_time": pd.NaT,
+            "entry_price": np.nan,
+            "exit_price": np.nan,
+            "gross_trade_return": (0.0 if direction == 0.0 else np.nan),
+            "net_trade_return": (0.0 if direction == 0.0 else np.nan),
+            "profitable": (0 if direction == 0.0 else np.nan),
+            "trade_taken": 0,
+            "outcome_available": (1 if direction == 0.0 else 0),
+        }
+
+        if direction == 0.0 or base_loc < 0:
+            rows.append(row)
+            continue
+
+        active_start = int(base_loc + signal_delay_bars)
+        active_end = int(active_start + holding_bars - 1)
+        if active_start >= len(valuation_series) or active_end >= len(valuation_series):
+            rows.append(row)
+            continue
+
+        entry_time = valuation_series.index[active_start]
+        exit_time = valuation_series.index[active_end]
+        if cutoff is not None and exit_time > cutoff:
+            rows.append(row)
+            continue
+
+        price_returns = direction * valuation_returns.iloc[active_start: active_end + 1].to_numpy(dtype=float)
+        gross_trade_return = float(np.prod(1.0 + price_returns) - 1.0)
+
+        funding_trade_return = 0.0
+        if funding_series is not None:
+            funding_bar_returns = -direction * funding_series.iloc[active_start: active_end + 1].to_numpy(dtype=float)
+            funding_trade_return = float(np.prod(1.0 + price_returns + funding_bar_returns) - 1.0) - gross_trade_return
+
+        net_trade_return = gross_trade_return + funding_trade_return - round_trip_cost
+        entry_price = execution_series.iloc[active_start]
+        exit_price = execution_series.iloc[active_end]
+        if not np.isfinite(entry_price):
+            entry_price = np.nan
+        if not np.isfinite(exit_price):
+            exit_price = np.nan
+
+        row.update(
+            {
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "gross_trade_return": gross_trade_return,
+                "net_trade_return": net_trade_return,
+                "profitable": int(net_trade_return > 0.0),
+                "trade_taken": 1,
+                "outcome_available": 1,
+            }
+        )
+        rows.append(row)
+
+    return pd.DataFrame(rows, index=prediction_series.index)
+
+
+def train_meta_model(primary_preds, primary_probabilities, y_true, labels=None,
+                     trade_outcomes=None, sample_weight=None, model_params=None):
     """Train a meta-labeling model on primary predictions and probabilities.
 
     The preferred target is trade profitability after costs, derived from the
-    realized label outcomes. If profitability data is unavailable, the model
-    falls back to raw directional correctness.
+    realized execution-aligned outcomes. If profitability data is unavailable,
+    the model falls back to label-derived outcomes and then raw directional
+    correctness.
     """
     model_params = dict(model_params or {})
     prediction_series = pd.Series(primary_preds, index=y_true.index)
-    trade_outcomes = build_trade_outcome_frame(prediction_series, labels)
-    if not trade_outcomes.empty and trade_outcomes["net_trade_return"].notna().any():
-        y_meta = trade_outcomes["profitable"].astype(int).reindex(prediction_series.index).fillna(0).astype(int)
-    else:
-        y_meta = (prediction_series == pd.Series(y_true, index=y_true.index)).astype(int)
+    if trade_outcomes is None:
+        trade_outcomes = build_trade_outcome_frame(prediction_series, labels)
 
-    sw = sample_weight.values if sample_weight is not None else None
+    if trade_outcomes is not None and not trade_outcomes.empty and trade_outcomes["profitable"].notna().any():
+        y_meta = pd.to_numeric(
+            trade_outcomes["profitable"].reindex(prediction_series.index),
+            errors="coerce",
+        )
+    else:
+        y_meta = (prediction_series == pd.Series(y_true, index=y_true.index)).astype(float)
+
+    X_meta = build_meta_feature_frame(prediction_series, primary_probabilities)
+    valid_mask = X_meta.notna().all(axis=1) & y_meta.notna()
+
+    sw = None
+    if sample_weight is not None:
+        sample_weight_series = pd.Series(sample_weight, index=X_meta.index)
+        valid_mask &= sample_weight_series.notna()
+        sw = sample_weight_series.loc[valid_mask].to_numpy(dtype=float)
+
+    X_meta = X_meta.loc[valid_mask]
+    y_meta = y_meta.loc[valid_mask].astype(int)
     if y_meta.nunique() < 2:
         if sw is not None and sw.sum() > 0:
             positive_rate = float(np.average(y_meta, weights=sw))
@@ -308,7 +429,6 @@ def train_meta_model(primary_preds, primary_probabilities, y_true, labels=None, 
             positive_rate = float(y_meta.mean()) if len(y_meta) else 0.5
         return ConstantProbabilityModel(positive_probability=positive_rate)
 
-    X_meta = build_meta_feature_frame(prediction_series, primary_probabilities)
     model = Pipeline(
         [
             ("scaler", StandardScaler()),
@@ -556,11 +676,10 @@ def summarize_feature_block_diagnostics(fold_diagnostics):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Regime detection  (KMeans or explicit trend/volatility/liquidity)
-# ───────────────────────────────────────────────────────────────────────────
-
-def _coalesce_regime_signal(features, include_terms, exclude_terms=None, fallback_column=None):
+def _coalesce_regime_signal(features, include_terms, exclude_terms=None,
+                            fallback_column=None, reference_features=None):
     exclude_terms = tuple(term.lower() for term in (exclude_terms or ()))
+    reference = features if reference_features is None else reference_features.reindex(columns=features.columns)
     selected_columns = []
     for column in features.columns:
         lower = column.lower()
@@ -574,13 +693,18 @@ def _coalesce_regime_signal(features, include_terms, exclude_terms=None, fallbac
         return pd.Series(0.0, index=features.index, dtype=float)
 
     selected = features[selected_columns].apply(pd.to_numeric, errors="coerce")
-    standardized = (selected - selected.mean()) / selected.std().replace(0, 1)
+    reference_selected = reference[selected_columns].apply(pd.to_numeric, errors="coerce")
+    reference_mean = reference_selected.mean()
+    reference_std = reference_selected.std().replace(0, 1)
+    standardized = (selected - reference_mean) / reference_std
     return standardized.mean(axis=1).fillna(0.0)
 
 
-def _bucket_regime_signal(series, lower_quantile=0.33, upper_quantile=0.67, invert=False):
+def _bucket_regime_signal(series, lower_quantile=0.33, upper_quantile=0.67,
+                          invert=False, reference_series=None):
     values = -pd.Series(series, copy=False) if invert else pd.Series(series, copy=False)
-    clean = values.dropna()
+    reference = values if reference_series is None else (-pd.Series(reference_series, copy=False) if invert else pd.Series(reference_series, copy=False))
+    clean = reference.dropna()
     if clean.empty:
         return pd.Series(0, index=values.index, dtype=int)
 
@@ -592,48 +716,88 @@ def _bucket_regime_signal(series, lower_quantile=0.33, upper_quantile=0.67, inve
     return bucket
 
 
-def _detect_explicit_regime(features, config=None):
+def _detect_explicit_regime(features, config=None, fit_features=None):
     config = dict(config or {})
     clean = features.dropna()
     if clean.empty:
         return pd.DataFrame(columns=["trend_regime", "volatility_regime", "liquidity_regime", "regime"])
 
+    reference = clean if fit_features is None else fit_features.reindex(columns=features.columns).dropna()
+    if reference.empty:
+        reference = clean
+
     trend_score = _coalesce_regime_signal(
         clean,
         include_terms=("trend", "ret_", "return", "momentum"),
         exclude_terms=("vol", "volume", "liquid"),
+        reference_features=reference,
     )
     volatility_score = _coalesce_regime_signal(
         clean,
         include_terms=("vol", "range", "atr", "dispersion"),
         exclude_terms=("volume", "liquid"),
+        reference_features=reference,
     )
     liquidity_score = _coalesce_regime_signal(
         clean,
         include_terms=("liquid", "volume", "turnover", "trade"),
         exclude_terms=("illiquid",),
+        reference_features=reference,
     )
     illiquidity_score = _coalesce_regime_signal(
         clean,
         include_terms=("illiquid", "amihud"),
+        reference_features=reference,
     )
     liquidity_score = liquidity_score - illiquidity_score
+
+    trend_reference = _coalesce_regime_signal(
+        reference,
+        include_terms=("trend", "ret_", "return", "momentum"),
+        exclude_terms=("vol", "volume", "liquid"),
+        reference_features=reference,
+    )
+    volatility_reference = _coalesce_regime_signal(
+        reference,
+        include_terms=("vol", "range", "atr", "dispersion"),
+        exclude_terms=("volume", "liquid"),
+        reference_features=reference,
+    )
+    liquidity_reference = _coalesce_regime_signal(
+        reference,
+        include_terms=("liquid", "volume", "turnover", "trade"),
+        exclude_terms=("illiquid",),
+        reference_features=reference,
+    )
+    illiquidity_reference = _coalesce_regime_signal(
+        reference,
+        include_terms=("illiquid", "amihud"),
+        reference_features=reference,
+    )
+    liquidity_reference = liquidity_reference - illiquidity_reference
 
     lower_quantile = float(config.get("lower_quantile", 0.33))
     upper_quantile = float(config.get("upper_quantile", 0.67))
     liquidity_invert = bool(config.get("liquidity_invert", False))
 
-    trend_regime = _bucket_regime_signal(trend_score, lower_quantile=lower_quantile, upper_quantile=upper_quantile)
+    trend_regime = _bucket_regime_signal(
+        trend_score,
+        lower_quantile=lower_quantile,
+        upper_quantile=upper_quantile,
+        reference_series=trend_reference,
+    )
     volatility_regime = _bucket_regime_signal(
         volatility_score,
         lower_quantile=lower_quantile,
         upper_quantile=upper_quantile,
+        reference_series=volatility_reference,
     )
     liquidity_regime = _bucket_regime_signal(
         liquidity_score,
         lower_quantile=lower_quantile,
         upper_quantile=upper_quantile,
         invert=liquidity_invert,
+        reference_series=liquidity_reference,
     )
 
     composite = (
@@ -653,7 +817,7 @@ def _detect_explicit_regime(features, config=None):
     )
 
 
-def detect_regime(features, n_regimes=2, method="kmeans", config=None):
+def detect_regime(features, n_regimes=2, method="kmeans", config=None, fit_features=None):
     """Detect regimes using KMeans or explicit rule-based buckets.
 
     Parameters
@@ -662,18 +826,34 @@ def detect_regime(features, n_regimes=2, method="kmeans", config=None):
     n_regimes : int         – number of KMeans clusters when method="kmeans"
     method : str            – "kmeans" or "explicit"
     config : dict or None   – optional method-specific settings
+    fit_features : pd.DataFrame or None – reference slice used to fit scaler,
+        quantiles, or clusters before applying to ``features``.
 
     Returns a pd.Series for KMeans mode or a pd.DataFrame with explicit regime
     components for method="explicit".
     """
     method = (method or "kmeans").lower()
     if method == "explicit":
-        return _detect_explicit_regime(features, config=config)
+        return _detect_explicit_regime(features, config=config, fit_features=fit_features)
 
     clean = features.dropna()
-    normed = (clean - clean.mean()) / clean.std().replace(0, 1)
-    km = KMeans(n_clusters=n_regimes, random_state=42, n_init=10)
-    return pd.Series(km.fit_predict(normed), index=clean.index, name="regime")
+    reference = clean if fit_features is None else fit_features.reindex(columns=features.columns).dropna()
+    if clean.empty:
+        return pd.Series(dtype=int, name="regime")
+    if reference.empty:
+        reference = clean
+
+    n_clusters = max(1, min(int(n_regimes), len(reference), len(clean)))
+    if n_clusters == 1:
+        return pd.Series(0, index=clean.index, name="regime", dtype=int)
+
+    scaler = StandardScaler()
+    scaler.fit(reference)
+    normed_reference = scaler.transform(reference)
+    normed = scaler.transform(clean)
+    km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    km.fit(normed_reference)
+    return pd.Series(km.predict(normed), index=clean.index, name="regime")
 
 
 # ───────────────────────────────────────────────────────────────────────────

@@ -67,6 +67,7 @@ from .labeling import (
     sequential_bootstrap,
 )
 from .models import (
+    build_execution_outcome_frame,
     build_trade_outcome_frame,
     build_model,
     walk_forward_split,
