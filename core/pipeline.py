@@ -397,6 +397,13 @@ def _resolve_profitability_target(predictions, y_true, trade_outcomes=None, labe
     return (pd.Series(predictions, index=predictions.index) == pd.Series(y_true, index=predictions.index)).astype(int)
 
 
+def _average_fold_metric(fold_metrics, key):
+    values = [float(metric[key]) for metric in fold_metrics if metric.get(key) is not None and np.isfinite(metric.get(key))]
+    if not values:
+        return None
+    return round(float(np.mean(values)), 4)
+
+
 def _position_size_from_profitability(probability, avg_win, avg_loss, signal_config):
     fraction = float(signal_config.get("fraction", 0.5))
     sizing_mode = signal_config.get("sizing_mode", "expected_utility")
@@ -1302,8 +1309,11 @@ class TrainModelsStep(PipelineStep):
                     config=selection_config,
                 )
                 if not selection_result.frame.empty:
-                    selected_columns = [column for column in selection_result.frame.columns if column in X.columns]
-                    fold_feature_blocks = selection_result.feature_blocks
+                    selected_columns = [column for column in selection_result.frame.columns if column in X_fit.columns]
+                    if selected_columns:
+                        fold_feature_blocks = selection_result.feature_blocks
+                    else:
+                        selected_columns = list(X_fit.columns)
 
             X_fit_model = X_fit.loc[:, selected_columns]
             X_test_model = X_test.loc[:, selected_columns]
@@ -1515,8 +1525,13 @@ class TrainModelsStep(PipelineStep):
         if last_model is None or last_meta is None:
             raise RuntimeError("No walk-forward folds were generated; adjust split sizes.")
 
-        avg_accuracy = sum(metric["accuracy"] for metric in fold_metrics) / len(fold_metrics)
-        avg_f1 = sum(metric["f1_macro"] for metric in fold_metrics) / len(fold_metrics)
+        avg_accuracy = _average_fold_metric(fold_metrics, "accuracy")
+        avg_f1 = _average_fold_metric(fold_metrics, "f1_macro")
+        avg_directional_accuracy = _average_fold_metric(fold_metrics, "directional_accuracy")
+        avg_directional_f1 = _average_fold_metric(fold_metrics, "directional_f1_macro")
+        avg_log_loss = _average_fold_metric(fold_metrics, "log_loss")
+        avg_brier_score = _average_fold_metric(fold_metrics, "brier_score")
+        avg_calibration_error = _average_fold_metric(fold_metrics, "calibration_error")
         oos_predictions = pd.concat(oos_predictions).sort_index()
         oos_probabilities = pd.concat(oos_probabilities).sort_index().reindex(oos_predictions.index)
         oos_meta_prob = pd.concat(oos_meta_prob).sort_index().reindex(oos_predictions.index)
@@ -1547,6 +1562,17 @@ class TrainModelsStep(PipelineStep):
             "fold_metrics": fold_metrics,
             "avg_accuracy": avg_accuracy,
             "avg_f1_macro": avg_f1,
+            "avg_directional_accuracy": avg_directional_accuracy,
+            "avg_directional_f1_macro": avg_directional_f1,
+            "avg_log_loss": avg_log_loss,
+            "avg_brier_score": avg_brier_score,
+            "avg_calibration_error": avg_calibration_error,
+            "headline_metrics": {
+                "directional_accuracy": avg_directional_accuracy if avg_directional_accuracy is not None else avg_accuracy,
+                "log_loss": avg_log_loss,
+                "brier_score": avg_brier_score,
+                "calibration_error": avg_calibration_error,
+            },
             "last_model": last_model,
             "last_meta": last_meta,
             "last_primary_calibrator": last_primary_calibrator,

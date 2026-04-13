@@ -85,6 +85,32 @@ class SignalProfitabilitySizingTest(unittest.TestCase):
         self.assertAlmostEqual(float(outcomes.loc[index[1], "net_trade_return"]), short_expected, places=6)
         self.assertEqual(int(outcomes.loc[index[2], "trade_taken"]), 0)
 
+    def test_execution_outcome_frame_uses_execution_price_path_when_prices_diverge(self):
+        index = pd.date_range("2026-03-08", periods=6, freq="1h", tz="UTC")
+        valuation = pd.Series([100.0, 101.0, 103.0, 102.0, 100.0, 99.0], index=index)
+        execution = pd.Series([100.0, 105.0, 104.0, 109.0, 107.0, 108.0], index=index)
+        predictions = pd.Series([1, -1], index=index[:2])
+
+        outcomes = build_execution_outcome_frame(
+            predictions,
+            valuation_prices=valuation,
+            execution_prices=execution,
+            holding_bars=2,
+            signal_delay_bars=1,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+        )
+
+        execution_returns = execution.pct_change().fillna(0.0)
+        valuation_returns = valuation.pct_change().fillna(0.0)
+        long_expected = (1.0 + execution_returns.iloc[1]) * (1.0 + execution_returns.iloc[2]) - 1.0
+        short_expected = (1.0 - execution_returns.iloc[2]) * (1.0 - execution_returns.iloc[3]) - 1.0
+        long_valuation_path = (1.0 + valuation_returns.iloc[1]) * (1.0 + valuation_returns.iloc[2]) - 1.0
+
+        self.assertAlmostEqual(float(outcomes.loc[index[0], "net_trade_return"]), long_expected, places=6)
+        self.assertAlmostEqual(float(outcomes.loc[index[1], "net_trade_return"]), short_expected, places=6)
+        self.assertNotAlmostEqual(float(outcomes.loc[index[0], "net_trade_return"]), long_valuation_path, places=4)
+
     def test_pipeline_oos_avg_win_loss_ignore_label_gross_return(self):
         index = pd.date_range("2026-03-10", periods=220, freq="1h", tz="UTC")
         steps = np.linspace(0.0, 1.0, len(index))

@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, log_loss
+from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, log_loss
 from sklearn.cluster import KMeans
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -315,7 +315,7 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
     holding_bars = max(1, int(holding_bars))
     signal_delay_bars = max(0, int(signal_delay_bars))
     cutoff = pd.Timestamp(cutoff_timestamp) if cutoff_timestamp is not None else None
-    valuation_returns = valuation_series.pct_change().fillna(0.0)
+    execution_returns = execution_series.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
     round_trip_cost = 2.0 * (float(fee_rate) + float(slippage_rate))
 
     rows = []
@@ -355,7 +355,7 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
             rows.append(row)
             continue
 
-        price_returns = direction * valuation_returns.iloc[active_start: active_end + 1].to_numpy(dtype=float)
+        price_returns = direction * execution_returns.iloc[active_start: active_end + 1].to_numpy(dtype=float)
         gross_trade_return = float(np.prod(1.0 + price_returns) - 1.0)
 
         funding_trade_return = 0.0
@@ -452,6 +452,79 @@ def train_meta_model(primary_preds, primary_probabilities, y_true, labels=None,
 # Evaluation
 # ───────────────────────────────────────────────────────────────────────────
 
+def _binary_expected_calibration_error(y_true, positive_probability, n_bins=10):
+    """Return a simple expected calibration error for binary probabilities."""
+    truth = np.asarray(y_true, dtype=float).reshape(-1)
+    probability = np.clip(np.asarray(positive_probability, dtype=float).reshape(-1), 0.0, 1.0)
+
+    valid_mask = np.isfinite(truth) & np.isfinite(probability)
+    if not valid_mask.any():
+        return np.nan
+
+    truth = truth[valid_mask]
+    probability = probability[valid_mask]
+    if len(probability) == 0:
+        return np.nan
+
+    bins = np.linspace(0.0, 1.0, int(max(2, n_bins)) + 1)
+    assignments = np.digitize(probability, bins[1:-1], right=True)
+    total = float(len(probability))
+    calibration_error = 0.0
+
+    for bin_idx in range(len(bins) - 1):
+        bin_mask = assignments == bin_idx
+        if not bin_mask.any():
+            continue
+        avg_confidence = float(probability[bin_mask].mean())
+        avg_accuracy = float(truth[bin_mask].mean())
+        calibration_error += (float(bin_mask.sum()) / total) * abs(avg_confidence - avg_accuracy)
+
+    return calibration_error
+
+
+def _evaluate_directional_probability_quality(probability_frame, y_true):
+    """Score directional probabilities on the non-abstain subset only."""
+    y_series = pd.Series(y_true, index=probability_frame.index)
+    directional_mask = y_series.ne(0)
+    if not directional_mask.any():
+        return {}
+
+    directional_frame = probability_frame.loc[directional_mask, [-1, 1]].copy()
+    row_sums = directional_frame.sum(axis=1).replace(0.0, np.nan)
+    valid_mask = row_sums.notna() & directional_frame.notna().all(axis=1)
+    if not valid_mask.any():
+        return {}
+
+    directional_frame = directional_frame.loc[valid_mask].div(row_sums.loc[valid_mask], axis=0)
+    directional_truth = y_series.loc[directional_mask].loc[valid_mask]
+    binary_truth = directional_truth.eq(1).astype(int)
+    positive_probability = directional_frame[1].clip(1e-6, 1.0 - 1e-6)
+
+    metrics = {
+        "directional_log_loss": round(
+            float(
+                log_loss(
+                    binary_truth,
+                    np.column_stack([1.0 - positive_probability.to_numpy(), positive_probability.to_numpy()]),
+                    labels=[0, 1],
+                )
+            ),
+            4,
+        ),
+        "directional_brier_score": round(
+            float(brier_score_loss(binary_truth, positive_probability.to_numpy())),
+            4,
+        ),
+        "directional_calibration_error": round(
+            float(_binary_expected_calibration_error(binary_truth, positive_probability.to_numpy())),
+            4,
+        ),
+    }
+    metrics["log_loss"] = metrics["directional_log_loss"]
+    metrics["brier_score"] = metrics["directional_brier_score"]
+    metrics["calibration_error"] = metrics["directional_calibration_error"]
+    return metrics
+
 def evaluate_model(model, X, y):
     """Return dict of classification metrics."""
     preds = model.predict(X)
@@ -483,10 +556,8 @@ def evaluate_model(model, X, y):
         )
     if hasattr(model, "predict_proba"):
         try:
-            m["log_loss"] = round(
-                float(log_loss(y_series, model.predict_proba(X), labels=model.classes_)),
-                4,
-            )
+            probability_frame = predict_probability_frame(model, X)
+            m.update(_evaluate_directional_probability_quality(probability_frame, y_series))
         except Exception:
             pass
     return m

@@ -58,10 +58,9 @@ def main():
             "automl": {
                 "enabled": True,
                 "n_trials": 8,
-                "objective": "composite",
+                "objective": "accuracy_first",
                 "seed": 42,
-                "min_trades": 10,
-                "study_name": "BTCUSDT_1h_composite_oos_demo",
+                "study_name": "BTCUSDT_1h_accuracy_first_oos_demo",
             },
         }
     )
@@ -77,7 +76,17 @@ def main():
     print(f"  trials     : {automl['trial_count']}")
     print(f"  best value : {automl['best_value']:.4f}")
     print(f"  best params: {automl['best_params']}")
+    print(f"  best train : {automl['best_training']}")
     print(f"  best bt    : {automl['best_backtest']}")
+    locked_holdout = automl.get("locked_holdout") or {}
+    if locked_holdout.get("enabled"):
+        print(
+            "  holdout    : "
+            f"rows={locked_holdout['aligned_holdout_rows']}  "
+            f"range={locked_holdout['start_timestamp']} -> {locked_holdout['end_timestamp']}"
+        )
+        print(f"  holdout tr : {locked_holdout.get('training')}")
+        print(f"  holdout bt : {locked_holdout.get('backtest')}")
 
     print(f"\n{sep}\nStep 3 · Rebuild pipeline with best config\n{sep}")
     features = pipeline.build_features()
@@ -100,14 +109,15 @@ def main():
     if screening["transform_usage"]:
         print(f"  transforms   : {screening['transform_usage']}")
     print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
+    print(f"  avg dir acc  : {training['avg_directional_accuracy']:.4f}")
+    if training.get("avg_log_loss") is not None:
+        print(f"  avg log loss : {training['avg_log_loss']:.4f}")
+    if training.get("avg_brier_score") is not None:
+        print(f"  avg brier    : {training['avg_brier_score']:.4f}")
+    if training.get("avg_calibration_error") is not None:
+        print(f"  avg calib    : {training['avg_calibration_error']:.4f}")
     print(f"  avg accuracy : {training['avg_accuracy']:.4f}")
     print(f"  avg f1       : {training['avg_f1_macro']:.4f}")
-    directional_accuracy = [metric.get("directional_accuracy") for metric in training["fold_metrics"] if metric.get("directional_accuracy") is not None]
-    directional_f1 = [metric.get("directional_f1_macro") for metric in training["fold_metrics"] if metric.get("directional_f1_macro") is not None]
-    if directional_accuracy:
-        print(f"  avg dir acc  : {sum(directional_accuracy) / len(directional_accuracy):.4f}")
-    if directional_f1:
-        print(f"  avg dir f1   : {sum(directional_f1) / len(directional_f1):.4f}")
     block_diag = training["feature_block_diagnostics"]
     if block_diag["summary"]:
         print("  top blocks   :")
