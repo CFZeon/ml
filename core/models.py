@@ -61,7 +61,7 @@ def build_model(model_type="gbm", model_params=None):
             n_estimators=int(model_params.get("n_estimators", 200)),
             max_depth=model_params.get("max_depth"),
             min_samples_leaf=int(model_params.get("min_samples_leaf", 1)),
-            class_weight=model_params.get("class_weight", "balanced"),
+            class_weight=model_params.get("class_weight", None),
             random_state=int(model_params.get("random_state", 42)),
             n_jobs=int(model_params.get("n_jobs", -1)),
         )
@@ -85,7 +85,7 @@ def build_model(model_type="gbm", model_params=None):
                     LogisticRegression(
                         C=float(model_params.get("c", model_params.get("C", 1.0))),
                         max_iter=int(model_params.get("max_iter", 1000)),
-                        class_weight=model_params.get("class_weight", "balanced"),
+                        class_weight=model_params.get("class_weight", None),
                         random_state=int(model_params.get("random_state", 42)),
                     ),
                 ),
@@ -220,8 +220,20 @@ def predict_probability_frame(model, X, ordered_classes=(-1, 0, 1)):
     return frame.loc[:, list(ordered_classes)]
 
 
-def build_meta_feature_frame(primary_preds, primary_probabilities):
-    """Build a compact, probability-aware meta-label feature frame."""
+def build_meta_feature_frame(primary_preds, primary_probabilities, context=None):
+    """Build a compact, probability-aware meta-label feature frame.
+
+    Parameters
+    ----------
+    primary_preds : array-like
+        Directional predictions from the primary model.
+    primary_probabilities : pd.DataFrame
+        Per-class probability frame aligned to primary_preds.
+    context : pd.DataFrame or None
+        Optional regime / volatility features to merge into the meta frame.
+        Columns are prefixed with ``ctx_`` and NaN-filled to guard against
+        alignment gaps.
+    """
     prediction_series = pd.Series(primary_preds, index=primary_probabilities.index)
     probability_frame = primary_probabilities.copy()
 
@@ -239,6 +251,18 @@ def build_meta_feature_frame(primary_preds, primary_probabilities):
         else:
             predicted_class_prob.append(0.0)
     meta["predicted_class_prob"] = predicted_class_prob
+
+    if context is not None:
+        context_df = context if isinstance(context, pd.DataFrame) else pd.DataFrame(context)
+        numeric_ctx = (
+            context_df
+            .select_dtypes(include=[np.number])
+            .reindex(meta.index)
+            .fillna(0.0)
+        )
+        for col in numeric_ctx.columns:
+            meta[f"ctx_{col}"] = numeric_ctx[col].values
+
     return meta
 
 
@@ -390,7 +414,8 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
 
 
 def train_meta_model(primary_preds, primary_probabilities, y_true, labels=None,
-                     trade_outcomes=None, sample_weight=None, model_params=None):
+                     trade_outcomes=None, sample_weight=None, model_params=None,
+                     context=None):
     """Train a meta-labeling model on primary predictions and probabilities.
 
     The preferred target is trade profitability after costs, derived from the
@@ -411,7 +436,7 @@ def train_meta_model(primary_preds, primary_probabilities, y_true, labels=None,
     else:
         y_meta = (prediction_series == pd.Series(y_true, index=y_true.index)).astype(float)
 
-    X_meta = build_meta_feature_frame(prediction_series, primary_probabilities)
+    X_meta = build_meta_feature_frame(prediction_series, primary_probabilities, context=context)
     valid_mask = X_meta.notna().all(axis=1) & y_meta.notna()
 
     sw = None

@@ -173,6 +173,16 @@ def _price_volume_features(df, rolling_window):
         frame["trades_change"] = df["trades"].astype(float).pct_change(1)
         frame["trades_zscore"] = _rolling_zscore(df["trades"].astype(float), rolling_window)
 
+    if "taker_buy_base_vol" in df.columns and "volume" in df.columns:
+        taker_vol = df["taker_buy_base_vol"].astype(float)
+        total_vol = df["volume"].astype(float).replace(0, np.nan)
+        taker_buy_ratio = _safe_divide(taker_vol, total_vol).clip(0.0, 1.0)
+        taker_imbalance = taker_buy_ratio - 0.5
+        frame["taker_buy_ratio"] = taker_buy_ratio
+        frame["taker_imbalance"] = taker_imbalance
+        frame["taker_imbalance_zscore"] = _rolling_zscore(taker_imbalance, rolling_window)
+        frame["taker_buy_change"] = taker_buy_ratio.diff()
+
     laggable = [
         "return_1",
         "return_5",
@@ -187,6 +197,9 @@ def _price_volume_features(df, rolling_window):
         "quote_vol_zscore",
         "trades_change",
         "trades_zscore",
+        "taker_imbalance",
+        "taker_imbalance_zscore",
+        "taker_buy_change",
     ]
     return _as_feature_block(frame, laggable, block_name="price_volume")
 

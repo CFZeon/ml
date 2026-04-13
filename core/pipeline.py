@@ -1,7 +1,6 @@
 """Stepwise research pipeline abstraction for reusable model workflows."""
 
 import copy
-from itertools import product
 
 import numpy as np
 import pandas as pd
@@ -287,6 +286,28 @@ def _close_window_for_labels(close, labels):
     return close.loc[(close.index >= start) & (close.index <= end)]
 
 
+def _combine_class_balance_weights(y, uniqueness_weights):
+    """Combine uniqueness-based sample weights with inverse class-frequency weights.
+
+    Multiplying uniqueness weights by the inverse class frequency corrects for
+    class imbalance for all model types (GBM has no class_weight parameter; RF
+    and logistic no longer set class_weight='balanced' so this is the sole
+    correction).  The result is normalised to unit mean to preserve scale.
+    """
+    class_counts = y.value_counts()
+    n_samples = len(y)
+    n_classes = len(class_counts)
+    if n_classes == 0:
+        return uniqueness_weights.clip(lower=1e-6)
+    inv_freq = n_samples / (n_classes * class_counts)
+    class_balance = y.map(inv_freq).astype(float)
+    combined = uniqueness_weights * class_balance
+    mean_weight = combined.mean()
+    if mean_weight > 0:
+        combined = combined / mean_weight
+    return combined.clip(lower=1e-6)
+
+
 def _compute_fold_sample_weights(labels, close):
     if labels is None or labels.empty:
         return pd.Series(dtype=float, name="sample_weight")
@@ -501,6 +522,42 @@ def _apply_primary_probability_calibrator(probability_frame, calibrator):
     return frame
 
 
+def _compute_theory_thresholds(avg_win, avg_loss, backtest_config, signal_config):
+    """Derive signal thresholds from cost math and Kelly break-even probability.
+
+    No search or in-sample optimisation is performed.  All thresholds are derived
+    from first principles so they are identical whether computed on training data,
+    validation data, or live:
+
+    * ``threshold`` — minimum absolute signal size to cover round-trip transaction
+      costs (2 × fee + slippage).
+    * ``edge_threshold`` — minimum directional probability edge (|p_long − p_short|)
+      before issuing a signal.
+    * ``meta_threshold`` / ``profitability_threshold`` — Kelly break-even: the
+      minimum probability of a profitable trade needed for positive expected return,
+      i.e. ``avg_loss / (avg_win + avg_loss)``.
+    """
+    fee_rate = float(backtest_config.get("fee_rate", 0.001))
+    slippage_rate = float(backtest_config.get("slippage_rate", 0.0))
+    round_trip_cost = 2.0 * (fee_rate + slippage_rate)
+
+    break_even_prob = float(avg_loss) / max(float(avg_win) + float(avg_loss), 1e-12)
+    meta_threshold = max(0.5, round(break_even_prob, 6))
+
+    threshold = max(round_trip_cost, float(signal_config.get("threshold", round_trip_cost)))
+    edge_threshold = max(0.02, float(signal_config.get("edge_threshold", 0.02)))
+    fraction = float(signal_config.get("fraction", 0.5))
+
+    params = {
+        "threshold": threshold,
+        "edge_threshold": edge_threshold,
+        "meta_threshold": meta_threshold,
+        "profitability_threshold": break_even_prob,
+        "fraction": fraction,
+    }
+    return {"params": params}
+
+
 def _resolve_signal_threshold_grid(signal_config):
     def _grid(key, fallback):
         values = signal_config.get(key)
@@ -599,92 +656,7 @@ def _score_signal_state(backtest, signal_config):
     return score
 
 
-def _tune_signal_parameters(validation_close, validation_execution_prices, prediction_series, probability_frame, meta_prob_series, signal_config, backtest_config, avg_win, avg_loss, holding_bars, backtest_runtime_kwargs=None):
-    if validation_close is None or len(validation_close) < 25:
-        default_config = dict(signal_config)
-        state = _build_signal_state(
-            prediction_series,
-            probability_frame,
-            meta_prob_series,
-            default_config,
-            avg_win,
-            avg_loss,
-            holding_bars,
-        )
-        backtest = run_backtest(
-            close=validation_close.loc[state["continuous_signals"].index] if validation_close is not None else prediction_series,
-            signals=state["continuous_signals"],
-            equity=backtest_config.get("equity", 10_000.0),
-            fee_rate=backtest_config.get("fee_rate", 0.001),
-            slippage_rate=backtest_config.get("slippage_rate", 0.0),
-            signal_delay_bars=_resolve_signal_delay_bars(backtest_config),
-            execution_prices=(
-                validation_execution_prices.loc[state["continuous_signals"].index]
-                if validation_execution_prices is not None
-                else None
-            ),
-            **(backtest_runtime_kwargs or {}),
-        ) if validation_close is not None else None
-        return {
-            "params": state["tuned_params"],
-            "signal_state": state,
-            "backtest": backtest,
-            "score": _score_signal_state(backtest, signal_config) if backtest is not None else None,
-        }
-
-    threshold_grid = _resolve_signal_threshold_grid(signal_config)
-    best = None
-    for threshold, edge_threshold, meta_threshold, fraction in product(
-        threshold_grid["threshold"],
-        threshold_grid["edge_threshold"],
-        threshold_grid["meta_threshold"],
-        threshold_grid["fraction"],
-    ):
-        candidate_config = dict(signal_config)
-        candidate_config.update(
-            {
-                "threshold": threshold,
-                "edge_threshold": edge_threshold,
-                "meta_threshold": meta_threshold,
-                "fraction": fraction,
-            }
-        )
-        state = _build_signal_state(
-            prediction_series,
-            probability_frame,
-            meta_prob_series,
-            candidate_config,
-            avg_win,
-            avg_loss,
-            holding_bars,
-        )
-        backtest = run_backtest(
-            close=validation_close.loc[state["continuous_signals"].index],
-            signals=state["continuous_signals"],
-            equity=backtest_config.get("equity", 10_000.0),
-            fee_rate=backtest_config.get("fee_rate", 0.001),
-            slippage_rate=backtest_config.get("slippage_rate", 0.0),
-            signal_delay_bars=_resolve_signal_delay_bars(backtest_config),
-            execution_prices=(
-                validation_execution_prices.loc[state["continuous_signals"].index]
-                if validation_execution_prices is not None
-                else None
-            ),
-            **(backtest_runtime_kwargs or {}),
-        )
-        score = _score_signal_state(backtest, signal_config)
-        if best is None or score > best["score"]:
-            best = {
-                "params": state["tuned_params"],
-                "signal_state": state,
-                "backtest": backtest,
-                "score": score,
-            }
-
-    return best
-
-
-def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None, trade_outcome_builder=None):
+def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None, trade_outcome_builder=None, context_frame=None):
     inner_predictions = []
     inner_probabilities = []
     inner_truth = []
@@ -727,6 +699,7 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
             w_inner_train = w_inner_train.loc[binary_mask]
             if len(X_inner_train) < min_train_rows:
                 continue
+        w_inner_train = _combine_class_balance_weights(y_inner_train, w_inner_train)
 
         inner_model = train_model(
             X_inner_train,
@@ -757,6 +730,10 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
     meta_weights = pd.concat(inner_weights).sort_index().reindex(meta_predictions.index).fillna(1.0)
     meta_trade_outcomes = trade_outcome_builder(meta_predictions) if trade_outcome_builder is not None else None
 
+    meta_context = None
+    if context_frame is not None:
+        meta_context = context_frame.reindex(meta_predictions.index)
+
     return train_meta_model(
         meta_predictions,
         meta_probabilities,
@@ -765,6 +742,7 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
         trade_outcomes=meta_trade_outcomes,
         sample_weight=meta_weights,
         model_params=model_config.get("meta_params"),
+        context=meta_context,
     )
 
 
@@ -1018,6 +996,7 @@ class LabelsStep(PipelineStep):
 
     def run(self, pipeline):
         data = pipeline.require("data")
+        raw_data = pipeline.require("raw_data")
         config = pipeline.section("labels")
         backtest_config = pipeline.section("backtest")
         label_kind = config.get("kind", "triple_barrier")
@@ -1027,6 +1006,15 @@ class LabelsStep(PipelineStep):
                 float(backtest_config.get("fee_rate", 0.0))
                 + float(backtest_config.get("slippage_rate", 0.0))
             )
+
+        # Resolve execution-aligned entry: anchor label barriers to the actual fill
+        # price (open[T+delay] or close[T+delay]) rather than close[T].
+        signal_delay = _resolve_signal_delay_bars(backtest_config)
+        if backtest_config.get("use_open_execution", True) and "open" in raw_data.columns:
+            entry_prices = raw_data["open"]
+        else:
+            entry_prices = raw_data["close"]
+        start_offset = signal_delay
 
         if label_kind == "triple_barrier":
             volatility_builder = config.get("volatility_builder")
@@ -1046,6 +1034,8 @@ class LabelsStep(PipelineStep):
                 min_return=config.get("min_return", 0.0),
                 cost_rate=float(cost_rate),
                 barrier_tie_break=config.get("barrier_tie_break", "sl"),
+                entry_prices=entry_prices,
+                start_offset=start_offset,
             )
         elif label_kind == "fixed_horizon":
             labels = fixed_horizon_labels(
@@ -1053,6 +1043,8 @@ class LabelsStep(PipelineStep):
                 horizon=config.get("horizon", 5),
                 threshold=config.get("threshold", 0.0),
                 cost_rate=float(cost_rate),
+                entry_prices=entry_prices,
+                start_offset=start_offset,
             )
         elif label_kind == "trend_scanning":
             labels = trend_scanning_labels(
@@ -1064,6 +1056,8 @@ class LabelsStep(PipelineStep):
                 min_return=config.get("min_return", 0.0),
                 cost_rate=float(cost_rate),
                 price_transform=config.get("price_transform", "log"),
+                entry_prices=entry_prices,
+                start_offset=start_offset,
             )
         else:
             raise ValueError(f"Unsupported label kind={label_kind!r}")
@@ -1336,6 +1330,7 @@ class TrainModelsStep(PipelineStep):
                 X_train_primary = X_fit_model.loc[binary_mask]
                 y_train_primary = y_fit.loc[binary_mask]
                 w_train_primary = w_fit.loc[binary_mask]
+            w_train_primary = _combine_class_balance_weights(y_train_primary, w_train_primary)
 
             model = train_model(
                 X_train_primary,
@@ -1360,6 +1355,17 @@ class TrainModelsStep(PipelineStep):
                 holding_bars=holding_bars,
                 cutoff_timestamp=X_fit_model.index[-1],
             )
+            # Extract regime / volatility context columns for meta-model enrichment.
+            # Cap at 8 columns to avoid the context overshadowing the primary signal.
+            _META_CTX_PREFIXES = ("regime", "trend_regime", "volatility_regime", "liquidity_regime")
+            _META_CTX_SUFFIXES = ("_atr_pct", "_vol_zscore", "_bw_zscore")
+            meta_context_cols = [
+                col for col in fold_frame.columns
+                if any(col.startswith(p) for p in _META_CTX_PREFIXES)
+                or any(col.endswith(s) for s in _META_CTX_SUFFIXES)
+            ][:8]
+            meta_context_frame = fold_frame[meta_context_cols] if meta_context_cols else None
+
             meta_model = _train_inner_meta_model(
                 X_fit_model,
                 y_fit,
@@ -1372,6 +1378,7 @@ class TrainModelsStep(PipelineStep):
                     holding_bars=holding_bars,
                     cutoff_timestamp=cutoff_timestamp,
                 ),
+                context_frame=meta_context_frame.reindex(X_fit_model.index) if meta_context_frame is not None else None,
             )
             fit_primary_preds = pd.Series(model.predict(X_fit_model), index=X_fit_model.index)
             fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats(
@@ -1393,7 +1400,11 @@ class TrainModelsStep(PipelineStep):
                     calibrator_config=config.get("calibration_params"),
                 )
 
-                X_meta_val = build_meta_feature_frame(val_primary_preds, val_primary_probs_raw)
+                X_meta_val = build_meta_feature_frame(
+                    val_primary_preds,
+                    val_primary_probs_raw,
+                    context=meta_context_frame.reindex(X_val_model.index) if meta_context_frame is not None else None,
+                )
                 val_meta_prob_raw = pd.Series(
                     _positive_class_probability(meta_model, X_meta_val),
                     index=X_val_model.index,
@@ -1423,23 +1434,42 @@ class TrainModelsStep(PipelineStep):
                     fold_avg_loss,
                 )
 
-                tuning = _tune_signal_parameters(
-                    validation_close=_resolve_backtest_valuation_close(pipeline, X_val_model.index),
-                    validation_execution_prices=_resolve_backtest_execution_prices(pipeline, X_val_model.index),
-                    prediction_series=val_primary_preds,
-                    probability_frame=val_primary_probs,
-                    meta_prob_series=val_meta_prob,
-                    signal_config=signal_config,
-                    backtest_config=backtest_config,
+                tuning = _compute_theory_thresholds(
                     avg_win=fold_avg_win,
                     avg_loss=fold_avg_loss,
-                    holding_bars=holding_bars,
-                    backtest_runtime_kwargs=_resolve_backtest_runtime_kwargs(pipeline, X_val_model.index),
+                    backtest_config=backtest_config,
+                    signal_config=signal_config,
                 )
-                if tuning is not None:
-                    tuned_signal_params = dict(tuning["params"])
-                    tuning_backtest = tuning["backtest"]
-                    tuning_score = tuning["score"]
+                tuned_signal_params = dict(tuning["params"])
+                # Single diagnostic backtest on validation data — no parameter selection
+                val_signal_state = _build_signal_state(
+                    val_primary_preds,
+                    val_primary_probs,
+                    val_meta_prob,
+                    {**signal_config, **tuned_signal_params},
+                    fold_avg_win,
+                    fold_avg_loss,
+                    holding_bars,
+                )
+                val_close_for_bt = _resolve_backtest_valuation_close(pipeline, X_val_model.index)
+                if val_close_for_bt is not None and len(val_close_for_bt) > 0:
+                    tuning_backtest = run_backtest(
+                        close=val_close_for_bt.loc[val_signal_state["continuous_signals"].index],
+                        signals=val_signal_state["continuous_signals"],
+                        equity=backtest_config.get("equity", 10_000.0),
+                        fee_rate=backtest_config.get("fee_rate", 0.001),
+                        slippage_rate=backtest_config.get("slippage_rate", 0.0),
+                        signal_delay_bars=_resolve_signal_delay_bars(backtest_config),
+                        execution_prices=(
+                            _resolve_backtest_execution_prices(pipeline, X_val_model.index).loc[
+                                val_signal_state["continuous_signals"].index
+                            ]
+                            if _resolve_backtest_execution_prices(pipeline, X_val_model.index) is not None
+                            else None
+                        ),
+                        **(_resolve_backtest_runtime_kwargs(pipeline, X_val_model.index) or {}),
+                    )
+                    tuning_score = _score_signal_state(tuning_backtest, signal_config) if tuning_backtest is not None else None
 
             test_primary_probs = _apply_primary_probability_calibrator(test_primary_probs_raw, primary_calibrator)
 
@@ -1453,7 +1483,11 @@ class TrainModelsStep(PipelineStep):
             )
             fold_block_diagnostics.append(block_diagnostics)
 
-            X_meta_test = build_meta_feature_frame(test_primary_preds, test_primary_probs_raw)
+            X_meta_test = build_meta_feature_frame(
+                test_primary_preds,
+                test_primary_probs_raw,
+                context=meta_context_frame.reindex(X_test_model.index) if meta_context_frame is not None else None,
+            )
             meta_prob_test_raw = pd.Series(
                 _positive_class_probability(meta_model, X_meta_test),
                 index=X_test_model.index,
@@ -1692,7 +1726,15 @@ class SignalsStep(PipelineStep):
                 probability_frame_raw,
                 training.get("last_primary_calibrator"),
             )
-            X_meta = build_meta_feature_frame(predictions, probability_frame_raw)
+            _META_CTX_PREFIXES = ("regime", "trend_regime", "volatility_regime", "liquidity_regime")
+            _META_CTX_SUFFIXES = ("_atr_pct", "_vol_zscore", "_bw_zscore")
+            signals_ctx_cols = [
+                col for col in X.columns
+                if any(col.startswith(p) for p in _META_CTX_PREFIXES)
+                or any(col.endswith(s) for s in _META_CTX_SUFFIXES)
+            ][:8]
+            signals_context_frame = X[signals_ctx_cols] if signals_ctx_cols else None
+            X_meta = build_meta_feature_frame(predictions, probability_frame_raw, context=signals_context_frame)
             meta_prob_raw = pd.Series(_positive_class_probability(meta_model, X_meta), index=X_model.index)
             meta_prob_series = pd.Series(
                 apply_binary_probability_calibrator(

@@ -10,7 +10,8 @@ import pandas as pd
 
 def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.0),
                           max_holding=10, min_return=0.0, cost_rate=0.0,
-                          barrier_tie_break="sl"):
+                          barrier_tie_break="sl",
+                          entry_prices=None, start_offset=0):
     """Apply triple-barrier labeling.
 
     Three concurrent barriers decide the label per bar:
@@ -28,6 +29,10 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
     min_return : float      – returns below this at the time barrier → label 0 (abstain)
     cost_rate : float       – round-trip cost buffer applied to label thresholds
     barrier_tie_break : str – when pt/sl hit in the same bar, choose "sl" or "pt"
+    entry_prices : pd.Series or None – execution prices (e.g. open[T+delay]); when
+        provided barriers are anchored to the actual fill price, not close[T].
+    start_offset : int      – bars between signal bar and execution bar; the future
+        window starts at this offset so label horizons align to real holding periods.
 
     Returns
     -------
@@ -35,21 +40,28 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
         label ∈ {-1, 0, +1};  barrier ∈ {"pt", "sl", "time"}
     """
     pt_m, sl_m = pt_sl
+    start_offset = max(0, int(start_offset))
     high = close if high is None else high.reindex(close.index)
     low = close if low is None else low.reindex(close.index)
+    _entry_series = entry_prices if entry_prices is not None else close
     rows = []
 
-    for i in range(len(close) - max_holding):
-        entry = close.iloc[i]
+    # Ensure we never index beyond the close series
+    for i in range(len(close) - max_holding - start_offset):
+        # Entry price: execution price at bar i+start_offset
+        entry = _entry_series.iloc[i + start_offset]
         vol = volatility.iloc[i]
+        if pd.isna(entry) or not np.isfinite(entry) or entry <= 0:
+            continue
         if pd.isna(vol) or vol <= 0:
             continue
 
         upper = entry * (1 + pt_m * vol + cost_rate)
         lower = entry * (1 - sl_m * vol - cost_rate)
-        future_close = close.iloc[i + 1: i + 1 + max_holding]
-        future_high = high.iloc[i + 1: i + 1 + max_holding]
-        future_low = low.iloc[i + 1: i + 1 + max_holding]
+        # Future window begins at the execution bar (bar i+start_offset)
+        future_close = close.iloc[i + start_offset: i + start_offset + max_holding]
+        future_high = high.iloc[i + start_offset: i + start_offset + max_holding]
+        future_low = low.iloc[i + start_offset: i + start_offset + max_holding]
 
         label = None
         barrier = None
@@ -104,20 +116,35 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
     return pd.DataFrame(rows).set_index("t0")
 
 
-def fixed_horizon_labels(close, horizon=5, threshold=0.0, cost_rate=0.0):
+def fixed_horizon_labels(close, horizon=5, threshold=0.0, cost_rate=0.0,
+                         entry_prices=None, start_offset=0):
     """Label by forward return over *horizon* bars.
 
     Returns DataFrame with columns [label, t1, forward_return].
     label ∈ {-1, 0, +1} (0 = below threshold → abstain).
+
+    Parameters
+    ----------
+    entry_prices : pd.Series or None – execution price series; when provided,
+        returns are computed from entry_prices[T+start_offset] to
+        entry_prices[T+start_offset+horizon] instead of close[T].
+    start_offset : int – execution delay in bars.
     """
-    fwd = close.pct_change(horizon).shift(-horizon)
+    start_offset = max(0, int(start_offset))
+    _prices = entry_prices if entry_prices is not None else close
+    # entry_value[T] = _prices[T + start_offset]
+    entry_value = _prices.shift(-start_offset) if start_offset > 0 else pd.Series(_prices, copy=True)
+    # exit_value[T] = _prices[T + start_offset + horizon]
+    exit_value = entry_value.shift(-horizon)
+    fwd = (exit_value - entry_value) / entry_value.replace(0, np.nan)
     effective_threshold = float(threshold) + float(cost_rate)
     label = pd.Series(0, index=close.index)
     label[fwd > effective_threshold] = 1
     label[fwd < -effective_threshold] = -1
+    t1_series = pd.Series(_prices.index, index=_prices.index).shift(-(start_offset + horizon))
     result = pd.DataFrame({
         "label": label,
-        "t1": close.index.to_series().shift(-horizon),
+        "t1": t1_series,
         "forward_return": fwd,
         "gross_return": fwd,
         "cost_rate": cost_rate,
@@ -158,7 +185,8 @@ def _linear_trend_t_value(values):
 
 def trend_scanning_labels(close, min_horizon=8, max_horizon=48, step=4,
                           min_t_value=1.5, min_return=0.0, cost_rate=0.0,
-                          price_transform="log"):
+                          price_transform="log",
+                          entry_prices=None, start_offset=0):
     """Label by the strongest forward trend over a range of horizons.
 
     For each timestamp, fit simple linear trends over candidate forward windows and
@@ -169,8 +197,16 @@ def trend_scanning_labels(close, min_horizon=8, max_horizon=48, step=4,
     Returns a DataFrame with columns:
         label, t1, trend_t_value, trend_slope, trend_horizon, forward_return
     label ∈ {-1, 0, +1}; 0 means the trend was not statistically/economically strong enough.
+
+    Parameters
+    ----------
+    entry_prices : pd.Series or None – execution price series; return is computed
+        from entry_prices[T+start_offset] rather than close[T].
+    start_offset : int – execution delay in bars.
     """
     close = pd.Series(close, copy=False).astype(float)
+    start_offset = max(0, int(start_offset))
+    _entry_series = pd.Series(entry_prices, copy=False).astype(float) if entry_prices is not None else close
     min_horizon = max(2, int(min_horizon))
     max_horizon = max(min_horizon, int(max_horizon))
     step = max(1, int(step))
@@ -186,19 +222,21 @@ def trend_scanning_labels(close, min_horizon=8, max_horizon=48, step=4,
         raise ValueError(f"Unsupported price_transform={price_transform!r}")
 
     rows = []
-    last_start = len(close) - min_horizon
+    last_start = len(close) - min_horizon - start_offset
     for i in range(max(0, last_start)):
-        entry_price = float(close.iloc[i])
+        # Execution entry at bar i+start_offset
+        entry_price = float(_entry_series.iloc[i + start_offset])
         if not np.isfinite(entry_price) or entry_price <= 0:
             continue
 
         best = None
         for horizon in range(min_horizon, max_horizon + 1, step):
-            end = i + horizon
+            end = i + start_offset + horizon
             if end >= len(close):
                 break
 
-            window = transformed.iloc[i: end + 1]
+            # Trend is measured over the forward price path starting at execution bar
+            window = transformed.iloc[i + start_offset: end + 1]
             if window.isna().any():
                 continue
 

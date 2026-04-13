@@ -35,8 +35,14 @@ _COLUMNS = [
     "taker_buy_base_vol", "taker_buy_quote_vol", "ignore",
 ]
 
-_FLOAT_COLUMNS = ["open", "high", "low", "close", "volume", "quote_volume"]
-_OUTPUT_COLUMNS = ["open", "high", "low", "close", "volume", "quote_volume", "trades"]
+_FLOAT_COLUMNS = [
+    "open", "high", "low", "close", "volume", "quote_volume",
+    "taker_buy_base_vol", "taker_buy_quote_vol",
+]
+_OUTPUT_COLUMNS = [
+    "open", "high", "low", "close", "volume", "quote_volume", "trades",
+    "taker_buy_base_vol", "taker_buy_quote_vol",
+]
 
 
 @dataclass(frozen=True)
