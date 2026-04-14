@@ -37,7 +37,7 @@ def main():
                 "max_holding": 24,
                 "min_return": 0.001,
                 "volatility_window": 24,
-                "barrier_tie_break": "sl",
+                "collision_penalty": 0.0001,
             },
             "model": {"type": "gbm", "n_splits": 3, "gap": 24, "validation_fraction": 0.2, "meta_n_splits": 2},
             "signals": {
@@ -100,7 +100,7 @@ def main():
     signals = pipeline.generate_signals()
     backtest = pipeline.run_backtest()
 
-    screening = stationarity["feature_screening"]["summary"]
+    screening = stationarity["summary"]
     print(f"  feature count: {features.shape[1]}")
     print(
         f"  screened     : {screening['screened_feature_count']}/{screening['total_features']}  "

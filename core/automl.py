@@ -489,7 +489,7 @@ def _sample_trial_overrides(trial, search_space):
             pt_mult = _sample_from_spec(trial, "labels.pt_mult", label_space["pt_mult"])
             sl_mult = _sample_from_spec(trial, "labels.sl_mult", label_space["sl_mult"])
             label_overrides["pt_sl"] = (pt_mult, sl_mult)
-        for key in ["max_holding", "min_return", "volatility_window", "barrier_tie_break"]:
+        for key in ["max_holding", "min_return", "volatility_window", "collision_penalty"]:
             if key in label_space:
                 label_overrides[key] = _sample_from_spec(trial, f"labels.{key}", label_space[key])
         if label_overrides:

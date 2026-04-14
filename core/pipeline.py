@@ -673,6 +673,7 @@ def _build_signal_state(prediction_series, probability_frame, meta_prob_series, 
         "break_even_profit_prob": float(break_even_prob.mean()) if isinstance(break_even_prob, pd.Series) else float(break_even_prob),
         "profitability_threshold": float(profitability_threshold) if not isinstance(profitability_threshold, pd.Series) else float(profitability_threshold.mean()),
         "position_size": position_size,
+        "kelly_size": position_size,
         "event_signals": event_signals,
         "holding_bars": holding_bars,
         "continuous_signals": continuous,
@@ -1041,6 +1042,7 @@ class RegimeStep(PipelineStep):
             "mode": "explicit_global_preview",
             "columns": list(regimes.columns) if isinstance(regimes, pd.DataFrame) else ["regime"],
             "rows": len(regimes.dropna()),
+            "note": "KMeans-based regime detection is deferred to fold-local training to avoid global fit bias.",
         }
 
         return {
@@ -1093,7 +1095,7 @@ class LabelsStep(PipelineStep):
                 min_return=config.get("min_return", 0.0),
                 cost_rate=float(cost_rate),
                 slippage_buffer=float(config.get("slippage_buffer", 0.0)),
-                barrier_tie_break=config.get("barrier_tie_break", "sl"),
+                collision_penalty=float(config.get("collision_penalty", 0.0)),
                 entry_prices=entry_prices,
                 start_offset=start_offset,
             )
