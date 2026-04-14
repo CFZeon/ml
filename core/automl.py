@@ -13,6 +13,8 @@ except ImportError:  # pragma: no cover - handled at runtime when AutoML is enab
     optuna = None
     TPESampler = None
 
+from .backtest import probabilistic_sharpe_ratio, deflated_sharpe_ratio
+
 
 DEFAULT_AUTOML_SEARCH_SPACE = {
     "features": {
@@ -28,14 +30,6 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
         "enabled": {"type": "categorical", "choices": [True, False]},
         "max_features": {"type": "categorical", "choices": [32, 48, 64, 96, 128]},
         "min_mi_threshold": {"type": "categorical", "choices": [0.0, 0.0005, 0.001, 0.002]},
-    },
-    "labels": {
-        "pt_mult": {"type": "float", "low": 1.0, "high": 3.0, "step": 0.5},
-        "sl_mult": {"type": "float", "low": 1.0, "high": 3.0, "step": 0.5},
-        "max_holding": {"type": "categorical", "choices": [12, 24, 48]},
-        "min_return": {"type": "categorical", "choices": [0.0, 0.0005, 0.001, 0.002]},
-        "volatility_window": {"type": "categorical", "choices": [12, 24, 48]},
-        "barrier_tie_break": {"type": "categorical", "choices": ["sl", "pt"]},
     },
     "regime": {
         "n_regimes": {"type": "categorical", "choices": [2, 3, 4]},
@@ -297,6 +291,10 @@ def _summarize_backtest(backtest):
         "net_profit",
         "net_profit_pct",
         "sharpe_ratio",
+        "probabilistic_sharpe_ratio",
+        "deflated_sharpe_ratio",
+        "skewness",
+        "kurtosis",
         "sortino_ratio",
         "calmar_ratio",
         "profit_factor",
@@ -409,6 +407,23 @@ def compute_objective_value(objective_name, training, backtest, automl_config=No
         return float(backtest.get("net_profit_pct", 0.0))
     if objective_name == "sharpe_ratio":
         return float(backtest.get("sharpe_ratio", 0.0))
+
+    if objective_name == "probabilistic_sharpe_ratio":
+        sr = float(backtest.get("sharpe_ratio", 0.0))
+        sk = float(backtest.get("skewness", 0.0))
+        kurt = float(backtest.get("kurtosis", 0.0))
+        n_obs = len(backtest.get("equity_curve", []))
+        return probabilistic_sharpe_ratio(sr, sk, kurt, n_obs)
+
+    if objective_name == "deflated_sharpe_ratio":
+        sr = float(backtest.get("sharpe_ratio", 0.0))
+        sk = float(backtest.get("skewness", 0.0))
+        kurt = float(backtest.get("kurtosis", 0.0))
+        n_obs = len(backtest.get("equity_curve", []))
+        sr_var = float(automl_config.get("sr_variance", 0.0))
+        n_trials = int(automl_config.get("n_trials", 1))
+        return deflated_sharpe_ratio(sr, sr_var, n_trials, sk, kurt, n_obs)
+
     if objective_name == "profit_factor":
         profit_factor = backtest.get("profit_factor", 0.0)
         if not np.isfinite(profit_factor):
@@ -470,13 +485,15 @@ def _sample_trial_overrides(trial, search_space):
     label_space = search_space.get("labels", {})
     if label_space:
         label_overrides = {}
-        pt_mult = _sample_from_spec(trial, "labels.pt_mult", label_space["pt_mult"])
-        sl_mult = _sample_from_spec(trial, "labels.sl_mult", label_space["sl_mult"])
-        label_overrides["pt_sl"] = (pt_mult, sl_mult)
+        if "pt_mult" in label_space and "sl_mult" in label_space:
+            pt_mult = _sample_from_spec(trial, "labels.pt_mult", label_space["pt_mult"])
+            sl_mult = _sample_from_spec(trial, "labels.sl_mult", label_space["sl_mult"])
+            label_overrides["pt_sl"] = (pt_mult, sl_mult)
         for key in ["max_holding", "min_return", "volatility_window", "barrier_tie_break"]:
             if key in label_space:
                 label_overrides[key] = _sample_from_spec(trial, f"labels.{key}", label_space[key])
-        overrides["labels"] = label_overrides
+        if label_overrides:
+            overrides["labels"] = label_overrides
 
     regime_space = search_space.get("regime", {})
     if regime_space:
@@ -600,7 +617,29 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
 
         training = candidate.state["training"]
         backtest = candidate.state["backtest"]
-        value = compute_objective_value(_normalize_objective_name(automl_config.get("objective", "accuracy_first")), training, backtest, automl_config)
+        
+        # Track trial metrics in user attributes for cross-trial calculations (like DSR)
+        current_sr = float(backtest.get("sharpe_ratio", 0.0))
+        trial.set_user_attr("sharpe_ratio", current_sr)
+
+        # To compute DSR, we need the variance of SRs across all trials so far
+        completed_trials = [t for t in trial.study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        all_srs = [t.user_attrs.get("sharpe_ratio", 0.0) for t in completed_trials]
+        all_srs.append(current_sr)
+        
+        sr_variance = float(np.var(all_srs)) if len(all_srs) > 1 else 0.0
+        
+        # Inject running stats into automl_config for objective computation
+        running_config = copy.deepcopy(automl_config)
+        running_config["sr_variance"] = sr_variance
+        running_config["n_trials"] = len(all_srs)
+
+        value = compute_objective_value(
+            _normalize_objective_name(automl_config.get("objective", "accuracy_first")), 
+            training, 
+            backtest, 
+            running_config
+        )
 
         trial.set_user_attr("overrides", _json_ready(_clone_value(overrides)))
         trial.set_user_attr("training", _json_ready(_summarize_training(training)))

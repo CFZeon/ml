@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm, skew, kurtosis
 
 try:  # pragma: no cover - optional dependency exercised in integration tests
     import vectorbt as vbt
@@ -16,7 +17,7 @@ _SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Kelly criterion
+# Kelly criterion and Statistical Robustness
 # ───────────────────────────────────────────────────────────────────────────
 
 def kelly_fraction(prob_win, avg_win, avg_loss, fraction=0.5):
@@ -37,6 +38,56 @@ def kelly_fraction(prob_win, avg_win, avg_loss, fraction=0.5):
     q = 1 - prob_win
     k = (prob_win * b - q) / b
     return max(0.0, min(k, 1.0)) * fraction
+
+
+def probabilistic_sharpe_ratio(observed_sr, skewness, kurtosis, n_observations,
+                              benchmark_sr=0.0):
+    """Calculate the Probabilistic Sharpe Ratio (PSR).
+
+    PSR adjusts the Sharpe Ratio for non-normality (skewness and kurtosis)
+    and sample length. It represents the probability that the true SR
+    is greater than the benchmark.
+    """
+    if n_observations <= 2:
+        return 0.5
+    
+    # Calculate the standard deviation of the Sharpe Ratio
+    # Note: observed_sr should be non-annualized here for the formula, 
+    # but often used with annualized SR and adjusted n. 
+    # Here we use the standard formula for SR estimation error.
+    variance_sr = (1.0 - skewness * observed_sr + ((kurtosis - 1.0) / 4.0) * observed_sr**2) / (n_observations - 1.0)
+    sr_std = np.sqrt(max(0.0, variance_sr))
+    
+    if sr_std <= 0:
+        return 1.0 if observed_sr > benchmark_sr else 0.0
+        
+    return float(norm.cdf((observed_sr - benchmark_sr) / sr_std))
+
+
+def deflated_sharpe_ratio(observed_sr, sr_variance, n_trials, skewness, kurtosis,
+                          n_observations):
+    """Calculate the Deflated Sharpe Ratio (DSR).
+
+    DSR accounts for selection bias (multiple testing) by using the 
+    Expected Maximum Sharpe Ratio under the null hypothesis as the benchmark.
+    """
+    if n_trials <= 1:
+        return probabilistic_sharpe_ratio(observed_sr, skewness, kurtosis, n_observations)
+
+    # Euler-Mascheroni constant
+    emc = 0.57721566490153286
+    
+    # Expected maximum Sharpe Ratio under null (False Strategy Theorem)
+    # n_trials should ideally be the number of independent trials.
+    expected_max_sr = np.sqrt(sr_variance) * (
+        (1.0 - emc) * norm.ppf(1.0 - 1.0 / n_trials) +
+        emc * norm.ppf(1.0 - 1.0 / (n_trials * np.e))
+    )
+    
+    return probabilistic_sharpe_ratio(
+        observed_sr, skewness, kurtosis, n_observations, 
+        benchmark_sr=expected_max_sr
+    )
 
 
 def _infer_periods_per_year(index):
@@ -238,6 +289,12 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
     volatility = strat_ret.std()
     sharpe = (strat_ret.mean() / volatility * annualization
               if volatility > 0 and annualization > 0 else 0.0)
+    
+    # Statistical moments for DSR/PSR
+    sk = float(skew(strat_ret)) if len(strat_ret) > 2 else 0.0
+    kurt = float(kurtosis(strat_ret)) if len(strat_ret) > 2 else 0.0
+    psr = probabilistic_sharpe_ratio(sharpe, sk, kurt, len(strat_ret))
+
     downside = strat_ret.where(strat_ret < 0, 0.0)
     downside_vol = downside.std()
     sortino = (strat_ret.mean() / downside_vol * annualization
@@ -301,6 +358,9 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
         "total_return": _round_metric(total_ret, 4),
         "cagr": _round_metric(cagr, 4),
         "sharpe_ratio": _round_metric(sharpe, 2),
+        "probabilistic_sharpe_ratio": _round_metric(psr, 4),
+        "skewness": _round_metric(sk, 4),
+        "kurtosis": _round_metric(kurt, 4),
         "sortino_ratio": _round_metric(sortino, 2),
         "calmar_ratio": _round_metric(calmar, 2),
         "annualized_volatility": _round_metric(volatility * annualization, 4),

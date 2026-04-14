@@ -39,7 +39,7 @@ def fractional_diff(series, d, threshold=1e-5):
     """Fractionally differentiate *series* by order *d*.
 
     Uses expanding-window weights (cut off at *threshold*) applied as a
-    convolution. Preserves long-memory information that integer differencing
+    dot product. Preserves long-memory information that integer differencing
     destroys.
 
     Returns a pd.Series (leading values are NaN until the weight window is
@@ -59,8 +59,9 @@ def fractional_diff(series, d, threshold=1e-5):
     values = series.values.astype(float)
     out = np.full(len(values), np.nan)
 
-    for i in range(width - 1, len(values)):
-        out[i] = weights @ values[i - width + 1: i + 1]
+    if len(values) >= width:
+        for i in range(width - 1, len(values)):
+            out[i] = weights @ values[i - width + 1: i + 1]
 
     series_name = getattr(series, "name", None)
     if series_name:
