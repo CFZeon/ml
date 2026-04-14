@@ -989,19 +989,28 @@ class RegimeStep(PipelineStep):
         config = pipeline.section("regime")
         builder = config.get("builder") or _default_regime_features
         regime_features = builder(pipeline)
-        
-        # We do not globally detect regimes here to prevent lookahead bias.
-        # Instead, we just save the regime features so fold-local steps can use them.
+
+        # We use explicit rule-based detection for the global preview.
+        # This is safe because it uses rolling indicators and fixed buckets,
+        # avoiding the lookahead bias inherent in global KMeans fitting.
+        regimes = detect_regime(
+            regime_features,
+            method="explicit",
+            config=config,
+        )
+
         pipeline.state["regime_features"] = regime_features
-        pipeline.state["regimes"] = None
+        pipeline.state["regimes"] = regimes
         pipeline.state["regime_detection"] = {
-            "mode": "global_preview_disabled",
-            "note": "Regime detection runs strictly within fold-local bounds to avoid lookahead bias."
+            "mode": "explicit_global_preview",
+            "columns": list(regimes.columns) if isinstance(regimes, pd.DataFrame) else ["regime"],
+            "rows": len(regimes.dropna()),
         }
+
         return {
             "regime_features": regime_features,
-            "regimes": None,
-            "mode": "global_preview_disabled",
+            "regimes": regimes,
+            "mode": "explicit_global_preview",
         }
 
 

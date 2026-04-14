@@ -1026,9 +1026,21 @@ def detect_regime(features, n_regimes=2, method="kmeans", config=None, fit_featu
     scaler.fit(reference)
     normed_reference = scaler.transform(reference)
     normed = scaler.transform(clean)
+
     km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     km.fit(normed_reference)
-    return pd.Series(km.predict(normed), index=clean.index, name="regime")
+    labels = km.predict(normed)
+
+    # Sort clusters by the mean of their centers to ensure consistent labels across folds.
+    # (e.g., Cluster 0 is always the one with the lowest feature average).
+    centers = km.cluster_centers_
+    sort_idx = np.argsort(centers.mean(axis=1))
+    lookup = np.zeros(n_clusters, dtype=int)
+    for i, original_idx in enumerate(sort_idx):
+        lookup[original_idx] = i
+
+    sorted_labels = lookup[labels]
+    return pd.Series(sorted_labels, index=clean.index, name="regime", dtype=int)
 
 
 # ───────────────────────────────────────────────────────────────────────────

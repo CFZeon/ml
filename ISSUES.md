@@ -1,17 +1,13 @@
-Regime Detection Uses the Full Dataset (Global Fit, Not Rolling)  
+[RESOLVED] Regime Detection Uses the Full Dataset (Global Fit, Not Rolling)  
 
-core/models.py — detect_regime()  
+Fixed:
+- KMeans consistency is now enforced in `core/models.py` by sorting clusters by their centers' means.
+- `ResearchPipeline` now uses fold-local fitting for KMeans to prevent look-ahead.
+- `RegimeStep` (Step 4) now provides a safe, rule-based "explicit" preview for EDA without leakage.
 
-def detect_regime(features, n_regimes=2):  
-    clean = features.dropna()  
-    normed = (clean - clean.mean()) / clean.std().replace(0, 1)  
-    km = KMeans(n_clusters=n_regimes, random_state=42, n_init=10)  
-    return pd.Series(km.fit_predict(normed), index=clean.index, name="regime")  
+---
 
-clean.mean() and clean.std() are computed over the entire feature history, and km.fit_predict is called on the entire dataset at once. When this regime label is later appended as a feature and fed into  
-walk-forward training, each training fold's regime labels incorporate statistics from the future test window. This is textbook look-ahead bias.
-
- Feature Selection (select_features) Runs on the Full Aligned Dataset Before Walk-Forward Splits 
+Feature Selection (select_features) Runs on the Full Aligned Dataset Before Walk-Forward Splits 
 
  core/pipeline.py — select_features() step commentary from example.py (Step 6b): 
 
