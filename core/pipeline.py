@@ -587,7 +587,7 @@ def _resolve_signal_threshold_grid(signal_config):
     }
 
 
-def _build_signal_state(prediction_series, probability_frame, meta_prob_series, signal_config, avg_win, avg_loss, holding_bars, trade_outcomes=None):
+def _build_signal_state(prediction_series, probability_frame, meta_prob_series, signal_config, avg_win, avg_loss, holding_bars, trade_outcomes=None, equity_curve=None, data_close=None):
     direction = prediction_series.apply(lambda value: 1.0 if value > 0 else (-1.0 if value < 0 else 0.0))
     direction_edge = probability_frame[1] - probability_frame[-1]
     confidence = direction_edge.abs().clip(0.0, 1.0)
@@ -598,36 +598,66 @@ def _build_signal_state(prediction_series, probability_frame, meta_prob_series, 
     # Calculate rolling OOS trade outcomes for Kelly inputs
     rolling_win = pd.Series(float(avg_win), index=profitability_prob.index)
     rolling_loss = pd.Series(float(avg_loss), index=profitability_prob.index)
+    n_trades_series = pd.Series(0, index=profitability_prob.index)
+    
     if trade_outcomes is not None and not trade_outcomes.empty and "net_trade_return" in trade_outcomes.columns:
         realized = trade_outcomes.loc[trade_outcomes["trade_taken"].eq(1), "net_trade_return"]
         if not realized.empty:
             wins = realized[realized > 0]
             losses = realized[realized < 0].abs()
+            n_trades_series.update(trade_outcomes["trade_taken"].expanding().sum())
             if not wins.empty:
                 rolling_win.update(wins.expanding().mean().reindex(profitability_prob.index).ffill())
             if not losses.empty:
                 rolling_loss.update(losses.expanding().mean().reindex(profitability_prob.index).ffill())
-                
+
+    # Volatility Baseline (200-bar rolling mean)
+    baseline_vol = None
+    current_vols = None
+    if data_close is not None:
+        returns = data_close.pct_change().fillna(0.0)
+        current_vols = returns.abs()  # Simple absolute return as vol proxy
+        baseline_vol = current_vols.rolling(200).mean().reindex(profitability_prob.index).ffill()
+
+    # Strategy Drawdown from Equity Curve
+    drawdown_series = pd.Series(0.0, index=profitability_prob.index)
+    if equity_curve is not None:
+        peak = equity_curve.cummax()
+        drawdown_series = (peak - equity_curve) / peak.replace(0.0, np.nan)
+        drawdown_series = drawdown_series.fillna(0.0)
+
     for timestamp, probability in profitability_prob.items():
         current_win = float(rolling_win.loc[timestamp])
         current_loss = float(rolling_loss.loc[timestamp])
-        size, edge = _position_size_from_profitability(probability, current_win, current_loss, signal_config)
+        
+        # Institutional Kelly Fraction with Shrinkage & Caps
+        size = kelly_fraction(
+            prob_win=probability,
+            avg_win=current_win,
+            avg_loss=current_loss,
+            fraction=float(signal_config.get("fraction", 0.5)),
+            n_trades=int(n_trades_series.loc[timestamp]),
+            confidence_k=float(signal_config.get("confidence_k", 0.1)),
+            max_equity_cap=signal_config.get("max_equity_cap"),
+            max_var_cap=signal_config.get("max_var_cap"),
+            current_vol=float(current_vols.loc[timestamp]) if current_vols is not None else None,
+            baseline_vol=float(baseline_vol.loc[timestamp]) if baseline_vol is not None else None,
+            drawdown_pct=float(drawdown_series.loc[timestamp]),
+            kill_switch_threshold=float(signal_config.get("kill_switch_threshold", 0.3)),
+        )
+        
         position_size.loc[timestamp] = size
-        expected_trade_edge.loc[timestamp] = edge
+        expected_trade_edge.loc[timestamp] = probability * current_win - (1.0 - probability) * current_loss
 
     break_even_prob = rolling_loss / (rolling_win + rolling_loss).clip(lower=1e-12)
     profitability_threshold = signal_config.get("profitability_threshold")
     if profitability_threshold is None:
-        if signal_config.get("sizing_mode", "expected_utility") == "kelly":
-            profitability_threshold = signal_config.get("meta_threshold", 0.55)
-        else:
-            profitability_threshold = break_even_prob
+        profitability_threshold = break_even_prob
 
     event_signals = direction * position_size
     event_signals = event_signals.where(direction.ne(0.0), 0.0)
     event_signals = event_signals.where(confidence >= signal_config.get("edge_threshold", 0.05), 0.0)
     event_signals = event_signals.where(profitability_prob >= profitability_threshold, 0.0)
-    event_signals = event_signals.where(expected_trade_edge >= signal_config.get("expected_edge_threshold", 0.0), 0.0)
     event_signals = event_signals.where(event_signals.abs() >= signal_config.get("threshold", 0.03), 0.0)
 
     continuous = _apply_holding_period(event_signals, holding_bars)
@@ -640,24 +670,15 @@ def _build_signal_state(prediction_series, probability_frame, meta_prob_series, 
         "direction_edge": direction_edge,
         "confidence": confidence,
         "expected_trade_edge": expected_trade_edge,
-        "expected_trade_utility": expected_trade_edge,
         "break_even_profit_prob": float(break_even_prob.mean()) if isinstance(break_even_prob, pd.Series) else float(break_even_prob),
         "profitability_threshold": float(profitability_threshold) if not isinstance(profitability_threshold, pd.Series) else float(profitability_threshold.mean()),
         "position_size": position_size,
-        "kelly_size": position_size,
         "event_signals": event_signals,
         "holding_bars": holding_bars,
         "continuous_signals": continuous,
         "signals": signals,
         "avg_win_used": float(rolling_win.mean()),
         "avg_loss_used": float(rolling_loss.mean()),
-        "tuned_params": {
-            "threshold": float(signal_config.get("threshold", 0.03)),
-            "edge_threshold": float(signal_config.get("edge_threshold", 0.05)),
-            "meta_threshold": float(signal_config.get("meta_threshold", 0.55)),
-            "profitability_threshold": float(profitability_threshold) if not isinstance(profitability_threshold, pd.Series) else float(profitability_threshold.mean()),
-            "fraction": float(signal_config.get("fraction", 0.5)),
-        },
     }
 
 

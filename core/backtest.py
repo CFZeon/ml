@@ -20,24 +20,78 @@ _SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 # Kelly criterion and Statistical Robustness
 # ───────────────────────────────────────────────────────────────────────────
 
-def kelly_fraction(prob_win, avg_win, avg_loss, fraction=0.5):
-    """Fractional Kelly position size.
+def kelly_fraction(prob_win, avg_win, avg_loss, fraction=0.5,
+                   n_trades=0, prior_prob=0.5, prior_ratio=1.0,
+                   confidence_k=0.1, max_equity_cap=None,
+                   max_var_cap=None, current_vol=None, baseline_vol=None,
+                   drawdown_pct=0.0, kill_switch_threshold=0.3):
+    """Institutional Kelly sizing with Bayesian shrinkage and risk controls.
 
     Parameters
     ----------
-    prob_win : float   – estimated probability of a winning trade
-    avg_win  : float   – average win magnitude  (positive)
-    avg_loss : float   – average loss magnitude  (positive)
-    fraction : float   – Kelly fraction (0.5 = half-Kelly)
+    prob_win : float   – OOS estimated probability of a winning trade
+    avg_win  : float   – OOS average win magnitude (positive)
+    avg_loss : float   – OOS average loss magnitude (positive)
+    fraction : float   – Kelly fraction (e.g. 0.5 = half-Kelly)
+    n_trades : int     – number of OOS trades collected so far
+    prior_prob : float – neutral prior win rate (default 0.5)
+    prior_ratio : float – neutral prior win/loss ratio (default 1.0)
+    confidence_k : float – convergence speed (higher = trust OOS data faster)
+    max_equity_cap : float or None – hard cap on % of total equity per trade
+    max_var_cap : float or None – 95% 1-bar VaR cap as % of equity
+    current_vol : float or None – current bar volatility (decimal)
+    baseline_vol : float or None – 200-bar rolling volatility baseline
+    drawdown_pct : float – current strategy drawdown from peak (decimal)
+    kill_switch_threshold : float – max drawdown before sizing hits zero
 
     Returns float in [0, 1].
     """
-    if avg_loss <= 0 or avg_win <= 0:
+    if avg_loss <= 0:
         return 0.0
-    b = avg_win / avg_loss
-    q = 1 - prob_win
-    k = (prob_win * b - q) / b
-    return max(0.0, min(k, 1.0)) * fraction
+
+    # 1. Bayesian Shrinkage (Neutral Prior)
+    # Confidence C = 1 - exp(-k * N)
+    confidence = 1.0 - np.exp(-max(0, confidence_k) * max(0, n_trades))
+    
+    # Blended stats
+    b_oos = avg_win / avg_loss
+    b_blended = confidence * b_oos + (1.0 - confidence) * prior_ratio
+    p_blended = confidence * prob_win + (1.0 - confidence) * prior_prob
+
+    # 2. Raw Kelly
+    q_blended = 1.0 - p_blended
+    if b_blended <= 0:
+        return 0.0
+    
+    k_raw = (p_blended * b_blended - q_blended) / b_blended
+    k_fractional = max(0.0, k_raw) * fraction
+
+    # 3. Volatility Adjustment
+    if current_vol is not None and baseline_vol is not None and baseline_vol > 0:
+        vol_ratio = current_vol / baseline_vol
+        if vol_ratio > 1.0:
+            k_fractional /= vol_ratio  # Linear scaling
+
+    # 4. Drawdown De-leveraging (Linear)
+    if drawdown_pct >= kill_switch_threshold:
+        return 0.0
+    
+    dd_scale = (kill_switch_threshold - drawdown_pct) / kill_switch_threshold
+    k_fractional *= max(0.0, dd_scale)
+
+    # 5. Risk Capping
+    final_size = k_fractional
+    if max_equity_cap is not None:
+        final_size = min(final_size, float(max_equity_cap))
+
+    if max_var_cap is not None and current_vol is not None:
+        # 95% VaR ~ 1.645 * Volatility
+        # Size * (1.645 * current_vol) <= max_var_cap
+        # Size <= max_var_cap / (1.645 * current_vol)
+        var_limit = float(max_var_cap) / (1.645 * max(current_vol, 1e-6))
+        final_size = min(final_size, var_limit)
+
+    return float(np.clip(final_size, 0.0, 1.0))
 
 
 def probabilistic_sharpe_ratio(observed_sr, skewness, kurtosis, n_observations,
