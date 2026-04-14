@@ -61,24 +61,14 @@ def main():
     print(f"  feature count: {features.shape[1]}")
 
     stationarity = pipeline.check_stationarity()
-    raw_stat = stationarity["close"]
-    fd_stat = stationarity["close_fracdiff"]
-    screening = stationarity["feature_screening"]["summary"]
-    print(f"  close stationary?  {raw_stat['stationary']}  (p={raw_stat['p_value']})")
-    print(f"  frac-diff close?   {fd_stat['stationary']}  (p={fd_stat['p_value']})")
-    print(
-        f"  screened features: {screening['screened_feature_count']}/{screening['total_features']}  "
-        f"transformed={screening['transformed_features']}  dropped={screening['dropped_features']}"
-    )
-    if screening["transform_usage"]:
-        print(f"  transforms used : {screening['transform_usage']}")
+    print(f"  stationarity preview: {stationarity.get('mode', 'disabled')}")
+    print(f"  note: {stationarity.get('note', 'N/A')}")
 
     # ── 4. Regime detection ───────────────────────────────────────────────
     print(f"\n{SEP}\nStep 4 · Regime detection\n{SEP}")
     regime_result = pipeline.detect_regimes()
-    regimes = regime_result["regimes"]
-    features = pipeline.state["features"]
-    print(f"  regime counts:\n{regimes.value_counts().to_string()}")
+    print(f"  regime preview: {regime_result.get('mode', 'disabled')}")
+    print(f"  note: {pipeline.state.get('regime_detection', {}).get('note', 'N/A')}")
 
     # ── 5. Triple-barrier labels ──────────────────────────────────────────
     print(f"\n{SEP}\nStep 5 · Triple-barrier labeling\n{SEP}")
@@ -99,12 +89,8 @@ def main():
     print(f"\n{SEP}\nStep 6b · Feature selection (mutual information)\n{SEP}")
     selection = pipeline.select_features()
     sel_report = selection.report
-    X = pipeline.state["X"]
-    print("  global preselection disabled; supervised MI filtering runs inside each walk-forward fold")
-    print(
-        f"  configured cap: {sel_report['max_features'] or 'auto'}  "
-        f"min_mi={sel_report['min_mi_threshold']}"
-    )
+    print(f"  selection mode: {sel_report.get('mode', 'N/A')}")
+    print(f"  note: {sel_report.get('note', 'N/A')}")
 
     # ── 7. Sample weights ─────────────────────────────────────────────────
     print(f"\n{SEP}\nStep 7 · Sample weights by uniqueness\n{SEP}")
@@ -112,59 +98,32 @@ def main():
     print(f"  range=[{weights.min():.3f}, {weights.max():.3f}]  mean={weights.mean():.3f}")
 
     # ── 8. Walk-forward training ──────────────────────────────────────────
-    print(f"\n{SEP}\nStep 8 · Walk-forward training (3 folds)\n{SEP}")
+    print(f"\n{SEP}\nStep 8 · Walk-forward training (purging + embargo + rolling Kelly)\n{SEP}")
     training = pipeline.train_models()
     for metric in training["fold_metrics"]:
         print(f"  fold {metric['fold']}: acc={metric['accuracy']}  f1={metric['f1_macro']}")
     print(f"  avg  acc={training['avg_accuracy']:.4f}  f1={training['avg_f1_macro']:.4f}")
     directional_accuracy = [metric.get("directional_accuracy") for metric in training["fold_metrics"] if metric.get("directional_accuracy") is not None]
-    directional_f1 = [metric.get("directional_f1_macro") for metric in training["fold_metrics"] if metric.get("directional_f1_macro") is not None]
     if directional_accuracy:
         print(f"  avg dir acc={sum(directional_accuracy) / len(directional_accuracy):.4f}")
-    if directional_f1:
-        print(f"  avg dir f1 ={sum(directional_f1) / len(directional_f1):.4f}")
-    print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
+    print(f"  OOS avg win : {training.get('oos_avg_win', 0):.4%}")
+    print(f"  OOS avg loss: {training.get('oos_avg_loss', 0):.4%}")
 
-    block_diag = training["feature_block_diagnostics"]
-    if block_diag["summary"]:
-        print("  top feature blocks:")
-        for block in block_diag["summary"][:5]:
-            print(
-                f"    {block['block']}: f1_drop={block['avg_f1_drop']:.4f}  "
-                f"acc_drop={block['avg_accuracy_drop']:.4f}  "
-                f"native={block['avg_native_importance']:.4f}"
-            )
-
-    # ── 9. Signals + profitability sizing ────────────────────────────────
-    print(f"\n{SEP}\nStep 9 · Generating signals with profitability-aware sizing\n{SEP}")
+    # ── 9. Signals ────────────────────────────────────────────────────────
+    print(f"\n{SEP}\nStep 9 · Generating signals (with rolling Kelly sizing)\n{SEP}")
     signal_result = pipeline.generate_signals()
     sig_cat = signal_result["signals"]
     print(f"  long={int((sig_cat == 1).sum())}  short={int((sig_cat == -1).sum())}  "
           f"flat={int((sig_cat == 0).sum())}")
+    print(f"  avg win used: {signal_result.get('avg_win_used', 0):.4%}")
+    print(f"  avg loss used: {signal_result.get('avg_loss_used', 0):.4%}")
 
     # ── 10. Backtest ──────────────────────────────────────────────────────
     print(f"\n{SEP}\nStep 10 · Backtest\n{SEP}")
     bt = pipeline.run_backtest()
-    print(f"  start equity : ${bt['starting_equity']:,.2f}")
-    print(f"  end equity   : ${bt['ending_equity']:,.2f}")
-    print(f"  net profit   : ${bt['net_profit']:,.2f} ({bt['net_profit_pct']:.2%})")
-    print(f"  gross profit : ${bt['gross_profit']:,.2f}")
-    print(f"  gross loss   : ${bt['gross_loss']:,.2f}")
-    print(f"  fees paid    : ${bt['fees_paid']:,.2f}")
+    print(f"  net profit   : {bt['net_profit_pct']:.2%}")
     print(f"  sharpe ratio : {bt['sharpe_ratio']}")
-    print(f"  sortino      : {bt['sortino_ratio']}")
-    print(f"  calmar       : {bt['calmar_ratio']}")
-    print(f"  CAGR         : {bt['cagr']:.2%}")
-    print(f"  volatility   : {bt['annualized_volatility']:.2%}")
-    print(f"  max drawdown : {bt['max_drawdown']:.2%} (${bt['max_drawdown_amount']:,.2f})")
-    print(f"  dd duration  : {bt['max_drawdown_duration_bars']} bars ({bt['max_drawdown_duration']})")
-    print(f"  exposure     : {bt['exposure_rate']:.2%}")
-    print(f"  signal delay : {bt['signal_delay_bars']} bars")
-    print(f"  profit factor: {bt['profit_factor']}")
-    print(f"  expectancy   : ${bt['expectancy']:,.2f} per active bar")
-    print(f"  avg win      : ${bt['avg_win']:,.2f}")
-    print(f"  avg loss     : ${bt['avg_loss']:,.2f}")
-    print(f"  trades       : {bt['total_trades']}")
+    print(f"  max drawdown : {bt['max_drawdown']:.2%}")
     print(f"  win rate     : {bt['win_rate']:.2%} (active bars)")
     print(f"  closed trades: {bt['closed_trades']}")
     print(f"  trade win rt : {bt['trade_win_rate']:.2%}")

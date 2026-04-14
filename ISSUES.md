@@ -56,3 +56,13 @@ def kelly_fraction(prob_win, avg_win, avg_loss, fraction=0.5):
 avg_win and avg_loss are injected from config (both 0.02), making b=1. The Kelly fraction therefore depends only on prob_win. This is mathematically consistent if the config values actually reflect the  
 strategy's true win/loss sizes, but since they're hardcoded rather than estimated from OOS fold metrics, the sizing is not grounded in the actual strategy's return profile. With b=1, Kelly degenerates to  
 2*prob_win - 1, which only makes sense if the average win and loss are exactly equal. Any deviation in reality means the position sizing is wrong.
+
+Summary of Critical Issues
+Look-ahead bias in regime detection — Statistics computed on full dataset before walk-forward splits
+Look-ahead bias in stationarity screening — Transform selection uses future data
+Triple-barrier exit price mismatch — Barrier levels ≠ executable prices
+Hardcoded Kelly parameters — Not derived from OOS evidence
+No embargo after purging — Overlapping returns possible
+Non-reproducible bootstrap — No random seed
+AutoML not time-series aware — Standard TPE sampler
+Simplified slippage model — Flat rate regardless of conditions

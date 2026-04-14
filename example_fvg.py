@@ -88,23 +88,13 @@ def main():
     print(f"  feature count: {features.shape[1]}")
 
     stationarity = pipeline.check_stationarity()
-    raw_stat = stationarity["close"]
-    fd_stat = stationarity["close_fracdiff"]
-    screening = stationarity["feature_screening"]["summary"]
-    print(f"  close stationary?  {raw_stat['stationary']}  (p={raw_stat['p_value']})")
-    print(f"  frac-diff close?   {fd_stat['stationary']}  (p={fd_stat['p_value']})")
-    print(
-        f"  screened features: {screening['screened_feature_count']}/{screening['total_features']}  "
-        f"transformed={screening['transformed_features']}  dropped={screening['dropped_features']}"
-    )
-    if screening["transform_usage"]:
-        print(f"  transforms used : {screening['transform_usage']}")
+    print(f"  stationarity : {stationarity['mode']}")
+    print(f"  note         : {stationarity['note']}")
 
     print(f"\n{sep}\nStep 4 · Regime detection\n{sep}")
     regime_result = pipeline.detect_regimes()
-    regimes = regime_result["regimes"]
-    features = pipeline.state["features"]
-    print(f"  regime counts:\n{regimes.value_counts().to_string()}")
+    print(f"  regimes      : {regime_result['mode']}")
+    print(f"  note         : {pipeline.state['regime_detection']['note']}")
 
     print(f"\n{sep}\nStep 5 · Triple-barrier labeling\n{sep}")
     labels = pipeline.build_labels()
@@ -137,6 +127,8 @@ def main():
         print(f"  fold {metric['fold']}: acc={metric['accuracy']}  f1={metric['f1_macro']}")
     print(f"  avg acc={training['avg_accuracy']:.4f}  f1={training['avg_f1_macro']:.4f}")
     print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
+    print(f"  stationarity : {training['stationarity']['mode']}")
+    print(f"  regime mode  : {training['regime']['mode']}")
 
     block_diag = training["feature_block_diagnostics"]
     if block_diag["summary"]:

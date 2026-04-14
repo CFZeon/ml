@@ -71,6 +71,7 @@ from .models import (
     build_trade_outcome_frame,
     build_model,
     walk_forward_split,
+    combinatorial_purged_split,
     train_model,
     train_meta_model,
     evaluate_model,

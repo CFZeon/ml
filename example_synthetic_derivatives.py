@@ -187,12 +187,12 @@ def main():
     print(f"\n{sep}\nStep 2 - Indicators, features, and explicit regimes\n{sep}")
     pipeline.run_indicators()
     features = pipeline.build_features()
-    regimes = pipeline.detect_regimes()["regimes"]
+    regime_result = pipeline.detect_regimes()
     print(f"  feature count: {features.shape[1]}")
     print(f"  has fut block: {'fut_funding_rate' in features.columns}")
     print(f"  has ctx block: {'ctx_ethusdt_ret_1' in features.columns}")
     print(f"  has mtf block: {'mtf_4h_trend' in features.columns}")
-    print(f"  regime cols  : {list(regimes.columns)}")
+    print(f"  regimes       : {regime_result['mode']} (fold-local detection active)")
 
     print(f"\n{sep}\nStep 3 - Labels, alignment, and sample weights\n{sep}")
     labels = pipeline.build_labels()
@@ -211,6 +211,8 @@ def main():
     print(f"  avg accuracy : {training['avg_accuracy']:.4f}")
     print(f"  avg f1       : {training['avg_f1_macro']:.4f}")
     print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
+    print(f"  stationarity : {training['stationarity']['mode']}")
+    print(f"  regime mode  : {training['regime']['mode']}")
     print(
         f"  long={int((signal_classes == 1).sum())}  "
         f"short={int((signal_classes == -1).sum())}  flat={int((signal_classes == 0).sum())}"

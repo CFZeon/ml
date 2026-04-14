@@ -1,6 +1,7 @@
 """Training, meta-labeling, walk-forward CV, regime detection, model store."""
 
 import pickle
+import itertools
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,7 @@ from sklearn.preprocessing import StandardScaler
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Walk-forward splits
+# Cross-Validation splits
 # ───────────────────────────────────────────────────────────────────────────
 
 def walk_forward_split(X, n_splits=3, train_size=None, test_size=None,
@@ -46,6 +47,53 @@ def walk_forward_split(X, n_splits=3, train_size=None, test_size=None,
 
         yield (np.arange(train_start, train_end),
                np.arange(test_start, min(test_end, n)))
+
+
+def combinatorial_purged_split(X, n_splits=6, n_test_splits=2, gap=0):
+    """Yield (train_idx, test_idx) arrays using Combinatorial Purged Cross-Validation.
+    
+    Parameters
+    ----------
+    X : array-like        – only length is used
+    n_splits : int        – number of groups to divide the data into (N)
+    n_test_splits : int   – number of groups to use for testing in each split (k)
+    gap : int             – embargo/purge rows between train and test groups
+    """
+    n = len(X)
+    group_size = max(1, n // n_splits)
+    groups = []
+    for i in range(n_splits):
+        start = i * group_size
+        end = n if i == n_splits - 1 else (i + 1) * group_size
+        groups.append((start, end))
+
+    for test_group_indices in itertools.combinations(range(n_splits), n_test_splits):
+        test_idx = []
+        for i in test_group_indices:
+            test_idx.append(np.arange(groups[i][0], groups[i][1]))
+        test_idx = np.concatenate(test_idx)
+
+        train_idx = []
+        for i in range(n_splits):
+            if i in test_group_indices:
+                continue
+
+            valid_start, valid_end = groups[i]
+            for t_i in test_group_indices:
+                t_start, t_end = groups[t_i]
+                if i < t_i:
+                    valid_end = min(valid_end, max(valid_start, t_start - gap))
+                elif i > t_i:
+                    valid_start = max(valid_start, min(valid_end, t_end + gap))
+
+            if valid_start < valid_end:
+                train_idx.append(np.arange(valid_start, valid_end))
+
+        if not train_idx:
+            continue
+
+        train_idx = np.concatenate(train_idx)
+        yield train_idx, test_idx
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -315,7 +363,7 @@ def build_trade_outcome_frame(primary_preds, labels):
 def build_execution_outcome_frame(primary_preds, valuation_prices, execution_prices=None,
                                   holding_bars=1, signal_delay_bars=1,
                                   fee_rate=0.0, slippage_rate=0.0,
-                                  funding_rates=None, cutoff_timestamp=None):
+                                  funding_rates=None, cutoff_timestamp=None, labels=None):
     """Build execution-aligned trade outcomes for a directional prediction series.
 
     Outcomes are computed using the same delayed, bar-by-bar return semantics as
@@ -369,18 +417,51 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
 
         active_start = int(base_loc + signal_delay_bars)
         active_end = int(active_start + holding_bars - 1)
-        if active_start >= len(valuation_series) or active_end >= len(valuation_series):
+        if active_start >= len(valuation_series):
             rows.append(row)
             continue
 
         entry_time = valuation_series.index[active_start]
-        exit_time = valuation_series.index[active_end]
+        entry_price = execution_series.iloc[active_start]
+
+        if labels is not None and timestamp in labels.index:
+            label_row = labels.loc[timestamp]
+            if pd.notna(label_row.get("t1")) and pd.notna(label_row.get("exit_price")):
+                exit_time = label_row["t1"]
+                exit_price = label_row["exit_price"]
+                exit_locs = valuation_series.index.get_indexer([exit_time])
+                if exit_locs[0] >= 0:
+                    active_end = exit_locs[0]
+                    price_returns = direction * execution_returns.iloc[active_start: active_end + 1].to_numpy(dtype=float)
+                    if len(price_returns) > 0:
+                        prev_close = valuation_series.iloc[active_end - 1] if active_end > active_start else entry_price
+                        price_returns[-1] = direction * (exit_price / prev_close - 1.0)
+                    gross_trade_return = float(np.prod(1.0 + price_returns) - 1.0)
+                else:
+                    active_end = min(active_end, len(valuation_series) - 1)
+                    exit_time = valuation_series.index[active_end]
+                    exit_price = execution_series.iloc[active_end]
+                    price_returns = direction * execution_returns.iloc[active_start: active_end + 1].to_numpy(dtype=float)
+                    gross_trade_return = float(np.prod(1.0 + price_returns) - 1.0)
+            else:
+                active_end = min(active_end, len(valuation_series) - 1)
+                exit_time = valuation_series.index[active_end]
+                exit_price = execution_series.iloc[active_end]
+                price_returns = direction * execution_returns.iloc[active_start: active_end + 1].to_numpy(dtype=float)
+                gross_trade_return = float(np.prod(1.0 + price_returns) - 1.0)
+        else:
+            active_end = min(active_end, len(valuation_series) - 1)
+            if active_end < 0:
+                rows.append(row)
+                continue
+            exit_time = valuation_series.index[active_end]
+            exit_price = execution_series.iloc[active_end]
+            price_returns = direction * execution_returns.iloc[active_start: active_end + 1].to_numpy(dtype=float)
+            gross_trade_return = float(np.prod(1.0 + price_returns) - 1.0)
+
         if cutoff is not None and exit_time > cutoff:
             rows.append(row)
             continue
-
-        price_returns = direction * execution_returns.iloc[active_start: active_end + 1].to_numpy(dtype=float)
-        gross_trade_return = float(np.prod(1.0 + price_returns) - 1.0)
 
         funding_trade_return = 0.0
         if funding_series is not None:
@@ -388,8 +469,6 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
             funding_trade_return = float(np.prod(1.0 + price_returns + funding_bar_returns) - 1.0) - gross_trade_return
 
         net_trade_return = gross_trade_return + funding_trade_return - round_trip_cost
-        entry_price = execution_series.iloc[active_start]
-        exit_price = execution_series.iloc[active_end]
         if not np.isfinite(entry_price):
             entry_price = np.nan
         if not np.isfinite(exit_price):

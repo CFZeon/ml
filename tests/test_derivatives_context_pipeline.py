@@ -170,8 +170,7 @@ class DerivativesContextPipelineTest(unittest.TestCase):
 
         regime_result = pipeline.detect_regimes()
         regimes = regime_result["regimes"]
-        self.assertIsInstance(regimes, pd.DataFrame)
-        self.assertTrue({"trend_regime", "volatility_regime", "liquidity_regime", "regime"}.issubset(regimes.columns))
+        self.assertIsNone(regimes)
 
         labels = pipeline.build_labels()
         self.assertIn("trend_t_value", labels.columns)

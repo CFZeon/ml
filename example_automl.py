@@ -57,7 +57,7 @@ def main():
             },
             "automl": {
                 "enabled": True,
-                "n_trials": 8,
+                "n_trials": 20,
                 "objective": "accuracy_first",
                 "seed": 42,
                 "study_name": "BTCUSDT_1h_accuracy_first_oos_demo",

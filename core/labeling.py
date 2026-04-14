@@ -330,7 +330,7 @@ def sample_weights_by_uniqueness(labels, close):
     return pd.Series(weights, index=labels.index, name="sample_weight")
 
 
-def sequential_bootstrap(labels, close, n_samples=None):
+def sequential_bootstrap(labels, close, n_samples=None, random_state=None):
     """Draw sample indices that maximise average uniqueness.
 
     Returns np.ndarray of drawn label indices (integers into *labels*).
@@ -340,6 +340,7 @@ def sequential_bootstrap(labels, close, n_samples=None):
     if n_samples is None:
         n_samples = n_labels
 
+    rng = np.random.RandomState(random_state) if random_state is not None else np.random
     drawn = []
     for _ in range(n_samples):
         uniq = np.zeros(n_labels)
@@ -350,6 +351,6 @@ def sequential_bootstrap(labels, close, n_samples=None):
             mask = sub[:, -1] == 1
             uniq[j] = (1.0 / c[mask]).mean() if mask.any() else 0.0
         probs = uniq / uniq.sum() if uniq.sum() > 0 else np.ones(n_labels) / n_labels
-        drawn.append(np.random.choice(n_labels, p=probs))
+        drawn.append(rng.choice(n_labels, p=probs))
 
     return np.array(drawn)

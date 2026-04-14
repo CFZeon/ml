@@ -12,6 +12,8 @@ def print_training_summary(training):
     print(f"  avg accuracy : {training['avg_accuracy']:.4f}")
     print(f"  avg f1       : {training['avg_f1_macro']:.4f}")
     print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
+    print(f"  stationarity : {training['stationarity']['mode']}")
+    print(f"  regime mode  : {training['regime']['mode']}")
     print(f"  tuned signals: {training['last_signal_params']}")
 
 
@@ -99,21 +101,17 @@ def main():
     indicator_run = pipeline.run_indicators()
     features = pipeline.build_features()
     stationarity = pipeline.check_stationarity()
-    screening = stationarity["feature_screening"]["summary"]
     print(f"  indicators    : {[result.kind for result in indicator_run.results]}")
     print(f"  feature count : {features.shape[1]}")
-    print(
-        f"  screening     : {screening['screened_feature_count']}/{screening['total_features']}  "
-        f"transformed={screening['transformed_features']}  dropped={screening['dropped_features']}"
-    )
+    print(f"  stationarity  : {stationarity['mode']} (fold-local screening enabled)")
 
     print(f"\n{sep}\nStep 3 - Regimes, labels, and alignment\n{sep}")
-    regimes = pipeline.detect_regimes()["regimes"]
+    regime_result = pipeline.detect_regimes()
     labels = pipeline.build_labels()
     aligned = pipeline.align_data()
     pipeline.select_features()
     weights = pipeline.compute_sample_weights()
-    print(f"  regime counts : {regimes.value_counts().to_dict()}")
+    print(f"  regimes       : {regime_result['mode']} (fold-local detection enabled)")
     print(f"  labels        : {labels['label'].value_counts().to_dict()}")
     print(f"  samples       : {len(aligned['X'])}")
     print(f"  weight range  : [{weights.min():.3f}, {weights.max():.3f}]")

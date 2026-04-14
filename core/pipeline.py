@@ -37,6 +37,7 @@ from .models import (
     train_meta_model,
     train_model,
     walk_forward_split,
+    combinatorial_purged_split,
 )
 
 
@@ -255,12 +256,20 @@ def _drop_all_nan_feature_columns(X, feature_blocks=None):
     return filtered_X, filtered_blocks, all_nan_columns
 
 
-def _purge_overlapping_training_rows(X, y, labels, cutoff_timestamp, sample_weights=None):
+def _purge_overlapping_training_rows(X, y, labels, cutoff_timestamp, sample_weights=None, embargo_bars=0):
     if cutoff_timestamp is None or labels is None or labels.empty or "t1" not in labels.columns:
         return X, y, labels, sample_weights, 0
 
     label_ends = pd.to_datetime(labels["t1"], errors="coerce")
     keep_mask = label_ends.notna() & (label_ends < cutoff_timestamp)
+    
+    if embargo_bars > 0:
+        valid_indices = np.where(keep_mask)[0]
+        if len(valid_indices) > embargo_bars:
+            keep_mask.iloc[valid_indices[-embargo_bars:]] = False
+        else:
+            keep_mask.iloc[:] = False
+
     removed = int((~keep_mask).sum())
     if removed == 0:
         return X, y, labels, sample_weights, 0
@@ -578,19 +587,35 @@ def _resolve_signal_threshold_grid(signal_config):
     }
 
 
-def _build_signal_state(prediction_series, probability_frame, meta_prob_series, signal_config, avg_win, avg_loss, holding_bars):
+def _build_signal_state(prediction_series, probability_frame, meta_prob_series, signal_config, avg_win, avg_loss, holding_bars, trade_outcomes=None):
     direction = prediction_series.apply(lambda value: 1.0 if value > 0 else (-1.0 if value < 0 else 0.0))
     direction_edge = probability_frame[1] - probability_frame[-1]
     confidence = direction_edge.abs().clip(0.0, 1.0)
     profitability_prob = meta_prob_series.clip(0.0, 1.0)
     position_size = pd.Series(index=profitability_prob.index, dtype=float)
     expected_trade_edge = pd.Series(index=profitability_prob.index, dtype=float)
+
+    # Calculate rolling OOS trade outcomes for Kelly inputs
+    rolling_win = pd.Series(float(avg_win), index=profitability_prob.index)
+    rolling_loss = pd.Series(float(avg_loss), index=profitability_prob.index)
+    if trade_outcomes is not None and not trade_outcomes.empty and "net_trade_return" in trade_outcomes.columns:
+        realized = trade_outcomes.loc[trade_outcomes["trade_taken"].eq(1), "net_trade_return"]
+        if not realized.empty:
+            wins = realized[realized > 0]
+            losses = realized[realized < 0].abs()
+            if not wins.empty:
+                rolling_win.update(wins.expanding().mean().reindex(profitability_prob.index).ffill())
+            if not losses.empty:
+                rolling_loss.update(losses.expanding().mean().reindex(profitability_prob.index).ffill())
+                
     for timestamp, probability in profitability_prob.items():
-        size, edge = _position_size_from_profitability(probability, avg_win, avg_loss, signal_config)
+        current_win = float(rolling_win.loc[timestamp])
+        current_loss = float(rolling_loss.loc[timestamp])
+        size, edge = _position_size_from_profitability(probability, current_win, current_loss, signal_config)
         position_size.loc[timestamp] = size
         expected_trade_edge.loc[timestamp] = edge
 
-    break_even_prob = float(avg_loss) / max(float(avg_win) + float(avg_loss), 1e-12)
+    break_even_prob = rolling_loss / (rolling_win + rolling_loss).clip(lower=1e-12)
     profitability_threshold = signal_config.get("profitability_threshold")
     if profitability_threshold is None:
         if signal_config.get("sizing_mode", "expected_utility") == "kelly":
@@ -616,21 +641,21 @@ def _build_signal_state(prediction_series, probability_frame, meta_prob_series, 
         "confidence": confidence,
         "expected_trade_edge": expected_trade_edge,
         "expected_trade_utility": expected_trade_edge,
-        "break_even_profit_prob": break_even_prob,
-        "profitability_threshold": float(profitability_threshold),
+        "break_even_profit_prob": float(break_even_prob.mean()) if isinstance(break_even_prob, pd.Series) else float(break_even_prob),
+        "profitability_threshold": float(profitability_threshold) if not isinstance(profitability_threshold, pd.Series) else float(profitability_threshold.mean()),
         "position_size": position_size,
         "kelly_size": position_size,
         "event_signals": event_signals,
         "holding_bars": holding_bars,
         "continuous_signals": continuous,
         "signals": signals,
-        "avg_win_used": avg_win,
-        "avg_loss_used": avg_loss,
+        "avg_win_used": float(rolling_win.mean()),
+        "avg_loss_used": float(rolling_loss.mean()),
         "tuned_params": {
             "threshold": float(signal_config.get("threshold", 0.03)),
             "edge_threshold": float(signal_config.get("edge_threshold", 0.05)),
             "meta_threshold": float(signal_config.get("meta_threshold", 0.55)),
-            "profitability_threshold": float(profitability_threshold),
+            "profitability_threshold": float(profitability_threshold) if not isinstance(profitability_threshold, pd.Series) else float(profitability_threshold.mean()),
             "fraction": float(signal_config.get("fraction", 0.5)),
         },
     }
@@ -656,7 +681,7 @@ def _score_signal_state(backtest, signal_config):
     return score
 
 
-def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None, trade_outcome_builder=None, context_frame=None):
+def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None, trade_outcome_builder=None, context_frame=None, embargo_bars=0):
     inner_predictions = []
     inner_probabilities = []
     inner_truth = []
@@ -666,12 +691,23 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
     min_test_rows = 20
     binary_primary = model_config.get("binary_primary", True)
 
-    for inner_train_idx, inner_test_idx in walk_forward_split(
-        X_train,
-        n_splits=model_config.get("meta_n_splits", max(2, min(3, model_config.get("n_splits", 3)))),
-        gap=model_config.get("gap", 0),
-        expanding=model_config.get("expanding", False),
-    ):
+    cv_type = model_config.get("cv_type", "walk_forward")
+    if cv_type == "cpcv":
+        splits = combinatorial_purged_split(
+            X_train,
+            n_splits=model_config.get("cpcv_n_splits", 6),
+            n_test_splits=model_config.get("cpcv_n_test_splits", 2),
+            gap=model_config.get("gap", 0),
+        )
+    else:
+        splits = walk_forward_split(
+            X_train,
+            n_splits=model_config.get("meta_n_splits", max(2, min(3, model_config.get("n_splits", 3)))),
+            gap=model_config.get("gap", 0),
+            expanding=model_config.get("expanding", False),
+        )
+
+    for inner_train_idx, inner_test_idx in splits:
         if len(inner_train_idx) < min_train_rows or len(inner_test_idx) < min_test_rows:
             continue
 
@@ -688,6 +724,7 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
             inner_labels_train,
             cutoff_timestamp=inner_test_start,
             sample_weights=w_inner_train,
+            embargo_bars=embargo_bars,
         )
         if len(X_inner_train) < min_train_rows:
             continue
@@ -925,18 +962,8 @@ class FeaturesStep(PipelineStep):
                 for column in features.columns
             }
 
-        screening_result = screen_features_for_stationarity(
-            features,
-            feature_blocks=feature_blocks,
-            config=_resolve_stationarity_screening_config(pipeline),
-        )
-        screening_report = copy.deepcopy(screening_result.report)
-        screening_report["mode"] = "global_preview_only"
-        screening_report.setdefault("summary", {})["mode"] = "global_preview_only"
-
         pipeline.state["raw_features"] = features
         pipeline.state["feature_blocks_raw"] = feature_blocks
-        pipeline.state["feature_screening"] = screening_report
         pipeline.state["feature_blocks"] = feature_blocks
         pipeline.state["features"] = features
         return features
@@ -946,19 +973,11 @@ class StationarityStep(PipelineStep):
     name = "check_stationarity"
 
     def run(self, pipeline):
-        config = pipeline.section("stationarity")
-        specs = config.get("series") or _default_stationarity_specs(pipeline)
-        results = {}
-
-        for spec in specs:
-            source = pipeline.require(spec.get("source", "data"))
-            column = spec["column"]
-            series = source[column]
-            results[spec.get("name", column)] = check_stationarity(series.dropna())
-
-        if "feature_screening" in pipeline.state:
-            results["feature_screening"] = pipeline.state["feature_screening"]
-
+        results = {
+            "enabled": False,
+            "mode": "global_preview_disabled",
+            "note": "Stationarity screening runs strictly within fold-local bounds to avoid lookahead bias."
+        }
         pipeline.state["stationarity"] = results
         return results
 
@@ -970,24 +989,19 @@ class RegimeStep(PipelineStep):
         config = pipeline.section("regime")
         builder = config.get("builder") or _default_regime_features
         regime_features = builder(pipeline)
-        regimes = detect_regime(
-            regime_features,
-            n_regimes=config.get("n_regimes", 2),
-            method=config.get("method", "kmeans"),
-            config=config,
-        )
-
+        
+        # We do not globally detect regimes here to prevent lookahead bias.
+        # Instead, we just save the regime features so fold-local steps can use them.
         pipeline.state["regime_features"] = regime_features
-        pipeline.state["regimes"] = regimes
+        pipeline.state["regimes"] = None
         pipeline.state["regime_detection"] = {
-            "mode": "global_preview_only",
-            "method": config.get("method", "kmeans"),
-            "columns": list(regimes.columns) if isinstance(regimes, pd.DataFrame) else [config.get("column_name", "regime")],
+            "mode": "global_preview_disabled",
+            "note": "Regime detection runs strictly within fold-local bounds to avoid lookahead bias."
         }
         return {
             "regime_features": regime_features,
-            "regimes": regimes,
-            "mode": "global_preview_only",
+            "regimes": None,
+            "mode": "global_preview_disabled",
         }
 
 
@@ -1500,6 +1514,14 @@ class TrainModelsStep(PipelineStep):
 
             fold_signal_config = dict(signal_config)
             fold_signal_config.update(tuned_signal_params)
+            
+            oos_outcomes = _build_execution_trade_outcomes(
+                pipeline,
+                test_primary_preds,
+                holding_bars=holding_bars,
+                cutoff_timestamp=X_test_model.index[-1],
+            )
+            
             signal_state = _build_signal_state(
                 test_primary_preds,
                 test_primary_probs,
@@ -1508,6 +1530,7 @@ class TrainModelsStep(PipelineStep):
                 fold_avg_win,
                 fold_avg_loss,
                 holding_bars,
+                trade_outcomes=oos_outcomes,
             )
 
             fold_metrics.append(metrics)

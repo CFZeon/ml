@@ -231,7 +231,8 @@ def _merge_frames(frames):
 
     merged = pd.concat(valid_frames).sort_index()
     merged = merged[~merged.index.duplicated(keep="first")]
-    return merged[_OUTPUT_COLUMNS]
+    available_columns = [col for col in _OUTPUT_COLUMNS if col in merged.columns]
+    return merged[available_columns]
 
 
 def _period_window(period, request_start, request_end):
