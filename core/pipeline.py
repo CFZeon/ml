@@ -15,7 +15,7 @@ from .context import (
     fetch_context_symbol_bars,
 )
 from .data import fetch_binance_bars, fetch_binance_symbol_filters, join_custom_data
-from .features import build_feature_set, check_stationarity, screen_features_for_stationarity, select_features
+from .features import build_feature_set, select_features, StationarityGuard
 from .indicators import run_indicators
 from .labeling import (
     fixed_horizon_labels,
@@ -58,14 +58,6 @@ def _default_regime_features(pipeline):
             "trades_20": (data["trades"].rolling(20).mean() if "trades" in data.columns else np.nan),
         }
     ).dropna()
-
-
-def _default_stationarity_specs(pipeline):
-    specs = [{"name": "close", "source": "data", "column": "close"}]
-    features = pipeline.state.get("features")
-    if features is not None and "close_fracdiff" in features.columns:
-        specs.append({"name": "close_fracdiff", "source": "features", "column": "close_fracdiff"})
-    return specs
 
 
 def _positive_class_probability(model, X, positive_class=1):
@@ -944,7 +936,6 @@ class FeaturesStep(PipelineStep):
         feature_set = build_feature_set(
             data,
             lags=config.get("lags"),
-            frac_diff_d=config.get("frac_diff_d"),
             indicator_run=indicator_run,
             rolling_window=config.get("rolling_window", 20),
             squeeze_quantile=config.get("squeeze_quantile", 0.2),
@@ -1250,6 +1241,12 @@ class TrainModelsStep(PipelineStep):
         oos_signals = []
         oos_trade_outcomes = []
 
+        stationarity_guard = StationarityGuard(
+            significance=stationarity_config.get("significance", 0.05),
+            max_d=1.0,
+            step_d=0.1,
+        )
+
         for fold, (train_idx, test_idx) in enumerate(
             walk_forward_split(
                 X,
@@ -1298,11 +1295,11 @@ class TrainModelsStep(PipelineStep):
                 continue
 
             fold_window = pd.concat([X_train_raw, X_test_raw]).sort_index()
-            fold_screening = screen_features_for_stationarity(
-                fold_window,
+            fold_screening = stationarity_guard.screen_and_transform(
+                X_fit,
+                X_apply=fold_window,
                 feature_blocks=feature_blocks,
                 config=stationarity_config,
-                fit_features=X_fit,
             )
             fold_feature_blocks = dict(fold_screening.feature_blocks)
             fold_stationarity.append(
@@ -1877,7 +1874,6 @@ DEFAULT_STEPS = [
     IndicatorsStep,
     AutoMLStep,
     FeaturesStep,
-    StationarityStep,
     RegimeStep,
     LabelsStep,
     AlignDataStep,
@@ -1924,9 +1920,6 @@ class ResearchPipeline:
 
     def run_automl(self):
         return self.run_step("run_automl")
-
-    def check_stationarity(self):
-        return self.run_step("check_stationarity")
 
     def detect_regimes(self):
         return self.run_step("detect_regimes")

@@ -23,7 +23,6 @@ def main():
             "indicators": [RSI(14), MACD(), BollingerBands(20), ATR(14)],
             "features": {
                 "lags": [1, 3, 6],
-                "frac_diff_d": 0.4,
                 "rolling_window": 20,
                 "squeeze_quantile": 0.2,
                 "context_timeframes": ["4h", "1d"],
@@ -90,7 +89,6 @@ def main():
 
     print(f"\n{sep}\nStep 3 · Rebuild pipeline with best config\n{sep}")
     features = pipeline.build_features()
-    stationarity = pipeline.check_stationarity()
     pipeline.detect_regimes()
     pipeline.build_labels()
     pipeline.align_data()
@@ -100,7 +98,9 @@ def main():
     signals = pipeline.generate_signals()
     backtest = pipeline.run_backtest()
 
-    screening = stationarity["summary"]
+    # Pull stationarity report from the last fold's training state
+    stationarity = training.get("stationarity", {})
+    screening = stationarity.get("folds", [{}])[-1].get("summary", {})
     print(f"  feature count: {features.shape[1]}")
     print(
         f"  screened     : {screening['screened_feature_count']}/{screening['total_features']}  "

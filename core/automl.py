@@ -22,7 +22,6 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
             "type": "categorical",
             "choices": ["1,3,6", "1,2,4,8", "1,4,12", "1,6,12"],
         },
-        "frac_diff_d": {"type": "float", "low": 0.2, "high": 0.8, "step": 0.2},
         "rolling_window": {"type": "categorical", "choices": [14, 20, 28, 40]},
         "squeeze_quantile": {"type": "categorical", "choices": [0.1, 0.15, 0.2, 0.25]},
     },
@@ -451,12 +450,6 @@ def _sample_trial_overrides(trial, search_space):
                 feature_overrides["lags"] = [int(value) for value in lag_choice.split(",") if value]
             else:
                 feature_overrides["lags"] = list(lag_choice)
-        if "frac_diff_d" in feature_space:
-            feature_overrides["frac_diff_d"] = _sample_from_spec(
-                trial,
-                "features.frac_diff_d",
-                feature_space["frac_diff_d"],
-            )
         for key in ["rolling_window", "squeeze_quantile"]:
             if key in feature_space:
                 feature_overrides[key] = _sample_from_spec(trial, f"features.{key}", feature_space[key])
