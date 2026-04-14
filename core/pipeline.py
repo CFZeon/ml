@@ -973,10 +973,25 @@ class StationarityStep(PipelineStep):
     name = "check_stationarity"
 
     def run(self, pipeline):
+        X = pipeline.require("features")
+        feature_blocks = pipeline.state.get("feature_blocks", {})
+        config = _resolve_stationarity_screening_config(pipeline)
+
+        # We run the screening in "preview" mode by disabling the actual
+        # transformation logic. This calculates ADF stats for all features
+        # without selecting or applying any lookahead-prone transforms.
+        preview_config = {**config, "enabled": False}
+        screening = screen_features_for_stationarity(
+            X,
+            feature_blocks=feature_blocks,
+            config=preview_config,
+        )
+
         results = {
             "enabled": False,
-            "mode": "global_preview_disabled",
-            "note": "Stationarity screening runs strictly within fold-local bounds to avoid lookahead bias."
+            "mode": "global_preview",
+            "summary": screening.report.get("summary", {}),
+            "note": "Stationarity transformations are deferred to fold-local bounds to avoid lookahead bias."
         }
         pipeline.state["stationarity"] = results
         return results
@@ -1056,6 +1071,7 @@ class LabelsStep(PipelineStep):
                 max_holding=config.get("max_holding", 24),
                 min_return=config.get("min_return", 0.0),
                 cost_rate=float(cost_rate),
+                slippage_buffer=float(config.get("slippage_buffer", 0.0)),
                 barrier_tie_break=config.get("barrier_tie_break", "sl"),
                 entry_prices=entry_prices,
                 start_offset=start_offset,
@@ -1148,7 +1164,12 @@ class SampleWeightsStep(PipelineStep):
     def run(self, pipeline):
         labels_aligned = pipeline.require("labels_aligned")
         raw_data = pipeline.require("raw_data")
-        weights = sample_weights_by_uniqueness(labels_aligned, raw_data["close"])
+        config = pipeline.section("model")
+        weights = sample_weights_by_uniqueness(
+            labels_aligned,
+            raw_data["close"],
+            random_state=config.get("random_state", 42),
+        )
         pipeline.state["sample_weights"] = weights
         return weights
 

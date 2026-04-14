@@ -10,7 +10,7 @@ import pandas as pd
 
 def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.0),
                           max_holding=10, min_return=0.0, cost_rate=0.0,
-                          barrier_tie_break="sl",
+                          slippage_buffer=0.0, barrier_tie_break="sl",
                           entry_prices=None, start_offset=0):
     """Apply triple-barrier labeling.
 
@@ -28,6 +28,7 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
     max_holding : int       – bars until vertical barrier
     min_return : float      – returns below this at the time barrier → label 0 (abstain)
     cost_rate : float       – round-trip cost buffer applied to label thresholds
+    slippage_buffer : float – exit price slippage (decimal) applied when a barrier is hit
     barrier_tie_break : str – when pt/sl hit in the same bar, choose "sl" or "pt"
     entry_prices : pd.Series or None – execution prices (e.g. open[T+delay]); when
         provided barriers are anchored to the actual fill price, not close[T].
@@ -77,16 +78,16 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
             hit_sl = bool(low_price <= lower)
             if hit_pt and hit_sl:
                 if barrier_tie_break == "pt":
-                    label, barrier, exit_price = 1, "pt", upper
+                    label, barrier, exit_price = 1, "pt", upper * (1 - slippage_buffer)
                 else:
-                    label, barrier, exit_price = -1, "sl", lower
+                    label, barrier, exit_price = -1, "sl", lower * (1 + slippage_buffer)
                 t1 = timestamp
                 break
             if hit_pt:
-                label, barrier, t1, exit_price = 1, "pt", timestamp, upper
+                label, barrier, t1, exit_price = 1, "pt", timestamp, upper * (1 - slippage_buffer)
                 break
             if hit_sl:
-                label, barrier, t1, exit_price = -1, "sl", timestamp, lower
+                label, barrier, t1, exit_price = -1, "sl", timestamp, lower * (1 + slippage_buffer)
                 break
 
         if t1 is not None:
@@ -302,13 +303,14 @@ def _indicator_matrix(labels, timestamps):
     return mat
 
 
-def sample_weights_by_uniqueness(labels, close):
+def sample_weights_by_uniqueness(labels, close, random_state=None):
     """Weight each label by its average uniqueness (inverse of concurrency).
 
     Parameters
     ----------
     labels : pd.DataFrame  – output of triple_barrier_labels (index=t0, col t1)
     close  : pd.Series     – full close-price series (used as timestamp source)
+    random_state : int or None – random seed (not used by this deterministic method)
 
     Returns
     -------

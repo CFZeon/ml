@@ -484,8 +484,16 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
 def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=0.0,
                  execution_prices=None, signal_delay_bars=1, engine="vectorbt",
                  market="spot", leverage=1.0, allow_short=None, symbol_filters=None,
-                 funding_rates=None):
+                 funding_rates=None, volume=None, liquidity_param=0.0):
     """Run a backtest through the configured execution adapter.
+
+    Signals are shifted forward by *signal_delay_bars* before being applied to 
+    execution prices. A delay of 1 means a signal generated at the close of 
+    bar T is executed at the close (or open) of bar T+1.
+
+    Market impact is optionally modeled if *volume* and *liquidity_param* are
+    provided. Effective slippage increases as position size increases relative
+    to the average volume.
 
     Parameters
     ----------
@@ -493,27 +501,50 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     signals          : pd.Series  – target portfolio weights before execution delay
     equity           : float      – starting capital
     fee_rate         : float      – one-way fee
-    slippage_rate    : float      – one-way slippage estimate applied on turnover
+    slippage_rate    : float      – one-way baseline slippage estimate
     execution_prices : pd.Series or None – optional execution price series, e.g. next-bar open
     signal_delay_bars: int        – bars to delay signal application before execution
     engine           : str        – "vectorbt" (default) or "pandas"
     market           : str        – "spot", "um_futures", or "cm_futures"
-    leverage         : float      – exposure multiplier applied to target weights
-    allow_short      : bool|None  – defaults to False for spot, True for futures
-    symbol_filters   : dict|None  – Binance execution filters (tick size, lot size, min notional)
-    funding_rates    : pd.Series|None – futures funding rates aligned to close index; applied on funding timestamps only
-
-    Returns dict with metrics and equity curve.
+    leverage         : float      – target leverage multiplier
+    allow_short      : bool or None – whether short positions are permitted
+    symbol_filters   : dict or None – exchange filters (min_qty, step_size, etc.)
+    funding_rates    : pd.Series or None – funding rate series for futures
+    volume           : pd.Series or None – trade volume for market impact modeling
+    liquidity_param  : float      – sensitivity of slippage to trade size (0 = none)
     """
     close = pd.Series(close, copy=False).astype(float)
     signal_series = pd.Series(signals, index=close.index).reindex(close.index).fillna(0.0).astype(float)
     signal_delay_bars = max(0, int(signal_delay_bars))
+
+    if signal_delay_bars == 0:
+        import warnings
+        warnings.warn(
+            "signal_delay_bars=0 detected. This assumes instantaneous execution at "
+            "the signal bar's close/valuation price, which is usually a lookahead leak.",
+            UserWarning,
+            stacklevel=2
+        )
+
     allow_short = (market or "spot") != "spot" if allow_short is None else bool(allow_short)
     position = _normalize_position_targets(
         signal_series.shift(signal_delay_bars).fillna(0.0),
         leverage=leverage,
         allow_short=allow_short,
     )
+
+    # Effective slippage modeling (Market Impact)
+    effective_slippage = float(slippage_rate)
+    if liquidity_param > 0 and volume is not None:
+        avg_vol = volume.rolling(24).mean().reindex(close.index).ffill().fillna(volume.mean())
+        # Turnover is the change in target weights * equity
+        turnover_nominal = position.diff().abs().fillna(position.abs()) * float(equity)
+        # Ratio of trade size to average volume
+        impact_ratio = (turnover_nominal / (avg_vol * close).replace(0, np.nan)).fillna(0.0)
+        # Effective slippage = baseline + liquidity_param * impact_ratio
+        # We take the mean impact for simplicity in the flat-rate engine, 
+        # but institutional models apply this per-trade.
+        effective_slippage += float(liquidity_param * impact_ratio.mean())
 
     selected_engine = (engine or "vectorbt").lower()
     if selected_engine == "vectorbt":
@@ -523,7 +554,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                 position=position,
                 equity=equity,
                 fee_rate=fee_rate,
-                slippage_rate=slippage_rate,
+                slippage_rate=effective_slippage,
                 execution_prices=execution_prices,
                 signal_delay_bars=signal_delay_bars,
                 allow_short=allow_short,
@@ -538,7 +569,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         position=position,
         equity=equity,
         fee_rate=fee_rate,
-        slippage_rate=slippage_rate,
+        slippage_rate=effective_slippage,
         execution_prices=execution_prices,
         signal_delay_bars=signal_delay_bars,
         funding_rates=funding_rates,

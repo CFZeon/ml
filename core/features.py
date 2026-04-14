@@ -38,11 +38,10 @@ class FeatureScreeningResult:
 def fractional_diff(series, d, threshold=1e-5):
     """Fractionally differentiate *series* by order *d*.
 
-    Uses expanding-window weights (cut off at *threshold*) applied as a
-    dot product. Preserves long-memory information that integer differencing
-    destroys.
+    Uses fixed-window weights (cut off at *threshold*) applied as a 
+    convolution. Preserves long-memory information while achieving stationarity.
 
-    Returns a pd.Series (leading values are NaN until the weight window is
+    Returns a pd.Series (leading values are NaN until the weight window is 
     filled).
     """
     weights = [1.0]
@@ -54,20 +53,23 @@ def fractional_diff(series, d, threshold=1e-5):
         weights.append(w)
         k += 1
 
-    weights = np.array(weights[::-1])
+    weights = np.array(weights, dtype=float)
     width = len(weights)
     values = series.values.astype(float)
+    
+    # We convolve the series with the weights. Note: we don't reverse weights
+    # here because we're using the standard FIR filter definition.
+    # 'valid' mode returns only the full-window results.
     out = np.full(len(values), np.nan)
-
     if len(values) >= width:
-        for i in range(width - 1, len(values)):
-            out[i] = weights @ values[i - width + 1: i + 1]
+        # np.convolve(v, w) performs sum(v[i-k] * w[k]).
+        # For fractional differentiation weights [w0, w1, w2...], 
+        # the result is w0*x[t] + w1*x[t-1] + w2*x[t-2]...
+        res = np.convolve(values, weights, mode='valid')
+        out[width-1:] = res
 
     series_name = getattr(series, "name", None)
-    if series_name:
-        output_name = f"{series_name}_fracdiff"
-    else:
-        output_name = "fracdiff"
+    output_name = f"{series_name}_fracdiff" if series_name else "fracdiff"
     return pd.Series(out, index=series.index, name=output_name)
 
 
