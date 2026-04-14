@@ -385,64 +385,58 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
 
 
 def compute_objective_value(objective_name, training, backtest, automl_config=None):
-    """Compute the scalar objective value used by the AutoML study."""
+    """Compute institutional-grade multi-objective values for AutoML.
+    
+    Returns a tuple: (financial_score, model_integrity_score).
+    """
     automl_config = automl_config or {}
-    objective_name = _normalize_objective_name(objective_name)
-
+    
+    # 1. Financial Score (Objective 1)
+    # We use per-bar stats for PSR to maintain statistical validity with high N.
+    per_bar_sr = float(backtest.get("per_bar_sharpe", 0.0))
+    sk = float(backtest.get("skewness", 0.0))
+    kurt = float(backtest.get("kurtosis", 0.0))
+    n_obs = len(backtest.get("equity_curve", []))
+    
+    # Zero-Benchmark PSR
+    psr = probabilistic_sharpe_ratio(per_bar_sr, sk, kurt, n_obs, benchmark_sr=0.0)
+    
+    # Confidence Penalization (Soft filtering)
+    # If confidence < 95%, we apply a sharp non-linear decay.
+    financial_score = psr
+    if psr < 0.95:
+        financial_score = psr * np.exp(5.0 * (psr - 0.95))
+        
+    # Hard Constraints (Soft Pruning)
+    total_trades = int(backtest.get("total_trades", 0))
+    min_trades = int(automl_config.get("min_total_trades", 15))
+    if total_trades < min_trades:
+        # Severe penalty for under-trading
+        financial_score -= 1e6 * (1.0 - total_trades / max(1, min_trades))
+        
+    max_dd = abs(float(backtest.get("max_drawdown", 0.0)))
+    if max_dd > float(automl_config.get("max_drawdown_limit", 0.4)):
+        financial_score -= 1e6
+        
+    # 2. Model Integrity Score (Objective 2)
+    # Balanced composite of accuracy, log loss, and calibration.
     directional_accuracy = _resolve_metric(training, "avg_directional_accuracy", fallback="avg_accuracy") or 0.0
-    log_loss_value = _resolve_metric(training, "avg_log_loss")
-    brier_score_value = _resolve_metric(training, "avg_brier_score")
-    calibration_error = _resolve_metric(training, "avg_calibration_error")
-
-    if objective_name == "directional_accuracy":
-        return float(directional_accuracy)
-    if objective_name in {"neg_log_loss", "log_loss"}:
-        return float(-(log_loss_value if log_loss_value is not None else 1e6))
-    if objective_name in {"neg_brier_score", "brier_score"}:
-        return float(-(brier_score_value if brier_score_value is not None else 1e6))
-    if objective_name in {"neg_calibration_error", "calibration_error"}:
-        return float(-(calibration_error if calibration_error is not None else 1e6))
-
-    if objective_name == "net_profit_pct":
-        return float(backtest.get("net_profit_pct", 0.0))
-    if objective_name == "sharpe_ratio":
-        return float(backtest.get("sharpe_ratio", 0.0))
-
-    if objective_name == "probabilistic_sharpe_ratio":
-        sr = float(backtest.get("sharpe_ratio", 0.0))
-        sk = float(backtest.get("skewness", 0.0))
-        kurt = float(backtest.get("kurtosis", 0.0))
-        n_obs = len(backtest.get("equity_curve", []))
-        return probabilistic_sharpe_ratio(sr, sk, kurt, n_obs)
-
-    if objective_name == "deflated_sharpe_ratio":
-        sr = float(backtest.get("sharpe_ratio", 0.0))
-        sk = float(backtest.get("skewness", 0.0))
-        kurt = float(backtest.get("kurtosis", 0.0))
-        n_obs = len(backtest.get("equity_curve", []))
-        sr_var = float(automl_config.get("sr_variance", 0.0))
-        n_trials = int(automl_config.get("n_trials", 1))
-        return deflated_sharpe_ratio(sr, sr_var, n_trials, sk, kurt, n_obs)
-
-    if objective_name == "profit_factor":
-        profit_factor = backtest.get("profit_factor", 0.0)
-        if not np.isfinite(profit_factor):
-            return float(automl_config.get("profit_factor_cap", 5.0))
-        return float(profit_factor)
-    if objective_name == "calmar_ratio":
-        return float(backtest.get("calmar_ratio", 0.0))
-
-    score = automl_config.get("weight_directional_accuracy", 100.0) * directional_accuracy
-    score += automl_config.get("weight_accuracy", 5.0) * (_resolve_metric(training, "avg_accuracy") or directional_accuracy)
-
-    if log_loss_value is not None:
-        score -= automl_config.get("weight_log_loss", 1.0) * log_loss_value
-    if brier_score_value is not None:
-        score -= automl_config.get("weight_brier_score", 0.5) * brier_score_value
-    if calibration_error is not None:
-        score -= automl_config.get("weight_calibration_error", 0.5) * calibration_error
-
-    return float(score)
+    log_loss_value = _resolve_metric(training, "avg_log_loss") or 1.0
+    calibration_error = _resolve_metric(training, "avg_calibration_error") or 0.5
+    
+    # Normalize components to [0, 1] range where possible
+    # Negative Log Loss is clipped and shifted
+    integrity_log_loss = np.clip(1.0 - log_loss_value, 0.0, 1.0)
+    integrity_calibration = np.clip(1.0 - (calibration_error * 2.0), 0.0, 1.0) # 0.5 error is "zero" integrity
+    
+    # Weighted composite for integrity
+    model_integrity_score = (
+        0.50 * directional_accuracy +
+        0.30 * integrity_log_loss +
+        0.20 * integrity_calibration
+    )
+    
+    return float(financial_score), float(model_integrity_score)
 
 
 def _sample_trial_overrides(trial, search_space):
@@ -579,7 +573,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         )
 
     study = optuna.create_study(
-        direction="maximize",
+        directions=["maximize", "maximize"],
         sampler=sampler,
         study_name=study_name,
         storage=storage_url,
@@ -644,7 +638,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         trial.set_user_attr("overrides", _json_ready(_clone_value(overrides)))
         trial.set_user_attr("training", _json_ready(_summarize_training(training)))
         trial.set_user_attr("backtest", _json_ready(_summarize_backtest(backtest)))
-        return value
+        return value # Returns tuple (financial, integrity)
 
     study.optimize(
         objective,
@@ -654,11 +648,18 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         catch=(ValueError, RuntimeError),
     )
 
-    completed_trials = [trial for trial in study.trials if trial.value is not None]
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if not completed_trials:
         raise RuntimeError("AutoML finished without any completed trials")
 
-    best_overrides = study.best_trial.user_attrs.get("overrides", {})
+    # Selection Heuristic: 60% Financial / 40% Model Integrity
+    def selection_score(t):
+        f_score, i_score = t.values
+        return 0.6 * f_score + 0.4 * i_score
+
+    best_trial = max(completed_trials, key=selection_score)
+    best_overrides = best_trial.user_attrs.get("overrides", {})
+    
     locked_holdout = _evaluate_locked_holdout(
         base_config=base_config,
         best_overrides=best_overrides,
@@ -669,11 +670,12 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     )
 
     top_trials = []
-    for trial in sorted(completed_trials, key=lambda item: item.value, reverse=True)[:5]:
+    # Sort by the selection heuristic for the top 5 report
+    for trial in sorted(completed_trials, key=selection_score, reverse=True)[:5]:
         top_trials.append(
             {
                 "number": trial.number,
-                "value": trial.value,
+                "values": trial.values,
                 "params": _json_ready(trial.params),
                 "training": trial.user_attrs.get("training", {}),
                 "backtest": trial.user_attrs.get("backtest", {}),
@@ -683,13 +685,13 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     summary = {
         "study_name": study.study_name,
         "storage": str(storage_path),
-        "objective": _normalize_objective_name(automl_config.get("objective", "accuracy_first")),
+        "objective": "multi_objective_psr_integrity",
         "feature_schema_version": base_config.get("features", {}).get("schema_version"),
-        "best_value": study.best_value,
-        "best_params": _json_ready(study.best_trial.params),
+        "best_values": best_trial.values,
+        "best_params": _json_ready(best_trial.params),
         "best_overrides": best_overrides,
-        "best_backtest": study.best_trial.user_attrs.get("backtest", {}),
-        "best_training": study.best_trial.user_attrs.get("training", {}),
+        "best_backtest": best_trial.user_attrs.get("backtest", {}),
+        "best_training": best_trial.user_attrs.get("training", {}),
         "locked_holdout": locked_holdout,
         "top_trials": top_trials,
         "trial_count": len(completed_trials),

@@ -74,7 +74,7 @@ def main():
     print(f"  study name : {automl['study_name']}")
     print(f"  objective  : {automl['objective']}")
     print(f"  trials     : {automl['trial_count']}")
-    print(f"  best value : {automl['best_value']:.4f}")
+    print(f"  best values: {automl['best_values']}")
     print(f"  best params: {automl['best_params']}")
     print(f"  best train : {automl['best_training']}")
     print(f"  best bt    : {automl['best_backtest']}")

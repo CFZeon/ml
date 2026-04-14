@@ -106,16 +106,18 @@ def probabilistic_sharpe_ratio(observed_sr, skewness, kurtosis, n_observations,
         return 0.5
     
     # Calculate the standard deviation of the Sharpe Ratio
-    # Note: observed_sr should be non-annualized here for the formula, 
-    # but often used with annualized SR and adjusted n. 
-    # Here we use the standard formula for SR estimation error.
-    variance_sr = (1.0 - skewness * observed_sr + ((kurtosis - 1.0) / 4.0) * observed_sr**2) / (n_observations - 1.0)
+    # Note: For statistical validity with high N (thousands of bars), 
+    # we use the non-annualized (per-bar) Sharpe Ratio.
+    sr2 = observed_sr**2
+    variance_sr = (1.0 - skewness * observed_sr + ((kurtosis - 1.0) / 4.0) * sr2) / (n_observations - 1.0)
     sr_std = np.sqrt(max(0.0, variance_sr))
     
-    if sr_std <= 0:
+    if sr_std <= 1e-12:
         return 1.0 if observed_sr > benchmark_sr else 0.0
         
-    return float(norm.cdf((observed_sr - benchmark_sr) / sr_std))
+    z = (observed_sr - benchmark_sr) / sr_std
+    # Cap Z to avoid CDF overflow/underflow issues in extreme cases
+    return float(norm.cdf(np.clip(z, -10, 10)))
 
 
 def deflated_sharpe_ratio(observed_sr, sr_variance, n_trials, skewness, kurtosis,
@@ -341,13 +343,14 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
     periods_per_year = _infer_periods_per_year(equity_curve.index)
     annualization = np.sqrt(periods_per_year) if periods_per_year > 0 else 0.0
     volatility = strat_ret.std()
-    sharpe = (strat_ret.mean() / volatility * annualization
-              if volatility > 0 and annualization > 0 else 0.0)
+    per_bar_sr = (strat_ret.mean() / volatility
+                  if volatility > 0 else 0.0)
+    sharpe = per_bar_sr * annualization if annualization > 0 else 0.0
     
     # Statistical moments for DSR/PSR
     sk = float(skew(strat_ret)) if len(strat_ret) > 2 else 0.0
     kurt = float(kurtosis(strat_ret)) if len(strat_ret) > 2 else 0.0
-    psr = probabilistic_sharpe_ratio(sharpe, sk, kurt, len(strat_ret))
+    psr = probabilistic_sharpe_ratio(per_bar_sr, sk, kurt, len(strat_ret))
 
     downside = strat_ret.where(strat_ret < 0, 0.0)
     downside_vol = downside.std()
@@ -412,6 +415,7 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
         "total_return": _round_metric(total_ret, 4),
         "cagr": _round_metric(cagr, 4),
         "sharpe_ratio": _round_metric(sharpe, 2),
+        "per_bar_sharpe": _round_metric(per_bar_sr, 6),
         "probabilistic_sharpe_ratio": _round_metric(psr, 4),
         "skewness": _round_metric(sk, 4),
         "kurtosis": _round_metric(kurt, 4),
