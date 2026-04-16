@@ -82,7 +82,7 @@ def print_alignment_summary(aligned):
 
 def print_feature_selection_summary(selection):
     report = getattr(selection, "report", {})
-    print("  preview mode : supervised MI filtering runs inside each walk-forward fold")
+    print("  preview mode : supervised MI filtering runs inside each validation split")
     print(
         "  configured   : "
         f"max_features={report.get('max_features') or 'auto'}  "
@@ -100,9 +100,27 @@ def print_weight_summary(weights):
 
 
 def print_training_summary(training):
+    validation = training.get("validation", {})
+    if validation:
+        if validation.get("method") == "cpcv":
+            print(
+                "  validation   : "
+                f"cpcv  splits={validation.get('split_count')}  "
+                f"n_blocks={validation.get('n_blocks')}  "
+                f"test_blocks={validation.get('test_blocks')}  "
+                f"embargo={validation.get('embargo_bars')}"
+            )
+        else:
+            print(
+                "  validation   : "
+                f"walk_forward  splits={validation.get('split_count')}  "
+                f"gap={validation.get('gap')}"
+            )
+
     for metric in training.get("fold_metrics", []):
+        split_label = metric.get("split_id") or f"fold {metric.get('fold')}"
         parts = [
-            f"fold {metric.get('fold')}",
+            split_label,
             f"acc={_format_metric(metric.get('accuracy'))}",
             f"f1={_format_metric(metric.get('f1_macro'))}",
         ]
@@ -112,6 +130,8 @@ def print_training_summary(training):
             parts.append(f"dir_f1={_format_metric(metric.get('directional_f1_macro'))}")
         if metric.get("log_loss") is not None:
             parts.append(f"log_loss={_format_metric(metric.get('log_loss'))}")
+        if metric.get("test_blocks") is not None:
+            parts.append(f"test_blocks={metric.get('test_blocks')}")
         print(f"  {'  '.join(parts)}")
 
     print(f"  avg accuracy : {_format_metric(training.get('avg_accuracy'))}")
@@ -167,6 +187,35 @@ def print_signal_summary(signal_result, allow_short=True):
             f"scored={fallback_scope.get('scored_row_count', fallback_scope.get('aligned_safe_row_count', 0))}  "
             f"excluded={fallback_scope.get('excluded_row_count', 0)}"
         )
+    paths = signal_result.get("paths") or []
+    if paths:
+        long_counts = []
+        short_counts = []
+        flat_counts = []
+        avg_abs_sizes = []
+        for path in paths:
+            signals = pd.Series(path["signals"], copy=False)
+            executable_signals = signals if allow_short else signals.clip(lower=0)
+            long_counts.append(float((executable_signals == 1).sum()))
+            short_counts.append(float((executable_signals == -1).sum()))
+            flat_counts.append(float((executable_signals == 0).sum()))
+            continuous = path.get("continuous_signals")
+            if continuous is not None:
+                continuous_series = pd.Series(continuous, copy=False)
+                executable_continuous = continuous_series if allow_short else continuous_series.clip(lower=0.0)
+                avg_abs_sizes.append(float(executable_continuous.abs().mean()))
+
+        print(f"  path count   : {len(paths)}")
+        print(
+            "  avg signal mix: "
+            f"long={_format_metric(sum(long_counts) / len(long_counts), digits=2)}  "
+            f"short={_format_metric(sum(short_counts) / len(short_counts), digits=2)}  "
+            f"flat={_format_metric(sum(flat_counts) / len(flat_counts), digits=2)}"
+        )
+        if avg_abs_sizes:
+            print(f"  avg abs size : {_format_metric(sum(avg_abs_sizes) / len(avg_abs_sizes))}")
+        return
+
     signals = pd.Series(signal_result["signals"], copy=False)
     executable_signals = signals if allow_short else signals.clip(lower=0)
     print(
@@ -185,6 +234,14 @@ def print_signal_summary(signal_result, allow_short=True):
 
 
 def print_backtest_summary(backtest):
+    if backtest.get("path_count"):
+        print(
+            "  validation   : "
+            f"{backtest.get('validation_method')}  "
+            f"aggregate={backtest.get('aggregate_mode')}  "
+            f"paths={backtest.get('path_count')}"
+        )
+
     for label, key, formatter in [
         ("engine", "engine", None),
         ("start equity", "starting_equity", "money"),
@@ -232,6 +289,19 @@ def print_backtest_summary(backtest):
             f"{backtest.get('max_drawdown_duration_bars')} bars "
             f"({backtest.get('max_drawdown_duration')})"
         )
+    metric_ranges = backtest.get("metric_ranges") or {}
+    if metric_ranges:
+        for key, label in [("net_profit_pct", "net range"), ("sharpe_ratio", "sharpe rng"), ("max_drawdown", "mdd range")]:
+            stats = metric_ranges.get(key)
+            if not stats:
+                continue
+            percent = key in {"net_profit_pct", "max_drawdown"}
+            print(
+                f"  {label:<12}: "
+                f"min={_format_metric(stats.get('min'), percent=percent)}  "
+                f"med={_format_metric(stats.get('median'), percent=percent)}  "
+                f"max={_format_metric(stats.get('max'), percent=percent)}"
+            )
 
 
 def print_automl_summary(automl):

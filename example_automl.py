@@ -52,7 +52,14 @@ def main():
                 "volatility_window": 24,
                 "barrier_tie_break": "sl",
             },
-            "model": {"type": "gbm", "n_splits": 3, "gap": 24, "validation_fraction": 0.2, "meta_n_splits": 2},
+            "model": {
+                "type": "gbm",
+                "cv_method": "cpcv",
+                "n_blocks": 4,
+                "test_blocks": 2,
+                "validation_fraction": 0.2,
+                "meta_n_splits": 2,
+            },
             "signals": {
                 "avg_win": 0.02,
                 "avg_loss": 0.02,
@@ -113,7 +120,7 @@ def main():
     weights = pipeline.compute_sample_weights()
     print_weight_summary(weights)
 
-    print_section(sep, 8, "Walk-forward training")
+    print_section(sep, 8, "CPCV training")
     training = pipeline.train_models()
     print_training_summary(training)
 

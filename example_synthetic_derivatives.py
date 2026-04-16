@@ -147,8 +147,9 @@ def main():
             },
             "model": {
                 "type": "logistic",
-                "n_splits": 3,
-                "gap": 6,
+                "cv_method": "cpcv",
+                "n_blocks": 4,
+                "test_blocks": 2,
                 "validation_fraction": 0.2,
                 "meta_n_splits": 2,
             },
@@ -215,7 +216,7 @@ def main():
     weights = pipeline.compute_sample_weights()
     print_weight_summary(weights)
 
-    print_section(sep, 7, "Walk-forward training")
+    print_section(sep, 7, "CPCV training")
     training = pipeline.train_models()
     print_training_summary(training)
 

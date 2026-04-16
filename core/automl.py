@@ -397,6 +397,7 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
 
     candidate.config["model"] = {
         **candidate.config.get("model", {}),
+        "cv_method": "walk_forward",
         "n_splits": 1,
         "train_size": aligned_search_rows,
         "test_size": aligned_holdout_rows,
@@ -1080,7 +1081,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 search_state_bundle,
             )
         except RuntimeError as exc:
-            if "No walk-forward folds were generated" in str(exc):
+            if "No validation splits were generated" in str(exc) or "No walk-forward folds were generated" in str(exc):
                 raise optuna.TrialPruned(str(exc)) from exc
             raise
 

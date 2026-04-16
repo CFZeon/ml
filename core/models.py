@@ -1,6 +1,7 @@
-"""Training, meta-labeling, walk-forward CV, regime detection, model store."""
+"""Training, meta-labeling, validation splitters, regime detection, model store."""
 
 import pickle
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Walk-forward splits
+# Validation splits
 # ───────────────────────────────────────────────────────────────────────────
 
 def walk_forward_split(X, n_splits=3, train_size=None, test_size=None,
@@ -45,6 +46,78 @@ def walk_forward_split(X, n_splits=3, train_size=None, test_size=None,
 
         yield (np.arange(train_start, train_end),
                np.arange(test_start, min(test_end, n)))
+
+
+def cpcv_split(X, n_blocks=4, test_blocks=None, embargo=0):
+    """Yield CPCV train/test index arrays plus split metadata.
+
+    Parameters
+    ----------
+    X : array-like
+        Only the length is used.
+    n_blocks : int
+        Number of contiguous blocks to partition the sample into.
+    test_blocks : int or None
+        Number of blocks to designate as the test path in each combination.
+        Defaults to half the available blocks, rounded down.
+    embargo : int
+        Number of rows to embargo immediately after each test block.
+    """
+    n = len(X)
+    if n < 2:
+        return
+
+    block_count = max(2, min(int(n_blocks), n))
+    blocks = [
+        np.asarray(block, dtype=int)
+        for block in np.array_split(np.arange(n, dtype=int), block_count)
+        if len(block) > 0
+    ]
+    block_count = len(blocks)
+    if block_count < 2:
+        return
+
+    if test_blocks is None:
+        test_block_count = max(1, block_count // 2)
+    else:
+        test_block_count = int(test_blocks)
+    test_block_count = max(1, min(test_block_count, block_count - 1))
+
+    embargo = max(0, int(embargo))
+
+    for split_number, test_block_ids in enumerate(combinations(range(block_count), test_block_count)):
+        test_parts = [blocks[block_id] for block_id in test_block_ids]
+        test_idx = np.concatenate(test_parts)
+
+        test_mask = np.zeros(n, dtype=bool)
+        test_mask[test_idx] = True
+
+        embargo_mask = np.zeros(n, dtype=bool)
+        for block_id in test_block_ids:
+            block = blocks[block_id]
+            embargo_start = int(block[-1]) + 1
+            embargo_end = min(n, embargo_start + embargo)
+            if embargo_start < embargo_end:
+                embargo_mask[embargo_start:embargo_end] = True
+
+        train_mask = ~(test_mask | embargo_mask)
+        train_idx = np.flatnonzero(train_mask)
+        if len(train_idx) == 0 or len(test_idx) == 0:
+            continue
+
+        yield (
+            train_idx,
+            test_idx,
+            {
+                "split_id": f"cpcv_{split_number}",
+                "validation_method": "cpcv",
+                "block_count": int(block_count),
+                "test_block_count": int(test_block_count),
+                "train_blocks": tuple(block_id for block_id in range(block_count) if block_id not in test_block_ids),
+                "test_blocks": tuple(test_block_ids),
+                "embargo_rows": int((embargo_mask & ~test_mask).sum()),
+            },
+        )
 
 
 # ───────────────────────────────────────────────────────────────────────────

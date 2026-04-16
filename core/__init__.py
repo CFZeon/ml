@@ -70,6 +70,7 @@ from .models import (
     build_execution_outcome_frame,
     build_trade_outcome_frame,
     build_model,
+    cpcv_split,
     walk_forward_split,
     train_model,
     train_meta_model,

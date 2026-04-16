@@ -138,7 +138,7 @@ class SignalProfitabilitySizingTest(unittest.TestCase):
                 "indicators": [],
                 "features": {"lags": [1, 3], "frac_diff_d": 0.4, "rolling_window": 20},
                 "labels": {"kind": "fixed_horizon", "horizon": 6, "threshold": 0.0001},
-                "model": {"type": "gbm", "n_splits": 1, "gap": 0},
+                "model": {"type": "gbm", "cv_method": "walk_forward", "n_splits": 1, "gap": 0},
                 "feature_selection": {"enabled": True, "max_features": 12},
                 "signals": {"avg_win": 0.02, "avg_loss": 0.02},
                 "backtest": {"use_open_execution": False, "signal_delay_bars": 1, "fee_rate": 0.0, "slippage_rate": 0.0},

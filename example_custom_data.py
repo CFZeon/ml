@@ -93,8 +93,9 @@ def main():
             },
             "model": {
                 "type": "gbm",
-                "n_splits": 3,
-                "gap": 12,
+                "cv_method": "cpcv",
+                "n_blocks": 4,
+                "test_blocks": 2,
                 "validation_fraction": 0.2,
                 "meta_n_splits": 2,
             },
@@ -156,7 +157,7 @@ def main():
     weights = pipeline.compute_sample_weights()
     print_weight_summary(weights)
 
-    print_section(sep, 8, "Walk-forward training")
+    print_section(sep, 8, "CPCV training")
     training = pipeline.train_models()
     print_training_summary(training)
 
