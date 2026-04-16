@@ -9,6 +9,18 @@ import numpy as np
 import pandas as pd
 
 from core import ATR, RSI, ResearchPipeline
+from example_utils import (
+    print_alignment_summary,
+    print_backtest_summary,
+    print_feature_selection_summary,
+    print_label_summary,
+    print_regime_summary,
+    print_section,
+    print_signal_summary,
+    print_stationarity_summary,
+    print_training_summary,
+    print_weight_summary,
+)
 
 
 def make_ohlcv(index, drift=18.0, amplitude=2.5, volume_base=1_500.0):
@@ -106,16 +118,6 @@ def make_futures_context(index, spot_close):
     }
 
 
-def print_backtest_summary(backtest):
-    print(f"  engine       : {backtest['engine']}")
-    print(f"  end equity   : ${backtest['ending_equity']:,.2f}")
-    print(f"  net profit   : ${backtest['net_profit']:,.2f} ({backtest['net_profit_pct']:.2%})")
-    print(f"  sharpe ratio : {backtest['sharpe_ratio']}")
-    print(f"  max drawdown : {backtest['max_drawdown']:.2%}")
-    print(f"  trades       : {backtest['total_trades']}")
-    print(f"  funding pnl  : ${backtest['funding_pnl']:,.2f}")
-
-
 def main():
     sep = "=" * 60
     index = pd.date_range("2025-01-01", periods=720, freq="1h", tz="UTC")
@@ -179,42 +181,50 @@ def main():
     pipeline.state["cross_asset_context"] = {"ETHUSDT": eth_data, "SOLUSDT": sol_data}
     pipeline.state["symbol_filters"] = {"tick_size": 0.1, "step_size": 0.001, "min_notional": 10.0}
 
-    print(f"\n{sep}\nStep 1 - Loading offline synthetic market state\n{sep}")
+    print_section(sep, 1, "Loading offline synthetic market state")
     print(f"  bars         : {len(raw_data)}")
     print(f"  range        : {raw_data.index[0]} -> {raw_data.index[-1]}")
     print("  network fetch: skipped")
 
-    print(f"\n{sep}\nStep 2 - Indicators, features, and explicit regimes\n{sep}")
-    pipeline.run_indicators()
+    print_section(sep, 2, "Running indicators")
+    indicator_run = pipeline.run_indicators()
+    print(f"  indicators   : {[result.kind for result in indicator_run.results]}")
+
+    print_section(sep, 3, "Building features and screening stationarity")
     features = pipeline.build_features()
-    regimes = pipeline.detect_regimes()["regimes"]
     print(f"  feature count: {features.shape[1]}")
     print(f"  has fut block: {'fut_funding_rate' in features.columns}")
     print(f"  has ctx block: {'ctx_ethusdt_ret_1' in features.columns}")
     print(f"  has mtf block: {'mtf_4h_trend' in features.columns}")
-    print(f"  regime cols  : {list(regimes.columns)}")
+    stationarity = pipeline.check_stationarity()
+    print_stationarity_summary(stationarity)
 
-    print(f"\n{sep}\nStep 3 - Labels, alignment, and sample weights\n{sep}")
+    print_section(sep, 4, "Previewing regime features")
+    regimes = pipeline.detect_regimes()["regimes"]
+    print_regime_summary(regimes)
+
+    print_section(sep, 5, "Building labels and aligning research matrix")
     labels = pipeline.build_labels()
     aligned = pipeline.align_data()
-    pipeline.select_features()
-    weights = pipeline.compute_sample_weights()
-    print(f"  labels       : {labels['label'].value_counts().to_dict()}")
-    print(f"  samples      : {len(aligned['X'])}")
-    print(f"  weight mean  : {weights.mean():.3f}")
+    print_label_summary(labels)
+    print_alignment_summary(aligned)
 
-    print(f"\n{sep}\nStep 4 - Training, signals, and backtest\n{sep}")
+    print_section(sep, 6, "Previewing feature-selection and weighting")
+    selection = pipeline.select_features()
+    print_feature_selection_summary(selection)
+    weights = pipeline.compute_sample_weights()
+    print_weight_summary(weights)
+
+    print_section(sep, 7, "Walk-forward training")
     training = pipeline.train_models()
+    print_training_summary(training)
+
+    print_section(sep, 8, "Generating signals")
     signals = pipeline.generate_signals()
+    print_signal_summary(signals)
+
+    print_section(sep, 9, "Backtesting")
     backtest = pipeline.run_backtest()
-    signal_classes = signals["signals"]
-    print(f"  avg accuracy : {training['avg_accuracy']:.4f}")
-    print(f"  avg f1       : {training['avg_f1_macro']:.4f}")
-    print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
-    print(
-        f"  long={int((signal_classes == 1).sum())}  "
-        f"short={int((signal_classes == -1).sum())}  flat={int((signal_classes == 0).sum())}"
-    )
     print_backtest_summary(backtest)
 
     print(f"\n{sep}\nSynthetic derivatives example complete.\n{sep}")

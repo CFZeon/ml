@@ -1,58 +1,6 @@
-Regime Detection Uses the Full Dataset (Global Fit, Not Rolling)  
-
-core/models.py — detect_regime()  
-
-def detect_regime(features, n_regimes=2):  
-    clean = features.dropna()  
-    normed = (clean - clean.mean()) / clean.std().replace(0, 1)  
-    km = KMeans(n_clusters=n_regimes, random_state=42, n_init=10)  
-    return pd.Series(km.fit_predict(normed), index=clean.index, name="regime")  
-
-clean.mean() and clean.std() are computed over the entire feature history, and km.fit_predict is called on the entire dataset at once. When this regime label is later appended as a feature and fed into  
-walk-forward training, each training fold's regime labels incorporate statistics from the future test window. This is textbook look-ahead bias.
-
- Feature Selection (select_features) Runs on the Full Aligned Dataset Before Walk-Forward Splits 
-
- core/pipeline.py — select_features() step commentary from example.py (Step 6b): 
-
- "global preselection disabled; supervised MI filtering runs inside each walk-forward fold" 
-
- The code says this runs inside each fold, which is correct in principle. However, screen_features_for_stationarity (the ADF screening step, Step 3) runs on the full features dataframe before any fold 
- splitting. The fit_features parameter exists to fix this, but the pipeline only uses it if explicitly wired. Stationarity screening on the full dataset means ADF tests can "see" the distribution of future 
- data when deciding which transform to apply to early-period data — a subtle but real form of look-ahead.
-
- Triple-Barrier Labels Use high and low of Future Bars, Enabling Intrabar Touch Detection That Cannot Be Exploited at Bar Close  
-
-core/labeling.py  
-
-for timestamp, high_price, low_price, close_price in zip(...):  
-    hit_pt = bool(high_price >= upper)  
-    hit_sl = bool(low_price <= lower)  
-
-The code checks whether the high of each future bar touched the PT barrier, or the low touched the SL. This is the correct implementation for triple-barrier labeling. However, when barrier_tie_break="sl" (the  
- default) and both are hit on the same bar, the label is -1 (stop loss). This is conservative and fine.  
-
-The subtle flaw: the exit price is set to upper or lower (the barrier level), not the actual execution price, and this exit price is recorded in gross_return which feeds the backtest's win/loss statistics but  
- is not the price used in the actual backtest engine. The backtest uses signals + next-bar returns, not exit_price. So gross_return in the label frame is effectively decorative — it doesn't affect PnL, but it  
- does affect the avg_win / avg_loss inputs to the Kelly criterion if these are computed from label statistics rather than realized backtest returns.
-
- Kelly Criterion Inputs Are Config-Hardcoded, Not Derived From Out-of-Sample Evidence  
-
-example.py  
-
-"signals": {  
-    "avg_win": 0.02,  
-    "avg_loss": 0.02,  
-    "fraction": 0.5,  
-    ...  
-}  
-
-core/backtest.py — kelly_fraction()  
-
-def kelly_fraction(prob_win, avg_win, avg_loss, fraction=0.5):  
-    b = avg_win / avg_loss  # b = 1.0 when avg_win == avg_loss  
-    k = (prob_win * b - q) / b  
-
-avg_win and avg_loss are injected from config (both 0.02), making b=1. The Kelly fraction therefore depends only on prob_win. This is mathematically consistent if the config values actually reflect the  
-strategy's true win/loss sizes, but since they're hardcoded rather than estimated from OOS fold metrics, the sizing is not grounded in the actual strategy's return profile. With b=1, Kelly degenerates to  
-2*prob_win - 1, which only makes sense if the average win and loss are exactly equal. Any deviation in reality means the position sizing is wrong.
+- **What**: The AutoML study runs N trials (default 25) via Optuna, selects the best trial by objective score, and reports its backtest Sharpe / net profit as if it were a single unbiased estimate. No correction is applied for the number of configurations tested.
+- **Industry standard**: De Prado's *Deflated Sharpe Ratio* (DSR) and Bailey & López de Prado's *Probability of Backtest Overfitting* (PBO) are standard at quantitative firms. DSR adjusts the Sharpe ratio for the number of trials, skewness, and kurtosis. PBO uses combinatorial symmetric cross-validation to estimate the probability that the best in-sample strategy underperforms the median out-of-sample.
+- **Why it matters**: With 25+ trials, even noise-fitting configurations will occasionally produce attractive backtests. Reporting the raw best-trial Sharpe without DSR is the primary mechanism by which this pipeline can appear profitable while being pure noise. The locked holdout partially mitigates this, but a single holdout period is one draw and does not produce a distribution of OOS performance.
+- **How firms do it**: Two Sigma, AQR, and most systematic macro shops apply DSR as a minimum filter. More rigorous shops estimate PBO via CPCV. Citadel's research framework reportedly imposes Bonferroni-like trial penalties before any strategy reaches paper trading.
+- **Gap in repo**: `compute_objective_value()` in `core/automl.py` returns a raw score. No DSR, no PBO, no trial-count penalty. The `locked_holdout` is a single chronological block—not CPCV.
+- **File**: [core/automl.py](core/automl.py)

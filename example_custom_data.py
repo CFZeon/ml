@@ -9,6 +9,18 @@ import numpy as np
 import pandas as pd
 
 from core import ATR, BollingerBands, RSI, ResearchPipeline, fetch_binance_bars
+from example_utils import (
+    print_alignment_summary,
+    print_backtest_summary,
+    print_feature_selection_summary,
+    print_label_summary,
+    print_regime_summary,
+    print_section,
+    print_signal_summary,
+    print_stationarity_summary,
+    print_training_summary,
+    print_weight_summary,
+)
 
 
 def build_custom_feed(symbol, interval, start, end):
@@ -29,23 +41,14 @@ def build_custom_feed(symbol, interval, start, end):
     return bars, custom.reset_index(drop=True)
 
 
-def print_backtest_summary(backtest):
-    print(f"  engine       : {backtest['engine']}")
-    print(f"  end equity   : ${backtest['ending_equity']:,.2f}")
-    print(f"  net profit   : ${backtest['net_profit']:,.2f} ({backtest['net_profit_pct']:.2%})")
-    print(f"  sharpe ratio : {backtest['sharpe_ratio']}")
-    print(f"  max drawdown : {backtest['max_drawdown']:.2%}")
-    print(f"  trades       : {backtest['total_trades']}")
-
-
 def main():
     sep = "=" * 60
     symbol = "BTCUSDT"
     interval = "1h"
     start = "2024-01-01"
-    end = "2024-04-01"
+    end = "2024-05-01"
 
-    print(f"\n{sep}\nStep 1 - Building delayed custom data feed\n{sep}")
+    print_section(sep, 1, "Building delayed custom data feed")
     base_bars, custom_feed = build_custom_feed(symbol=symbol, interval=interval, start=start, end=end)
     print(f"  source rows   : {len(base_bars)}")
     print(f"  custom rows   : {len(custom_feed)}")
@@ -79,8 +82,15 @@ def main():
                 "context_timeframes": ["4h"],
             },
             "feature_selection": {"enabled": True, "max_features": 72, "min_mi_threshold": 0.0},
-            "regime": {"n_regimes": 2},
-            "labels": {"kind": "fixed_horizon", "horizon": 12, "threshold": 0.0005},
+            "regime": {"method": "explicit"},
+            "labels": {
+                "kind": "triple_barrier",
+                "pt_sl": (2.0, 2.0),
+                "max_holding": 12,
+                "min_return": 0.0005,
+                "volatility_window": 24,
+                "barrier_tie_break": "sl",
+            },
             "model": {
                 "type": "gbm",
                 "n_splits": 3,
@@ -96,6 +106,7 @@ def main():
                 "profitability_threshold": 0.5,
                 "expected_edge_threshold": 0.0,
                 "sizing_mode": "expected_utility",
+                "tuning_min_trades": 5,
             },
             "backtest": {
                 "equity": 10_000,
@@ -108,7 +119,7 @@ def main():
         }
     )
 
-    print(f"\n{sep}\nStep 2 - Fetching market data and joining custom feed\n{sep}")
+    print_section(sep, 2, "Fetching market data and joining custom feed")
     data = pipeline.fetch_data()
     custom_report = pipeline.state["custom_data_report"][0]
     exogenous_columns = [column for column in data.columns if column.startswith("exo_")]
@@ -117,32 +128,44 @@ def main():
     print(f"  join coverage : {custom_report['coverage']:.2%}")
     print(f"  raw exogenous : {exogenous_columns}")
 
-    print(f"\n{sep}\nStep 3 - Indicators, features, and labels\n{sep}")
-    pipeline.run_indicators()
+    print_section(sep, 3, "Running indicators")
+    indicator_run = pipeline.run_indicators()
+    print(f"  indicators   : {[result.kind for result in indicator_run.results]}")
+
+    print_section(sep, 4, "Building features and screening stationarity")
     features = pipeline.build_features()
+    print(f"  feature count : {features.shape[1]}")
+    feature_columns = [column for column in features.columns if column.startswith("exo_")]
+    print(f"  exogenous fts : {feature_columns[:10]}")
+    stationarity = pipeline.check_stationarity()
+    print_stationarity_summary(stationarity)
+
+    print_section(sep, 5, "Previewing regime features")
+    regimes = pipeline.detect_regimes()["regimes"]
+    print_regime_summary(regimes)
+
+    print_section(sep, 6, "Building labels and aligning research matrix")
     labels = pipeline.build_labels()
     aligned = pipeline.align_data()
-    pipeline.select_features()
-    weights = pipeline.compute_sample_weights()
-    feature_columns = [column for column in features.columns if column.startswith("exo_")]
-    print(f"  feature count : {features.shape[1]}")
-    print(f"  exogenous fts : {feature_columns[:10]}")
-    print(f"  labels        : {labels['label'].value_counts().to_dict()}")
-    print(f"  samples       : {len(aligned['X'])}")
-    print(f"  weight mean   : {weights.mean():.3f}")
+    print_label_summary(labels)
+    print_alignment_summary(aligned)
 
-    print(f"\n{sep}\nStep 4 - Training, signals, and backtest\n{sep}")
+    print_section(sep, 7, "Previewing feature-selection and weighting")
+    selection = pipeline.select_features()
+    print_feature_selection_summary(selection)
+    weights = pipeline.compute_sample_weights()
+    print_weight_summary(weights)
+
+    print_section(sep, 8, "Walk-forward training")
     training = pipeline.train_models()
+    print_training_summary(training)
+
+    print_section(sep, 9, "Generating signals")
     signals = pipeline.generate_signals()
+    print_signal_summary(signals, allow_short=False)
+
+    print_section(sep, 10, "Backtesting")
     backtest = pipeline.run_backtest()
-    signal_classes = signals["signals"]
-    print(f"  avg accuracy  : {training['avg_accuracy']:.4f}")
-    print(f"  avg f1        : {training['avg_f1_macro']:.4f}")
-    print(f"  avg selected  : {training['feature_selection']['avg_selected_features']}")
-    print(
-        f"  long={int((signal_classes == 1).sum())}  "
-        f"short={int((signal_classes == -1).sum())}  flat={int((signal_classes == 0).sum())}"
-    )
     print_backtest_summary(backtest)
 
     print(f"\n{sep}\nCustom data example complete.\n{sep}")

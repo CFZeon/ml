@@ -6,28 +6,18 @@ Usage
 """
 
 from core import ATR, MACD, RSI, ResearchPipeline
-
-
-def print_training_summary(training):
-    print(f"  avg accuracy : {training['avg_accuracy']:.4f}")
-    print(f"  avg f1       : {training['avg_f1_macro']:.4f}")
-    print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
-    print(f"  tuned signals: {training['last_signal_params']}")
-
-
-def print_backtest_summary(backtest):
-    print(f"  engine       : {backtest['engine']}")
-    print(f"  start equity : ${backtest['starting_equity']:,.2f}")
-    print(f"  end equity   : ${backtest['ending_equity']:,.2f}")
-    print(f"  net profit   : ${backtest['net_profit']:,.2f} ({backtest['net_profit_pct']:.2%})")
-    print(f"  funding pnl  : ${backtest['funding_pnl']:,.2f}")
-    print(f"  fees paid    : ${backtest['fees_paid']:,.2f}")
-    print(f"  slippage     : ${backtest['slippage_paid']:,.2f}")
-    print(f"  sharpe ratio : {backtest['sharpe_ratio']}")
-    print(f"  max drawdown : {backtest['max_drawdown']:.2%}")
-    print(f"  trades       : {backtest['total_trades']}")
-    print(f"  closed trades: {backtest['closed_trades']}")
-    print(f"  trade win rt : {backtest['trade_win_rate']:.2%}")
+from example_utils import (
+    print_alignment_summary,
+    print_backtest_summary,
+    print_feature_selection_summary,
+    print_label_summary,
+    print_regime_summary,
+    print_section,
+    print_signal_summary,
+    print_stationarity_summary,
+    print_training_summary,
+    print_weight_summary,
+)
 
 
 def main():
@@ -51,8 +41,15 @@ def main():
                 "context_timeframes": ["4h"],
             },
             "feature_selection": {"enabled": True, "max_features": 64, "min_mi_threshold": 0.0},
-            "regime": {"n_regimes": 2},
-            "labels": {"kind": "fixed_horizon", "horizon": 8, "threshold": 0.0005},
+            "regime": {"method": "explicit"},
+            "labels": {
+                "kind": "triple_barrier",
+                "pt_sl": (1.5, 1.5),
+                "max_holding": 12,
+                "min_return": 0.0005,
+                "volatility_window": 24,
+                "barrier_tie_break": "sl",
+            },
             "model": {
                 "type": "logistic",
                 "n_splits": 3,
@@ -68,6 +65,7 @@ def main():
                 "profitability_threshold": 0.5,
                 "expected_edge_threshold": 0.0,
                 "sizing_mode": "expected_utility",
+                "tuning_min_trades": 5,
             },
             "backtest": {
                 "equity": 10_000,
@@ -84,52 +82,54 @@ def main():
         }
     )
 
-    print(f"\n{sep}\nStep 1 - Fetching BTCUSDT futures data\n{sep}")
+    print_section(sep, 1, "Fetching BTCUSDT futures data")
     data = pipeline.fetch_data()
     filters = pipeline.state.get("symbol_filters", {})
     futures_context = pipeline.state.get("futures_context", {})
-    print(f"  rows={len(data)}  range={data.index[0]} -> {data.index[-1]}")
+    print(f"  rows         : {len(data)}")
+    print(f"  range        : {data.index[0]} -> {data.index[-1]}")
     print(
         "  symbol filters: "
         f"tick={filters.get('tick_size')}  step={filters.get('step_size')}  min_notional={filters.get('min_notional')}"
     )
     print(f"  futures context tables: {sorted(futures_context)}")
 
-    print(f"\n{sep}\nStep 2 - Running indicators and building features\n{sep}")
+    print_section(sep, 2, "Running indicators")
     indicator_run = pipeline.run_indicators()
+    print(f"  indicators   : {[result.kind for result in indicator_run.results]}")
+
+    print_section(sep, 3, "Building features and screening stationarity")
     features = pipeline.build_features()
     stationarity = pipeline.check_stationarity()
-    screening = stationarity["feature_screening"]["summary"]
-    print(f"  indicators    : {[result.kind for result in indicator_run.results]}")
     print(f"  feature count : {features.shape[1]}")
-    print(
-        f"  screening     : {screening['screened_feature_count']}/{screening['total_features']}  "
-        f"transformed={screening['transformed_features']}  dropped={screening['dropped_features']}"
-    )
+    print_stationarity_summary(stationarity)
 
-    print(f"\n{sep}\nStep 3 - Regimes, labels, and alignment\n{sep}")
+    print_section(sep, 4, "Previewing regime features")
     regimes = pipeline.detect_regimes()["regimes"]
+    print_regime_summary(regimes)
+
+    print_section(sep, 5, "Building labels and aligning research matrix")
     labels = pipeline.build_labels()
     aligned = pipeline.align_data()
-    pipeline.select_features()
-    weights = pipeline.compute_sample_weights()
-    print(f"  regime counts : {regimes.value_counts().to_dict()}")
-    print(f"  labels        : {labels['label'].value_counts().to_dict()}")
-    print(f"  samples       : {len(aligned['X'])}")
-    print(f"  weight range  : [{weights.min():.3f}, {weights.max():.3f}]")
+    print_label_summary(labels)
+    print_alignment_summary(aligned)
 
-    print(f"\n{sep}\nStep 4 - Walk-forward training\n{sep}")
+    print_section(sep, 6, "Previewing feature-selection and weighting")
+    selection = pipeline.select_features()
+    print_feature_selection_summary(selection)
+    weights = pipeline.compute_sample_weights()
+    print_weight_summary(weights)
+
+    print_section(sep, 7, "Walk-forward training")
     training = pipeline.train_models()
     print_training_summary(training)
 
-    print(f"\n{sep}\nStep 5 - Signals and backtest\n{sep}")
+    print_section(sep, 8, "Generating signals")
     signals = pipeline.generate_signals()
-    signal_classes = signals["signals"]
+    print_signal_summary(signals)
+
+    print_section(sep, 9, "Backtesting")
     backtest = pipeline.run_backtest()
-    print(
-        f"  long={int((signal_classes == 1).sum())}  "
-        f"short={int((signal_classes == -1).sum())}  flat={int((signal_classes == 0).sum())}"
-    )
     print_backtest_summary(backtest)
 
     print(f"\n{sep}\nFutures example complete.\n{sep}")

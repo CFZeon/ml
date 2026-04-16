@@ -21,6 +21,21 @@ class DataBacktestAdapterTest(unittest.TestCase):
         self.assertEqual(len(prepared), 1)
         self.assertAlmostEqual(float(prepared.iloc[0]["close"]), 100.5, places=6)
 
+    def test_prepare_frame_backfills_missing_taker_columns(self):
+        raw = pd.DataFrame(
+            [
+                [1704067200000, "100", "101", "99", "100.5", "10", 1704070799999, "1000", "12"],
+            ],
+            columns=_COLUMNS[:9],
+        )
+
+        prepared = _prepare_frame(raw)
+
+        self.assertIn("taker_buy_base_vol", prepared.columns)
+        self.assertIn("taker_buy_quote_vol", prepared.columns)
+        self.assertAlmostEqual(float(prepared.iloc[0]["taker_buy_base_vol"]), 0.0, places=6)
+        self.assertAlmostEqual(float(prepared.iloc[0]["taker_buy_quote_vol"]), 0.0, places=6)
+
     def test_point_in_time_custom_join_uses_availability_timestamp(self):
         index = pd.date_range("2026-03-10", periods=4, freq="1h", tz="UTC")
         base = pd.DataFrame(

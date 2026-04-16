@@ -39,6 +39,7 @@ _FLOAT_COLUMNS = [
     "open", "high", "low", "close", "volume", "quote_volume",
     "taker_buy_base_vol", "taker_buy_quote_vol",
 ]
+_OPTIONAL_FLOAT_COLUMNS = ["taker_buy_base_vol", "taker_buy_quote_vol"]
 _OUTPUT_COLUMNS = [
     "open", "high", "low", "close", "volume", "quote_volume", "trades",
     "taker_buy_base_vol", "taker_buy_quote_vol",
@@ -186,7 +187,7 @@ def _cache_path(cache_dir, symbol, interval, period, market="spot"):
 def _read_cache(path):
     if not path.exists():
         return None
-    return pd.read_pickle(path)
+    return _normalize_output_schema(pd.read_pickle(path))
 
 
 def _write_cache(path, frame):
@@ -194,6 +195,21 @@ def _write_cache(path, frame):
     temp_path = path.with_suffix(path.suffix + ".tmp")
     frame.to_pickle(temp_path)
     temp_path.replace(path)
+
+
+def _normalize_output_schema(frame):
+    if frame is None:
+        return None
+
+    normalized = frame.copy()
+    # Older cache files were written before taker-side volumes became part of
+    # the canonical output schema, so backfill those optional columns as zeros.
+    for column in _OPTIONAL_FLOAT_COLUMNS:
+        if column not in normalized.columns:
+            normalized[column] = 0.0
+        normalized[column] = pd.to_numeric(normalized[column], errors="coerce").fillna(0.0).astype(float)
+
+    return normalized
 
 
 def _infer_timestamp_unit(raw_times):
@@ -215,6 +231,7 @@ def _prepare_frame(frame):
         utc=True,
     )
     prepared = prepared.set_index("timestamp").sort_index()
+    prepared = _normalize_output_schema(prepared)
 
     for column in _FLOAT_COLUMNS:
         prepared[column] = prepared[column].astype(float)
@@ -229,7 +246,7 @@ def _merge_frames(frames):
     if not valid_frames:
         return pd.DataFrame(columns=_OUTPUT_COLUMNS)
 
-    merged = pd.concat(valid_frames).sort_index()
+    merged = pd.concat([_normalize_output_schema(frame) for frame in valid_frames]).sort_index()
     merged = merged[~merged.index.duplicated(keep="first")]
     return merged[_OUTPUT_COLUMNS]
 

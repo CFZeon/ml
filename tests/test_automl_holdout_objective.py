@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from core.automl import compute_objective_value, run_automl_study
+from core.automl import compute_cpcv_pbo, compute_objective_value, run_automl_study
 
 
 class _BasePipelineStub:
@@ -185,6 +185,44 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
 
         self.assertGreater(accurate_score, profitable_score)
 
+    def test_compute_objective_value_can_apply_deflated_sharpe_penalty(self):
+        raw_score = compute_objective_value("sharpe_ratio", {}, {"sharpe_ratio": 2.5})
+        penalized_score = compute_objective_value(
+            "sharpe_ratio",
+            {},
+            {"sharpe_ratio": 2.5},
+            overfitting_context={"apply_penalty": True, "deflated_sharpe_ratio": 0.37},
+        )
+
+        self.assertAlmostEqual(raw_score, 2.5, places=6)
+        self.assertAlmostEqual(penalized_score, 0.37, places=6)
+
+    def test_compute_cpcv_pbo_reports_consistent_winner(self):
+        index = pd.date_range("2026-01-01", periods=24, freq="1h", tz="UTC")
+        trial_returns = pd.DataFrame(
+            {
+                0: np.tile([0.012, 0.008, 0.011, 0.009], 6),
+                1: np.tile([0.010, -0.010, 0.012, -0.012], 6),
+                2: np.tile([-0.004, 0.002, -0.003, 0.001], 6),
+            },
+            index=index,
+        )
+
+        report = compute_cpcv_pbo(trial_returns, n_blocks=6, test_blocks=3, min_block_size=2)
+
+        self.assertTrue(report["enabled"])
+        self.assertGreaterEqual(int(report["split_count"]), 1)
+        self.assertLess(float(report["probability_of_backtest_overfitting"]), 0.5)
+
+    def test_compute_cpcv_pbo_requires_multiple_trials(self):
+        index = pd.date_range("2026-01-01", periods=8, freq="1h", tz="UTC")
+        trial_returns = pd.DataFrame({0: np.linspace(0.001, 0.008, len(index))}, index=index)
+
+        report = compute_cpcv_pbo(trial_returns, n_blocks=4, test_blocks=2, min_block_size=2)
+
+        self.assertFalse(report["enabled"])
+        self.assertEqual(report["reason"], "insufficient_trials")
+
     def test_run_automl_study_propagates_state_and_reports_locked_holdout(self):
         index = pd.date_range("2026-01-01", periods=120, freq="1h", tz="UTC")
         raw = pd.DataFrame(
@@ -230,7 +268,11 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
         )
 
         self.assertEqual(summary["objective"], "accuracy_first")
+        self.assertEqual(summary["selection_metric"], "accuracy_first")
         self.assertAlmostEqual(float(summary["best_training"]["avg_directional_accuracy"]), 0.9, places=6)
+        self.assertIn("overfitting_diagnostics", summary)
+        self.assertTrue(summary["overfitting_diagnostics"]["enabled"])
+        self.assertFalse(summary["overfitting_diagnostics"]["pbo"]["enabled"])
         self.assertTrue(summary["locked_holdout"]["enabled"])
         self.assertEqual(int(summary["locked_holdout"]["search_rows"]), 96)
         self.assertEqual(int(summary["locked_holdout"]["holdout_rows"]), 24)

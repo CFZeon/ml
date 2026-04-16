@@ -6,6 +6,19 @@ Usage
 """
 
 from core import ATR, BollingerBands, MACD, RSI, ResearchPipeline
+from example_utils import (
+    print_alignment_summary,
+    print_automl_summary,
+    print_backtest_summary,
+    print_feature_selection_summary,
+    print_label_summary,
+    print_regime_summary,
+    print_section,
+    print_signal_summary,
+    print_stationarity_summary,
+    print_training_summary,
+    print_weight_summary,
+)
 
 
 def main():
@@ -27,10 +40,10 @@ def main():
                 "rolling_window": 20,
                 "squeeze_quantile": 0.2,
                 "context_timeframes": ["4h", "1d"],
-                "schema_version": "indicator_aware_v6_contextual",
+                "schema_version": "indicator_aware_v7_example_workflow",
             },
             "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
-            "regime": {"n_regimes": 2},
+            "regime": {"method": "explicit"},
             "labels": {
                 "kind": "triple_barrier",
                 "pt_sl": (2.0, 2.0),
@@ -60,102 +73,57 @@ def main():
                 "n_trials": 8,
                 "objective": "accuracy_first",
                 "seed": 42,
-                "study_name": "BTCUSDT_1h_accuracy_first_oos_demo",
+                "study_name": "BTCUSDT_1h_accuracy_first_oos_demo_v2",
             },
         }
     )
 
-    print(f"\n{sep}\nStep 1 · Fetching data and indicators\n{sep}")
-    pipeline.fetch_data()
-    pipeline.run_indicators()
+    print_section(sep, 1, "Fetching BTCUSDT spot data")
+    data = pipeline.fetch_data()
+    print(f"  rows         : {len(data)}")
+    print(f"  range        : {data.index[0]} -> {data.index[-1]}")
 
-    print(f"\n{sep}\nStep 2 · AutoML search\n{sep}")
+    print_section(sep, 2, "Running indicators")
+    indicator_run = pipeline.run_indicators()
+    print(f"  indicators   : {[result.kind for result in indicator_run.results]}")
+
+    print_section(sep, 3, "Running AutoML search")
     automl = pipeline.run_automl()
-    print(f"  study name : {automl['study_name']}")
-    print(f"  objective  : {automl['objective']}")
-    print(f"  trials     : {automl['trial_count']}")
-    print(f"  best value : {automl['best_value']:.4f}")
-    print(f"  best params: {automl['best_params']}")
-    print(f"  best train : {automl['best_training']}")
-    print(f"  best bt    : {automl['best_backtest']}")
-    locked_holdout = automl.get("locked_holdout") or {}
-    if locked_holdout.get("enabled"):
-        print(
-            "  holdout    : "
-            f"rows={locked_holdout['aligned_holdout_rows']}  "
-            f"range={locked_holdout['start_timestamp']} -> {locked_holdout['end_timestamp']}"
-        )
-        print(f"  holdout tr : {locked_holdout.get('training')}")
-        print(f"  holdout bt : {locked_holdout.get('backtest')}")
+    print_automl_summary(automl)
 
-    print(f"\n{sep}\nStep 3 · Rebuild pipeline with best config\n{sep}")
+    print_section(sep, 4, "Rebuilding the canonical workflow with the selected config")
     features = pipeline.build_features()
-    stationarity = pipeline.check_stationarity()
-    pipeline.detect_regimes()
-    pipeline.build_labels()
-    pipeline.align_data()
-    pipeline.select_features()
-    pipeline.compute_sample_weights()
-    training = pipeline.train_models()
-    signals = pipeline.generate_signals()
-    backtest = pipeline.run_backtest()
-
-    screening = stationarity["feature_screening"]["summary"]
     print(f"  feature count: {features.shape[1]}")
-    print(
-        f"  screened     : {screening['screened_feature_count']}/{screening['total_features']}  "
-        f"transformed={screening['transformed_features']}  dropped={screening['dropped_features']}"
-    )
-    if screening["transform_usage"]:
-        print(f"  transforms   : {screening['transform_usage']}")
-    print(f"  avg selected : {training['feature_selection']['avg_selected_features']}")
-    print(f"  avg dir acc  : {training['avg_directional_accuracy']:.4f}")
-    if training.get("avg_log_loss") is not None:
-        print(f"  avg log loss : {training['avg_log_loss']:.4f}")
-    if training.get("avg_brier_score") is not None:
-        print(f"  avg brier    : {training['avg_brier_score']:.4f}")
-    if training.get("avg_calibration_error") is not None:
-        print(f"  avg calib    : {training['avg_calibration_error']:.4f}")
-    print(f"  avg accuracy : {training['avg_accuracy']:.4f}")
-    print(f"  avg f1       : {training['avg_f1_macro']:.4f}")
-    block_diag = training["feature_block_diagnostics"]
-    if block_diag["summary"]:
-        print("  top blocks   :")
-        for block in block_diag["summary"][:5]:
-            print(
-                f"    {block['block']}: f1_drop={block['avg_f1_drop']:.4f}  "
-                f"acc_drop={block['avg_accuracy_drop']:.4f}  "
-                f"native={block['avg_native_importance']:.4f}"
-            )
-    print(f"  long signals : {int((signals['signals'] == 1).sum())}")
-    print(f"  short signals: {int((signals['signals'] == -1).sum())}")
-    print(f"  net profit   : ${backtest['net_profit']:,.2f}")
-    print(f"  sharpe ratio : {backtest['sharpe_ratio']}")
-    print(f"  max drawdown : {backtest['max_drawdown']:.2%}")
-    print(f"  start equity : ${backtest['starting_equity']:,.2f}")
-    print(f"  end equity   : ${backtest['ending_equity']:,.2f}")
-    print(f"  net profit   : ${backtest['net_profit']:,.2f} ({backtest['net_profit_pct']:.2%})")
-    print(f"  gross profit : ${backtest['gross_profit']:,.2f}")
-    print(f"  gross loss   : ${backtest['gross_loss']:,.2f}")
-    print(f"  fees paid    : ${backtest['fees_paid']:,.2f}")
-    print(f"  sharpe ratio : {backtest['sharpe_ratio']}")
-    print(f"  sortino      : {backtest['sortino_ratio']}")
-    print(f"  calmar       : {backtest['calmar_ratio']}")
-    print(f"  CAGR         : {backtest['cagr']:.2%}")
-    print(f"  volatility   : {backtest['annualized_volatility']:.2%}")
-    print(f"  max drawdown : {backtest['max_drawdown']:.2%} (${backtest['max_drawdown_amount']:,.2f})")
-    print(f"  dd duration  : {backtest['max_drawdown_duration_bars']} bars ({backtest['max_drawdown_duration']})")
-    print(f"  exposure     : {backtest['exposure_rate']:.2%}")
-    print(f"  signal delay : {backtest['signal_delay_bars']} bars")
-    print(f"  profit factor: {backtest['profit_factor']}")
-    print(f"  expectancy   : ${backtest['expectancy']:,.2f} per active bar")
-    print(f"  avg win      : ${backtest['avg_win']:,.2f}")
-    print(f"  avg loss     : ${backtest['avg_loss']:,.2f}")
-    print(f"  trades       : {backtest['total_trades']}")
-    print(f"  win rate     : {backtest['win_rate']:.2%} (active bars)")
-    print(f"  closed trades: {backtest['closed_trades']}")
-    print(f"  trade win rt : {backtest['trade_win_rate']:.2%}")
-    print(f"  trade pf     : {backtest['trade_profit_factor']}")
+    stationarity = pipeline.check_stationarity()
+    print_stationarity_summary(stationarity)
+
+    print_section(sep, 5, "Previewing regime features")
+    regimes = pipeline.detect_regimes()["regimes"]
+    print_regime_summary(regimes)
+
+    print_section(sep, 6, "Building labels and aligning research matrix")
+    labels = pipeline.build_labels()
+    print_label_summary(labels)
+    aligned = pipeline.align_data()
+    print_alignment_summary(aligned)
+
+    print_section(sep, 7, "Previewing feature-selection and weighting")
+    selection = pipeline.select_features()
+    print_feature_selection_summary(selection)
+    weights = pipeline.compute_sample_weights()
+    print_weight_summary(weights)
+
+    print_section(sep, 8, "Walk-forward training")
+    training = pipeline.train_models()
+    print_training_summary(training)
+
+    print_section(sep, 9, "Generating signals")
+    signals = pipeline.generate_signals()
+    print_signal_summary(signals, allow_short=False)
+
+    print_section(sep, 10, "Backtesting")
+    backtest = pipeline.run_backtest()
+    print_backtest_summary(backtest)
 
 
 if __name__ == "__main__":
