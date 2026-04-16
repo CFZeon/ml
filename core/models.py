@@ -1,7 +1,6 @@
 """Training, meta-labeling, walk-forward CV, regime detection, model store."""
 
 import pickle
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +8,6 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, log_loss
-from sklearn.cluster import KMeans
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -918,8 +916,8 @@ def _detect_hmm_regime(features, n_regimes=2, config=None, fit_features=None):
     """Gaussian HMM-based regime detection with stable state ordering.
 
     States are sorted by ascending L1 norm of their mean vectors so that state 0
-    is the most neutral and the last state is the most deviant. This prevents the
-    cross-fold label-flipping that makes raw KMeans cluster IDs inconsistent.
+    is the most neutral and the last state is the most deviant. This keeps regime
+    semantics stable across walk-forward folds.
 
     Parameters
     ----------
@@ -994,12 +992,12 @@ def detect_regime(features, n_regimes=2, method="hmm", config=None, fit_features
     ----------
     features : pd.DataFrame – numeric columns describing regime state
     n_regimes : int         – number of regimes / hidden states
-    method : str            – "hmm" (default), "explicit", or "kmeans" (deprecated)
+    method : str            – "hmm" (default) or "explicit"
     config : dict or None   – optional method-specific settings
     fit_features : pd.DataFrame or None – reference slice used to fit scaler,
-        HMM parameters, quantiles, or clusters before applying to ``features``.
+        HMM parameters or quantiles before applying to ``features``.
 
-    Returns a pd.Series (hmm/kmeans) or a pd.DataFrame (explicit).
+    Returns a pd.Series (hmm) or a pd.DataFrame (explicit).
     """
     method = (method or "hmm").lower()
     if method == "explicit":
@@ -1007,33 +1005,9 @@ def detect_regime(features, n_regimes=2, method="hmm", config=None, fit_features
     if method == "hmm":
         return _detect_hmm_regime(features, n_regimes=n_regimes, config=config, fit_features=fit_features)
 
-    if method == "kmeans":
-        warnings.warn(
-            "detect_regime method='kmeans' is deprecated. KMeans cluster IDs are "
-            "arbitrary across folds and degrade model quality through inconsistent "
-            "regime labels. Use method='hmm' (default) or method='explicit' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-    clean = features.dropna()
-    reference = clean if fit_features is None else fit_features.reindex(columns=features.columns).dropna()
-    if clean.empty:
-        return pd.Series(dtype=int, name="regime")
-    if reference.empty:
-        reference = clean
-
-    n_clusters = max(1, min(int(n_regimes), len(reference), len(clean)))
-    if n_clusters == 1:
-        return pd.Series(0, index=clean.index, name="regime", dtype=int)
-
-    scaler = StandardScaler()
-    scaler.fit(reference)
-    normed_reference = scaler.transform(reference)
-    normed = scaler.transform(clean)
-    km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    km.fit(normed_reference)
-    return pd.Series(km.predict(normed), index=clean.index, name="regime")
+    raise ValueError(
+        f"Unknown regime detection method={method!r}. Choose from ['hmm', 'explicit']"
+    )
 
 
 # ───────────────────────────────────────────────────────────────────────────

@@ -6,7 +6,7 @@ Sorted by priority: **critical** flaws that invalidate results first, then **hig
 
 ## CRITICAL — Results May Be Invalid
 
-### C1. No Multiple-Testing Correction (Deflated Sharpe Ratio / PBO)
+### C1. No Multiple-Testing Correction (Deflated Sharpe Ratio / PBO) [implemented]
 
 - **What**: The AutoML study runs N trials (default 25) via Optuna, selects the best trial by objective score, and reports its backtest Sharpe / net profit as if it were a single unbiased estimate. No correction is applied for the number of configurations tested.
 - **Industry standard**: De Prado's *Deflated Sharpe Ratio* (DSR) and Bailey & López de Prado's *Probability of Backtest Overfitting* (PBO) are standard at quantitative firms. DSR adjusts the Sharpe ratio for the number of trials, skewness, and kurtosis. PBO uses combinatorial symmetric cross-validation to estimate the probability that the best in-sample strategy underperforms the median out-of-sample.
@@ -43,13 +43,13 @@ Sorted by priority: **critical** flaws that invalidate results first, then **hig
 
 ## HIGH — Performance Likely Inflated
 
-### H1. Regime Detection Leakage Through KMeans Scaling
+### H1. Regime Detection Leakage Through KMeans Scaling [implemented]
 
-- **What**: `_build_fold_local_regime_frame()` now fits KMeans on `fit_index` only (training data). However, the `_rolling_zscore()` used inside `_default_regime_features()` computes rolling statistics that look backward within each fold window. When the fold window includes both train and test, the rolling statistics in the overlapping zone (first rows of test set) use values that were visible during training. More importantly, KMeans cluster IDs are arbitrary—cluster 0 in fold 1 may correspond to cluster 2 in fold 3. No label alignment across folds is performed.
-- **Industry standard**: Firms that use regime conditioning (Bridgewater, Two Sigma) either use explicitly defined regimes (VIX thresholds, yield curve inversions) that require no fitting, or use hidden Markov models (HMM) with time-series-aware estimation. KMeans on return features is considered unreliable because (a) cluster assignment is non-deterministic across folds, (b) there is no temporal coherence constraint, and (c) Euclidean distance in return-volatility space is not a natural metric.
-- **Why it matters**: Regime labels that flip meaning between folds add noise rather than signal. This doesn't just leak—it actively degrades model quality by providing inconsistent conditioning.
-- **Gap in repo**: `detect_regime()` uses KMeans. No HMM, no explicit/rule-based regimes in the default configuration. The `method='explicit'` option exists but is not the default.
-- **Files**: [core/models.py](core/models.py), [core/pipeline.py](core/pipeline.py)
+- **What changed**: The public regime API no longer exposes KMeans. `detect_regime()` now accepts only `method="hmm"` and `method="explicit"`, and fold-local regime frames are still rebuilt from buffered fold windows before fitting on the training slice.
+- **Industry standard**: Firms that use regime conditioning typically prefer explicitly defined thresholds or sequence-aware latent-state models. The repo now defaults to Gaussian HMM with stable norm-sorted state ordering so regime IDs retain consistent semantics across walk-forward folds.
+- **Why it mattered**: Arbitrary KMeans cluster IDs across folds added noisy, inconsistent conditioning even when the scaler and centroids were fit on train-only data.
+- **Status in repo**: Closed. HMM is the default, explicit regimes remain supported, and unsupported legacy methods fail fast instead of silently reintroducing unstable clustering semantics.
+- **Files**: [core/models.py](core/models.py), [core/pipeline.py](core/pipeline.py), [tests/test_regime_leakage_controls.py](tests/test_regime_leakage_controls.py)
 
 ### H2. Fractional Differentiation Applied Globally, Not Per-Fold
 
@@ -59,7 +59,7 @@ Sorted by priority: **critical** flaws that invalidate results first, then **hig
 - **Nuance**: The current fold-local screening mitigates this partially. But `build_features` still computes the frac-diff column globally. If the screening decides "this feature doesn't need frac-diff" based on the full distribution (which includes the test period), that decision is contaminated.
 - **File**: [core/features.py](core/features.py)
 
-### H3. Feature Selection MI Scores Computed on Training Data Only—But Column Retention Propagates Across Folds
+### H3. Feature Selection MI Scores Computed on Training Data Only—But Column Retention Propagates Across Folds [implemented]
 
 - **What**: MI-based feature selection runs inside each fold on training data only (good). However, the `last_selected_columns` variable carries the final fold's column selection into the `SignalsStep` fallback path. If the pipeline re-generates signals outside the walk-forward loop, it uses the last fold's feature set—which was selected based on the last fold's training data.
 - **Industry standard**: Feature selection should be strictly fold-local, and any inference after training should use the final fold's feature set *only* on data that comes after the final fold's training window.

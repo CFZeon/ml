@@ -1,6 +1,7 @@
-Feature Selection MI Scores Computed on Training Data Only—But Column Retention Propagates Across Folds
+C2. No Combinatorial Purged Cross-Validation (CPCV)
 
-- **What**: MI-based feature selection runs inside each fold on training data only (good). However, the `last_selected_columns` variable carries the final fold's column selection into the `SignalsStep` fallback path. If the pipeline re-generates signals outside the walk-forward loop, it uses the last fold's feature set—which was selected based on the last fold's training data.
-- **Industry standard**: Feature selection should be strictly fold-local, and any inference after training should use the final fold's feature set *only* on data that comes after the final fold's training window.
-- **Why it matters**: Minor in the walk-forward path (since OOS predictions are already accumulated per-fold). But the `SignalsStep` fallback path (when `training["oos_continuous_signals"]` is None) applies the last fold's model and feature selection to the *entire* aligned dataset, which includes training periods from earlier folds.
-- **File**: [core/pipeline.py](core/pipeline.py#L1650)
+- **What**: Walk-forward CV splits data into sequential folds. This produces exactly N test-set observations per fold, and the test sets are non-overlapping. CPCV generates all $\binom{N}{N/2}$ (or a tractable subset) combinations of train/test paths, with purging and embargo applied to each, producing a distribution of OOS paths rather than a single equity curve per fold. 
+- **Industry standard**: CPCV is the validation method recommended in *Advances in Financial Machine Learning* (AFML Ch. 12). It enables computing PBO and provides a statistically meaningful distribution of strategy performance. Standard walk-forward CV with 3 folds provides 3 correlated performance estimates—insufficient for statistical inference.
+- **Why it matters**: With only 3 walk-forward folds, the pipeline cannot distinguish between a strategy with genuine edge and one that was lucky on 3 particular test windows. CPCV would expose whether performance is stable across many possible train/test partitions.
+- **Gap in repo**: `walk_forward_split()` in `core/models.py` implements standard sequential splits only. No CPCV implementation exists.
+- **File**: [core/models.py](core/models.py)

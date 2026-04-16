@@ -153,16 +153,16 @@ class RegimeLeakageControlsTest(unittest.TestCase):
         self.assertNotIn(0, high_vol_labels, "State 0 (most neutral) should not dominate the high-vol window")
 
     # ------------------------------------------------------------------
-    # NEW: KMeans raises DeprecationWarning
+    # NEW: unsupported legacy regime methods are rejected
     # ------------------------------------------------------------------
-    def test_kmeans_emits_deprecation_warning(self):
+    def test_kmeans_method_is_rejected(self):
         rng = np.random.default_rng(1)
         index = pd.date_range("2026-04-01", periods=80, freq="1h", tz="UTC")
         features = pd.DataFrame(
             {"vol_20": np.abs(rng.normal(0.02, 0.005, 80)), "trend_20": rng.normal(0, 0.01, 80)},
             index=index,
         )
-        with self.assertWarns(DeprecationWarning):
+        with self.assertRaisesRegex(ValueError, r"Unknown regime detection method='kmeans'"):
             detect_regime(features, n_regimes=2, method="kmeans")
 
     # ------------------------------------------------------------------
