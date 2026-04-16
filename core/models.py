@@ -1,6 +1,7 @@
 """Training, meta-labeling, walk-forward CV, regime detection, model store."""
 
 import pickle
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -913,24 +914,107 @@ def _detect_explicit_regime(features, config=None, fit_features=None):
     )
 
 
-def detect_regime(features, n_regimes=2, method="kmeans", config=None, fit_features=None):
-    """Detect regimes using KMeans or explicit rule-based buckets.
+def _detect_hmm_regime(features, n_regimes=2, config=None, fit_features=None):
+    """Gaussian HMM-based regime detection with stable state ordering.
+
+    States are sorted by ascending L1 norm of their mean vectors so that state 0
+    is the most neutral and the last state is the most deviant. This prevents the
+    cross-fold label-flipping that makes raw KMeans cluster IDs inconsistent.
 
     Parameters
     ----------
     features : pd.DataFrame – numeric columns describing regime state
-    n_regimes : int         – number of KMeans clusters when method="kmeans"
-    method : str            – "kmeans" or "explicit"
+    n_regimes : int         – number of hidden states
+    config : dict or None   – optional HMM settings:
+        covariance_type (default "diag"), n_iter (default 100),
+        tol (default 1e-3), random_state (default 42)
+    fit_features : pd.DataFrame or None – reference training slice used to fit
+        the scaler and HMM transition/emission parameters.
+    """
+    try:
+        from hmmlearn.hmm import GaussianHMM  # deferred – not a hard runtime dep
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "hmmlearn is required for method='hmm'. "
+            "Install it with: pip install hmmlearn>=0.3"
+        ) from exc
+
+    config = dict(config or {})
+    clean = features.dropna()
+    if clean.empty:
+        return pd.Series(dtype=int, name="regime")
+
+    reference = clean if fit_features is None else fit_features.reindex(columns=features.columns).dropna()
+    if reference.empty:
+        reference = clean
+
+    n_states = max(1, min(int(n_regimes), len(reference)))
+    if n_states == 1:
+        return pd.Series(0, index=clean.index, name="regime", dtype=int)
+
+    covariance_type = config.get("covariance_type", "diag")
+    n_iter = int(config.get("n_iter", 100))
+    tol = float(config.get("tol", 1e-3))
+    random_state = int(config.get("random_state", 42))
+
+    scaler = StandardScaler()
+    scaler.fit(reference)
+    normed_reference = scaler.transform(reference)
+    normed = scaler.transform(clean)
+
+    hmm_model = GaussianHMM(
+        n_components=n_states,
+        covariance_type=covariance_type,
+        n_iter=n_iter,
+        tol=tol,
+        random_state=random_state,
+    )
+    try:
+        hmm_model.fit(normed_reference)
+        raw_labels = hmm_model.predict(normed)
+    except Exception:  # noqa: BLE001 – fall back gracefully on convergence failures
+        return pd.Series(0, index=clean.index, name="regime", dtype=int)
+
+    # Stable ordering: sort states by ascending L1 norm of state means.
+    # State 0 = most neutral; last state = most extreme. This keeps regime
+    # semantics consistent across folds even though HMM init is random.
+    norms = np.linalg.norm(hmm_model.means_, ord=1, axis=1)
+    sort_order = np.argsort(norms)  # old_label -> rank position
+    remap = np.empty(n_states, dtype=int)
+    for new_label, old_label in enumerate(sort_order):
+        remap[old_label] = new_label
+
+    return pd.Series(remap[raw_labels], index=clean.index, name="regime", dtype=int)
+
+
+def detect_regime(features, n_regimes=2, method="hmm", config=None, fit_features=None):
+    """Detect market regimes from a feature frame.
+
+    Parameters
+    ----------
+    features : pd.DataFrame – numeric columns describing regime state
+    n_regimes : int         – number of regimes / hidden states
+    method : str            – "hmm" (default), "explicit", or "kmeans" (deprecated)
     config : dict or None   – optional method-specific settings
     fit_features : pd.DataFrame or None – reference slice used to fit scaler,
-        quantiles, or clusters before applying to ``features``.
+        HMM parameters, quantiles, or clusters before applying to ``features``.
 
-    Returns a pd.Series for KMeans mode or a pd.DataFrame with explicit regime
-    components for method="explicit".
+    Returns a pd.Series (hmm/kmeans) or a pd.DataFrame (explicit).
     """
-    method = (method or "kmeans").lower()
+    method = (method or "hmm").lower()
     if method == "explicit":
         return _detect_explicit_regime(features, config=config, fit_features=fit_features)
+    if method == "hmm":
+        return _detect_hmm_regime(features, n_regimes=n_regimes, config=config, fit_features=fit_features)
+
+    if method == "kmeans":
+        warnings.warn(
+            "detect_regime method='kmeans' is deprecated. KMeans cluster IDs are "
+            "arbitrary across folds and degrade model quality through inconsistent "
+            "regime labels. Use method='hmm' (default) or method='explicit' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     clean = features.dropna()
     reference = clean if fit_features is None else fit_features.reindex(columns=features.columns).dropna()

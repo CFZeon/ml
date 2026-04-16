@@ -6,3 +6,4 @@ requests>=2.28
 optuna>=4.4
 vectorbt>=0.28
 pyarrow>=15.0
+hmmlearn>=0.3

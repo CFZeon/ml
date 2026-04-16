@@ -58,7 +58,7 @@ def main():
                 "squeeze_quantile": 0.2,
             },
             "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
-            "regime": {"method": "explicit", "builder": build_fvg_regime_features},
+            "regime": {"method": "hmm", "builder": build_fvg_regime_features},  # HMM with stable norm-sorted state ordering
             "labels": {
                 "kind": "triple_barrier",
                 "pt_sl": (2.0, 2.0),

@@ -43,7 +43,7 @@ def main():
                 "schema_version": "indicator_aware_v7_example_workflow",
             },
             "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
-            "regime": {"method": "explicit"},
+            "regime": {"method": "hmm"},  # HMM with stable norm-sorted state ordering
             "labels": {
                 "kind": "triple_barrier",
                 "pt_sl": (2.0, 2.0),

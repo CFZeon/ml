@@ -82,7 +82,7 @@ def main():
                 "context_timeframes": ["4h"],
             },
             "feature_selection": {"enabled": True, "max_features": 72, "min_mi_threshold": 0.0},
-            "regime": {"method": "explicit"},
+            "regime": {"method": "hmm"},  # HMM with stable norm-sorted state ordering
             "labels": {
                 "kind": "triple_barrier",
                 "pt_sl": (2.0, 2.0),

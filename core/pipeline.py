@@ -1,6 +1,7 @@
 """Stepwise research pipeline abstraction for reusable model workflows."""
 
 import copy
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -335,6 +336,33 @@ def _coerce_regime_frame(regimes, column_name="regime"):
     return pd.DataFrame({column_name: pd.Series(regimes, copy=False)})
 
 
+class _FoldScopedPipeline:
+    """Lightweight pipeline view that scopes 'data' and 'raw_data' to a fold window.
+
+    Passed to user-supplied regime feature builders so that rolling statistics
+    are computed only from fold-local data.  This prevents regime feature
+    quantile thresholds from being informed by bars outside the fold window.
+    """
+
+    _DATA_KEYS = frozenset({"raw_data", "data"})
+
+    def __init__(self, pipeline, windowed_data):
+        self._pipeline = pipeline
+        self._windowed_data = windowed_data
+
+    def section(self, key):
+        return self._pipeline.section(key)
+
+    def require(self, key):
+        if key in self._DATA_KEYS:
+            return self._windowed_data
+        return self._pipeline.require(key)
+
+    @property
+    def state(self):
+        return self._pipeline.state
+
+
 def _build_regime_feature_source(pipeline):
     regime_features = pipeline.state.get("regime_features")
     if regime_features is not None:
@@ -348,12 +376,41 @@ def _build_regime_feature_source(pipeline):
 
 
 def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
+    """Build regime columns scoped to a single walk-forward fold.
+
+    Per-fold recomputation guarantees that regime feature rolling statistics
+    (e.g. rolling z-scores, trend slopes) and quantile/HMM parameters are
+    computed only from data visible within the fold window plus a configurable
+    lookback buffer.  The HMM / scaler / quantile thresholds are then fitted
+    exclusively on ``fit_index`` (the training portion of the fold).
+    """
     config = pipeline.section("regime")
     if not config.get("enabled", True):
         return pd.DataFrame(index=index), {}
 
-    regime_features = _build_regime_feature_source(pipeline)
-    if regime_features is None or regime_features.empty:
+    if index is None or len(index) == 0:
+        return pd.DataFrame(index=index if index is not None else pd.Index([])), {}
+
+    # --- Per-fold data scoping: include a lookback buffer so rolling stats
+    #     at the fold start are not NaN due to insufficient history, while
+    #     still preventing future-bar data from influencing quantile thresholds.
+    raw_data = pipeline.state.get("raw_data")
+    if raw_data is None:
+        raw_data = pipeline.state.get("data")
+    lookback = int(config.get("feature_lookback", 80))
+    if raw_data is not None and hasattr(raw_data, "index"):
+        fold_start_pos = raw_data.index.searchsorted(index[0])
+        fold_end_pos = raw_data.index.searchsorted(index[-1], side="right")
+        buffer_start = max(0, fold_start_pos - lookback)
+        buffered_data = raw_data.iloc[buffer_start:fold_end_pos]
+    else:
+        buffered_data = raw_data
+
+    builder = config.get("builder") or _default_regime_features
+    scoped_pipeline = _FoldScopedPipeline(pipeline, buffered_data)
+    regime_features = builder(scoped_pipeline)
+
+    if regime_features is None or (hasattr(regime_features, "empty") and regime_features.empty):
         return pd.DataFrame(index=index), {}
 
     regime_window = regime_features.reindex(index)
@@ -361,7 +418,7 @@ def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
     regimes = detect_regime(
         regime_window,
         n_regimes=config.get("n_regimes", 2),
-        method=config.get("method", "kmeans"),
+        method=config.get("method", "hmm"),
         config=config,
         fit_features=fit_features,
     )
@@ -634,6 +691,51 @@ def _build_signal_state(prediction_series, probability_frame, meta_prob_series, 
             "fraction": float(signal_config.get("fraction", 0.5)),
         },
     }
+
+
+def _build_empty_signal_state(index, signal_config, avg_win, avg_loss, holding_bars):
+    empty_probabilities = pd.DataFrame(0.0, index=index, columns=[-1, 0, 1], dtype=float)
+    return _build_signal_state(
+        pd.Series(index=index, dtype=float),
+        empty_probabilities,
+        pd.Series(index=index, dtype=float),
+        signal_config,
+        avg_win,
+        avg_loss,
+        holding_bars,
+    )
+
+
+def _resolve_fallback_signal_frame(X, training):
+    fallback_scope = dict(training.get("fallback_inference") or {})
+    fallback_scope.setdefault("mode", "unrestricted")
+
+    if fallback_scope["mode"] != "post_final_training_only":
+        fallback_scope["aligned_input_row_count"] = int(len(X))
+        fallback_scope["scored_row_count"] = int(len(X))
+        fallback_scope["excluded_row_count"] = 0
+        return X, fallback_scope
+
+    train_end = fallback_scope.get("last_fold_train_end")
+    if train_end is None:
+        fit_index = training.get("last_regime_fit_index")
+        if fit_index is not None and len(fit_index) > 0:
+            train_end = fit_index[-1]
+            fallback_scope["last_fold_train_end"] = train_end
+
+    if train_end is None:
+        fallback_scope["aligned_input_row_count"] = int(len(X))
+        fallback_scope["scored_row_count"] = int(len(X))
+        fallback_scope["excluded_row_count"] = 0
+        return X, fallback_scope
+
+    safe_X = X.loc[X.index > train_end]
+    fallback_scope["aligned_input_row_count"] = int(len(X))
+    fallback_scope["scored_row_count"] = int(len(safe_X))
+    fallback_scope["excluded_row_count"] = int(len(X) - len(safe_X))
+    fallback_scope["aligned_safe_start"] = safe_X.index[0] if len(safe_X) > 0 else None
+    fallback_scope["aligned_safe_end"] = safe_X.index[-1] if len(safe_X) > 0 else None
+    return safe_X, fallback_scope
 
 
 def _score_signal_state(backtest, signal_config):
@@ -973,7 +1075,7 @@ class RegimeStep(PipelineStep):
         regimes = detect_regime(
             regime_features,
             n_regimes=config.get("n_regimes", 2),
-            method=config.get("method", "kmeans"),
+            method=config.get("method", "hmm"),
             config=config,
         )
 
@@ -981,7 +1083,7 @@ class RegimeStep(PipelineStep):
         pipeline.state["regimes"] = regimes
         pipeline.state["regime_detection"] = {
             "mode": "global_preview_only",
-            "method": config.get("method", "kmeans"),
+            "method": config.get("method", "hmm"),
             "columns": list(regimes.columns) if isinstance(regimes, pd.DataFrame) else [config.get("column_name", "regime")],
         }
         return {
@@ -1163,6 +1265,7 @@ class TrainModelsStep(PipelineStep):
         last_meta_calibrator = None
         last_selected_columns = list(X.columns)
         last_regime_fit_index = X.index[:0]
+        last_test_index = X.index[:0]
         last_signal_params = {
             "threshold": float(signal_config.get("threshold", 0.03)),
             "edge_threshold": float(signal_config.get("edge_threshold", 0.05)),
@@ -1534,6 +1637,7 @@ class TrainModelsStep(PipelineStep):
             last_meta_calibrator = meta_calibrator
             last_selected_columns = list(selected_columns)
             last_regime_fit_index = X_fit.index.copy()
+            last_test_index = X_test_model.index.copy()
             last_signal_params = dict(tuned_signal_params)
             last_avg_win = fold_avg_win
             last_avg_loss = fold_avg_loss
@@ -1566,6 +1670,8 @@ class TrainModelsStep(PipelineStep):
         avg_log_loss = _average_fold_metric(fold_metrics, "log_loss")
         avg_brier_score = _average_fold_metric(fold_metrics, "brier_score")
         avg_calibration_error = _average_fold_metric(fold_metrics, "calibration_error")
+        last_fold_train_end = last_regime_fit_index[-1] if len(last_regime_fit_index) > 0 else None
+        aligned_safe_index = X.index[X.index > last_fold_train_end] if last_fold_train_end is not None else X.index[:0]
         oos_predictions = pd.concat(oos_predictions).sort_index()
         oos_probabilities = pd.concat(oos_probabilities).sort_index().reindex(oos_predictions.index)
         oos_meta_prob = pd.concat(oos_meta_prob).sort_index().reindex(oos_predictions.index)
@@ -1613,6 +1719,17 @@ class TrainModelsStep(PipelineStep):
             "last_meta_calibrator": last_meta_calibrator,
             "last_selected_columns": last_selected_columns,
             "last_regime_fit_index": last_regime_fit_index,
+            "fallback_inference": {
+                "mode": "post_final_training_only",
+                "feature_selection_fit_scope": "last_fold_train_only",
+                "warning_policy": "warn_and_skip_if_empty",
+                "last_fold_train_end": last_fold_train_end,
+                "last_fold_test_start": last_test_index[0] if len(last_test_index) > 0 else None,
+                "last_fold_test_end": last_test_index[-1] if len(last_test_index) > 0 else None,
+                "aligned_safe_start": aligned_safe_index[0] if len(aligned_safe_index) > 0 else None,
+                "aligned_safe_end": aligned_safe_index[-1] if len(aligned_safe_index) > 0 else None,
+                "aligned_safe_row_count": int(len(aligned_safe_index)),
+            },
             "last_signal_params": last_signal_params,
             "last_avg_win": last_avg_win,
             "last_avg_loss": last_avg_loss,
@@ -1658,6 +1775,7 @@ class SignalsStep(PipelineStep):
     def run(self, pipeline):
         training = pipeline.require("training")
         config = pipeline.section("signals")
+        fallback_scope = training.get("fallback_inference")
 
         if training.get("oos_continuous_signals") is not None:
             break_even_prob = float(
@@ -1698,6 +1816,8 @@ class SignalsStep(PipelineStep):
                 "avg_loss_used": training.get("oos_avg_loss") if training.get("oos_avg_loss") is not None else training.get("last_avg_loss", config.get("avg_loss", 0.02)),
                 "signal_tuning": training.get("signal_tuning", []),
                 "tuned_params": training.get("last_signal_params", {}),
+                "signal_source": "walk_forward_oos",
+                "fallback_scope": fallback_scope,
             }
             pipeline.state["signals"] = result
             return result
@@ -1705,8 +1825,33 @@ class SignalsStep(PipelineStep):
         prediction_series = training.get("oos_predictions")
         probability_frame = training.get("oos_probabilities")
         meta_prob_series = training.get("oos_meta_prob")
+        signal_source = "recomputed_from_oos_predictions"
         if prediction_series is None or meta_prob_series is None or probability_frame is None:
             X = pipeline.require("X")
+            avg_win = training.get("oos_avg_win", config.get("avg_win", 0.02))
+            avg_loss = training.get("oos_avg_loss", config.get("avg_loss", 0.02))
+            holding_bars = _resolve_signal_holding_bars(pipeline, config)
+            signal_config = dict(config)
+            signal_config.update(training.get("last_signal_params", {}))
+            X, fallback_scope = _resolve_fallback_signal_frame(X, training)
+            if X.empty:
+                warnings.warn(
+                    "SignalsStep fallback is restricted to post-final-training rows; no rows remain, returning empty signals.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                result = _build_empty_signal_state(
+                    X.index,
+                    signal_config,
+                    avg_win,
+                    avg_loss,
+                    holding_bars,
+                )
+                result["signal_source"] = "post_final_training_fallback_empty"
+                result["fallback_scope"] = fallback_scope
+                pipeline.state["signals"] = result
+                return result
+
             selected_columns = training.get("last_selected_columns") or list(X.columns)
             missing_columns = [column for column in selected_columns if column not in X.columns]
             if missing_columns:
@@ -1745,6 +1890,7 @@ class SignalsStep(PipelineStep):
                 dtype=float,
             ).clip(0.0, 1.0) if training.get("last_meta_calibrator") is not None else meta_prob_raw.clip(0.0, 1.0)
             prediction_series = predictions
+            signal_source = "post_final_training_fallback"
 
         prediction_series = prediction_series.sort_index()
         probability_frame = probability_frame.reindex(prediction_series.index).fillna(0.0)
@@ -1769,6 +1915,8 @@ class SignalsStep(PipelineStep):
             avg_loss,
             holding_bars,
         )
+        result["signal_source"] = signal_source
+        result["fallback_scope"] = fallback_scope
         pipeline.state["signals"] = result
         return result
 

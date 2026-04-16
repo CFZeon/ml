@@ -133,6 +133,14 @@ def print_training_summary(training):
             "  avg selected : "
             f"{_format_metric(feature_selection.get('avg_selected_features'), digits=2)}"
         )
+    fallback_scope = training.get("fallback_inference", {})
+    if fallback_scope:
+        print(
+            "  fallback     : "
+            f"mode={fallback_scope.get('mode')}  "
+            f"safe_rows={fallback_scope.get('aligned_safe_row_count', 0)}  "
+            f"last_train_end={fallback_scope.get('last_fold_train_end')}"
+        )
     if training.get("last_signal_params"):
         print(f"  tuned signals: {training['last_signal_params']}")
 
@@ -149,6 +157,16 @@ def print_training_summary(training):
 
 
 def print_signal_summary(signal_result, allow_short=True):
+    signal_source = signal_result.get("signal_source")
+    if signal_source is not None:
+        print(f"  source       : {signal_source}")
+    fallback_scope = signal_result.get("fallback_scope", {})
+    if signal_source is not None and signal_source.startswith("post_final_training_fallback"):
+        print(
+            "  fallback     : "
+            f"scored={fallback_scope.get('scored_row_count', fallback_scope.get('aligned_safe_row_count', 0))}  "
+            f"excluded={fallback_scope.get('excluded_row_count', 0)}"
+        )
     signals = pd.Series(signal_result["signals"], copy=False)
     executable_signals = signals if allow_short else signals.clip(lower=0)
     print(
