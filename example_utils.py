@@ -21,6 +21,19 @@ def _format_metric(value, digits=4, percent=False, money=False):
     return f"{numeric:.{digits}f}"
 
 
+def _format_confidence_interval(interval, digits=4, percent=False, money=False):
+    if not isinstance(interval, dict):
+        return None
+    lower = interval.get("lower")
+    upper = interval.get("upper")
+    confidence_level = interval.get("confidence_level")
+    if lower is None or upper is None or confidence_level is None:
+        return None
+    rendered_lower = _format_metric(lower, digits=digits, percent=percent, money=money)
+    rendered_upper = _format_metric(upper, digits=digits, percent=percent, money=money)
+    return f"{confidence_level:.0%} [{rendered_lower}, {rendered_upper}]"
+
+
 def print_section(sep, step, title):
     print(f"\n{sep}\nStep {step} · {title}\n{sep}")
 
@@ -302,6 +315,52 @@ def print_backtest_summary(backtest):
                 f"med={_format_metric(stats.get('median'), percent=percent)}  "
                 f"max={_format_metric(stats.get('max'), percent=percent)}"
             )
+
+    significance = backtest.get("statistical_significance") or {}
+    if significance.get("enabled"):
+        print(
+            "  stats        : "
+            f"{significance.get('method')}  "
+            f"samples={significance.get('bootstrap_samples')}  "
+            f"ci={significance.get('confidence_level', 0.95):.0%}  "
+            f"block={significance.get('mean_block_length')}"
+        )
+        if significance.get("aggregate_mode") is not None:
+            print(
+                "  stats agg    : "
+                f"{significance.get('aggregate_mode')}  "
+                f"paths={significance.get('path_count')}"
+            )
+        if significance.get("benchmark_sharpe_ratio") is not None:
+            print(f"  bench sharpe : {_format_metric(significance.get('benchmark_sharpe_ratio'))}")
+
+        stats_metrics = significance.get("metrics") or {}
+        for label, key, formatter in [
+            ("sharpe ci", "sharpe_ratio", None),
+            ("sortino ci", "sortino_ratio", None),
+            ("calmar ci", "calmar_ratio", None),
+            ("net ret ci", "net_profit_pct", "percent"),
+            ("mdd ci", "max_drawdown", "percent"),
+        ]:
+            metric = stats_metrics.get(key)
+            if not metric:
+                continue
+            interval = _format_confidence_interval(
+                metric.get("confidence_interval"),
+                digits=4,
+                percent=formatter == "percent",
+            )
+            if interval is None:
+                continue
+            suffix = []
+            if metric.get("p_value_gt_zero") is not None:
+                suffix.append(f"p>0={_format_metric(metric.get('p_value_gt_zero'), digits=6)}")
+            if metric.get("p_value_gt_benchmark") is not None:
+                suffix.append(f"p>bench={_format_metric(metric.get('p_value_gt_benchmark'), digits=6)}")
+            suffix_text = f"  {'  '.join(suffix)}" if suffix else ""
+            print(f"  {label:<12}: {interval}{suffix_text}")
+    elif significance.get("reason"):
+        print(f"  stats        : unavailable ({significance.get('reason')})")
 
 
 def print_automl_summary(automl):

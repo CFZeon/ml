@@ -312,7 +312,10 @@ def _summarize_backtest(backtest):
         "win_rate",
         "ending_equity",
     ]
-    return {key: backtest.get(key) for key in keys}
+    summary = {key: backtest.get(key) for key in keys}
+    if backtest.get("statistical_significance") is not None:
+        summary["statistical_significance"] = backtest.get("statistical_significance")
+    return summary
 
 
 def _resolve_metric(training, key, fallback=None):

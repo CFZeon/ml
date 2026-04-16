@@ -13,6 +13,15 @@ except ImportError:  # pragma: no cover
 
 
 _SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
+_DEFAULT_SIGNIFICANCE_CONFIG = {
+    "enabled": True,
+    "method": "stationary_bootstrap",
+    "bootstrap_samples": 500,
+    "confidence_level": 0.95,
+    "mean_block_length": None,
+    "random_state": 42,
+    "min_observations": 8,
+}
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -86,6 +95,260 @@ def _normalize_position_targets(signals, leverage=1.0, allow_short=True):
     if allow_short:
         return target.clip(-abs(float(leverage)), abs(float(leverage)))
     return target.clip(0.0, abs(float(leverage)))
+
+
+def _annualized_sharpe(returns, annualization):
+    if annualization <= 0 or len(returns) < 2:
+        return 0.0
+    volatility = float(np.std(returns, ddof=1))
+    if volatility <= 0:
+        return 0.0
+    return float(np.mean(returns) / volatility * annualization)
+
+
+def _annualized_sortino(returns, annualization):
+    if annualization <= 0 or len(returns) < 2:
+        return 0.0
+    downside = np.where(np.asarray(returns, dtype=float) < 0.0, returns, 0.0)
+    downside_vol = float(np.std(downside, ddof=1))
+    if downside_vol <= 0:
+        return 0.0
+    return float(np.mean(returns) / downside_vol * annualization)
+
+
+def _compute_total_return(equity_curve, starting_equity):
+    if len(equity_curve) == 0 or starting_equity <= 0:
+        return 0.0
+    return float(equity_curve[-1] / starting_equity - 1.0)
+
+
+def _compute_max_drawdown_from_equity(equity_curve):
+    if len(equity_curve) == 0:
+        return 0.0
+    peak = np.maximum.accumulate(equity_curve)
+    return float(np.min((equity_curve - peak) / peak))
+
+
+def _compute_cagr_from_equity(equity_curve, starting_equity, elapsed_years):
+    if len(equity_curve) == 0 or elapsed_years <= 0 or starting_equity <= 0 or equity_curve[-1] <= 0:
+        return 0.0
+    return float((equity_curve[-1] / starting_equity) ** (1.0 / elapsed_years) - 1.0)
+
+
+def _compute_calmar(cagr, max_drawdown):
+    return float(_safe_ratio(cagr, abs(max_drawdown)))
+
+
+def _resolve_significance_config(significance):
+    if significance is None:
+        return dict(_DEFAULT_SIGNIFICANCE_CONFIG)
+    if isinstance(significance, bool):
+        return {**_DEFAULT_SIGNIFICANCE_CONFIG, "enabled": significance}
+    if not isinstance(significance, dict):
+        raise TypeError("significance must be None, a bool, or a dict")
+    return {**_DEFAULT_SIGNIFICANCE_CONFIG, **dict(significance)}
+
+
+def _default_mean_block_length(sample_size):
+    if sample_size <= 1:
+        return 1
+    return max(2, min(sample_size, int(round(sample_size ** (1.0 / 3.0)))))
+
+
+def _stationary_bootstrap_indices(sample_size, mean_block_length, rng):
+    if sample_size <= 0:
+        return np.array([], dtype=int)
+
+    mean_block_length = max(1, int(mean_block_length))
+    restart_probability = min(1.0, 1.0 / float(mean_block_length))
+    indices = np.empty(sample_size, dtype=int)
+    indices[0] = int(rng.integers(0, sample_size))
+
+    for loc in range(1, sample_size):
+        if rng.random() < restart_probability:
+            indices[loc] = int(rng.integers(0, sample_size))
+        else:
+            indices[loc] = (indices[loc - 1] + 1) % sample_size
+
+    return indices
+
+
+def _build_bootstrap_interval(samples, confidence_level, digits=4):
+    finite = np.asarray(samples, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return None
+
+    alpha = (1.0 - float(confidence_level)) / 2.0
+    lower, upper = np.quantile(finite, [alpha, 1.0 - alpha])
+    return {
+        "lower": _round_metric(float(lower), digits),
+        "upper": _round_metric(float(upper), digits),
+        "confidence_level": float(confidence_level),
+    }
+
+
+def _centered_bootstrap_p_value(samples, observed_estimate, threshold):
+    finite = np.asarray(samples, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0 or observed_estimate is None or threshold is None:
+        return None
+
+    observed_estimate = float(observed_estimate)
+    threshold = float(threshold)
+    deviations = finite - observed_estimate
+    test_statistic = observed_estimate - threshold
+    equal_mask = np.isclose(deviations, test_statistic, rtol=1e-9, atol=1e-12)
+    tail_probability = float(np.mean(deviations > test_statistic) + 0.5 * np.mean(equal_mask))
+    return max(0.0, min(1.0, tail_probability))
+
+
+def _align_benchmark_returns(benchmark_returns, index):
+    if benchmark_returns is None:
+        return None
+
+    if isinstance(benchmark_returns, pd.Series):
+        aligned = pd.Series(benchmark_returns, copy=False).reindex(index)
+    else:
+        aligned = pd.Series(benchmark_returns, index=index)
+
+    if aligned.isna().any():
+        raise ValueError("benchmark_returns must cover every backtest timestamp")
+
+    return aligned.astype(float)
+
+
+def _compute_significance_metrics(strat_ret, equity, periods_per_year, elapsed_years,
+                                  sharpe, sortino, calmar, total_ret, max_dd,
+                                  significance=None, benchmark_returns=None,
+                                  benchmark_sharpe=None):
+    config = _resolve_significance_config(significance)
+    payload = {
+        "enabled": bool(config.get("enabled", True)),
+        "method": str(config.get("method", "stationary_bootstrap")),
+        "bootstrap_samples": int(config.get("bootstrap_samples", 500)),
+        "confidence_level": float(config.get("confidence_level", 0.95)),
+        "mean_block_length": None,
+        "random_state": config.get("random_state"),
+        "benchmark_sharpe_ratio": None,
+        "metrics": {},
+    }
+    if not payload["enabled"]:
+        payload["reason"] = "disabled"
+        return payload
+
+    if payload["bootstrap_samples"] <= 0:
+        raise ValueError("bootstrap_samples must be greater than zero")
+    if not 0.0 < payload["confidence_level"] < 1.0:
+        raise ValueError("confidence_level must be between 0 and 1")
+
+    method = payload["method"].lower()
+    if method not in {"stationary", "stationary_bootstrap"}:
+        raise ValueError(f"unsupported significance method: {payload['method']}")
+    payload["method"] = "stationary_bootstrap"
+
+    strategy_returns = pd.Series(strat_ret, copy=False).astype(float)
+    benchmark_series = _align_benchmark_returns(benchmark_returns, strategy_returns.index)
+
+    finite_mask = np.isfinite(strategy_returns.to_numpy())
+    if benchmark_series is not None:
+        finite_mask &= np.isfinite(benchmark_series.to_numpy())
+
+    strategy_returns = strategy_returns.loc[finite_mask]
+    benchmark_series = benchmark_series.loc[finite_mask] if benchmark_series is not None else None
+
+    min_observations = max(2, int(config.get("min_observations", 8)))
+    if len(strategy_returns) < min_observations:
+        payload["enabled"] = False
+        payload["reason"] = "insufficient_observations"
+        return payload
+
+    mean_block_length = config.get("mean_block_length")
+    if mean_block_length is None:
+        mean_block_length = _default_mean_block_length(len(strategy_returns))
+    mean_block_length = max(1, int(mean_block_length))
+    payload["mean_block_length"] = mean_block_length
+
+    annualization = np.sqrt(periods_per_year) if periods_per_year > 0 else 0.0
+    rng = np.random.default_rng(config.get("random_state"))
+    strategy_values = strategy_returns.to_numpy(dtype=float)
+    benchmark_values = benchmark_series.to_numpy(dtype=float) if benchmark_series is not None else None
+
+    bootstrap_metrics = {
+        "sharpe_ratio": np.empty(payload["bootstrap_samples"], dtype=float),
+        "sortino_ratio": np.empty(payload["bootstrap_samples"], dtype=float),
+        "calmar_ratio": np.empty(payload["bootstrap_samples"], dtype=float),
+        "net_profit_pct": np.empty(payload["bootstrap_samples"], dtype=float),
+        "max_drawdown": np.empty(payload["bootstrap_samples"], dtype=float),
+    }
+    benchmark_sharpes = np.empty(payload["bootstrap_samples"], dtype=float) if benchmark_values is not None else None
+
+    for sample_idx in range(payload["bootstrap_samples"]):
+        sampled_idx = _stationary_bootstrap_indices(len(strategy_values), mean_block_length, rng)
+        sampled_returns = strategy_values[sampled_idx]
+        sampled_equity = equity * np.cumprod(1.0 + sampled_returns)
+        sampled_total_ret = _compute_total_return(sampled_equity, equity)
+        sampled_max_dd = _compute_max_drawdown_from_equity(sampled_equity)
+        sampled_cagr = _compute_cagr_from_equity(sampled_equity, equity, elapsed_years)
+
+        bootstrap_metrics["sharpe_ratio"][sample_idx] = _annualized_sharpe(sampled_returns, annualization)
+        bootstrap_metrics["sortino_ratio"][sample_idx] = _annualized_sortino(sampled_returns, annualization)
+        bootstrap_metrics["calmar_ratio"][sample_idx] = _compute_calmar(sampled_cagr, sampled_max_dd)
+        bootstrap_metrics["net_profit_pct"][sample_idx] = sampled_total_ret
+        bootstrap_metrics["max_drawdown"][sample_idx] = sampled_max_dd
+
+        if benchmark_sharpes is not None:
+            benchmark_sharpes[sample_idx] = _annualized_sharpe(benchmark_values[sampled_idx], annualization)
+
+    observed_metrics = {
+        "sharpe_ratio": float(sharpe),
+        "sortino_ratio": float(sortino),
+        "calmar_ratio": float(calmar),
+        "net_profit_pct": float(total_ret),
+        "max_drawdown": float(max_dd),
+    }
+
+    observed_benchmark_sharpe = None
+    if benchmark_series is not None:
+        observed_benchmark_sharpe = _annualized_sharpe(benchmark_values, annualization)
+        payload["benchmark_sharpe_ratio"] = _round_metric(observed_benchmark_sharpe, 4)
+    elif benchmark_sharpe is not None:
+        observed_benchmark_sharpe = float(benchmark_sharpe)
+        payload["benchmark_sharpe_ratio"] = _round_metric(observed_benchmark_sharpe, 4)
+
+    for metric_name, point_estimate in observed_metrics.items():
+        metric_payload = {
+            "point_estimate": _round_metric(point_estimate, 4),
+            "confidence_interval": _build_bootstrap_interval(
+                bootstrap_metrics[metric_name],
+                payload["confidence_level"],
+                digits=4,
+            ),
+        }
+        if metric_name == "sharpe_ratio":
+            metric_payload["p_value_gt_zero"] = _round_metric(
+                _centered_bootstrap_p_value(bootstrap_metrics[metric_name], point_estimate, 0.0),
+                6,
+            )
+            if benchmark_sharpes is not None:
+                observed_diff = point_estimate - float(observed_benchmark_sharpe)
+                bootstrap_diffs = bootstrap_metrics[metric_name] - benchmark_sharpes
+                metric_payload["p_value_gt_benchmark"] = _round_metric(
+                    _centered_bootstrap_p_value(bootstrap_diffs, observed_diff, 0.0),
+                    6,
+                )
+            elif payload["benchmark_sharpe_ratio"] is not None:
+                metric_payload["p_value_gt_benchmark"] = _round_metric(
+                    _centered_bootstrap_p_value(
+                        bootstrap_metrics[metric_name],
+                        point_estimate,
+                        float(payload["benchmark_sharpe_ratio"]),
+                    ),
+                    6,
+                )
+        payload["metrics"][metric_name] = metric_payload
+
+    return payload
 
 
 def _vectorbt_trade_ledger(portfolio, index):
@@ -228,7 +491,8 @@ def _build_trade_ledger(strat_ret, position, execution_series):
 
 def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equity,
                         fees_paid, slippage_paid, signal_delay_bars, trade_ledger,
-                        funding_pnl=0.0, engine="pandas"):
+                        funding_pnl=0.0, engine="pandas", significance=None,
+                        benchmark_returns=None, benchmark_sharpe=None):
     prev_equity = equity_curve.shift(1).fillna(equity)
     pnl = equity_curve - prev_equity
 
@@ -236,12 +500,8 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
     periods_per_year = _infer_periods_per_year(equity_curve.index)
     annualization = np.sqrt(periods_per_year) if periods_per_year > 0 else 0.0
     volatility = strat_ret.std()
-    sharpe = (strat_ret.mean() / volatility * annualization
-              if volatility > 0 and annualization > 0 else 0.0)
-    downside = strat_ret.where(strat_ret < 0, 0.0)
-    downside_vol = downside.std()
-    sortino = (strat_ret.mean() / downside_vol * annualization
-               if downside_vol > 0 and annualization > 0 else 0.0)
+    sharpe = _annualized_sharpe(strat_ret.to_numpy(dtype=float), annualization)
+    sortino = _annualized_sortino(strat_ret.to_numpy(dtype=float), annualization)
     peak = equity_curve.cummax()
     max_dd = ((equity_curve - peak) / peak).min()
     max_dd_amount = abs((equity_curve - peak).min())
@@ -278,9 +538,23 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
     elapsed_years = 0.0
     if len(equity_curve.index) > 1:
         elapsed_years = (equity_curve.index[-1] - equity_curve.index[0]).total_seconds() / _SECONDS_PER_YEAR
-    cagr = ((equity_curve.iloc[-1] / equity) ** (1 / elapsed_years) - 1
-            if elapsed_years > 0 and equity_curve.iloc[-1] > 0 else 0.0)
-    calmar = _safe_ratio(cagr, abs(max_dd))
+    cagr = _compute_cagr_from_equity(equity_curve.to_numpy(dtype=float), equity, elapsed_years)
+    calmar = _compute_calmar(cagr, max_dd)
+
+    significance_metrics = _compute_significance_metrics(
+        strat_ret=strat_ret,
+        equity=equity,
+        periods_per_year=periods_per_year,
+        elapsed_years=elapsed_years,
+        sharpe=sharpe,
+        sortino=sortino,
+        calmar=calmar,
+        total_ret=total_ret,
+        max_dd=max_dd,
+        significance=significance,
+        benchmark_returns=benchmark_returns,
+        benchmark_sharpe=benchmark_sharpe,
+    )
 
     funding_paid = max(-float(funding_pnl), 0.0)
     funding_received = max(float(funding_pnl), 0.0)
@@ -325,6 +599,7 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
         "avg_trade_return_pct": _round_metric(avg_trade_return_pct, 6),
         "avg_trade_bars": _round_metric(avg_trade_bars, 2),
         "trade_profit_factor": _round_metric(trade_profit_factor, 2),
+        "statistical_significance": significance_metrics,
         "trade_ledger": trade_ledger,
         "equity_curve": equity_curve,
     }
@@ -332,7 +607,9 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
 
 def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
                            execution_prices, signal_delay_bars, allow_short,
-                           symbol_filters=None, funding_rates=None):
+                           symbol_filters=None, funding_rates=None,
+                           significance=None, benchmark_returns=None,
+                           benchmark_sharpe=None):
     if vbt is None or Direction is None or SizeType is None:
         raise ImportError("vectorbt is not installed")
 
@@ -383,11 +660,16 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
         trade_ledger=trade_ledger,
         funding_pnl=float(funding_cash.sum()),
         engine="vectorbt",
+        significance=significance,
+        benchmark_returns=benchmark_returns,
+        benchmark_sharpe=benchmark_sharpe,
     )
 
 
 def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
-                         execution_prices, signal_delay_bars, funding_rates=None):
+                         execution_prices, signal_delay_bars, funding_rates=None,
+                         significance=None, benchmark_returns=None,
+                         benchmark_sharpe=None):
     valuation_series = pd.Series(close, copy=False).astype(float)
     execution_series = valuation_series if execution_prices is None else pd.Series(execution_prices, index=valuation_series.index).reindex(valuation_series.index).astype(float)
     returns = valuation_series.pct_change().fillna(0.0)
@@ -414,6 +696,9 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
         trade_ledger=trade_ledger,
         funding_pnl=float((prev_equity * funding_returns).sum()),
         engine="pandas",
+        significance=significance,
+        benchmark_returns=benchmark_returns,
+        benchmark_sharpe=benchmark_sharpe,
     )
 
 
@@ -424,7 +709,8 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
 def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=0.0,
                  execution_prices=None, signal_delay_bars=1, engine="vectorbt",
                  market="spot", leverage=1.0, allow_short=None, symbol_filters=None,
-                 funding_rates=None):
+                 funding_rates=None, significance=None, benchmark_returns=None,
+                 benchmark_sharpe=None):
     """Run a backtest through the configured execution adapter.
 
     Parameters
@@ -442,11 +728,15 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     allow_short      : bool|None  – defaults to False for spot, True for futures
     symbol_filters   : dict|None  – Binance execution filters (tick size, lot size, min notional)
     funding_rates    : pd.Series|None – futures funding rates aligned to close index; applied on funding timestamps only
+    significance     : bool|dict|None – stationary-bootstrap significance settings; enabled by default
+    benchmark_returns: pd.Series|array|None – optional benchmark returns aligned to backtest index for Sharpe comparison
+    benchmark_sharpe : float|None – optional benchmark Sharpe ratio threshold when no benchmark return series is supplied
 
     Returns dict with metrics and equity curve.
     """
     close = pd.Series(close, copy=False).astype(float)
     signal_series = pd.Series(signals, index=close.index).reindex(close.index).fillna(0.0).astype(float)
+    benchmark_returns = _align_benchmark_returns(benchmark_returns, close.index)
     signal_delay_bars = max(0, int(signal_delay_bars))
     allow_short = (market or "spot") != "spot" if allow_short is None else bool(allow_short)
     position = _normalize_position_targets(
@@ -469,6 +759,9 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                 allow_short=allow_short,
                 symbol_filters=symbol_filters,
                 funding_rates=funding_rates,
+                significance=significance,
+                benchmark_returns=benchmark_returns,
+                benchmark_sharpe=benchmark_sharpe,
             )
         except ImportError:
             selected_engine = "pandas"
@@ -482,4 +775,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         execution_prices=execution_prices,
         signal_delay_bars=signal_delay_bars,
         funding_rates=funding_rates,
+        significance=significance,
+        benchmark_returns=benchmark_returns,
+        benchmark_sharpe=benchmark_sharpe,
     )

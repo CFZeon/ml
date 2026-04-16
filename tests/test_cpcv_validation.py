@@ -98,6 +98,9 @@ class CPCVValidationTest(unittest.TestCase):
         self.assertEqual(backtest["validation_method"], "cpcv")
         self.assertEqual(int(backtest["path_count"]), len(training["oos_paths"]))
         self.assertEqual(backtest["aggregate_mode"], "mean")
+        self.assertIn("statistical_significance", backtest)
+        self.assertTrue(backtest["statistical_significance"]["enabled"])
+        self.assertEqual(backtest["statistical_significance"]["aggregate_mode"], "mean")
 
     def test_explicit_walk_forward_preserves_flat_oos_outputs(self):
         raw = _make_raw(n=320, seed=11)

@@ -1,7 +1,7 @@
-C2. No Combinatorial Purged Cross-Validation (CPCV)
+No Statistical Significance Testing on Backtest Results
 
-- **What**: Walk-forward CV splits data into sequential folds. This produces exactly N test-set observations per fold, and the test sets are non-overlapping. CPCV generates all $\binom{N}{N/2}$ (or a tractable subset) combinations of train/test paths, with purging and embargo applied to each, producing a distribution of OOS paths rather than a single equity curve per fold. 
-- **Industry standard**: CPCV is the validation method recommended in *Advances in Financial Machine Learning* (AFML Ch. 12). It enables computing PBO and provides a statistically meaningful distribution of strategy performance. Standard walk-forward CV with 3 folds provides 3 correlated performance estimates—insufficient for statistical inference.
-- **Why it matters**: With only 3 walk-forward folds, the pipeline cannot distinguish between a strategy with genuine edge and one that was lucky on 3 particular test windows. CPCV would expose whether performance is stable across many possible train/test partitions.
-- **Gap in repo**: `walk_forward_split()` in `core/models.py` implements standard sequential splits only. No CPCV implementation exists.
-- **File**: [core/models.py](core/models.py)
+- **What**: The pipeline reports metrics (Sharpe, net profit, win rate) as point estimates. No confidence intervals, no bootstrap distributions, no hypothesis tests.
+- **Industry standard**: At minimum, block-bootstrap the equity curve to produce confidence intervals on Sharpe. Better: use the stationary bootstrap (Politis & Romano) which preserves serial correlation. Report p-values for Sharpe > 0 and for Sharpe > benchmark. AQR and Man Group publish bootstrapped confidence intervals as standard practice.
+- **Why it matters**: A Sharpe of 1.5 computed from 3 months of hourly data has wide confidence intervals. Without them, there is no way to distinguish signal from noise. The reported Sharpe 8.48 from the initial test run (43 trades, 3 months) almost certainly has a 95% CI that includes 0.
+- **Gap in repo**: `_summarize_backtest()` returns scalar metrics only. No bootstrapping, no CI, no hypothesis testing.
+- **File**: [core/backtest.py](core/backtest.py)

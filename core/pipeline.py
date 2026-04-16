@@ -295,6 +295,24 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
     if allow_short is None:
         allow_short = market != "spot"
 
+    significance_config = backtest_config.get("significance")
+    benchmark_returns = None
+    if pipeline.state.get("benchmark_returns") is not None:
+        benchmark_returns = pd.Series(pipeline.state["benchmark_returns"], copy=False).reindex(index)
+    elif isinstance(significance_config, dict):
+        benchmark_returns_column = significance_config.get("benchmark_returns_column")
+        benchmark_price_column = significance_config.get("benchmark_price_column")
+        for frame_name in ["raw_data", "data"]:
+            frame = pipeline.state.get(frame_name)
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            if benchmark_returns_column and benchmark_returns_column in frame.columns:
+                benchmark_returns = pd.Series(frame[benchmark_returns_column], copy=False).reindex(index)
+                break
+            if benchmark_price_column and benchmark_price_column in frame.columns:
+                benchmark_returns = pd.Series(frame[benchmark_price_column], copy=False).reindex(index).pct_change().fillna(0.0)
+                break
+
     return {
         "engine": backtest_config.get("engine", "vectorbt"),
         "market": market,
@@ -302,6 +320,9 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "allow_short": bool(allow_short),
         "symbol_filters": pipeline.state.get("symbol_filters"),
         "funding_rates": _resolve_backtest_funding_rates(pipeline, index),
+        "significance": significance_config,
+        "benchmark_returns": benchmark_returns,
+        "benchmark_sharpe": significance_config.get("benchmark_sharpe") if isinstance(significance_config, dict) else None,
     }
 
 
@@ -317,6 +338,90 @@ def _summarize_path_backtests(path_backtests):
     first_backtest = path_backtests[0].get("backtest", {})
     if first_backtest.get("engine") is not None:
         summary["engine"] = first_backtest.get("engine")
+
+    significance_payloads = []
+    for path in path_backtests:
+        payload = path.get("backtest", {}).get("statistical_significance")
+        if isinstance(payload, dict):
+            significance_payloads.append(payload)
+
+    enabled_significance_payloads = [payload for payload in significance_payloads if payload.get("enabled")]
+    if enabled_significance_payloads:
+        aggregated_significance = {
+            "enabled": True,
+            "aggregate_mode": "mean",
+            "path_count": int(len(enabled_significance_payloads)),
+            "method": enabled_significance_payloads[0].get("method"),
+            "bootstrap_samples": enabled_significance_payloads[0].get("bootstrap_samples"),
+            "confidence_level": enabled_significance_payloads[0].get("confidence_level"),
+            "mean_block_length": enabled_significance_payloads[0].get("mean_block_length"),
+            "random_state": enabled_significance_payloads[0].get("random_state"),
+            "benchmark_sharpe_ratio": None,
+            "metrics": {},
+        }
+
+        benchmark_values = [
+            float(payload["benchmark_sharpe_ratio"])
+            for payload in enabled_significance_payloads
+            if payload.get("benchmark_sharpe_ratio") is not None
+        ]
+        if benchmark_values:
+            aggregated_significance["benchmark_sharpe_ratio"] = float(np.mean(benchmark_values))
+
+        metric_names = sorted(
+            {
+                metric_name
+                for payload in enabled_significance_payloads
+                for metric_name in (payload.get("metrics") or {}).keys()
+            }
+        )
+        for metric_name in metric_names:
+            metric_payload = {}
+
+            point_estimates = []
+            ci_lowers = []
+            ci_uppers = []
+            p_zero_values = []
+            p_benchmark_values = []
+            for payload in enabled_significance_payloads:
+                metric = (payload.get("metrics") or {}).get(metric_name) or {}
+                if metric.get("point_estimate") is not None:
+                    point_estimates.append(float(metric["point_estimate"]))
+                confidence_interval = metric.get("confidence_interval") or {}
+                if confidence_interval.get("lower") is not None:
+                    ci_lowers.append(float(confidence_interval["lower"]))
+                if confidence_interval.get("upper") is not None:
+                    ci_uppers.append(float(confidence_interval["upper"]))
+                if metric.get("p_value_gt_zero") is not None:
+                    p_zero_values.append(float(metric["p_value_gt_zero"]))
+                if metric.get("p_value_gt_benchmark") is not None:
+                    p_benchmark_values.append(float(metric["p_value_gt_benchmark"]))
+
+            if point_estimates:
+                metric_payload["point_estimate"] = float(np.mean(point_estimates))
+            if ci_lowers and ci_uppers:
+                metric_payload["confidence_interval"] = {
+                    "lower": float(np.mean(ci_lowers)),
+                    "upper": float(np.mean(ci_uppers)),
+                    "confidence_level": aggregated_significance["confidence_level"],
+                }
+            if p_zero_values:
+                metric_payload["p_value_gt_zero"] = float(np.mean(p_zero_values))
+            if p_benchmark_values:
+                metric_payload["p_value_gt_benchmark"] = float(np.mean(p_benchmark_values))
+            if metric_payload:
+                aggregated_significance["metrics"][metric_name] = metric_payload
+
+        summary["statistical_significance"] = aggregated_significance
+    elif significance_payloads:
+        summary["statistical_significance"] = {
+            "enabled": False,
+            "aggregate_mode": "mean",
+            "path_count": int(len(significance_payloads)),
+            "reason": significance_payloads[0].get("reason"),
+            "method": significance_payloads[0].get("method"),
+            "metrics": {},
+        }
 
     numeric_keys = [
         "starting_equity",

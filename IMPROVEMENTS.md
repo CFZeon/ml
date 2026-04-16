@@ -15,7 +15,7 @@ Sorted by priority: **critical** flaws that invalidate results first, then **hig
 - **Gap in repo**: `compute_objective_value()` in `core/automl.py` returns a raw score. No DSR, no PBO, no trial-count penalty. The `locked_holdout` is a single chronological block—not CPCV.
 - **File**: [core/automl.py](core/automl.py)
 
-### C2. No Combinatorial Purged Cross-Validation (CPCV)
+### C2. No Combinatorial Purged Cross-Validation (CPCV) pimplemented[]
 
 - **What**: Walk-forward CV splits data into sequential folds. This produces exactly N test-set observations per fold, and the test sets are non-overlapping. CPCV generates all $\binom{N}{N/2}$ (or a tractable subset) combinations of train/test paths, with purging and embargo applied to each, producing a distribution of OOS paths rather than a single equity curve per fold. 
 - **Industry standard**: CPCV is the validation method recommended in *Advances in Financial Machine Learning* (AFML Ch. 12). It enables computing PBO and provides a statistically meaningful distribution of strategy performance. Standard walk-forward CV with 3 folds provides 3 correlated performance estimates—insufficient for statistical inference.
