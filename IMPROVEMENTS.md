@@ -31,7 +31,7 @@ Sorted by priority: **critical** flaws that invalidate results first, then **hig
 - **Gap in repo**: `_run_pandas_backtest()` and `_run_vectorbt_backtest()` in `core/backtest.py` use `slippage_rate` as a scalar multiplied by turnover. No volume data is consumed. No time-of-day adjustment.
 - **File**: [core/backtest.py](core/backtest.py)
 
-### C4. No Statistical Significance Testing on Backtest Results
+### C4. No Statistical Significance Testing on Backtest Results [implemented]
 
 - **What**: The pipeline reports metrics (Sharpe, net profit, win rate) as point estimates. No confidence intervals, no bootstrap distributions, no hypothesis tests.
 - **Industry standard**: At minimum, block-bootstrap the equity curve to produce confidence intervals on Sharpe. Better: use the stationary bootstrap (Politis & Romano) which preserves serial correlation. Report p-values for Sharpe > 0 and for Sharpe > benchmark. AQR and Man Group publish bootstrapped confidence intervals as standard practice.

@@ -3,6 +3,8 @@
 import numpy as np
 import pandas as pd
 
+from .slippage import FlatSlippageModel, OrderBookImpactModel, SquareRootImpactModel
+
 try:  # pragma: no cover - optional dependency exercised in integration tests
     import vectorbt as vbt
     from vectorbt.portfolio.enums import Direction, SizeType
@@ -95,6 +97,83 @@ def _normalize_position_targets(signals, leverage=1.0, allow_short=True):
     if allow_short:
         return target.clip(-abs(float(leverage)), abs(float(leverage)))
     return target.clip(0.0, abs(float(leverage)))
+
+
+def _align_numeric_series(values, index, fill_value=0.0):
+    if values is None:
+        return pd.Series(fill_value, index=index, dtype=float)
+    if isinstance(values, pd.Series):
+        series = values.reindex(index)
+    else:
+        series = pd.Series(values, index=index)
+    return pd.to_numeric(series, errors="coerce").fillna(fill_value).astype(float)
+
+
+def _align_numeric_frame(frame, index):
+    if frame is None:
+        return None
+    aligned = frame.reindex(index).copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame, index=index)
+    for column in aligned.columns:
+        aligned[column] = pd.to_numeric(aligned[column], errors="coerce")
+    return aligned
+
+
+def _resolve_slippage_model(slippage_model, slippage_rate):
+    if slippage_model is None:
+        return FlatSlippageModel(rate=slippage_rate)
+
+    if isinstance(slippage_model, str):
+        aliases = {
+            "flat": "flat",
+            "sqrt-impact": "sqrt_impact",
+            "sqrt_impact": "sqrt_impact",
+            "square-root-impact": "sqrt_impact",
+            "square_root_impact": "sqrt_impact",
+            "orderbook": "orderbook",
+            "order_book": "orderbook",
+        }
+        resolved_name = aliases.get(slippage_model.strip().lower(), slippage_model.strip().lower())
+        if resolved_name == "flat":
+            return FlatSlippageModel(rate=slippage_rate)
+        if resolved_name == "sqrt_impact":
+            return SquareRootImpactModel()
+        if resolved_name == "orderbook":
+            return OrderBookImpactModel()
+        raise ValueError("Unsupported slippage_model. Choose from ['flat', 'sqrt_impact', 'orderbook']")
+
+    if not hasattr(slippage_model, "estimate"):
+        raise TypeError("slippage_model must be None, a supported string alias, or implement estimate(...)")
+    return slippage_model
+
+
+def _estimate_slippage_rates(position, equity, valuation_series, execution_series,
+                             slippage_rate, slippage_model=None, volume=None,
+                             funding_rates=None, orderbook_depth=None):
+    position = pd.Series(position, index=valuation_series.index, copy=False).reindex(valuation_series.index).fillna(0.0).astype(float)
+    turnover = position.diff().abs().fillna(position.abs()).astype(float)
+    model = _resolve_slippage_model(slippage_model, slippage_rate)
+
+    if not isinstance(model, FlatSlippageModel) and volume is None:
+        raise ValueError("volume is required when using a non-flat slippage model")
+
+    aligned_volume = _align_numeric_series(volume, execution_series.index, fill_value=0.0).clip(lower=0.0)
+    aligned_funding = _align_numeric_series(funding_rates, valuation_series.index, fill_value=0.0)
+    gross_returns = position * valuation_series.pct_change().fillna(0.0) - position * aligned_funding
+    gross_equity = float(equity) * (1.0 + gross_returns).cumprod()
+    prev_equity = gross_equity.shift(1).fillna(float(equity))
+    trade_notional = prev_equity * turnover
+    volatility_window = max(1, int(getattr(model, "adv_window", 14)))
+    volatility = execution_series.pct_change().rolling(volatility_window).std()
+
+    slippage_rates = model.estimate(
+        trade_notional=trade_notional,
+        volume=aligned_volume,
+        volatility=volatility,
+        price=execution_series,
+        orderbook_depth=_align_numeric_frame(orderbook_depth, execution_series.index),
+    )
+    slippage_rates = _align_numeric_series(slippage_rates, execution_series.index, fill_value=0.0).clip(lower=0.0)
+    return slippage_rates.where(turnover > 0.0, 0.0), turnover
 
 
 def _annualized_sharpe(returns, annualization):
@@ -609,7 +688,8 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
                            execution_prices, signal_delay_bars, allow_short,
                            symbol_filters=None, funding_rates=None,
                            significance=None, benchmark_returns=None,
-                           benchmark_sharpe=None):
+                           benchmark_sharpe=None, volume=None,
+                           slippage_model=None, orderbook_depth=None):
     if vbt is None or Direction is None or SizeType is None:
         raise ImportError("vectorbt is not installed")
 
@@ -621,6 +701,17 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
 
     valuation_series = _normalize_price_series(close, tick_size=tick_size)
     execution_series = _normalize_price_series(execution_prices if execution_prices is not None else close, tick_size=tick_size)
+    slippage_rates, turnover = _estimate_slippage_rates(
+        position=position,
+        equity=equity,
+        valuation_series=valuation_series,
+        execution_series=execution_series,
+        slippage_rate=slippage_rate,
+        slippage_model=slippage_model,
+        volume=volume,
+        funding_rates=funding_rates,
+        orderbook_depth=orderbook_depth,
+    )
     min_size = None
     if min_notional is not None and float(min_notional) > 0:
         min_size = (float(min_notional) / execution_series.replace(0.0, np.nan)).fillna(0.0)
@@ -632,7 +723,7 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
         direction=Direction.Both if allow_short else Direction.LongOnly,
         price=execution_series,
         fees=fee_rate,
-        slippage=slippage_rate,
+        slippage=slippage_rates,
         min_size=min_size,
         max_size=max_size,
         size_granularity=step_size,
@@ -646,7 +737,7 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
     adjusted_returns = adjusted_equity.pct_change().fillna(0.0)
     trade_ledger = _vectorbt_trade_ledger(portfolio, valuation_series.index)
     fees_paid = float(portfolio.orders.records_readable["Fees"].sum()) if not portfolio.orders.records_readable.empty else 0.0
-    slippage_paid = float((adjusted_equity.shift(1).fillna(equity) * position.diff().abs().fillna(position.abs()) * slippage_rate).sum())
+    slippage_paid = float((adjusted_equity.shift(1).fillna(equity) * turnover * slippage_rates).sum())
 
     return _summarize_backtest(
         equity_curve=adjusted_equity,
@@ -669,13 +760,24 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
 def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
                          execution_prices, signal_delay_bars, funding_rates=None,
                          significance=None, benchmark_returns=None,
-                         benchmark_sharpe=None):
+                         benchmark_sharpe=None, volume=None,
+                         slippage_model=None, orderbook_depth=None):
     valuation_series = pd.Series(close, copy=False).astype(float)
     execution_series = valuation_series if execution_prices is None else pd.Series(execution_prices, index=valuation_series.index).reindex(valuation_series.index).astype(float)
     returns = valuation_series.pct_change().fillna(0.0)
-    turnover = position.diff().abs().fillna(position.abs())
+    slippage_rates, turnover = _estimate_slippage_rates(
+        position=position,
+        equity=equity,
+        valuation_series=valuation_series,
+        execution_series=execution_series,
+        slippage_rate=slippage_rate,
+        slippage_model=slippage_model,
+        volume=volume,
+        funding_rates=funding_rates,
+        orderbook_depth=orderbook_depth,
+    )
     fees = turnover * fee_rate
-    slippage = turnover * slippage_rate
+    slippage = turnover * slippage_rates
     funding_returns = pd.Series(0.0, index=position.index, dtype=float)
     if funding_rates is not None:
         funding_returns = -position * pd.Series(funding_rates, index=position.index).reindex(position.index).fillna(0.0)
@@ -710,7 +812,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  execution_prices=None, signal_delay_bars=1, engine="vectorbt",
                  market="spot", leverage=1.0, allow_short=None, symbol_filters=None,
                  funding_rates=None, significance=None, benchmark_returns=None,
-                 benchmark_sharpe=None):
+                 benchmark_sharpe=None, volume=None, slippage_model=None,
+                 orderbook_depth=None):
     """Run a backtest through the configured execution adapter.
 
     Parameters
@@ -719,7 +822,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     signals          : pd.Series  – target portfolio weights before execution delay
     equity           : float      – starting capital
     fee_rate         : float      – one-way fee
-    slippage_rate    : float      – one-way slippage estimate applied on turnover
+    slippage_rate    : float      – one-way flat slippage rate used by the legacy/default model
     execution_prices : pd.Series or None – optional execution price series, e.g. next-bar open
     signal_delay_bars: int        – bars to delay signal application before execution
     engine           : str        – "vectorbt" (default) or "pandas"
@@ -731,6 +834,9 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     significance     : bool|dict|None – stationary-bootstrap significance settings; enabled by default
     benchmark_returns: pd.Series|array|None – optional benchmark returns aligned to backtest index for Sharpe comparison
     benchmark_sharpe : float|None – optional benchmark Sharpe ratio threshold when no benchmark return series is supplied
+    volume           : pd.Series|array|None – bar volume aligned to the backtest index; required for non-flat slippage models
+    slippage_model   : str|object|None – one of {"flat", "sqrt_impact", "orderbook"} or a custom estimator implementing estimate(...)
+    orderbook_depth  : pd.DataFrame|None – optional L2 depth frame for future order-book-aware slippage models
 
     Returns dict with metrics and equity curve.
     """
@@ -762,6 +868,9 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                 significance=significance,
                 benchmark_returns=benchmark_returns,
                 benchmark_sharpe=benchmark_sharpe,
+                volume=volume,
+                slippage_model=slippage_model,
+                orderbook_depth=orderbook_depth,
             )
         except ImportError:
             selected_engine = "pandas"
@@ -778,4 +887,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         significance=significance,
         benchmark_returns=benchmark_returns,
         benchmark_sharpe=benchmark_sharpe,
+        volume=volume,
+        slippage_model=slippage_model,
+        orderbook_depth=orderbook_depth,
     )

@@ -66,6 +66,7 @@ from .labeling import (
     sample_weights_by_uniqueness,
     sequential_bootstrap,
 )
+from .slippage import FlatSlippageModel, OrderBookImpactModel, SlippageModel, SquareRootImpactModel
 from .models import (
     build_execution_outcome_frame,
     build_trade_outcome_frame,

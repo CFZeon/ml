@@ -113,6 +113,7 @@ def main():
                 "equity": 10_000,
                 "fee_rate": 0.001,
                 "slippage_rate": 0.0003,
+                "slippage_model": "sqrt_impact",
                 "engine": "vectorbt",
                 "use_open_execution": True,
                 "signal_delay_bars": 1,

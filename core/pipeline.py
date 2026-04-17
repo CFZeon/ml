@@ -40,6 +40,7 @@ from .models import (
     train_model,
     walk_forward_split,
 )
+from .slippage import FlatSlippageModel, OrderBookImpactModel, SquareRootImpactModel
 
 
 def _default_regime_features(pipeline):
@@ -275,6 +276,58 @@ def _resolve_backtest_execution_prices(pipeline, index):
     return raw_data["close"].reindex(index)
 
 
+def _resolve_backtest_slippage_adv_window(pipeline):
+    backtest_config = pipeline.section("backtest")
+    configured = backtest_config.get("slippage_adv_window")
+    if configured is not None:
+        return max(1, int(configured))
+
+    for indicator in pipeline.section("indicators") or []:
+        if isinstance(indicator, dict):
+            kind = indicator.get("kind")
+            params = indicator.get("params", {}) or {}
+            period = params.get("period", indicator.get("period"))
+            if kind == "atr":
+                return max(1, int(period)) if period is not None else 14
+            continue
+
+        if getattr(indicator, "kind", None) == "atr":
+            period = getattr(indicator, "period", None)
+            return max(1, int(period)) if period is not None else 14
+
+    return 14
+
+
+def _resolve_backtest_slippage_model(pipeline):
+    backtest_config = pipeline.section("backtest")
+    configured = backtest_config.get("slippage_model")
+    if configured is None:
+        return None
+
+    if isinstance(configured, str):
+        aliases = {
+            "flat": "flat",
+            "sqrt-impact": "sqrt_impact",
+            "sqrt_impact": "sqrt_impact",
+            "square-root-impact": "sqrt_impact",
+            "square_root_impact": "sqrt_impact",
+            "orderbook": "orderbook",
+            "order_book": "orderbook",
+        }
+        resolved_name = aliases.get(configured.strip().lower(), configured.strip().lower())
+        if resolved_name == "flat":
+            return FlatSlippageModel(rate=float(backtest_config.get("slippage_rate", 0.0)))
+        if resolved_name == "sqrt_impact":
+            return SquareRootImpactModel(adv_window=_resolve_backtest_slippage_adv_window(pipeline))
+        if resolved_name == "orderbook":
+            return OrderBookImpactModel()
+        raise ValueError("Unsupported backtest.slippage_model. Choose from ['flat', 'sqrt_impact', 'orderbook']")
+
+    if hasattr(configured, "estimate"):
+        return configured
+    raise TypeError("backtest.slippage_model must be a supported string alias or implement estimate(...)")
+
+
 def _resolve_backtest_funding_rates(pipeline, index):
     backtest_config = pipeline.section("backtest")
     market = _resolve_backtest_market(pipeline)
@@ -291,6 +344,7 @@ def _resolve_backtest_funding_rates(pipeline, index):
 def _resolve_backtest_runtime_kwargs(pipeline, index):
     backtest_config = pipeline.section("backtest")
     market = _resolve_backtest_market(pipeline)
+    raw_data = pipeline.require("raw_data")
     allow_short = backtest_config.get("allow_short")
     if allow_short is None:
         allow_short = market != "spot"
@@ -320,6 +374,9 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "allow_short": bool(allow_short),
         "symbol_filters": pipeline.state.get("symbol_filters"),
         "funding_rates": _resolve_backtest_funding_rates(pipeline, index),
+        "volume": raw_data["volume"].reindex(index).fillna(0.0) if "volume" in raw_data.columns else None,
+        "slippage_model": _resolve_backtest_slippage_model(pipeline),
+        "orderbook_depth": pipeline.state.get("orderbook_depth"),
         "significance": significance_config,
         "benchmark_returns": benchmark_returns,
         "benchmark_sharpe": significance_config.get("benchmark_sharpe") if isinstance(significance_config, dict) else None,

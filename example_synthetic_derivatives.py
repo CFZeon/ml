@@ -165,6 +165,7 @@ def main():
                 "equity": 10_000,
                 "fee_rate": 0.0005,
                 "slippage_rate": 0.0002,
+                "slippage_model": "sqrt_impact",
                 "engine": "vectorbt",
                 "valuation_price": "mark",
                 "apply_funding": True,

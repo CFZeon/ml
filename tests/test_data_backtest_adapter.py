@@ -3,7 +3,8 @@ import unittest
 import pandas as pd
 
 from core.data import _COLUMNS, _prepare_frame
-from core import join_custom_data, run_backtest
+from core import FlatSlippageModel, SquareRootImpactModel, join_custom_data, run_backtest
+from core.slippage import OrderBookImpactModel
 
 
 class DataBacktestAdapterTest(unittest.TestCase):
@@ -35,6 +36,72 @@ class DataBacktestAdapterTest(unittest.TestCase):
         self.assertIn("taker_buy_quote_vol", prepared.columns)
         self.assertAlmostEqual(float(prepared.iloc[0]["taker_buy_base_vol"]), 0.0, places=6)
         self.assertAlmostEqual(float(prepared.iloc[0]["taker_buy_quote_vol"]), 0.0, places=6)
+
+    def test_slippage_sqrt_model_increases_with_volume_ratio(self):
+        index = pd.date_range("2026-03-09", periods=4, freq="1h", tz="UTC")
+        model = SquareRootImpactModel(adv_window=2)
+
+        rates = model.estimate(
+            trade_notional=pd.Series([0.0, 250.0, 5_000.0, 10_000.0], index=index),
+            volume=pd.Series(1_000.0, index=index),
+            volatility=pd.Series(20.0, index=index),
+            price=pd.Series(100.0, index=index),
+        )
+
+        self.assertAlmostEqual(float(rates.iloc[0]), 0.0, places=6)
+        self.assertGreater(float(rates.iloc[2]), float(rates.iloc[1]))
+        self.assertGreater(float(rates.iloc[3]), float(rates.iloc[2]))
+
+    def test_slippage_flat_model_matches_legacy_behavior(self):
+        index = pd.date_range("2026-03-10", periods=6, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 101.0, 103.0, 102.0, 104.0, 103.0], index=index)
+        signals = pd.Series([0.0, 1.0, 1.0, 0.0, -1.0, 0.0], index=index)
+        volume = pd.Series(1_000.0, index=index)
+
+        legacy = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.001,
+            slippage_rate=0.0005,
+            signal_delay_bars=0,
+            engine="pandas",
+            volume=volume,
+        )
+        explicit = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.001,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="pandas",
+            volume=volume,
+            slippage_model=FlatSlippageModel(0.0005),
+        )
+
+        self.assertAlmostEqual(float(legacy["ending_equity"]), float(explicit["ending_equity"]), places=6)
+        self.assertAlmostEqual(float(legacy["net_profit_pct"]), float(explicit["net_profit_pct"]), places=6)
+        self.assertAlmostEqual(float(legacy["slippage_paid"]), float(explicit["slippage_paid"]), places=6)
+
+    def test_slippage_orderbook_raises_not_implemented(self):
+        index = pd.date_range("2026-03-11", periods=4, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 101.0, 100.5, 101.5], index=index)
+        signals = pd.Series([0.0, 1.0, 0.0, 0.0], index=index)
+        volume = pd.Series(500.0, index=index)
+
+        with self.assertRaisesRegex(NotImplementedError, "L2 data adapter not yet available"):
+            run_backtest(
+                close=close,
+                signals=signals,
+                equity=10_000.0,
+                fee_rate=0.0,
+                slippage_rate=0.0,
+                signal_delay_bars=0,
+                engine="pandas",
+                volume=volume,
+                slippage_model=OrderBookImpactModel(),
+            )
 
     def test_point_in_time_custom_join_uses_availability_timestamp(self):
         index = pd.date_range("2026-03-10", periods=4, freq="1h", tz="UTC")
@@ -105,6 +172,37 @@ class DataBacktestAdapterTest(unittest.TestCase):
         self.assertIn("slippage_paid", result)
         self.assertIn("statistical_significance", result)
         self.assertFalse(result["statistical_significance"]["enabled"])
+
+    def test_backtest_with_sqrt_slippage_produces_lower_returns(self):
+        index = pd.date_range("2026-03-13", periods=10, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 103.0, 99.0, 104.0, 98.0, 105.0, 97.0, 106.0, 96.0, 107.0], index=index)
+        signals = pd.Series([0.0, 1.0, 1.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0, 0.0], index=index)
+        volume = pd.Series(5.0, index=index)
+
+        baseline = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="vectorbt",
+            volume=volume,
+        )
+        impacted = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="vectorbt",
+            volume=volume,
+            slippage_model="sqrt_impact",
+        )
+
+        self.assertLess(float(impacted["ending_equity"]), float(baseline["ending_equity"]))
+        self.assertGreater(float(impacted["slippage_paid"]), float(baseline["slippage_paid"]))
 
     def test_backtest_reports_stationary_bootstrap_confidence_intervals(self):
         index = pd.date_range("2026-03-12", periods=24, freq="1h", tz="UTC")

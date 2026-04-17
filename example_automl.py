@@ -72,6 +72,8 @@ def main():
             "backtest": {
                 "equity": 10_000,
                 "fee_rate": 0.001,
+                "slippage_rate": 0.0002,
+                "slippage_model": "sqrt_impact",
                 "use_open_execution": True,
                 "signal_delay_bars": 2,
             },
