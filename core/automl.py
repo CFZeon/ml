@@ -185,6 +185,25 @@ def _build_state_bundle(base_pipeline):
     }
 
 
+def _build_temporal_state_bundle(full_state_bundle, end_timestamp=None):
+    raw_data = pd.DataFrame(full_state_bundle["raw_data"], copy=True)
+    if end_timestamp is not None:
+        raw_data = raw_data.loc[raw_data.index <= end_timestamp].copy()
+
+    slice_index = raw_data.index
+    return {
+        "raw_data": raw_data,
+        "data": full_state_bundle["data"].reindex(slice_index).copy(),
+        "indicator_run": full_state_bundle.get("indicator_run"),
+        "futures_context": _slice_temporal_value(full_state_bundle.get("futures_context"), end_timestamp=end_timestamp),
+        "cross_asset_context": _slice_temporal_value(
+            full_state_bundle.get("cross_asset_context"),
+            end_timestamp=end_timestamp,
+        ),
+        "symbol_filters": copy.deepcopy(full_state_bundle.get("symbol_filters")),
+    }
+
+
 def _seed_candidate_state(candidate, state_bundle):
     for key, value in state_bundle.items():
         if value is None:
@@ -192,18 +211,22 @@ def _seed_candidate_state(candidate, state_bundle):
         candidate.state[key] = _slice_temporal_value(value)
 
 
-def _resolve_locked_holdout_plan(raw_data, automl_config):
+def _resolve_holdout_plan(raw_data, automl_config):
     plan = {
         "enabled": False,
         "reason": None,
         "search_rows": int(len(raw_data)),
+        "validation_rows": 0,
         "holdout_rows": 0,
+        "validation_start_timestamp": None,
+        "validation_end_timestamp": None,
+        "holdout_start_timestamp": None,
         "start_timestamp": None,
         "end_timestamp": None,
         "search_end_timestamp": None,
     }
 
-    if raw_data is None or len(raw_data) < 2:
+    if raw_data is None or len(raw_data) < 3:
         plan["reason"] = "insufficient_rows"
         return plan
     if not automl_config.get("locked_holdout_enabled", True):
@@ -219,20 +242,51 @@ def _resolve_locked_holdout_plan(raw_data, automl_config):
         plan["reason"] = "empty_holdout"
         return plan
 
+    validation_rows = int(round(len(raw_data) * float(automl_config.get("validation_fraction", 0.2))))
+    if validation_rows <= 0:
+        plan["reason"] = "empty_validation"
+        return plan
+
     min_search_rows = int(automl_config.get("locked_holdout_min_search_rows", 100))
-    if not explicit_holdout and len(raw_data) - holdout_rows < min_search_rows:
-        holdout_rows = len(raw_data) - min_search_rows
+    shortfall = max(min_search_rows - (len(raw_data) - validation_rows - holdout_rows), 0)
+    if shortfall > 0:
+        validation_reduction = min(shortfall, max(validation_rows - 1, 0))
+        validation_rows -= validation_reduction
+        shortfall -= validation_reduction
+
+    if shortfall > 0 and not explicit_holdout:
+        holdout_reduction = min(shortfall, max(holdout_rows - 1, 0))
+        holdout_rows -= holdout_reduction
+        shortfall -= holdout_reduction
+
     if holdout_rows <= 0:
+        plan["reason"] = "empty_holdout"
+        return plan
+    if validation_rows <= 0:
+        plan["reason"] = "empty_validation"
+        return plan
+    if shortfall > 0:
         plan["reason"] = "insufficient_search_rows"
         return plan
 
-    search_rows = int(len(raw_data) - holdout_rows)
+    search_rows = int(len(raw_data) - validation_rows - holdout_rows)
+    if search_rows <= 0:
+        plan["reason"] = "insufficient_search_rows"
+        return plan
+
+    validation_start_index = search_rows
+    validation_end_index = search_rows + validation_rows - 1
+    holdout_start_index = search_rows + validation_rows
     plan.update(
         {
             "enabled": True,
             "search_rows": search_rows,
+            "validation_rows": validation_rows,
             "holdout_rows": holdout_rows,
-            "start_timestamp": raw_data.index[search_rows],
+            "validation_start_timestamp": raw_data.index[validation_start_index],
+            "validation_end_timestamp": raw_data.index[validation_end_index],
+            "holdout_start_timestamp": raw_data.index[holdout_start_index],
+            "start_timestamp": raw_data.index[holdout_start_index],
             "end_timestamp": raw_data.index[-1],
             "search_end_timestamp": raw_data.index[search_rows - 1],
         }
@@ -356,28 +410,20 @@ def _execute_trial_candidate(base_config, overrides, pipeline_class, trial_step_
     return candidate.state["training"], candidate.state["backtest"]
 
 
-def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_step_classes, full_state_bundle, holdout_plan):
-    report = {
-        "enabled": bool(holdout_plan.get("enabled", False)),
-        "reason": holdout_plan.get("reason"),
-        "start_timestamp": _json_ready(holdout_plan.get("start_timestamp")),
-        "end_timestamp": _json_ready(holdout_plan.get("end_timestamp")),
-        "search_rows": int(holdout_plan.get("search_rows", 0)),
-        "holdout_rows": int(holdout_plan.get("holdout_rows", 0)),
-        "aligned_search_rows": 0,
-        "aligned_holdout_rows": 0,
-        "training": None,
-        "backtest": None,
-    }
-    if not holdout_plan.get("enabled"):
-        return report
-
+def _execute_temporal_split_candidate(
+    base_config,
+    overrides,
+    pipeline_class,
+    trial_step_classes,
+    state_bundle,
+    split_timestamp,
+):
     candidate_config = copy.deepcopy(base_config)
-    _deep_merge(candidate_config, copy.deepcopy(best_overrides or {}))
+    _deep_merge(candidate_config, copy.deepcopy(overrides or {}))
     candidate_config["automl"] = {**candidate_config.get("automl", {}), "enabled": False}
 
     candidate = pipeline_class(candidate_config, steps=trial_step_classes)
-    _seed_candidate_state(candidate, full_state_bundle)
+    _seed_candidate_state(candidate, state_bundle)
     _run_candidate_steps(
         candidate,
         [
@@ -389,23 +435,18 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
     )
 
     aligned_index = candidate.state["X"].index
-    holdout_start = holdout_plan["start_timestamp"]
-    aligned_search_rows = int((aligned_index < holdout_start).sum())
-    aligned_holdout_rows = int((aligned_index >= holdout_start).sum())
-    report["aligned_search_rows"] = aligned_search_rows
-    report["aligned_holdout_rows"] = aligned_holdout_rows
-    if aligned_search_rows <= 0 or aligned_holdout_rows <= 0:
-        report["reason"] = "aligned_split_empty"
-        return report
+    aligned_train_rows = int((aligned_index < split_timestamp).sum())
+    aligned_test_rows = int((aligned_index >= split_timestamp).sum())
+    if aligned_train_rows <= 0 or aligned_test_rows <= 0:
+        raise RuntimeError("Aligned split empty")
 
     candidate.config["model"] = {
         **candidate.config.get("model", {}),
         "cv_method": "walk_forward",
         "n_splits": 1,
-        "train_size": aligned_search_rows,
-        "test_size": aligned_holdout_rows,
+        "train_size": aligned_train_rows,
+        "test_size": aligned_test_rows,
     }
-
     _run_candidate_steps(
         candidate,
         [
@@ -415,9 +456,96 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
             "run_backtest",
         ],
     )
+    return candidate.state["training"], candidate.state["backtest"], {
+        "aligned_train_rows": int(aligned_train_rows),
+        "aligned_test_rows": int(aligned_test_rows),
+    }
 
-    report["training"] = _json_ready(_summarize_training(candidate.state["training"]))
-    report["backtest"] = _json_ready(_summarize_backtest(candidate.state["backtest"]))
+
+def _build_validation_holdout_report(best_trial_report, holdout_plan):
+    report = {
+        "enabled": bool(holdout_plan.get("enabled", False)),
+        "reason": holdout_plan.get("reason"),
+        "start_timestamp": _json_ready(holdout_plan.get("validation_start_timestamp")),
+        "end_timestamp": _json_ready(holdout_plan.get("validation_end_timestamp")),
+        "search_rows": int(holdout_plan.get("search_rows", 0)),
+        "validation_rows": int(holdout_plan.get("validation_rows", 0)),
+        "aligned_search_rows": 0,
+        "aligned_validation_rows": 0,
+        "training": None,
+        "backtest": None,
+        "raw_objective_value": None,
+        "selection_value": None,
+        "meets_minimum_dsr_threshold": None,
+    }
+    if not holdout_plan.get("enabled") or not best_trial_report:
+        return report
+
+    validation_metrics = best_trial_report.get("validation_metrics") or {}
+    split = validation_metrics.get("split") or {}
+    report["aligned_search_rows"] = int(split.get("aligned_train_rows", 0))
+    report["aligned_validation_rows"] = int(split.get("aligned_test_rows", 0))
+    report["training"] = validation_metrics.get("training")
+    report["backtest"] = validation_metrics.get("backtest")
+    report["raw_objective_value"] = validation_metrics.get("raw_objective_value")
+    report["selection_value"] = best_trial_report.get("selection_value")
+    report["meets_minimum_dsr_threshold"] = best_trial_report.get("meets_minimum_dsr_threshold")
+    return report
+
+
+def _extract_sharpe_ci_lower(backtest_summary):
+    significance = (backtest_summary or {}).get("statistical_significance") or {}
+    metrics = significance.get("metrics") or {}
+    sharpe = metrics.get("sharpe_ratio") or {}
+    confidence_interval = sharpe.get("confidence_interval") or {}
+    lower = confidence_interval.get("lower")
+    if lower is None or not np.isfinite(lower):
+        return None
+    return float(lower)
+
+
+def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_step_classes, full_state_bundle, holdout_plan):
+    report = {
+        "enabled": bool(holdout_plan.get("enabled", False)),
+        "reason": holdout_plan.get("reason"),
+        "start_timestamp": _json_ready(holdout_plan.get("holdout_start_timestamp")),
+        "end_timestamp": _json_ready(holdout_plan.get("end_timestamp")),
+        "search_rows": int(holdout_plan.get("search_rows", 0)),
+        "validation_rows": int(holdout_plan.get("validation_rows", 0)),
+        "pre_holdout_rows": int(holdout_plan.get("search_rows", 0) + holdout_plan.get("validation_rows", 0)),
+        "holdout_rows": int(holdout_plan.get("holdout_rows", 0)),
+        "aligned_search_rows": 0,
+        "aligned_pre_holdout_rows": 0,
+        "aligned_holdout_rows": 0,
+        "training": None,
+        "backtest": None,
+        "holdout_warning": False,
+    }
+    if not holdout_plan.get("enabled"):
+        return report
+
+    try:
+        training, backtest, split = _execute_temporal_split_candidate(
+            base_config,
+            best_overrides,
+            pipeline_class,
+            trial_step_classes,
+            full_state_bundle,
+            holdout_plan["holdout_start_timestamp"],
+        )
+    except RuntimeError as exc:
+        if "Aligned split empty" in str(exc):
+            report["reason"] = "aligned_split_empty"
+            return report
+        raise
+
+    report["aligned_search_rows"] = int(split["aligned_train_rows"])
+    report["aligned_pre_holdout_rows"] = int(split["aligned_train_rows"])
+    report["aligned_holdout_rows"] = int(split["aligned_test_rows"])
+    report["training"] = _json_ready(_summarize_training(training))
+    report["backtest"] = _json_ready(_summarize_backtest(backtest))
+    sharpe_ci_lower = _extract_sharpe_ci_lower(report["backtest"])
+    report["holdout_warning"] = bool(sharpe_ci_lower is not None and sharpe_ci_lower < 0.0)
     return report
 
 
@@ -491,7 +619,7 @@ def _compute_period_sharpe(returns):
     return float(series.mean() / volatility)
 
 
-def _build_trial_record(overrides, training, backtest, objective_name, automl_config):
+def _build_evaluation_record(training, backtest, objective_name, automl_config, split=None):
     training_summary = _json_ready(_summarize_training(training))
     backtest_summary = _json_ready(_summarize_backtest(backtest))
     returns = _extract_backtest_returns(backtest)
@@ -502,13 +630,33 @@ def _build_trial_record(overrides, training, backtest, objective_name, automl_co
         backtest_summary,
         automl_config,
     )
-    return {
-        "overrides": copy.deepcopy(overrides or {}),
+    record = {
         "training": training_summary,
         "backtest": backtest_summary,
         "returns": returns,
         "period_sharpe": period_sharpe,
         "raw_objective_value": float(raw_objective_value),
+    }
+    if split is not None:
+        record["split"] = {
+            "aligned_train_rows": int(split.get("aligned_train_rows", 0)),
+            "aligned_test_rows": int(split.get("aligned_test_rows", 0)),
+        }
+    return record
+
+
+def _build_trial_record(overrides, search_record, validation_record=None):
+    validation_record = validation_record or search_record
+    return {
+        "overrides": copy.deepcopy(overrides or {}),
+        "search": search_record,
+        "validation": validation_record,
+        "training": validation_record["training"],
+        "backtest": validation_record["backtest"],
+        "returns": validation_record["returns"],
+        "period_sharpe": validation_record["period_sharpe"],
+        "raw_objective_value": float(validation_record["raw_objective_value"]),
+        "search_raw_objective_value": float(search_record["raw_objective_value"]),
     }
 
 
@@ -764,6 +912,9 @@ def compute_cpcv_pbo(trial_return_frame, n_blocks=8, test_blocks=None, min_block
 
 def _build_trial_selection_report(completed_trials, trial_records, objective_name, automl_config):
     control = _resolve_overfitting_control(automl_config)
+    minimum_dsr_threshold = automl_config.get("minimum_dsr_threshold", 0.3)
+    if minimum_dsr_threshold is not None:
+        minimum_dsr_threshold = float(minimum_dsr_threshold)
     trial_return_frame = _build_trial_return_frame(trial_records)
     effective_trial_count = float(len(completed_trials))
     average_pairwise_correlation = None
@@ -781,19 +932,26 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
 
     sharpe_mean = float(np.mean(period_sharpes)) if period_sharpes else 0.0
     sharpe_std = float(np.std(period_sharpes, ddof=1)) if len(period_sharpes) > 1 else 0.0
-    apply_penalty = (
-        control["enabled"]
-        and control["selection_mode"] == "penalized_ranking"
-        and control["deflated_sharpe"]["enabled"]
-        and objective_name in control["penalized_objectives"]
-    )
-    selection_metric = "deflated_sharpe_ratio" if apply_penalty else objective_name
+    selection_metric = objective_name
+    selection_mode = "validation_objective_gated_dsr" if minimum_dsr_threshold is not None else "validation_objective"
 
     trial_reports = []
     for trial in completed_trials:
         record = trial_records.get(trial.number)
         if record is None:
             continue
+
+        search_metrics = {
+            "training": record.get("search", {}).get("training"),
+            "backtest": record.get("search", {}).get("backtest"),
+            "raw_objective_value": record.get("search", {}).get("raw_objective_value"),
+        }
+        validation_metrics = {
+            "training": record.get("validation", {}).get("training"),
+            "backtest": record.get("validation", {}).get("backtest"),
+            "raw_objective_value": record.get("validation", {}).get("raw_objective_value"),
+            "split": _json_ready(record.get("validation", {}).get("split")),
+        }
 
         deflated_sharpe = compute_deflated_sharpe_ratio(
             record.get("returns"),
@@ -807,11 +965,14 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             record["training"],
             record["backtest"],
             automl_config,
-            overfitting_context={
-                "apply_penalty": apply_penalty,
-                "deflated_sharpe_ratio": deflated_sharpe.get("deflated_sharpe_ratio"),
-            },
         )
+        meets_minimum_dsr_threshold = True
+        dsr_value = deflated_sharpe.get("deflated_sharpe_ratio")
+        if minimum_dsr_threshold is not None:
+            if dsr_value is None or not np.isfinite(dsr_value) or dsr_value < minimum_dsr_threshold:
+                selection_value = float("-inf")
+                meets_minimum_dsr_threshold = False
+
         trial_reports.append(
             {
                 "number": trial.number,
@@ -821,6 +982,9 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 "backtest": record["backtest"],
                 "raw_objective_value": float(record["raw_objective_value"]),
                 "selection_value": float(selection_value),
+                "search_metrics": search_metrics,
+                "validation_metrics": validation_metrics,
+                "meets_minimum_dsr_threshold": meets_minimum_dsr_threshold,
                 "overfitting": {"deflated_sharpe": deflated_sharpe},
             }
         )
@@ -852,8 +1016,9 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
     best_trial = trial_reports[0]
     diagnostics = {
         "enabled": control["enabled"],
-        "selection_mode": ("penalized_dsr" if apply_penalty else "raw_objective"),
+        "selection_mode": selection_mode,
         "selection_metric": selection_metric,
+        "minimum_dsr_threshold": minimum_dsr_threshold,
         "trial_count": int(len(completed_trials)),
         "effective_trial_count": float(effective_trial_count),
         "average_pairwise_correlation": average_pairwise_correlation,
@@ -869,13 +1034,14 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "number": int(best_trial["number"]),
             "raw_objective_value": float(best_trial["raw_objective_value"]),
             "selection_value": float(best_trial["selection_value"]),
+            "meets_minimum_dsr_threshold": bool(best_trial["meets_minimum_dsr_threshold"]),
             "deflated_sharpe": best_trial["overfitting"]["deflated_sharpe"],
         },
         "pbo": pbo_report,
     }
     return {
         "selection_metric": selection_metric,
-        "selection_mode": diagnostics["selection_mode"],
+        "selection_mode": selection_mode,
         "trial_reports": trial_reports,
         "diagnostics": diagnostics,
     }
@@ -1048,53 +1214,109 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     objective_name = _normalize_objective_name(automl_config.get("objective", "accuracy_first"))
 
     full_state_bundle = _build_state_bundle(base_pipeline)
-    holdout_plan = _resolve_locked_holdout_plan(full_state_bundle["raw_data"], automl_config)
-    search_state_bundle = _build_state_bundle(base_pipeline)
+    holdout_plan = _resolve_holdout_plan(full_state_bundle["raw_data"], automl_config)
+    search_state_bundle = full_state_bundle
+    validation_state_bundle = full_state_bundle
     if holdout_plan["enabled"]:
-        search_index = full_state_bundle["raw_data"].index[: holdout_plan["search_rows"]]
-        search_state_bundle["raw_data"] = full_state_bundle["raw_data"].loc[search_index].copy()
-        search_state_bundle["data"] = full_state_bundle["data"].reindex(search_index).copy()
-        search_end_timestamp = holdout_plan["search_end_timestamp"]
-        search_state_bundle["futures_context"] = _slice_temporal_value(
-            full_state_bundle.get("futures_context"),
-            end_timestamp=search_end_timestamp,
-        )
-        search_state_bundle["cross_asset_context"] = _slice_temporal_value(
-            full_state_bundle.get("cross_asset_context"),
-            end_timestamp=search_end_timestamp,
-        )
+        search_state_bundle = _build_temporal_state_bundle(full_state_bundle, holdout_plan["search_end_timestamp"])
+        validation_state_bundle = _build_temporal_state_bundle(full_state_bundle, holdout_plan["validation_end_timestamp"])
 
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=sampler,
-        study_name=study_name,
-        storage=storage_url,
-        load_if_exists=True,
-    )
+    enable_pruning = bool(automl_config.get("enable_pruning", True))
+    study_kwargs = {
+        "direction": "maximize",
+        "sampler": sampler,
+        "study_name": study_name,
+        "storage": storage_url,
+        "load_if_exists": True,
+    }
+    if enable_pruning:
+        study_kwargs["pruner"] = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=0)
+    study = optuna.create_study(**study_kwargs)
     trial_records = {}
 
     def objective(trial):
         overrides = _sample_trial_overrides(trial, search_space)
         try:
-            training, backtest = _execute_trial_candidate(
+            search_training, search_backtest = _execute_trial_candidate(
                 base_config,
                 overrides,
                 pipeline_class,
                 trial_step_classes,
                 search_state_bundle,
             )
+            search_record = _build_evaluation_record(
+                search_training,
+                search_backtest,
+                objective_name,
+                automl_config,
+            )
         except RuntimeError as exc:
-            if "No validation splits were generated" in str(exc) or "No walk-forward folds were generated" in str(exc):
+            if (
+                "No validation splits were generated" in str(exc)
+                or "No walk-forward folds were generated" in str(exc)
+                or "Aligned split empty" in str(exc)
+            ):
                 raise optuna.TrialPruned(str(exc)) from exc
             raise
 
-        record = _build_trial_record(overrides, training, backtest, objective_name, automl_config)
+        trial.set_user_attr("overrides", _json_ready(_clone_value(overrides)))
+        trial.set_user_attr(
+            "search_metrics",
+            {
+                "training": search_record["training"],
+                "backtest": search_record["backtest"],
+                "raw_objective_value": float(search_record["raw_objective_value"]),
+            },
+        )
+        trial.set_user_attr("search_raw_objective_value", float(search_record["raw_objective_value"]))
+
+        trial.report(float(search_record["raw_objective_value"]), step=0)
+        if enable_pruning and trial.should_prune():
+            raise optuna.TrialPruned("Pruned after search-stage objective")
+
+        validation_record = search_record
+        if holdout_plan["enabled"]:
+            try:
+                validation_training, validation_backtest, validation_split = _execute_temporal_split_candidate(
+                    base_config,
+                    overrides,
+                    pipeline_class,
+                    trial_step_classes,
+                    validation_state_bundle,
+                    holdout_plan["validation_start_timestamp"],
+                )
+            except RuntimeError as exc:
+                if (
+                    "No validation splits were generated" in str(exc)
+                    or "No walk-forward folds were generated" in str(exc)
+                    or "Aligned split empty" in str(exc)
+                ):
+                    raise optuna.TrialPruned(str(exc)) from exc
+                raise
+            validation_record = _build_evaluation_record(
+                validation_training,
+                validation_backtest,
+                objective_name,
+                automl_config,
+                split=validation_split,
+            )
+            trial.report(float(validation_record["raw_objective_value"]), step=1)
+
+        record = _build_trial_record(overrides, search_record, validation_record)
         trial_records[trial.number] = record
         value = float(record["raw_objective_value"])
 
-        trial.set_user_attr("overrides", _json_ready(_clone_value(overrides)))
         trial.set_user_attr("training", record["training"])
         trial.set_user_attr("backtest", record["backtest"])
+        trial.set_user_attr(
+            "validation_metrics",
+            {
+                "training": record["training"],
+                "backtest": record["backtest"],
+                "raw_objective_value": value,
+                "split": _json_ready(record.get("validation", {}).get("split")),
+            },
+        )
         trial.set_user_attr("raw_objective_value", value)
         return value
 
@@ -1106,7 +1328,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         catch=(ValueError, RuntimeError),
     )
 
-    completed_trials = [trial for trial in study.trials if trial.value is not None]
+    completed_trials = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
     if not completed_trials:
         raise RuntimeError("AutoML finished without any completed trials")
 
@@ -1119,16 +1341,39 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         if overrides is None:
             continue
         try:
-            training, backtest = _execute_trial_candidate(
+            search_training, search_backtest = _execute_trial_candidate(
                 base_config,
                 overrides,
                 pipeline_class,
                 trial_step_classes,
                 search_state_bundle,
             )
+            search_record = _build_evaluation_record(
+                search_training,
+                search_backtest,
+                objective_name,
+                automl_config,
+            )
+            validation_record = search_record
+            if holdout_plan["enabled"]:
+                validation_training, validation_backtest, validation_split = _execute_temporal_split_candidate(
+                    base_config,
+                    overrides,
+                    pipeline_class,
+                    trial_step_classes,
+                    validation_state_bundle,
+                    holdout_plan["validation_start_timestamp"],
+                )
+                validation_record = _build_evaluation_record(
+                    validation_training,
+                    validation_backtest,
+                    objective_name,
+                    automl_config,
+                    split=validation_split,
+                )
         except RuntimeError:
             continue
-        trial_records[trial.number] = _build_trial_record(overrides, training, backtest, objective_name, automl_config)
+        trial_records[trial.number] = _build_trial_record(overrides, search_record, validation_record)
 
     selection_report = _build_trial_selection_report(completed_trials, trial_records, objective_name, automl_config)
     best_trial_report = selection_report["trial_reports"][0]
@@ -1136,6 +1381,8 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     best_optuna_trial = study.best_trial
     best_overrides = copy.deepcopy(best_trial_report["overrides"])
     best_overrides_summary = _json_ready(_clone_value(best_overrides))
+
+    validation_holdout = _build_validation_holdout_report(best_trial_report, holdout_plan)
 
     locked_holdout = _evaluate_locked_holdout(
         base_config=base_config,
@@ -1156,6 +1403,9 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 "params": report["params"],
                 "training": report["training"],
                 "backtest": report["backtest"],
+                "search_metrics": report["search_metrics"],
+                "validation_metrics": report["validation_metrics"],
+                "meets_minimum_dsr_threshold": report["meets_minimum_dsr_threshold"],
                 "overfitting": report["overfitting"],
             }
         )
@@ -1178,6 +1428,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "best_backtest": best_trial_report["backtest"],
         "best_training": best_trial_report["training"],
         "best_overfitting": best_trial_report["overfitting"],
+        "validation_holdout": validation_holdout,
         "locked_holdout": locked_holdout,
         "overfitting_diagnostics": selection_report["diagnostics"],
         "top_trials": top_trials,

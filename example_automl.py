@@ -82,7 +82,10 @@ def main():
                 "n_trials": 8,
                 "objective": "accuracy_first",
                 "seed": 42,
-                "study_name": "BTCUSDT_1h_accuracy_first_oos_demo_v2",
+                "validation_fraction": 0.2,
+                "minimum_dsr_threshold": 0.3,
+                "enable_pruning": True,
+                "study_name": "BTCUSDT_1h_accuracy_first_oos_demo_v3",
             },
         }
     )

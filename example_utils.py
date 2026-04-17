@@ -413,11 +413,27 @@ def print_automl_summary(automl):
     elif pbo:
         print(f"  CPCV PBO     : disabled ({pbo.get('reason')})")
 
+    validation_holdout = automl.get("validation_holdout") or {}
+    if validation_holdout.get("enabled"):
+        validation_backtest = validation_holdout.get("backtest") or {}
+        print(
+            "  validation   : "
+            f"rows={validation_holdout.get('aligned_validation_rows')}  "
+            f"range={validation_holdout.get('start_timestamp')} -> {validation_holdout.get('end_timestamp')}"
+        )
+        if validation_backtest:
+            print(
+                "  validation bt: "
+                f"sharpe={_format_metric(validation_backtest.get('sharpe_ratio'))}  "
+                f"net={_format_metric(validation_backtest.get('net_profit_pct'), percent=True)}  "
+                f"trades={validation_backtest.get('total_trades')}"
+            )
+
     locked_holdout = automl.get("locked_holdout") or {}
     if locked_holdout.get("enabled"):
         holdout_backtest = locked_holdout.get("backtest") or {}
         print(
-            "  holdout      : "
+            "  final holdout: "
             f"rows={locked_holdout.get('aligned_holdout_rows')}  "
             f"range={locked_holdout.get('start_timestamp')} -> {locked_holdout.get('end_timestamp')}"
         )
@@ -428,3 +444,5 @@ def print_automl_summary(automl):
                 f"net={_format_metric(holdout_backtest.get('net_profit_pct'), percent=True)}  "
                 f"trades={holdout_backtest.get('total_trades')}"
             )
+        if locked_holdout.get("holdout_warning"):
+            print("  holdout warn : Sharpe CI lower bound is below zero")
