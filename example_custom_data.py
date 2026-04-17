@@ -102,7 +102,10 @@ def main():
             "signals": {
                 "threshold": 0.0,
                 "edge_threshold": 0.0,
+                "shrinkage_alpha": 0.5,
                 "fraction": 0.75,
+                "min_trades_for_kelly": 30,
+                "max_kelly_fraction": 0.5,
                 "meta_threshold": 0.5,
                 "profitability_threshold": 0.5,
                 "expected_edge_threshold": 0.0,

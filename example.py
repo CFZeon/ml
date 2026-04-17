@@ -61,7 +61,10 @@ def main():
             "signals": {
                 "avg_win": 0.02,
                 "avg_loss": 0.02,
+                "shrinkage_alpha": 0.5,
                 "fraction": 0.5,
+                "min_trades_for_kelly": 30,
+                "max_kelly_fraction": 0.5,
                 "threshold": 0.01,
                 "edge_threshold": 0.05,
                 "meta_threshold": 0.55,

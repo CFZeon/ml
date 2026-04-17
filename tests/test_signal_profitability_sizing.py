@@ -4,10 +4,106 @@ import numpy as np
 import pandas as pd
 
 from core import ResearchPipeline, build_execution_outcome_frame, build_trade_outcome_frame
-from core.pipeline import _build_signal_state, _compute_theory_thresholds
+from core.pipeline import _build_signal_state, _compute_theory_thresholds, _estimate_trade_outcome_stats
 
 
 class SignalProfitabilitySizingTest(unittest.TestCase):
+    def test_kelly_fallback_to_flat_below_trade_threshold(self):
+        index = pd.date_range("2026-03-01", periods=2, freq="1h", tz="UTC")
+        predictions = pd.Series([1, -1], index=index)
+        probability_frame = pd.DataFrame(
+            {
+                -1: [0.1, 0.9],
+                0: [0.0, 0.0],
+                1: [0.9, 0.1],
+            },
+            index=index,
+        )
+        profitability_prob = pd.Series([0.8, 0.7], index=index)
+
+        with self.assertWarnsRegex(RuntimeWarning, "Kelly sizing fallback activated"):
+            state = _build_signal_state(
+                predictions,
+                probability_frame,
+                profitability_prob,
+                {
+                    "threshold": 0.0,
+                    "edge_threshold": 0.0,
+                    "meta_threshold": 0.55,
+                    "fraction": 0.4,
+                    "sizing_mode": "kelly",
+                    "min_trades_for_kelly": 30,
+                    "max_kelly_fraction": 0.5,
+                },
+                avg_win=0.03,
+                avg_loss=0.01,
+                holding_bars=1,
+                kelly_trade_count=8,
+            )
+
+        self.assertTrue(state["used_flat_kelly_fallback"])
+        self.assertEqual(int(state["kelly_trade_count"]), 8)
+        self.assertAlmostEqual(float(state["position_size"].iloc[0]), 0.4, places=6)
+        self.assertAlmostEqual(float(state["position_size"].iloc[1]), 0.4, places=6)
+        self.assertAlmostEqual(float(state["event_signals"].iloc[0]), 0.4, places=6)
+        self.assertAlmostEqual(float(state["event_signals"].iloc[1]), -0.4, places=6)
+
+    def test_kelly_shrinkage_blends_fold_and_pooled(self):
+        index = pd.date_range("2026-03-02", periods=3, freq="1h", tz="UTC")
+        fold_trade_outcomes = pd.DataFrame(
+            {
+                "net_trade_return": [0.10, 0.06, -0.04],
+                "trade_taken": [1, 1, 1],
+            },
+            index=index,
+        )
+        pooled_trade_outcomes = pd.DataFrame(
+            {
+                "net_trade_return": [0.02, -0.01, -0.03],
+                "trade_taken": [1, 1, 1],
+            },
+            index=pd.date_range("2026-02-20", periods=3, freq="1h", tz="UTC"),
+        )
+
+        avg_win, avg_loss = _estimate_trade_outcome_stats(
+            fold_trade_outcomes,
+            default_win=0.02,
+            default_loss=0.02,
+            pooled_trade_outcomes=pooled_trade_outcomes,
+            shrinkage_alpha=0.5,
+        )
+
+        self.assertAlmostEqual(avg_win, 0.05, places=6)
+        self.assertAlmostEqual(avg_loss, 0.03, places=6)
+
+    def test_kelly_capped_at_max_fraction(self):
+        index = pd.date_range("2026-03-03", periods=1, freq="1h", tz="UTC")
+        predictions = pd.Series([1], index=index)
+        probability_frame = pd.DataFrame({-1: [0.05], 0: [0.0], 1: [0.95]}, index=index)
+        profitability_prob = pd.Series([0.9], index=index)
+
+        state = _build_signal_state(
+            predictions,
+            probability_frame,
+            profitability_prob,
+            {
+                "threshold": 0.0,
+                "edge_threshold": 0.0,
+                "meta_threshold": 0.55,
+                "fraction": 1.0,
+                "sizing_mode": "kelly",
+                "min_trades_for_kelly": 30,
+                "max_kelly_fraction": 0.2,
+            },
+            avg_win=0.04,
+            avg_loss=0.01,
+            holding_bars=1,
+            kelly_trade_count=50,
+        )
+
+        self.assertFalse(state["used_flat_kelly_fallback"])
+        self.assertAlmostEqual(float(state["position_size"].iloc[0]), 0.2, places=6)
+
     def test_trade_outcome_frame_uses_profitability_not_raw_correctness(self):
         index = pd.date_range("2026-03-01", periods=4, freq="1h", tz="UTC")
         predictions = pd.Series([1, -1, 1, 0], index=index)

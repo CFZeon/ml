@@ -156,7 +156,10 @@ def main():
             "signals": {
                 "threshold": 0.0,
                 "edge_threshold": 0.0,
+                "shrinkage_alpha": 0.5,
                 "fraction": 1.0,
+                "min_trades_for_kelly": 30,
+                "max_kelly_fraction": 0.5,
                 "meta_threshold": 0.5,
                 "expected_edge_threshold": 0.0,
                 "sizing_mode": "expected_utility",

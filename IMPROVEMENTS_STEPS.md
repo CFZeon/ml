@@ -66,7 +66,7 @@ SlippageModel (Protocol)
 
 ---
 
-## H4. Two-Stage Holdout for AutoML
+## H4. Two-Stage Holdout for AutoML [implemented]
 
 **Priority**: High  
 **Status**: Open  

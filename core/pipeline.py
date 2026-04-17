@@ -832,14 +832,30 @@ def _build_execution_trade_outcomes(pipeline, predictions, holding_bars, cutoff_
     )
 
 
-def _estimate_trade_outcome_stats(trade_outcomes, default_win, default_loss):
+def _count_realized_trades(trade_outcomes):
+    if trade_outcomes is None or trade_outcomes.empty:
+        return 0
+
+    if "trade_taken" in trade_outcomes.columns:
+        trade_taken = pd.to_numeric(trade_outcomes["trade_taken"], errors="coerce").fillna(0)
+        return int(trade_taken.astype(bool).sum())
+
+    if "net_trade_return" in trade_outcomes.columns:
+        realized_returns = pd.to_numeric(trade_outcomes["net_trade_return"], errors="coerce")
+        return int(realized_returns.notna().sum())
+
+    return 0
+
+
+def _estimate_trade_outcome_stats(trade_outcomes, default_win, default_loss, pooled_trade_outcomes=None, shrinkage_alpha=None):
     if trade_outcomes is None or trade_outcomes.empty or "net_trade_return" not in trade_outcomes.columns:
         return float(default_win), float(default_loss)
 
-    realized_returns = pd.Series(trade_outcomes["net_trade_return"], index=trade_outcomes.index).dropna()
+    realized_returns = pd.to_numeric(trade_outcomes["net_trade_return"], errors="coerce")
     if "trade_taken" in trade_outcomes.columns:
-        trade_mask = trade_outcomes["trade_taken"].reindex(realized_returns.index).fillna(0).astype(bool)
+        trade_mask = pd.to_numeric(trade_outcomes["trade_taken"], errors="coerce").fillna(0).astype(bool)
         realized_returns = realized_returns.loc[trade_mask]
+    realized_returns = realized_returns.dropna()
     if realized_returns.empty:
         return float(default_win), float(default_loss)
 
@@ -847,6 +863,17 @@ def _estimate_trade_outcome_stats(trade_outcomes, default_win, default_loss):
     losses = realized_returns[realized_returns < 0]
     avg_win = float(wins.mean()) if len(wins) > 0 else float(default_win)
     avg_loss = float(losses.abs().mean()) if len(losses) > 0 else float(default_loss)
+
+    if pooled_trade_outcomes is not None and shrinkage_alpha is not None:
+        pooled_avg_win, pooled_avg_loss = _estimate_trade_outcome_stats(
+            pooled_trade_outcomes,
+            default_win,
+            default_loss,
+        )
+        alpha = float(np.clip(shrinkage_alpha, 0.0, 1.0))
+        avg_win = alpha * avg_win + (1.0 - alpha) * pooled_avg_win
+        avg_loss = alpha * avg_loss + (1.0 - alpha) * pooled_avg_loss
+
     return avg_win, avg_loss
 
 
@@ -887,6 +914,10 @@ def _position_size_from_profitability(probability, avg_win, avg_loss, signal_con
     else:
         size = max(0.0, expected_edge) / utility_scale
         size = min(size, 1.0) * fraction
+
+    max_kelly_fraction = signal_config.get("max_kelly_fraction")
+    if max_kelly_fraction is not None:
+        size = min(float(size), max(0.0, float(max_kelly_fraction)))
 
     return size, expected_edge
 
@@ -978,7 +1009,7 @@ def _resolve_round_trip_cost_rate(backtest_config, trade_outcomes=None):
 
     realized_costs = pd.to_numeric(trade_outcomes["round_trip_cost_rate"], errors="coerce")
     if "trade_taken" in trade_outcomes.columns:
-        trade_mask = trade_outcomes["trade_taken"].reindex(realized_costs.index).fillna(0).astype(bool)
+        trade_mask = pd.to_numeric(trade_outcomes["trade_taken"], errors="coerce").fillna(0).astype(bool)
         realized_costs = realized_costs.loc[trade_mask]
     realized_costs = realized_costs.dropna()
     if realized_costs.empty:
@@ -1040,15 +1071,42 @@ def _resolve_signal_threshold_grid(signal_config):
     }
 
 
-def _build_signal_state(prediction_series, probability_frame, meta_prob_series, signal_config, avg_win, avg_loss, holding_bars):
+def _build_signal_state(
+    prediction_series,
+    probability_frame,
+    meta_prob_series,
+    signal_config,
+    avg_win,
+    avg_loss,
+    holding_bars,
+    kelly_trade_count=None,
+):
     direction = prediction_series.apply(lambda value: 1.0 if value > 0 else (-1.0 if value < 0 else 0.0))
     direction_edge = probability_frame[1] - probability_frame[-1]
     confidence = direction_edge.abs().clip(0.0, 1.0)
     profitability_prob = meta_prob_series.clip(0.0, 1.0)
+    min_trades_for_kelly = int(signal_config.get("min_trades_for_kelly", 30))
+    use_flat_kelly_fallback = (
+        signal_config.get("sizing_mode", "expected_utility") == "kelly"
+        and kelly_trade_count is not None
+        and int(kelly_trade_count) < min_trades_for_kelly
+    )
+    if use_flat_kelly_fallback:
+        warnings.warn(
+            (
+                "Kelly sizing fallback activated: using flat fractional sizing because only "
+                f"{int(kelly_trade_count)} OOS trades are available, below min_trades_for_kelly={min_trades_for_kelly}."
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     position_size = pd.Series(index=profitability_prob.index, dtype=float)
     expected_trade_edge = pd.Series(index=profitability_prob.index, dtype=float)
     for timestamp, probability in profitability_prob.items():
         size, edge = _position_size_from_profitability(probability, avg_win, avg_loss, signal_config)
+        if use_flat_kelly_fallback:
+            size = min(float(signal_config.get("fraction", 0.5)), float(signal_config.get("max_kelly_fraction", 0.5)))
         position_size.loc[timestamp] = size
         expected_trade_edge.loc[timestamp] = edge
 
@@ -1088,12 +1146,16 @@ def _build_signal_state(prediction_series, probability_frame, meta_prob_series, 
         "signals": signals,
         "avg_win_used": avg_win,
         "avg_loss_used": avg_loss,
+        "kelly_trade_count": None if kelly_trade_count is None else int(kelly_trade_count),
+        "used_flat_kelly_fallback": bool(use_flat_kelly_fallback),
         "tuned_params": {
             "threshold": float(signal_config.get("threshold", 0.03)),
             "edge_threshold": float(signal_config.get("edge_threshold", 0.05)),
             "meta_threshold": float(signal_config.get("meta_threshold", 0.55)),
             "profitability_threshold": float(profitability_threshold),
             "fraction": float(signal_config.get("fraction", 0.5)),
+            "min_trades_for_kelly": min_trades_for_kelly,
+            "max_kelly_fraction": float(signal_config.get("max_kelly_fraction", 0.5)),
         },
     }
 
@@ -1655,6 +1717,7 @@ class TrainModelsStep(PipelineStep):
         holding_bars = _resolve_signal_holding_bars(pipeline, signal_config)
         default_avg_win = float(signal_config.get("avg_win", 0.02))
         default_avg_loss = float(signal_config.get("avg_loss", 0.02))
+        shrinkage_alpha = float(signal_config.get("shrinkage_alpha", 0.5))
         close_all = raw_data["close"]
         validation_method = _resolve_validation_method(config)
         validation_details = {"method": validation_method}
@@ -1693,9 +1756,12 @@ class TrainModelsStep(PipelineStep):
             "edge_threshold": float(signal_config.get("edge_threshold", 0.05)),
             "meta_threshold": float(signal_config.get("meta_threshold", 0.55)),
             "fraction": float(signal_config.get("fraction", 0.5)),
+            "min_trades_for_kelly": int(signal_config.get("min_trades_for_kelly", 30)),
+            "max_kelly_fraction": float(signal_config.get("max_kelly_fraction", 0.5)),
         }
         last_avg_win = default_avg_win
         last_avg_loss = default_avg_loss
+        last_kelly_trade_count = 0
         oos_predictions = []
         oos_probabilities = []
         oos_meta_prob = []
@@ -1889,6 +1955,8 @@ class TrainModelsStep(PipelineStep):
 
             primary_calibrator = None
             meta_calibrator = None
+            prior_oos_trade_outcomes = pd.concat(oos_trade_outcomes).sort_index() if oos_trade_outcomes else pd.DataFrame()
+            prior_oos_trade_count = _count_realized_trades(prior_oos_trade_outcomes)
             fit_trade_outcomes = _build_execution_trade_outcomes(
                 pipeline,
                 pd.Series(model.predict(X_fit_model), index=X_fit_model.index),
@@ -1921,11 +1989,10 @@ class TrainModelsStep(PipelineStep):
                 context_frame=meta_context_frame.reindex(X_fit_model.index) if meta_context_frame is not None else None,
             )
             fit_primary_preds = pd.Series(model.predict(X_fit_model), index=X_fit_model.index)
-            fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats(
-                fit_trade_outcomes,
-                default_avg_win,
-                default_avg_loss,
-            )
+            fold_avg_win = default_avg_win
+            fold_avg_loss = default_avg_loss
+            sizing_trade_outcomes = None
+            sizing_stats_source = "defaults"
 
             tuning = _compute_theory_thresholds(
                 avg_win=fold_avg_win,
@@ -1975,18 +2042,22 @@ class TrainModelsStep(PipelineStep):
                     calibrator_config=config.get("meta_calibration_params"),
                 )
 
+                sizing_trade_outcomes = val_trade_outcomes
                 fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats(
-                    val_trade_outcomes,
-                    fold_avg_win,
-                    fold_avg_loss,
+                    sizing_trade_outcomes,
+                    default_avg_win,
+                    default_avg_loss,
+                    pooled_trade_outcomes=prior_oos_trade_outcomes if not prior_oos_trade_outcomes.empty else None,
+                    shrinkage_alpha=shrinkage_alpha if not prior_oos_trade_outcomes.empty else None,
                 )
+                sizing_stats_source = "validation_shrunk" if not prior_oos_trade_outcomes.empty else "validation"
 
                 tuning = _compute_theory_thresholds(
                     avg_win=fold_avg_win,
                     avg_loss=fold_avg_loss,
                     backtest_config=backtest_config,
                     signal_config=signal_config,
-                    trade_outcomes=val_trade_outcomes,
+                    trade_outcomes=sizing_trade_outcomes,
                 )
                 tuned_signal_params = dict(tuning["params"])
                 # Single diagnostic backtest on validation data — no parameter selection
@@ -1998,6 +2069,7 @@ class TrainModelsStep(PipelineStep):
                     fold_avg_win,
                     fold_avg_loss,
                     holding_bars,
+                    kelly_trade_count=prior_oos_trade_count,
                 )
                 val_close_for_bt = _resolve_backtest_valuation_close(pipeline, X_val_model.index)
                 if val_close_for_bt is not None and len(val_close_for_bt) > 0:
@@ -2018,6 +2090,22 @@ class TrainModelsStep(PipelineStep):
                         **(_resolve_backtest_runtime_kwargs(pipeline, X_val_model.index) or {}),
                     )
                     tuning_score = _score_signal_state(tuning_backtest, signal_config) if tuning_backtest is not None else None
+            elif not prior_oos_trade_outcomes.empty:
+                sizing_trade_outcomes = prior_oos_trade_outcomes
+                fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats(
+                    sizing_trade_outcomes,
+                    default_avg_win,
+                    default_avg_loss,
+                )
+                sizing_stats_source = "prior_oos_pooled"
+                tuning = _compute_theory_thresholds(
+                    avg_win=fold_avg_win,
+                    avg_loss=fold_avg_loss,
+                    backtest_config=backtest_config,
+                    signal_config=signal_config,
+                    trade_outcomes=sizing_trade_outcomes,
+                )
+                tuned_signal_params = dict(tuning["params"])
 
             test_primary_probs = _apply_primary_probability_calibrator(test_primary_probs_raw, primary_calibrator)
 
@@ -2056,6 +2144,7 @@ class TrainModelsStep(PipelineStep):
                 fold_avg_win,
                 fold_avg_loss,
                 holding_bars,
+                kelly_trade_count=prior_oos_trade_count,
             )
 
             fold_metrics.append(metrics)
@@ -2076,6 +2165,12 @@ class TrainModelsStep(PipelineStep):
                         else None
                     ),
                 }
+            )
+            test_trade_outcomes = _build_execution_trade_outcomes(
+                pipeline,
+                test_primary_preds,
+                holding_bars=holding_bars,
+                cutoff_timestamp=X_test_model.index[-1],
             )
             oos_paths.append(
                 {
@@ -2098,7 +2193,10 @@ class TrainModelsStep(PipelineStep):
                     "signals": signal_state["signals"],
                     "avg_win_used": float(fold_avg_win),
                     "avg_loss_used": float(fold_avg_loss),
-                    "signal_params": dict(tuned_signal_params),
+                    "kelly_trade_count": signal_state["kelly_trade_count"],
+                    "used_flat_kelly_fallback": signal_state["used_flat_kelly_fallback"],
+                    "signal_params": {**fold_signal_config},
+                    "sizing_stats_source": sizing_stats_source,
                 }
             )
             last_model = model
@@ -2108,9 +2206,10 @@ class TrainModelsStep(PipelineStep):
             last_selected_columns = list(selected_columns)
             last_regime_fit_index = X_fit.index.copy()
             last_test_index = X_test_model.index.copy()
-            last_signal_params = dict(tuned_signal_params)
+            last_signal_params = {**fold_signal_config}
             last_avg_win = fold_avg_win
             last_avg_loss = fold_avg_loss
+            last_kelly_trade_count = prior_oos_trade_count
             oos_predictions.append(test_primary_preds)
             oos_probabilities.append(test_primary_probs)
             oos_meta_prob.append(meta_prob_test)
@@ -2121,14 +2220,7 @@ class TrainModelsStep(PipelineStep):
             oos_event_signals.append(signal_state["event_signals"])
             oos_continuous_signals.append(signal_state["continuous_signals"])
             oos_signals.append(signal_state["signals"])
-            oos_trade_outcomes.append(
-                _build_execution_trade_outcomes(
-                    pipeline,
-                    test_primary_preds,
-                    holding_bars=holding_bars,
-                    cutoff_timestamp=X_test_model.index[-1],
-                )
-            )
+            oos_trade_outcomes.append(test_trade_outcomes)
 
         if last_model is None or last_meta is None:
             raise RuntimeError("No validation splits were generated; adjust the split configuration.")
@@ -2170,9 +2262,11 @@ class TrainModelsStep(PipelineStep):
         # Estimate avg_win / avg_loss from OOS execution-aligned trade outcomes
         oos_avg_win = None
         oos_avg_loss = None
+        oos_trade_count = 0
         try:
             trade_outcomes = pd.concat(oos_trade_outcomes).sort_index() if oos_trade_outcomes else pd.DataFrame()
             if not trade_outcomes.empty:
+                oos_trade_count = _count_realized_trades(trade_outcomes)
                 oos_avg_win, oos_avg_loss = _estimate_trade_outcome_stats(
                     trade_outcomes,
                     default_avg_win,
@@ -2218,6 +2312,7 @@ class TrainModelsStep(PipelineStep):
             "last_signal_params": last_signal_params,
             "last_avg_win": last_avg_win,
             "last_avg_loss": last_avg_loss,
+            "last_kelly_trade_count": int(last_kelly_trade_count),
             "oos_predictions": oos_predictions,
             "oos_probabilities": oos_probabilities,
             "oos_meta_prob": oos_meta_prob,
@@ -2249,6 +2344,7 @@ class TrainModelsStep(PipelineStep):
             "signal_tuning": fold_signal_tuning,
             "oos_avg_win": oos_avg_win,
             "oos_avg_loss": oos_avg_loss,
+            "oos_trade_count": int(oos_trade_count),
         }
         pipeline.state["training"] = training
         return training
@@ -2308,6 +2404,8 @@ class SignalsStep(PipelineStep):
                         "signals": path["signals"],
                         "avg_win_used": path.get("avg_win_used"),
                         "avg_loss_used": path.get("avg_loss_used"),
+                        "kelly_trade_count": path.get("kelly_trade_count"),
+                        "used_flat_kelly_fallback": path.get("used_flat_kelly_fallback", False),
                         "tuned_params": path.get("signal_params", {}),
                     }
                 )
@@ -2320,8 +2418,10 @@ class SignalsStep(PipelineStep):
                 "tuned_params": training.get("last_signal_params", {}),
                 "signal_source": "cpcv_oos_paths",
                 "fallback_scope": fallback_scope,
-                "avg_win_used": training.get("oos_avg_win") if training.get("oos_avg_win") is not None else training.get("last_avg_win", config.get("avg_win", 0.02)),
-                "avg_loss_used": training.get("oos_avg_loss") if training.get("oos_avg_loss") is not None else training.get("last_avg_loss", config.get("avg_loss", 0.02)),
+                "avg_win_used": training.get("last_avg_win", config.get("avg_win", 0.02)),
+                "avg_loss_used": training.get("last_avg_loss", config.get("avg_loss", 0.02)),
+                "kelly_trade_count": int(training.get("oos_trade_count", 0)),
+                "used_flat_kelly_fallback": False,
             }
             pipeline.state["signals"] = result
             return result
@@ -2361,8 +2461,10 @@ class SignalsStep(PipelineStep):
                 "holding_bars": _resolve_signal_holding_bars(pipeline, config),
                 "continuous_signals": training["oos_continuous_signals"],
                 "signals": training["oos_signals"],
-                "avg_win_used": training.get("oos_avg_win") if training.get("oos_avg_win") is not None else training.get("last_avg_win", config.get("avg_win", 0.02)),
-                "avg_loss_used": training.get("oos_avg_loss") if training.get("oos_avg_loss") is not None else training.get("last_avg_loss", config.get("avg_loss", 0.02)),
+                "avg_win_used": training.get("last_avg_win", config.get("avg_win", 0.02)),
+                "avg_loss_used": training.get("last_avg_loss", config.get("avg_loss", 0.02)),
+                "kelly_trade_count": int(training.get("oos_trade_count", 0)),
+                "used_flat_kelly_fallback": False,
                 "signal_tuning": training.get("signal_tuning", []),
                 "tuned_params": training.get("last_signal_params", {}),
                 "signal_source": "walk_forward_oos",
@@ -2377,8 +2479,8 @@ class SignalsStep(PipelineStep):
         signal_source = "recomputed_from_oos_predictions"
         if prediction_series is None or meta_prob_series is None or probability_frame is None:
             X = pipeline.require("X")
-            avg_win = training.get("oos_avg_win", config.get("avg_win", 0.02))
-            avg_loss = training.get("oos_avg_loss", config.get("avg_loss", 0.02))
+            avg_win = training.get("last_avg_win", config.get("avg_win", 0.02))
+            avg_loss = training.get("last_avg_loss", config.get("avg_loss", 0.02))
             holding_bars = _resolve_signal_holding_bars(pipeline, config)
             signal_config = dict(config)
             signal_config.update(training.get("last_signal_params", {}))
@@ -2445,12 +2547,8 @@ class SignalsStep(PipelineStep):
         probability_frame = probability_frame.reindex(prediction_series.index).fillna(0.0)
         meta_prob_series = meta_prob_series.reindex(prediction_series.index)
 
-        avg_win = config.get("avg_win", 0.02)
-        avg_loss = config.get("avg_loss", 0.02)
-        if training.get("oos_avg_win") is not None:
-            avg_win = training["oos_avg_win"]
-        if training.get("oos_avg_loss") is not None:
-            avg_loss = training["oos_avg_loss"]
+        avg_win = training.get("last_avg_win", config.get("avg_win", 0.02))
+        avg_loss = training.get("last_avg_loss", config.get("avg_loss", 0.02))
 
         holding_bars = _resolve_signal_holding_bars(pipeline, config)
         signal_config = dict(config)
@@ -2463,6 +2561,7 @@ class SignalsStep(PipelineStep):
             avg_win,
             avg_loss,
             holding_bars,
+            kelly_trade_count=int(training.get("oos_trade_count", 0)),
         )
         result["signal_source"] = signal_source
         result["fallback_scope"] = fallback_scope
