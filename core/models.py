@@ -12,6 +12,8 @@ from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .slippage import _estimate_reference_trade_slippage_rates
+
 
 # ───────────────────────────────────────────────────────────────────────────
 # Validation splits
@@ -387,7 +389,9 @@ def build_trade_outcome_frame(primary_preds, labels):
 def build_execution_outcome_frame(primary_preds, valuation_prices, execution_prices=None,
                                   holding_bars=1, signal_delay_bars=1,
                                   fee_rate=0.0, slippage_rate=0.0,
-                                  funding_rates=None, cutoff_timestamp=None):
+                                  funding_rates=None, cutoff_timestamp=None,
+                                  equity=10_000.0, volume=None,
+                                  slippage_model=None, orderbook_depth=None):
     """Build execution-aligned trade outcomes for a directional prediction series.
 
     Outcomes are computed using the same delayed, bar-by-bar return semantics as
@@ -412,7 +416,15 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
     signal_delay_bars = max(0, int(signal_delay_bars))
     cutoff = pd.Timestamp(cutoff_timestamp) if cutoff_timestamp is not None else None
     execution_returns = execution_series.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    round_trip_cost = 2.0 * (float(fee_rate) + float(slippage_rate))
+    fee_cost_rate = 2.0 * float(fee_rate)
+    slippage_bar_rates = _estimate_reference_trade_slippage_rates(
+        equity=equity,
+        execution_series=execution_series,
+        slippage_rate=slippage_rate,
+        slippage_model=slippage_model,
+        volume=volume,
+        orderbook_depth=orderbook_depth,
+    )
 
     rows = []
     index_positions = valuation_series.index.get_indexer(prediction_series.index)
@@ -428,6 +440,13 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
             "exit_time": pd.NaT,
             "entry_price": np.nan,
             "exit_price": np.nan,
+            "entry_fee_rate": (0.0 if direction == 0.0 else np.nan),
+            "exit_fee_rate": (0.0 if direction == 0.0 else np.nan),
+            "fee_cost_rate": (0.0 if direction == 0.0 else np.nan),
+            "entry_slippage_rate": (0.0 if direction == 0.0 else np.nan),
+            "exit_slippage_rate": (0.0 if direction == 0.0 else np.nan),
+            "slippage_cost_rate": (0.0 if direction == 0.0 else np.nan),
+            "round_trip_cost_rate": (0.0 if direction == 0.0 else np.nan),
             "gross_trade_return": (0.0 if direction == 0.0 else np.nan),
             "net_trade_return": (0.0 if direction == 0.0 else np.nan),
             "profitable": (0 if direction == 0.0 else np.nan),
@@ -459,7 +478,11 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
             funding_bar_returns = -direction * funding_series.iloc[active_start: active_end + 1].to_numpy(dtype=float)
             funding_trade_return = float(np.prod(1.0 + price_returns + funding_bar_returns) - 1.0) - gross_trade_return
 
-        net_trade_return = gross_trade_return + funding_trade_return - round_trip_cost
+        entry_slippage_rate = float(slippage_bar_rates.iloc[active_start])
+        exit_slippage_rate = float(slippage_bar_rates.iloc[active_end])
+        slippage_cost_rate = entry_slippage_rate + exit_slippage_rate
+        round_trip_cost_rate = fee_cost_rate + slippage_cost_rate
+        net_trade_return = gross_trade_return + funding_trade_return - round_trip_cost_rate
         entry_price = execution_series.iloc[active_start]
         exit_price = execution_series.iloc[active_end]
         if not np.isfinite(entry_price):
@@ -473,6 +496,13 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
                 "exit_time": exit_time,
                 "entry_price": entry_price,
                 "exit_price": exit_price,
+                "entry_fee_rate": float(fee_rate),
+                "exit_fee_rate": float(fee_rate),
+                "fee_cost_rate": fee_cost_rate,
+                "entry_slippage_rate": entry_slippage_rate,
+                "exit_slippage_rate": exit_slippage_rate,
+                "slippage_cost_rate": slippage_cost_rate,
+                "round_trip_cost_rate": round_trip_cost_rate,
                 "gross_trade_return": gross_trade_return,
                 "net_trade_return": net_trade_return,
                 "profitable": int(net_trade_return > 0.0),

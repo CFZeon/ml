@@ -4,7 +4,7 @@ Each section provides: context, architectural decisions, step-by-step implementa
 
 ---
 
-## C3. Volume-Dependent Slippage Model
+## C3. Volume-Dependent Slippage Model [implemented]
 
 **Priority**: Critical  
 **Status**: Open  

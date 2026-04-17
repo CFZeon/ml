@@ -814,6 +814,7 @@ def _build_execution_trade_outcomes(pipeline, predictions, holding_bars, cutoff_
     raw_data = pipeline.require("raw_data")
     backtest_config = pipeline.section("backtest")
     full_index = raw_data.index
+    runtime_kwargs = _resolve_backtest_runtime_kwargs(pipeline, full_index)
     return build_execution_outcome_frame(
         predictions,
         valuation_prices=_resolve_backtest_valuation_close(pipeline, full_index),
@@ -822,8 +823,12 @@ def _build_execution_trade_outcomes(pipeline, predictions, holding_bars, cutoff_
         signal_delay_bars=_resolve_signal_delay_bars(backtest_config),
         fee_rate=float(backtest_config.get("fee_rate", 0.0)),
         slippage_rate=float(backtest_config.get("slippage_rate", 0.0)),
-        funding_rates=_resolve_backtest_funding_rates(pipeline, full_index),
+        funding_rates=runtime_kwargs.get("funding_rates"),
         cutoff_timestamp=cutoff_timestamp,
+        equity=float(backtest_config.get("equity", 10_000.0)),
+        volume=runtime_kwargs.get("volume"),
+        slippage_model=runtime_kwargs.get("slippage_model"),
+        orderbook_depth=runtime_kwargs.get("orderbook_depth"),
     )
 
 
@@ -963,24 +968,40 @@ def _apply_primary_probability_calibrator(probability_frame, calibrator):
     return frame
 
 
-def _compute_theory_thresholds(avg_win, avg_loss, backtest_config, signal_config):
+def _resolve_round_trip_cost_rate(backtest_config, trade_outcomes=None):
+    static_round_trip_cost = 2.0 * (
+        float(backtest_config.get("fee_rate", 0.001))
+        + float(backtest_config.get("slippage_rate", 0.0))
+    )
+    if trade_outcomes is None or trade_outcomes.empty or "round_trip_cost_rate" not in trade_outcomes.columns:
+        return static_round_trip_cost
+
+    realized_costs = pd.to_numeric(trade_outcomes["round_trip_cost_rate"], errors="coerce")
+    if "trade_taken" in trade_outcomes.columns:
+        trade_mask = trade_outcomes["trade_taken"].reindex(realized_costs.index).fillna(0).astype(bool)
+        realized_costs = realized_costs.loc[trade_mask]
+    realized_costs = realized_costs.dropna()
+    if realized_costs.empty:
+        return static_round_trip_cost
+    return float(realized_costs.mean())
+
+
+def _compute_theory_thresholds(avg_win, avg_loss, backtest_config, signal_config, trade_outcomes=None):
     """Derive signal thresholds from cost math and Kelly break-even probability.
 
-    No search or in-sample optimisation is performed.  All thresholds are derived
+    No search or in-sample optimisation is performed. All thresholds are derived
     from first principles so they are identical whether computed on training data,
     validation data, or live:
 
-    * ``threshold`` — minimum absolute signal size to cover round-trip transaction
-      costs (2 × fee + slippage).
+    * ``threshold`` — minimum absolute signal size to cover average round-trip
+      transaction costs, using realized dynamic slippage when available.
     * ``edge_threshold`` — minimum directional probability edge (|p_long − p_short|)
       before issuing a signal.
     * ``meta_threshold`` / ``profitability_threshold`` — Kelly break-even: the
       minimum probability of a profitable trade needed for positive expected return,
       i.e. ``avg_loss / (avg_win + avg_loss)``.
     """
-    fee_rate = float(backtest_config.get("fee_rate", 0.001))
-    slippage_rate = float(backtest_config.get("slippage_rate", 0.0))
-    round_trip_cost = 2.0 * (fee_rate + slippage_rate)
+    round_trip_cost = _resolve_round_trip_cost_rate(backtest_config, trade_outcomes=trade_outcomes)
 
     break_even_prob = float(avg_loss) / max(float(avg_win) + float(avg_loss), 1e-12)
     meta_threshold = max(0.5, round(break_even_prob, 6))
@@ -1906,7 +1927,14 @@ class TrainModelsStep(PipelineStep):
                 default_avg_loss,
             )
 
-            tuned_signal_params = dict(last_signal_params)
+            tuning = _compute_theory_thresholds(
+                avg_win=fold_avg_win,
+                avg_loss=fold_avg_loss,
+                backtest_config=backtest_config,
+                signal_config=signal_config,
+                trade_outcomes=fit_trade_outcomes,
+            )
+            tuned_signal_params = dict(tuning["params"])
             tuning_backtest = None
             tuning_score = None
             if X_val_model is not None and not X_val_model.empty:
@@ -1958,6 +1986,7 @@ class TrainModelsStep(PipelineStep):
                     avg_loss=fold_avg_loss,
                     backtest_config=backtest_config,
                     signal_config=signal_config,
+                    trade_outcomes=val_trade_outcomes,
                 )
                 tuned_signal_params = dict(tuning["params"])
                 # Single diagnostic backtest on validation data — no parameter selection

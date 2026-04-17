@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from core import ResearchPipeline, build_execution_outcome_frame, build_trade_outcome_frame
-from core.pipeline import _build_signal_state
+from core.pipeline import _build_signal_state, _compute_theory_thresholds
 
 
 class SignalProfitabilitySizingTest(unittest.TestCase):
@@ -111,6 +111,74 @@ class SignalProfitabilitySizingTest(unittest.TestCase):
         self.assertAlmostEqual(float(outcomes.loc[index[1], "net_trade_return"]), short_expected, places=6)
         self.assertNotAlmostEqual(float(outcomes.loc[index[0], "net_trade_return"]), long_valuation_path, places=4)
 
+    def test_execution_outcome_frame_applies_dynamic_slippage_costs(self):
+        index = pd.date_range("2026-03-09", periods=6, freq="1h", tz="UTC")
+        valuation = pd.Series([100.0, 101.0, 103.0, 102.0, 100.0, 101.0], index=index)
+        predictions = pd.Series([1, -1], index=index[:2])
+        volume = pd.Series(5.0, index=index)
+
+        baseline = build_execution_outcome_frame(
+            predictions,
+            valuation_prices=valuation,
+            execution_prices=valuation,
+            holding_bars=2,
+            signal_delay_bars=1,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            equity=10_000.0,
+            volume=volume,
+        )
+        impacted = build_execution_outcome_frame(
+            predictions,
+            valuation_prices=valuation,
+            execution_prices=valuation,
+            holding_bars=2,
+            signal_delay_bars=1,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            equity=10_000.0,
+            volume=volume,
+            slippage_model="sqrt_impact",
+        )
+
+        self.assertGreater(float(impacted.loc[index[0], "slippage_cost_rate"]), 0.0)
+        self.assertLess(float(impacted.loc[index[0], "net_trade_return"]), float(baseline.loc[index[0], "net_trade_return"]))
+        self.assertLess(float(impacted.loc[index[1], "net_trade_return"]), float(baseline.loc[index[1], "net_trade_return"]))
+
+    def test_execution_outcome_frame_requires_volume_for_dynamic_slippage(self):
+        index = pd.date_range("2026-03-09", periods=4, freq="1h", tz="UTC")
+        valuation = pd.Series([100.0, 101.0, 102.0, 103.0], index=index)
+        predictions = pd.Series([1], index=index[:1])
+
+        with self.assertRaisesRegex(ValueError, "volume is required"):
+            build_execution_outcome_frame(
+                predictions,
+                valuation_prices=valuation,
+                execution_prices=valuation,
+                holding_bars=1,
+                signal_delay_bars=1,
+                slippage_model="sqrt_impact",
+            )
+
+    def test_theory_thresholds_use_realized_dynamic_costs(self):
+        trade_outcomes = pd.DataFrame(
+            {
+                "trade_taken": [1, 1, 0],
+                "round_trip_cost_rate": [0.0040, 0.0060, 0.0],
+            },
+            index=pd.date_range("2026-03-09", periods=3, freq="1h", tz="UTC"),
+        )
+
+        thresholds = _compute_theory_thresholds(
+            avg_win=0.03,
+            avg_loss=0.02,
+            backtest_config={"fee_rate": 0.0, "slippage_rate": 0.0},
+            signal_config={"threshold": 0.0, "edge_threshold": 0.0, "fraction": 1.0},
+            trade_outcomes=trade_outcomes,
+        )
+
+        self.assertAlmostEqual(float(thresholds["params"]["threshold"]), 0.005, places=6)
+
     def test_pipeline_oos_avg_win_loss_ignore_label_gross_return(self):
         index = pd.date_range("2026-03-10", periods=220, freq="1h", tz="UTC")
         steps = np.linspace(0.0, 1.0, len(index))
@@ -141,7 +209,14 @@ class SignalProfitabilitySizingTest(unittest.TestCase):
                 "model": {"type": "gbm", "cv_method": "walk_forward", "n_splits": 1, "gap": 0},
                 "feature_selection": {"enabled": True, "max_features": 12},
                 "signals": {"avg_win": 0.02, "avg_loss": 0.02},
-                "backtest": {"use_open_execution": False, "signal_delay_bars": 1, "fee_rate": 0.0, "slippage_rate": 0.0},
+                "backtest": {
+                    "equity": 10_000.0,
+                    "use_open_execution": False,
+                    "signal_delay_bars": 1,
+                    "fee_rate": 0.0,
+                    "slippage_rate": 0.0,
+                    "slippage_model": "sqrt_impact",
+                },
             }
         )
         pipeline.state["raw_data"] = raw
@@ -161,6 +236,9 @@ class SignalProfitabilitySizingTest(unittest.TestCase):
             signal_delay_bars=1,
             fee_rate=0.0,
             slippage_rate=0.0,
+            equity=10_000.0,
+            volume=raw["volume"],
+            slippage_model="sqrt_impact",
             cutoff_timestamp=training["oos_predictions"].index[-1],
         )
         realized = expected_outcomes.loc[expected_outcomes["trade_taken"].eq(1), "net_trade_return"].dropna()
@@ -169,6 +247,7 @@ class SignalProfitabilitySizingTest(unittest.TestCase):
 
         self.assertAlmostEqual(float(training["oos_avg_win"]), expected_avg_win, places=6)
         self.assertAlmostEqual(float(training["oos_avg_loss"]), expected_avg_loss, places=6)
+        self.assertGreaterEqual(float(training["last_signal_params"]["threshold"]), 0.001)
 
 
 if __name__ == "__main__":

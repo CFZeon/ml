@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from .slippage import FlatSlippageModel, OrderBookImpactModel, SquareRootImpactModel
+from .slippage import _estimate_slippage_rates
 
 try:  # pragma: no cover - optional dependency exercised in integration tests
     import vectorbt as vbt
@@ -97,83 +97,6 @@ def _normalize_position_targets(signals, leverage=1.0, allow_short=True):
     if allow_short:
         return target.clip(-abs(float(leverage)), abs(float(leverage)))
     return target.clip(0.0, abs(float(leverage)))
-
-
-def _align_numeric_series(values, index, fill_value=0.0):
-    if values is None:
-        return pd.Series(fill_value, index=index, dtype=float)
-    if isinstance(values, pd.Series):
-        series = values.reindex(index)
-    else:
-        series = pd.Series(values, index=index)
-    return pd.to_numeric(series, errors="coerce").fillna(fill_value).astype(float)
-
-
-def _align_numeric_frame(frame, index):
-    if frame is None:
-        return None
-    aligned = frame.reindex(index).copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame, index=index)
-    for column in aligned.columns:
-        aligned[column] = pd.to_numeric(aligned[column], errors="coerce")
-    return aligned
-
-
-def _resolve_slippage_model(slippage_model, slippage_rate):
-    if slippage_model is None:
-        return FlatSlippageModel(rate=slippage_rate)
-
-    if isinstance(slippage_model, str):
-        aliases = {
-            "flat": "flat",
-            "sqrt-impact": "sqrt_impact",
-            "sqrt_impact": "sqrt_impact",
-            "square-root-impact": "sqrt_impact",
-            "square_root_impact": "sqrt_impact",
-            "orderbook": "orderbook",
-            "order_book": "orderbook",
-        }
-        resolved_name = aliases.get(slippage_model.strip().lower(), slippage_model.strip().lower())
-        if resolved_name == "flat":
-            return FlatSlippageModel(rate=slippage_rate)
-        if resolved_name == "sqrt_impact":
-            return SquareRootImpactModel()
-        if resolved_name == "orderbook":
-            return OrderBookImpactModel()
-        raise ValueError("Unsupported slippage_model. Choose from ['flat', 'sqrt_impact', 'orderbook']")
-
-    if not hasattr(slippage_model, "estimate"):
-        raise TypeError("slippage_model must be None, a supported string alias, or implement estimate(...)")
-    return slippage_model
-
-
-def _estimate_slippage_rates(position, equity, valuation_series, execution_series,
-                             slippage_rate, slippage_model=None, volume=None,
-                             funding_rates=None, orderbook_depth=None):
-    position = pd.Series(position, index=valuation_series.index, copy=False).reindex(valuation_series.index).fillna(0.0).astype(float)
-    turnover = position.diff().abs().fillna(position.abs()).astype(float)
-    model = _resolve_slippage_model(slippage_model, slippage_rate)
-
-    if not isinstance(model, FlatSlippageModel) and volume is None:
-        raise ValueError("volume is required when using a non-flat slippage model")
-
-    aligned_volume = _align_numeric_series(volume, execution_series.index, fill_value=0.0).clip(lower=0.0)
-    aligned_funding = _align_numeric_series(funding_rates, valuation_series.index, fill_value=0.0)
-    gross_returns = position * valuation_series.pct_change().fillna(0.0) - position * aligned_funding
-    gross_equity = float(equity) * (1.0 + gross_returns).cumprod()
-    prev_equity = gross_equity.shift(1).fillna(float(equity))
-    trade_notional = prev_equity * turnover
-    volatility_window = max(1, int(getattr(model, "adv_window", 14)))
-    volatility = execution_series.pct_change().rolling(volatility_window).std()
-
-    slippage_rates = model.estimate(
-        trade_notional=trade_notional,
-        volume=aligned_volume,
-        volatility=volatility,
-        price=execution_series,
-        orderbook_depth=_align_numeric_frame(orderbook_depth, execution_series.index),
-    )
-    slippage_rates = _align_numeric_series(slippage_rates, execution_series.index, fill_value=0.0).clip(lower=0.0)
-    return slippage_rates.where(turnover > 0.0, 0.0), turnover
 
 
 def _annualized_sharpe(returns, annualization):
