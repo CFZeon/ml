@@ -123,7 +123,7 @@ Full data
 
 ---
 
-## H5. Kelly Sizing Decontamination
+## H5. Kelly Sizing Decontamination [implemented]
 
 **Priority**: High  
 **Status**: Partially mitigated  

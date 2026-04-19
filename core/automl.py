@@ -340,6 +340,7 @@ def _build_study_storage_path(base_config, automl_config):
 
 
 def _summarize_training(training):
+    feature_selection = training.get("feature_selection") or {}
     return {
         "avg_accuracy": training.get("avg_accuracy"),
         "avg_f1_macro": training.get("avg_f1_macro"),
@@ -349,6 +350,11 @@ def _summarize_training(training):
         "avg_brier_score": training.get("avg_brier_score"),
         "avg_calibration_error": training.get("avg_calibration_error"),
         "headline_metrics": training.get("headline_metrics", {}),
+        "feature_selection": {
+            "enabled": bool(feature_selection.get("enabled", False)),
+            "avg_input_features": feature_selection.get("avg_input_features"),
+            "avg_selected_features": feature_selection.get("avg_selected_features"),
+        },
         "fold_count": len(training.get("fold_metrics", [])),
     }
 
@@ -519,6 +525,7 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
         "aligned_holdout_rows": 0,
         "training": None,
         "backtest": None,
+        "raw_objective_value": None,
         "holdout_warning": False,
     }
     if not holdout_plan.get("enabled"):
@@ -544,6 +551,14 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
     report["aligned_holdout_rows"] = int(split["aligned_test_rows"])
     report["training"] = _json_ready(_summarize_training(training))
     report["backtest"] = _json_ready(_summarize_backtest(backtest))
+    report["raw_objective_value"] = float(
+        compute_objective_value(
+            base_config.get("automl", {}).get("objective", "accuracy_first"),
+            training,
+            backtest,
+            base_config.get("automl", {}),
+        )
+    )
     sharpe_ci_lower = _extract_sharpe_ci_lower(report["backtest"])
     report["holdout_warning"] = bool(sharpe_ci_lower is not None and sharpe_ci_lower < 0.0)
     return report
@@ -658,6 +673,370 @@ def _build_trial_record(overrides, search_record, validation_record=None):
         "raw_objective_value": float(validation_record["raw_objective_value"]),
         "search_raw_objective_value": float(search_record["raw_objective_value"]),
     }
+
+
+def _resolve_selection_policy(automl_config=None):
+    policy = copy.deepcopy((automl_config or {}).get("selection_policy") or {})
+    enabled = bool(policy.get("enabled", True))
+    if not enabled:
+        return {
+            "enabled": False,
+            "max_generalization_gap": float("inf"),
+            "max_param_fragility": float("inf"),
+            "max_complexity_score": float("inf"),
+            "min_validation_trade_count": 0,
+            "require_locked_holdout_pass": False,
+            "min_locked_holdout_score": float("-inf"),
+            "max_feature_count_ratio": float("inf"),
+            "max_trials_per_model_family": int(1e9),
+            "local_perturbation_limit": 0,
+        }
+    return {
+        "enabled": True,
+        "max_generalization_gap": float(policy.get("max_generalization_gap", 0.35)),
+        "max_param_fragility": float(policy.get("max_param_fragility", 0.30)),
+        "max_complexity_score": float(policy.get("max_complexity_score", 18.0)),
+        "min_validation_trade_count": int(policy.get("min_validation_trade_count", 10)),
+        "require_locked_holdout_pass": bool(policy.get("require_locked_holdout_pass", False)),
+        "min_locked_holdout_score": float(policy.get("min_locked_holdout_score", 0.0)),
+        "max_feature_count_ratio": float(policy.get("max_feature_count_ratio", 1.0)),
+        "max_trials_per_model_family": int(policy.get("max_trials_per_model_family", 64)),
+        "local_perturbation_limit": int(policy.get("local_perturbation_limit", 8)),
+    }
+
+
+def _infer_model_family(overrides):
+    return str((overrides or {}).get("model", {}).get("type", "unknown")).lower()
+
+
+def _count_model_family_trials(trial_records):
+    counts = {}
+    for record in (trial_records or {}).values():
+        family = _infer_model_family(record.get("overrides"))
+        counts[family] = counts.get(family, 0) + 1
+    return counts
+
+
+def _coerce_float(value):
+    if value is None:
+        return None
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(coerced):
+        return None
+    return coerced
+
+
+def _build_generalization_gap_report(reference_value, compared_value):
+    reference_value = _coerce_float(reference_value)
+    compared_value = _coerce_float(compared_value)
+    report = {
+        "reference_value": reference_value,
+        "compared_value": compared_value,
+        "absolute_gap": None,
+        "degradation": None,
+        "normalized_degradation": None,
+    }
+    if reference_value is None or compared_value is None:
+        return report
+
+    absolute_gap = float(reference_value - compared_value)
+    degradation = max(absolute_gap, 0.0)
+    scale = max(abs(reference_value), abs(compared_value), 1.0)
+    report.update(
+        {
+            "absolute_gap": absolute_gap,
+            "degradation": float(degradation),
+            "normalized_degradation": float(degradation / scale),
+        }
+    )
+    return report
+
+
+def _count_configured_lags(raw_lags):
+    if raw_lags is None:
+        return 0
+    if isinstance(raw_lags, str):
+        return len([part for part in raw_lags.split(",") if str(part).strip()])
+    if isinstance(raw_lags, (list, tuple)):
+        return len(raw_lags)
+    return 1
+
+
+def _compute_trial_complexity(overrides, training_summary):
+    feature_selection = (training_summary or {}).get("feature_selection") or {}
+    feature_selection_enabled = bool(feature_selection.get("enabled", False))
+    avg_input_features = _coerce_float(feature_selection.get("avg_input_features"))
+    avg_selected_features = _coerce_float(feature_selection.get("avg_selected_features"))
+    feature_count_ratio = None
+    if (
+        feature_selection_enabled
+        and avg_input_features is not None
+        and avg_input_features > 0.0
+        and avg_selected_features is not None
+    ):
+        feature_count_ratio = float(avg_selected_features / avg_input_features)
+
+    feature_overrides = (overrides or {}).get("features") or {}
+    label_overrides = (overrides or {}).get("labels") or {}
+    regime_overrides = (overrides or {}).get("regime") or {}
+    model_overrides = (overrides or {}).get("model") or {}
+    model_params = model_overrides.get("params") or {}
+    model_family = _infer_model_family(overrides)
+
+    lag_count = _count_configured_lags(feature_overrides.get("lags"))
+    holding_period = int(label_overrides.get("max_holding") or label_overrides.get("horizon") or 0)
+    n_regimes = int(regime_overrides.get("n_regimes") or 0)
+    n_estimators = _coerce_float(model_params.get("n_estimators")) or 0.0
+    max_depth = model_params.get("max_depth")
+    if max_depth is None and model_family == "rf":
+        max_depth = 12.0
+    elif max_depth is None and model_family == "gbm":
+        max_depth = 6.0
+    max_depth = _coerce_float(max_depth) or 0.0
+    meta_layers = int(bool(model_overrides.get("calibration_params")))
+    meta_layers += int(bool(model_overrides.get("meta_params")))
+    meta_layers += int(bool(model_overrides.get("meta_calibration_params")))
+
+    score = 0.0
+    score += min(avg_selected_features or 0.0, 256.0) / 32.0
+    score += (feature_count_ratio or 0.0) * 4.0
+    score += float(lag_count) * 0.5
+    score += min(float(holding_period), 96.0) / 24.0
+    score += max(n_regimes - 1, 0) * 0.75
+    if model_family in {"rf", "gbm"}:
+        score += min(n_estimators, 800.0) / 200.0
+        score += min(max_depth, 12.0) / 3.0
+    elif model_family == "logistic":
+        score += 0.5
+    score += meta_layers * 0.75
+
+    return {
+        "trial_complexity_score": float(score),
+        "avg_input_features": avg_input_features,
+        "avg_selected_features": avg_selected_features,
+        "feature_count_ratio": feature_count_ratio,
+        "lag_count": int(lag_count),
+        "holding_period": int(holding_period),
+        "n_regimes": int(n_regimes),
+        "model_family": model_family,
+        "meta_layers": int(meta_layers),
+        "tree_count": int(n_estimators),
+        "tree_depth": max_depth,
+    }
+
+
+def _ordered_choices_from_spec(spec):
+    if not isinstance(spec, dict):
+        return []
+    spec_type = spec.get("type")
+    if spec_type == "categorical":
+        return [tuple(choice) if isinstance(choice, list) else choice for choice in spec.get("choices", [])]
+    return []
+
+
+def _neighbor_values_from_spec(current_value, spec):
+    if not isinstance(spec, dict):
+        return []
+
+    spec_type = spec.get("type")
+    if spec_type == "categorical":
+        choices = _ordered_choices_from_spec(spec)
+        if current_value not in choices:
+            return []
+        index = choices.index(current_value)
+        neighbors = []
+        if index - 1 >= 0:
+            neighbors.append(choices[index - 1])
+        if index + 1 < len(choices):
+            neighbors.append(choices[index + 1])
+        return neighbors
+
+    current_numeric = _coerce_float(current_value)
+    if current_numeric is None:
+        return []
+
+    if spec_type in {"float", "int"}:
+        step = spec.get("step")
+        if step is None:
+            return []
+        neighbors = []
+        low = _coerce_float(spec.get("low"))
+        high = _coerce_float(spec.get("high"))
+        for candidate in (current_numeric - float(step), current_numeric + float(step)):
+            if low is not None and candidate < low:
+                continue
+            if high is not None and candidate > high:
+                continue
+            if spec_type == "int":
+                candidate = int(round(candidate))
+            neighbors.append(candidate)
+        return neighbors
+
+    return []
+
+
+def _set_override_value(overrides, path, value):
+    updated = copy.deepcopy(overrides)
+    target = updated
+    for key in path[:-1]:
+        target = target.setdefault(key, {})
+    target[path[-1]] = value
+    return updated
+
+
+def _generate_local_perturbations(overrides, search_space, limit=8):
+    overrides = overrides or {}
+    search_space = search_space or {}
+    perturbations = []
+    seen = set()
+
+    candidates = [
+        (("signals", "threshold"), ((search_space.get("signals") or {}).get("threshold"))),
+        (("feature_selection", "max_features"), ((search_space.get("feature_selection") or {}).get("max_features"))),
+        (("labels", "max_holding"), ((search_space.get("labels") or {}).get("max_holding"))),
+    ]
+    model_family = _infer_model_family(overrides)
+    model_params = ((overrides.get("model") or {}).get("params") or {})
+    model_param_space = (((search_space.get("model") or {}).get("params") or {}).get(model_family) or {})
+    for key in sorted(model_params):
+        candidates.append((("model", "params", key), model_param_space.get(key)))
+
+    for path, spec in candidates:
+        current = overrides
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                current = None
+                break
+            current = current[key]
+        if current is None:
+            continue
+
+        for neighbor in _neighbor_values_from_spec(current, spec):
+            updated = _set_override_value(overrides, path, neighbor)
+            signature = str(_json_ready(updated))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            perturbations.append(
+                {
+                    "field": ".".join(path),
+                    "baseline_value": _json_ready(current),
+                    "perturbed_value": _json_ready(neighbor),
+                    "overrides": updated,
+                }
+            )
+            if len(perturbations) >= max(1, int(limit)):
+                return perturbations
+    return perturbations
+
+
+def _evaluate_candidate_fragility(
+    base_config,
+    overrides,
+    pipeline_class,
+    trial_step_classes,
+    evaluation_state_bundle,
+    evaluation_start_timestamp,
+    objective_name,
+    automl_config,
+    search_space,
+    baseline_value,
+    selection_policy,
+):
+    report = {
+        "enabled": bool(selection_policy.get("enabled", True)),
+        "baseline_value": _coerce_float(baseline_value),
+        "param_fragility_score": 0.0,
+        "dispersion": 0.0,
+        "max_downside": 0.0,
+        "evaluated_count": 0,
+        "perturbations": [],
+        "reason": None,
+        "passed": True,
+    }
+    if not report["enabled"]:
+        report["reason"] = "disabled"
+        return report
+    if report["baseline_value"] is None:
+        report["reason"] = "unavailable_baseline"
+        report["passed"] = False
+        return report
+
+    perturbations = _generate_local_perturbations(
+        overrides,
+        search_space,
+        limit=selection_policy.get("local_perturbation_limit", 8),
+    )
+    if not perturbations:
+        report["reason"] = "no_local_perturbations"
+        return report
+
+    scale = max(abs(report["baseline_value"]), 1.0)
+    evaluated_scores = []
+    for perturbation in perturbations:
+        try:
+            if evaluation_start_timestamp is None:
+                training, backtest = _execute_trial_candidate(
+                    base_config,
+                    perturbation["overrides"],
+                    pipeline_class,
+                    trial_step_classes,
+                    evaluation_state_bundle,
+                )
+                evaluation = _build_evaluation_record(training, backtest, objective_name, automl_config)
+            else:
+                training, backtest, split = _execute_temporal_split_candidate(
+                    base_config,
+                    perturbation["overrides"],
+                    pipeline_class,
+                    trial_step_classes,
+                    evaluation_state_bundle,
+                    evaluation_start_timestamp,
+                )
+                evaluation = _build_evaluation_record(
+                    training,
+                    backtest,
+                    objective_name,
+                    automl_config,
+                    split=split,
+                )
+            value = _coerce_float(evaluation.get("raw_objective_value"))
+        except (RuntimeError, ValueError, KeyError) as exc:
+            perturbation["error"] = str(exc)
+            report["perturbations"].append(perturbation)
+            continue
+
+        perturbation["raw_objective_value"] = value
+        perturbation["normalized_gap"] = (
+            float(abs(report["baseline_value"] - value) / scale) if value is not None else None
+        )
+        report["perturbations"].append(perturbation)
+        if value is not None:
+            evaluated_scores.append(value)
+
+    report["evaluated_count"] = int(len(evaluated_scores))
+    if not evaluated_scores:
+        report["reason"] = "no_successful_perturbations"
+        return report
+
+    evaluated_array = np.asarray(evaluated_scores, dtype=float)
+    relative_moves = np.abs(evaluated_array - report["baseline_value"]) / scale
+    downside_moves = np.maximum(report["baseline_value"] - evaluated_array, 0.0) / scale
+    dispersion = float(np.std(np.append(evaluated_array, report["baseline_value"]))) / scale
+    max_downside = float(np.max(downside_moves)) if len(downside_moves) else 0.0
+    fragility_score = float(max(np.mean(relative_moves), max_downside))
+    report.update(
+        {
+            "param_fragility_score": fragility_score,
+            "dispersion": dispersion,
+            "max_downside": max_downside,
+            "passed": bool(fragility_score <= selection_policy.get("max_param_fragility", 0.30)),
+        }
+    )
+    return report
 
 
 def compute_deflated_sharpe_ratio(
@@ -912,6 +1291,8 @@ def compute_cpcv_pbo(trial_return_frame, n_blocks=8, test_blocks=None, min_block
 
 def _build_trial_selection_report(completed_trials, trial_records, objective_name, automl_config):
     control = _resolve_overfitting_control(automl_config)
+    selection_policy = _resolve_selection_policy(automl_config)
+    explicit_minimum_dsr_threshold = "minimum_dsr_threshold" in (automl_config or {})
     minimum_dsr_threshold = automl_config.get("minimum_dsr_threshold", 0.3)
     if minimum_dsr_threshold is not None:
         minimum_dsr_threshold = float(minimum_dsr_threshold)
@@ -934,6 +1315,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
     sharpe_std = float(np.std(period_sharpes, ddof=1)) if len(period_sharpes) > 1 else 0.0
     selection_metric = objective_name
     selection_mode = "validation_objective_gated_dsr" if minimum_dsr_threshold is not None else "validation_objective"
+    model_family_counts = _count_model_family_trials(trial_records)
 
     trial_reports = []
     for trial in completed_trials:
@@ -973,6 +1355,59 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 selection_value = float("-inf")
                 meets_minimum_dsr_threshold = False
 
+        complexity = _compute_trial_complexity(record.get("overrides"), validation_metrics["training"])
+        search_gap = _build_generalization_gap_report(
+            search_metrics.get("raw_objective_value"),
+            validation_metrics.get("raw_objective_value"),
+        )
+        validation_trade_count = int((validation_metrics.get("backtest") or {}).get("total_trades") or 0)
+        model_family = complexity["model_family"]
+        dsr_reason = deflated_sharpe.get("reason")
+        dsr_gate_applies = bool(
+            minimum_dsr_threshold is not None
+            and (
+                explicit_minimum_dsr_threshold
+                or dsr_reason not in {"insufficient_track_record", "unavailable_sharpe"}
+            )
+        )
+        eligibility_checks = {
+            "minimum_dsr": bool(meets_minimum_dsr_threshold or not dsr_gate_applies),
+            "validation_trade_count": bool(
+                validation_trade_count >= selection_policy.get("min_validation_trade_count", 0)
+            ),
+            "complexity": bool(
+                complexity["trial_complexity_score"] <= selection_policy.get("max_complexity_score", np.inf)
+            ),
+            "feature_count_ratio": bool(
+                complexity.get("feature_count_ratio") is None
+                or complexity["feature_count_ratio"] <= selection_policy.get("max_feature_count_ratio", np.inf)
+            ),
+            "generalization_gap": bool(
+                (search_gap.get("normalized_degradation") or 0.0)
+                <= selection_policy.get("max_generalization_gap", np.inf)
+            ),
+            "model_family_trial_count": bool(
+                model_family_counts.get(model_family, 0)
+                <= selection_policy.get("max_trials_per_model_family", np.inf)
+            ),
+            "param_fragility": None,
+            "locked_holdout": None,
+            "locked_holdout_gap": None,
+        }
+        eligibility_reasons = []
+        if not eligibility_checks["minimum_dsr"]:
+            eligibility_reasons.append("deflated_sharpe_below_threshold")
+        if not eligibility_checks["validation_trade_count"]:
+            eligibility_reasons.append("validation_trade_count_below_minimum")
+        if not eligibility_checks["complexity"]:
+            eligibility_reasons.append("complexity_score_above_limit")
+        if not eligibility_checks["feature_count_ratio"]:
+            eligibility_reasons.append("feature_count_ratio_above_limit")
+        if not eligibility_checks["generalization_gap"]:
+            eligibility_reasons.append("search_validation_gap_above_limit")
+        if not eligibility_checks["model_family_trial_count"]:
+            eligibility_reasons.append("model_family_trial_count_above_limit")
+
         trial_reports.append(
             {
                 "number": trial.number,
@@ -986,6 +1421,24 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 "validation_metrics": validation_metrics,
                 "meets_minimum_dsr_threshold": meets_minimum_dsr_threshold,
                 "overfitting": {"deflated_sharpe": deflated_sharpe},
+                "model_family": model_family,
+                "trial_complexity_score": complexity["trial_complexity_score"],
+                "feature_count_ratio": complexity.get("feature_count_ratio"),
+                "complexity": complexity,
+                "generalization_gap": {
+                    "search_to_validation": search_gap,
+                    "validation_to_locked_holdout": None,
+                },
+                "param_fragility_score": None,
+                "param_fragility": None,
+                "locked_holdout": None,
+                "selection_policy": {
+                    "enabled": bool(selection_policy.get("enabled", True)),
+                    "eligible_before_post_checks": not eligibility_reasons,
+                    "eligible": None,
+                    "eligibility_checks": eligibility_checks,
+                    "eligibility_reasons": eligibility_reasons,
+                },
             }
         )
 
@@ -1019,8 +1472,13 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         "selection_mode": selection_mode,
         "selection_metric": selection_metric,
         "minimum_dsr_threshold": minimum_dsr_threshold,
+        "selection_policy": selection_policy,
         "trial_count": int(len(completed_trials)),
         "effective_trial_count": float(effective_trial_count),
+        "model_family_counts": model_family_counts,
+        "eligible_trial_count_before_post_checks": int(
+            sum(1 for report in trial_reports if report["selection_policy"]["eligible_before_post_checks"])
+        ),
         "average_pairwise_correlation": average_pairwise_correlation,
         "trial_path_rows": int(len(trial_return_frame)) if not trial_return_frame.empty else 0,
         "sharpe_distribution": {
@@ -1036,6 +1494,9 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "selection_value": float(best_trial["selection_value"]),
             "meets_minimum_dsr_threshold": bool(best_trial["meets_minimum_dsr_threshold"]),
             "deflated_sharpe": best_trial["overfitting"]["deflated_sharpe"],
+            "trial_complexity_score": best_trial["trial_complexity_score"],
+            "feature_count_ratio": best_trial.get("feature_count_ratio"),
+            "generalization_gap": best_trial.get("generalization_gap"),
         },
         "pbo": pbo_report,
     }
@@ -1376,22 +1837,109 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         trial_records[trial.number] = _build_trial_record(overrides, search_record, validation_record)
 
     selection_report = _build_trial_selection_report(completed_trials, trial_records, objective_name, automl_config)
-    best_trial_report = selection_report["trial_reports"][0]
+    selection_policy = _resolve_selection_policy(automl_config)
+    best_trial_report = None
+    evaluation_start_timestamp = holdout_plan["validation_start_timestamp"] if holdout_plan["enabled"] else None
+    for report in selection_report["trial_reports"]:
+        policy_report = report["selection_policy"]
+        if not policy_report["eligible_before_post_checks"]:
+            policy_report["eligible"] = False
+            continue
+
+        fragility = _evaluate_candidate_fragility(
+            base_config=base_config,
+            overrides=report["overrides"],
+            pipeline_class=pipeline_class,
+            trial_step_classes=trial_step_classes,
+            evaluation_state_bundle=validation_state_bundle,
+            evaluation_start_timestamp=evaluation_start_timestamp,
+            objective_name=objective_name,
+            automl_config=automl_config,
+            search_space=search_space,
+            baseline_value=report["raw_objective_value"],
+            selection_policy=selection_policy,
+        )
+        report["param_fragility"] = fragility
+        report["param_fragility_score"] = fragility.get("param_fragility_score")
+        policy_report["eligibility_checks"]["param_fragility"] = bool(fragility.get("passed", True))
+        if not fragility.get("passed", True):
+            policy_report["eligibility_reasons"].append("parameter_fragility_above_limit")
+
+        if holdout_plan["enabled"]:
+            locked_holdout_report = _evaluate_locked_holdout(
+                base_config=base_config,
+                best_overrides=report["overrides"],
+                pipeline_class=pipeline_class,
+                trial_step_classes=trial_step_classes,
+                full_state_bundle=full_state_bundle,
+                holdout_plan=holdout_plan,
+            )
+            holdout_gap = _build_generalization_gap_report(
+                report["raw_objective_value"],
+                locked_holdout_report.get("raw_objective_value"),
+            )
+            report["locked_holdout"] = locked_holdout_report
+            report["generalization_gap"]["validation_to_locked_holdout"] = holdout_gap
+
+            locked_holdout_pass = True
+            if selection_policy.get("require_locked_holdout_pass", True):
+                holdout_value = _coerce_float(locked_holdout_report.get("raw_objective_value"))
+                locked_holdout_pass = bool(
+                    holdout_value is not None
+                    and holdout_value >= selection_policy.get("min_locked_holdout_score", 0.0)
+                    and not locked_holdout_report.get("holdout_warning", False)
+                )
+            locked_holdout_gap_pass = bool(
+                not selection_policy.get("require_locked_holdout_pass", False)
+                or (holdout_gap.get("normalized_degradation") or 0.0)
+                <= selection_policy.get("max_generalization_gap", np.inf)
+            )
+            policy_report["eligibility_checks"]["locked_holdout"] = locked_holdout_pass
+            policy_report["eligibility_checks"]["locked_holdout_gap"] = locked_holdout_gap_pass
+            if selection_policy.get("require_locked_holdout_pass", True) and not locked_holdout_pass:
+                policy_report["eligibility_reasons"].append("locked_holdout_failed")
+            if not locked_holdout_gap_pass:
+                policy_report["eligibility_reasons"].append("validation_holdout_gap_above_limit")
+        else:
+            policy_report["eligibility_checks"]["locked_holdout"] = True
+            policy_report["eligibility_checks"]["locked_holdout_gap"] = True
+
+        policy_report["eligible"] = not policy_report["eligibility_reasons"]
+        if policy_report["eligible"]:
+            best_trial_report = report
+            break
+
+    if best_trial_report is None:
+        raise RuntimeError("AutoML found no eligible trial under the configured selection policy")
+
     best_trial_number = int(best_trial_report["number"])
     best_optuna_trial = study.best_trial
     best_overrides = copy.deepcopy(best_trial_report["overrides"])
     best_overrides_summary = _json_ready(_clone_value(best_overrides))
 
+    selection_report["diagnostics"]["promoted_trial"] = {
+        "number": int(best_trial_report["number"]),
+        "raw_objective_value": float(best_trial_report["raw_objective_value"]),
+        "selection_value": float(best_trial_report["selection_value"]),
+        "trial_complexity_score": float(best_trial_report["trial_complexity_score"]),
+        "feature_count_ratio": best_trial_report.get("feature_count_ratio"),
+        "param_fragility_score": best_trial_report.get("param_fragility_score"),
+        "generalization_gap": best_trial_report.get("generalization_gap"),
+        "eligibility_reasons": best_trial_report["selection_policy"].get("eligibility_reasons", []),
+    }
+
     validation_holdout = _build_validation_holdout_report(best_trial_report, holdout_plan)
 
-    locked_holdout = _evaluate_locked_holdout(
-        base_config=base_config,
-        best_overrides=best_overrides,
-        pipeline_class=pipeline_class,
-        trial_step_classes=trial_step_classes,
-        full_state_bundle=full_state_bundle,
-        holdout_plan=holdout_plan,
-    )
+    locked_holdout = best_trial_report.get("locked_holdout")
+    if locked_holdout is None:
+        locked_holdout = _evaluate_locked_holdout(
+            base_config=base_config,
+            best_overrides=best_overrides,
+            pipeline_class=pipeline_class,
+            trial_step_classes=trial_step_classes,
+            full_state_bundle=full_state_bundle,
+            holdout_plan=holdout_plan,
+        )
 
     top_trials = []
     for report in selection_report["trial_reports"][:5]:
@@ -1400,12 +1948,20 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 "number": int(report["number"]),
                 "value": float(report["selection_value"]),
                 "raw_value": float(report["raw_objective_value"]),
+                "model_family": report.get("model_family"),
                 "params": report["params"],
                 "training": report["training"],
                 "backtest": report["backtest"],
                 "search_metrics": report["search_metrics"],
                 "validation_metrics": report["validation_metrics"],
                 "meets_minimum_dsr_threshold": report["meets_minimum_dsr_threshold"],
+                "trial_complexity_score": report["trial_complexity_score"],
+                "feature_count_ratio": report.get("feature_count_ratio"),
+                "generalization_gap": report.get("generalization_gap"),
+                "param_fragility_score": report.get("param_fragility_score"),
+                "param_fragility": report.get("param_fragility"),
+                "selection_policy": report.get("selection_policy"),
+                "locked_holdout": report.get("locked_holdout"),
                 "overfitting": report["overfitting"],
             }
         )
@@ -1428,6 +1984,14 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "best_backtest": best_trial_report["backtest"],
         "best_training": best_trial_report["training"],
         "best_overfitting": best_trial_report["overfitting"],
+        "best_selection_policy": {
+            "trial_complexity_score": best_trial_report["trial_complexity_score"],
+            "feature_count_ratio": best_trial_report.get("feature_count_ratio"),
+            "generalization_gap": best_trial_report.get("generalization_gap"),
+            "param_fragility_score": best_trial_report.get("param_fragility_score"),
+            "param_fragility": best_trial_report.get("param_fragility"),
+            "selection_policy": best_trial_report.get("selection_policy"),
+        },
         "validation_holdout": validation_holdout,
         "locked_holdout": locked_holdout,
         "overfitting_diagnostics": selection_report["diagnostics"],

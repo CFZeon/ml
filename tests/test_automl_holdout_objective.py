@@ -146,7 +146,13 @@ class _AutoMLDummyPipeline:
                 "feature_block_diagnostics": {"summary": [], "top_features": [], "folds": []},
                 "regime": {"mode": "fold_local", "folds": []},
                 "stationarity": {"mode": "fold_local", "folds": []},
-                "feature_selection": {"enabled": False, "mode": "fold_local", "avg_selected_features": 1.0, "folds": []},
+                "feature_selection": {
+                    "enabled": False,
+                    "mode": "fold_local",
+                    "avg_input_features": 1.0,
+                    "avg_selected_features": 1.0,
+                    "folds": [],
+                },
                 "purging": [],
                 "signal_tuning": [],
                 "oos_avg_win": 0.02,
@@ -291,7 +297,13 @@ class _ScenarioAutoMLPipeline(_AutoMLDummyPipeline):
                 "feature_block_diagnostics": {"summary": [], "top_features": [], "folds": []},
                 "regime": {"mode": "fold_local", "folds": []},
                 "stationarity": {"mode": "fold_local", "folds": []},
-                "feature_selection": {"enabled": False, "mode": "fold_local", "avg_selected_features": 1.0, "folds": []},
+                "feature_selection": {
+                    "enabled": False,
+                    "mode": "fold_local",
+                    "avg_input_features": 1.0,
+                    "avg_selected_features": 1.0,
+                    "folds": [],
+                },
                 "purging": [],
                 "signal_tuning": [],
                 "oos_avg_win": 0.02,
@@ -697,6 +709,231 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
             )
 
         self.assertTrue(summary["locked_holdout"]["holdout_warning"])
+
+    def test_selection_policy_rejects_excess_complexity(self):
+        raw = _build_market_frame(100)
+        storage_path = _make_storage_path()
+
+        _ScenarioAutoMLPipeline.reset()
+        _ScenarioAutoMLPipeline.full_rows = len(raw)
+        _ScenarioAutoMLPipeline.metrics_by_variant = {
+            "rf": {
+                "search": {"sharpe_ratio": 2.2, "returns": [0.0018, 0.0014, 0.0019, 0.0015]},
+                "validation": {"sharpe_ratio": 2.0, "returns": [0.0017, 0.0013, 0.0018, 0.0014]},
+                "holdout": {"sharpe_ratio": 1.5, "returns": [0.0012, 0.0009, 0.0013, 0.0010]},
+            },
+            "logistic": {
+                "search": {"sharpe_ratio": 1.5, "returns": [0.0012, 0.0008, 0.0013, 0.0009]},
+                "validation": {"sharpe_ratio": 1.4, "returns": [0.0011, 0.0007, 0.0012, 0.0008]},
+                "holdout": {"sharpe_ratio": 1.1, "returns": [0.0009, 0.0006, 0.0010, 0.0007]},
+            },
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 2,
+                    "objective": "sharpe_ratio",
+                    "seed": 23,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_fraction": 0.2,
+                    "locked_holdout_min_search_rows": 40,
+                    "enable_pruning": False,
+                    "storage": storage_path,
+                    "study_name": "automl_complexity_gate_test",
+                    "selection_policy": {
+                        "min_validation_trade_count": 1,
+                        "max_complexity_score": 2.0,
+                        "require_locked_holdout_pass": False,
+                    },
+                },
+                "model": {"type": "rf"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        overrides = [
+            {
+                "model": {"type": "rf", "params": {"n_estimators": 400, "max_depth": 8, "min_samples_leaf": 1}},
+                "features": {"lags": "1,3,6"},
+                "labels": {"max_holding": 48},
+                "regime": {"n_regimes": 4},
+            },
+            {"model": {"type": "logistic", "params": {"c": 1.0}}},
+        ]
+        with mock.patch("core.automl._sample_trial_overrides", side_effect=lambda trial, _: overrides[trial.number]):
+            summary = run_automl_study(
+                base_pipeline,
+                pipeline_class=_ScenarioAutoMLPipeline,
+                trial_step_classes=[],
+            )
+
+        self.assertEqual(summary["best_overrides"]["model"]["type"], "logistic")
+        rejected_trial = next(trial for trial in summary["top_trials"] if trial["model_family"] == "rf")
+        self.assertFalse(rejected_trial["selection_policy"]["eligible"])
+        self.assertIn("complexity_score_above_limit", rejected_trial["selection_policy"]["eligibility_reasons"])
+        self.assertIn("trial_complexity_score", summary["best_selection_policy"])
+
+    def test_selection_policy_rejects_fragile_top_candidate(self):
+        raw = _build_market_frame(100)
+        storage_path = _make_storage_path()
+
+        _ScenarioAutoMLPipeline.reset()
+        _ScenarioAutoMLPipeline.full_rows = len(raw)
+        _ScenarioAutoMLPipeline.metrics_by_variant = {
+            "rf": {
+                "search": {"sharpe_ratio": 2.0, "returns": [0.0018, 0.0014, 0.0019, 0.0015]},
+                "validation": {"sharpe_ratio": 1.9, "returns": [0.0017, 0.0013, 0.0018, 0.0014]},
+                "holdout": {"sharpe_ratio": 1.6, "returns": [0.0014, 0.0010, 0.0015, 0.0011]},
+            },
+            "gbm": {
+                "search": {"sharpe_ratio": 1.7, "returns": [0.0015, 0.0011, 0.0016, 0.0012]},
+                "validation": {"sharpe_ratio": 1.6, "returns": [0.0014, 0.0010, 0.0015, 0.0011]},
+                "holdout": {"sharpe_ratio": 1.4, "returns": [0.0012, 0.0009, 0.0013, 0.0010]},
+            },
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 2,
+                    "objective": "sharpe_ratio",
+                    "seed": 29,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_fraction": 0.2,
+                    "locked_holdout_min_search_rows": 40,
+                    "enable_pruning": False,
+                    "storage": storage_path,
+                    "study_name": "automl_fragility_gate_test",
+                    "selection_policy": {
+                        "min_validation_trade_count": 1,
+                        "max_param_fragility": 0.10,
+                        "require_locked_holdout_pass": False,
+                    },
+                },
+                "model": {"type": "rf"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        variants = [
+            {"model": {"type": "rf"}},
+            {"model": {"type": "gbm"}},
+        ]
+
+        def _fragility_side_effect(*args, **kwargs):
+            overrides = kwargs["overrides"]
+            model_type = overrides["model"]["type"]
+            if model_type == "rf":
+                return {
+                    "enabled": True,
+                    "baseline_value": 1.9,
+                    "param_fragility_score": 0.55,
+                    "dispersion": 0.30,
+                    "max_downside": 0.55,
+                    "evaluated_count": 4,
+                    "perturbations": [],
+                    "reason": None,
+                    "passed": False,
+                }
+            return {
+                "enabled": True,
+                "baseline_value": 1.6,
+                "param_fragility_score": 0.04,
+                "dispersion": 0.02,
+                "max_downside": 0.04,
+                "evaluated_count": 4,
+                "perturbations": [],
+                "reason": None,
+                "passed": True,
+            }
+
+        with mock.patch("core.automl._sample_trial_overrides", side_effect=lambda trial, _: variants[trial.number]):
+            with mock.patch("core.automl._evaluate_candidate_fragility", side_effect=_fragility_side_effect):
+                summary = run_automl_study(
+                    base_pipeline,
+                    pipeline_class=_ScenarioAutoMLPipeline,
+                    trial_step_classes=[],
+                )
+
+        self.assertEqual(summary["best_overrides"]["model"]["type"], "gbm")
+        rejected_trial = next(trial for trial in summary["top_trials"] if trial["model_family"] == "rf")
+        self.assertFalse(rejected_trial["selection_policy"]["eligible"])
+        self.assertIn("parameter_fragility_above_limit", rejected_trial["selection_policy"]["eligibility_reasons"])
+        self.assertAlmostEqual(float(summary["best_selection_policy"]["param_fragility_score"]), 0.04, places=6)
+
+    def test_selection_policy_summary_exposes_gap_complexity_and_fragility(self):
+        raw = _build_market_frame(120)
+        storage_path = _make_storage_path()
+
+        _ScenarioAutoMLPipeline.reset()
+        _ScenarioAutoMLPipeline.full_rows = len(raw)
+        _ScenarioAutoMLPipeline.metrics_by_variant = {
+            "0.01": {
+                "search": {"sharpe_ratio": 1.1, "returns": [0.0011, 0.0007, 0.0012, 0.0008]},
+                "validation": {"sharpe_ratio": 1.0, "returns": [0.0010, 0.0006, 0.0011, 0.0007]},
+                "holdout": {"sharpe_ratio": 0.9, "returns": [0.0009, 0.0005, 0.0010, 0.0006]},
+            },
+            "0.02": {
+                "search": {"sharpe_ratio": 1.4, "returns": [0.0014, 0.0010, 0.0015, 0.0011]},
+                "validation": {"sharpe_ratio": 1.2, "returns": [0.0012, 0.0008, 0.0013, 0.0009]},
+                "holdout": {"sharpe_ratio": 1.0, "returns": [0.0010, 0.0007, 0.0011, 0.0008]},
+            },
+            "0.03": {
+                "search": {"sharpe_ratio": 1.0, "returns": [0.0010, 0.0006, 0.0011, 0.0007]},
+                "validation": {"sharpe_ratio": 0.9, "returns": [0.0009, 0.0005, 0.0010, 0.0006]},
+                "holdout": {"sharpe_ratio": 0.8, "returns": [0.0008, 0.0004, 0.0009, 0.0005]},
+            },
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 1,
+                    "objective": "sharpe_ratio",
+                    "seed": 31,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_fraction": 0.2,
+                    "locked_holdout_min_search_rows": 48,
+                    "enable_pruning": False,
+                    "storage": storage_path,
+                    "study_name": "automl_selection_policy_summary_test",
+                    "search_space": {"signals": {"threshold": {"type": "categorical", "choices": [0.01, 0.02, 0.03]}}},
+                    "selection_policy": {
+                        "min_validation_trade_count": 1,
+                        "require_locked_holdout_pass": False,
+                    },
+                },
+                "model": {"type": "gbm"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        with mock.patch(
+            "core.automl._sample_trial_overrides",
+            side_effect=lambda trial, _: {"signals": {"threshold": 0.02}, "model": {"type": "gbm"}},
+        ):
+            summary = run_automl_study(
+                base_pipeline,
+                pipeline_class=_ScenarioAutoMLPipeline,
+                trial_step_classes=[],
+            )
+
+        self.assertIn("trial_complexity_score", summary["best_selection_policy"])
+        self.assertIn("generalization_gap", summary["best_selection_policy"])
+        self.assertIn("param_fragility_score", summary["best_selection_policy"])
+        self.assertIsNotNone(summary["best_selection_policy"]["generalization_gap"]["search_to_validation"])
+        self.assertIsNotNone(summary["top_trials"][0]["trial_complexity_score"])
+        self.assertIsNotNone(summary["top_trials"][0]["param_fragility_score"])
 
 
 if __name__ == "__main__":
