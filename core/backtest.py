@@ -85,11 +85,36 @@ def _round_down_to_step(values, step):
     return np.floor(values / step) * step
 
 
-def _normalize_price_series(price, tick_size=None):
+def _normalize_price_series(price, tick_size=None, fill_policy="strict", fill_limit=None,
+                            return_diagnostics=False, series_name="price"):
     series = pd.Series(price, copy=False).astype(float)
     if tick_size is not None and tick_size > 0:
         series = pd.Series(_round_down_to_step(series.to_numpy(), tick_size), index=series.index, dtype=float)
-    return series.replace(0.0, np.nan).ffill().bfill()
+    series = series.replace(0.0, np.nan)
+    leading_missing_rows = int(series.isna().cumprod().sum()) if len(series) > 0 else 0
+
+    if fill_policy == "strict" or fill_policy == "drop_rows":
+        normalized = series.copy()
+    elif fill_policy == "ffill":
+        normalized = series.ffill()
+    elif fill_policy == "ffill_with_limit":
+        limit = max(1, int(fill_limit)) if fill_limit is not None else 1
+        normalized = series.ffill(limit=limit)
+    else:
+        raise ValueError(f"Unsupported price fill policy: {fill_policy!r}")
+
+    diagnostics = {
+        "series": series_name,
+        "policy": fill_policy,
+        "fill_limit": None if fill_limit is None else int(fill_limit),
+        "leading_missing_rows": leading_missing_rows,
+        "forward_filled_rows": int((series.isna() & normalized.notna()).sum()),
+        "invalid_rows": int(normalized.isna().sum()),
+        "dropped_rows": 0,
+    }
+    if return_diagnostics:
+        return normalized, diagnostics
+    return normalized
 
 
 def _normalize_position_targets(signals, leverage=1.0, allow_short=True):
@@ -97,6 +122,251 @@ def _normalize_position_targets(signals, leverage=1.0, allow_short=True):
     if allow_short:
         return target.clip(-abs(float(leverage)), abs(float(leverage)))
     return target.clip(0.0, abs(float(leverage)))
+
+
+def _enabled_limit(value):
+    if value is None:
+        return None
+    value = float(value)
+    if not np.isfinite(value) or value <= 0.0:
+        return None
+    return value
+
+
+def _resolve_weighted_average_price(symbol_filters, execution_price):
+    reference_price = symbol_filters.get("weighted_average_price")
+    if reference_price is None:
+        reference_price = symbol_filters.get("reference_price")
+    if reference_price is None:
+        return float(execution_price)
+    reference_price = float(reference_price)
+    if not np.isfinite(reference_price) or reference_price <= 0.0:
+        return float(execution_price)
+    return reference_price
+
+
+def _validate_order_intent(side, order_type, price, quantity, current_quantity,
+                           symbol_filters=None, market="spot",
+                           weighted_average_price=None):
+    symbol_filters = dict(symbol_filters or {})
+    normalized_market = str(market or "spot").lower()
+    price = float(price)
+    quantity = max(float(quantity), 0.0)
+    current_quantity = float(current_quantity)
+    side = str(side or "BUY").upper()
+    order_type = str(order_type or "market").lower()
+    weighted_average_price = float(weighted_average_price if weighted_average_price is not None else price)
+    adjustment_reasons = []
+
+    def _reject(reason):
+        return {
+            "status": "rejected",
+            "reason": reason,
+            "quantity": 0.0,
+            "adjustment_reasons": adjustment_reasons,
+            "notional": 0.0,
+        }
+
+    def _adjust(new_quantity, reason):
+        nonlocal quantity
+        new_quantity = max(float(new_quantity), 0.0)
+        if not np.isclose(new_quantity, quantity, rtol=1e-9, atol=1e-12):
+            quantity = new_quantity
+            adjustment_reasons.append(reason)
+
+    min_price = _enabled_limit(symbol_filters.get("min_price"))
+    max_price = _enabled_limit(symbol_filters.get("max_price"))
+    if min_price is not None and price < min_price - 1e-12:
+        return _reject("min_price")
+    if max_price is not None and price > max_price + 1e-12:
+        return _reject("max_price")
+
+    percent_price_by_side = symbol_filters.get("percent_price_by_side")
+    if percent_price_by_side:
+        if side == "BUY":
+            lower = weighted_average_price * float(percent_price_by_side.get("bid_multiplier_down", 0.0))
+            upper = weighted_average_price * float(percent_price_by_side.get("bid_multiplier_up", np.inf))
+        else:
+            lower = weighted_average_price * float(percent_price_by_side.get("ask_multiplier_down", 0.0))
+            upper = weighted_average_price * float(percent_price_by_side.get("ask_multiplier_up", np.inf))
+        if price < lower - 1e-12 or price > upper + 1e-12:
+            return _reject("percent_price_by_side")
+    elif symbol_filters.get("percent_price"):
+        percent_price = symbol_filters["percent_price"]
+        lower = weighted_average_price * float(percent_price.get("multiplier_down", 0.0))
+        upper = weighted_average_price * float(percent_price.get("multiplier_up", np.inf))
+        if price < lower - 1e-12 or price > upper + 1e-12:
+            return _reject("percent_price")
+
+    market_filter_active = order_type == "market" and any(
+        symbol_filters.get(key) is not None for key in ["market_min_qty", "market_max_qty", "market_step_size"]
+    )
+    min_qty = _enabled_limit(symbol_filters.get("market_min_qty" if market_filter_active else "min_qty"))
+    max_qty = _enabled_limit(symbol_filters.get("market_max_qty" if market_filter_active else "max_qty"))
+    step_size = _enabled_limit(symbol_filters.get("market_step_size" if market_filter_active else "step_size"))
+    lot_reason = "market_lot_size" if market_filter_active else "lot_size"
+
+    if max_qty is not None and quantity > max_qty:
+        _adjust(max_qty, lot_reason)
+
+    max_position = _enabled_limit(symbol_filters.get("max_position"))
+    if max_position is not None and normalized_market == "spot" and side == "BUY":
+        allowed_quantity = max_position - current_quantity
+        if allowed_quantity <= 0.0:
+            return _reject("max_position")
+        if quantity > allowed_quantity:
+            _adjust(allowed_quantity, "max_position")
+
+    max_notional = _enabled_limit(symbol_filters.get("max_notional"))
+    apply_max_to_market = bool(symbol_filters.get("notional_apply_max_to_market", True))
+    if max_notional is not None and (order_type != "market" or apply_max_to_market):
+        max_quantity_for_notional = max_notional / max(weighted_average_price, 1e-12)
+        if quantity * weighted_average_price > max_notional + 1e-12:
+            _adjust(max_quantity_for_notional, "max_notional")
+
+    if step_size is not None and quantity > 0.0:
+        _adjust(float(_round_down_to_step(np.asarray([quantity]), step_size)[0]), lot_reason)
+
+    if quantity <= 0.0:
+        return _reject(adjustment_reasons[-1] if adjustment_reasons else lot_reason)
+    if min_qty is not None and quantity < min_qty - 1e-12:
+        return _reject(lot_reason)
+
+    min_notional = _enabled_limit(symbol_filters.get("min_notional"))
+    min_notional_applies = bool(symbol_filters.get("min_notional_apply_to_market", True))
+    if min_notional is not None and (order_type != "market" or min_notional_applies):
+        if quantity * weighted_average_price < min_notional - 1e-12:
+            return _reject("min_notional")
+
+    min_notional_floor = _enabled_limit(symbol_filters.get("notional_min_notional"))
+    apply_min_to_market = bool(symbol_filters.get("notional_apply_min_to_market", True))
+    if min_notional_floor is not None and (order_type != "market" or apply_min_to_market):
+        if quantity * weighted_average_price < min_notional_floor - 1e-12:
+            return _reject("min_notional")
+
+    return {
+        "status": "adjusted" if adjustment_reasons else "accepted",
+        "reason": adjustment_reasons[0] if adjustment_reasons else None,
+        "quantity": quantity,
+        "adjustment_reasons": adjustment_reasons,
+        "notional": quantity * price,
+    }
+
+
+def _build_execution_contract(close, requested_position, equity, execution_prices=None,
+                              symbol_filters=None, market="spot"):
+    symbol_filters = dict(symbol_filters or {})
+    valuation_series = pd.Series(close, copy=False).astype(float)
+    raw_execution = execution_prices if execution_prices is not None else close
+    execution_series = pd.Series(raw_execution, index=valuation_series.index).reindex(valuation_series.index).astype(float)
+    requested_position = pd.Series(requested_position, index=valuation_series.index).reindex(valuation_series.index).fillna(0.0).astype(float)
+
+    executable_position = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    order_rows = []
+    current_position = 0.0
+    current_quantity = 0.0
+    working_equity = float(equity)
+    previous_valuation_price = None
+
+    for timestamp in valuation_series.index:
+        valuation_price = float(valuation_series.loc[timestamp])
+        execution_price = float(execution_series.loc[timestamp])
+        if previous_valuation_price is not None and previous_valuation_price > 0.0:
+            valuation_return = (valuation_price / previous_valuation_price) - 1.0
+            working_equity *= 1.0 + current_position * valuation_return
+
+        desired_position = float(requested_position.loc[timestamp])
+        executed_position = current_position
+        status = "accepted"
+        reason = None
+        requested_order_quantity = 0.0
+        executed_order_quantity = 0.0
+        requested_notional = 0.0
+        executed_notional = 0.0
+        side = None
+        adjustment_reasons = []
+
+        if execution_price <= 0.0 or not np.isfinite(execution_price):
+            executed_position = current_position
+            status = "rejected"
+            reason = "invalid_execution_price"
+        elif np.isclose(desired_position, current_position, rtol=1e-9, atol=1e-12):
+            status = "noop"
+            executed_position = current_position
+        else:
+            desired_quantity = desired_position * max(working_equity, 0.0) / max(execution_price, 1e-12)
+            delta_quantity = desired_quantity - current_quantity
+            side = "BUY" if delta_quantity > 0.0 else "SELL"
+            requested_order_quantity = abs(float(delta_quantity))
+            requested_notional = requested_order_quantity * execution_price
+            validation = _validate_order_intent(
+                side=side,
+                order_type="market",
+                price=execution_price,
+                quantity=requested_order_quantity,
+                current_quantity=current_quantity,
+                symbol_filters=symbol_filters,
+                market=market,
+                weighted_average_price=_resolve_weighted_average_price(symbol_filters, execution_price),
+            )
+            status = validation["status"]
+            reason = validation["reason"]
+            adjustment_reasons = validation.get("adjustment_reasons", [])
+            if status == "rejected":
+                executed_position = current_position
+            else:
+                executed_order_quantity = float(validation["quantity"])
+                executed_notional = float(validation["notional"])
+                signed_delta = executed_order_quantity if side == "BUY" else -executed_order_quantity
+                current_quantity = current_quantity + signed_delta
+                if np.isclose(current_quantity, 0.0, rtol=1e-9, atol=1e-12):
+                    current_quantity = 0.0
+                executed_position = current_quantity * execution_price / max(working_equity, 1e-12)
+                if np.isclose(executed_position, 0.0, rtol=1e-9, atol=1e-12):
+                    executed_position = 0.0
+
+        executable_position.loc[timestamp] = executed_position
+        if status != "noop":
+            order_rows.append(
+                {
+                    "timestamp": timestamp,
+                    "requested_position": desired_position,
+                    "executed_position": float(executed_position),
+                    "previous_position": float(current_position),
+                    "side": side,
+                    "requested_order_quantity": float(requested_order_quantity),
+                    "executed_order_quantity": float(executed_order_quantity),
+                    "requested_notional": float(requested_notional),
+                    "executed_notional": float(executed_notional),
+                    "execution_price": execution_price,
+                    "status": status,
+                    "reason": reason,
+                    "adjustment_reasons": adjustment_reasons,
+                }
+            )
+        current_position = float(executed_position)
+        previous_valuation_price = valuation_price
+
+    order_ledger = pd.DataFrame(order_rows)
+    rejected_mask = order_ledger["status"] == "rejected" if not order_ledger.empty else pd.Series(dtype=bool)
+    total_requested_notional = float(order_ledger.get("requested_notional", pd.Series(dtype=float)).sum()) if not order_ledger.empty else 0.0
+    blocked_notional = float(order_ledger.loc[rejected_mask, "requested_notional"].sum()) if not order_ledger.empty else 0.0
+    return {
+        "valuation_series": valuation_series,
+        "execution_series": execution_series,
+        "requested_position": requested_position,
+        "position": executable_position,
+        "order_ledger": order_ledger,
+        "blocked_orders": int((order_ledger.get("status") == "rejected").sum()) if not order_ledger.empty else 0,
+        "adjusted_orders": int((order_ledger.get("status") == "adjusted").sum()) if not order_ledger.empty else 0,
+        "accepted_orders": int((order_ledger.get("status") == "accepted").sum()) if not order_ledger.empty else 0,
+        "blocked_notional_share": _round_metric(_safe_ratio(blocked_notional, total_requested_notional), 6),
+        "order_rejection_reasons": (
+            order_ledger.loc[order_ledger["status"] == "rejected", "reason"].value_counts().to_dict()
+            if not order_ledger.empty
+            else {}
+        ),
+    }
 
 
 def _annualized_sharpe(returns, annualization):
@@ -429,7 +699,6 @@ def _build_trade_ledger(strat_ret, position, execution_series):
     entry_time = None
     entry_price = None
     segment_returns = []
-    previous_timestamp = None
 
     for timestamp in strat_ret.index:
         sign_now = float(np.sign(position.loc[timestamp]))
@@ -438,13 +707,14 @@ def _build_trade_ledger(strat_ret, position, execution_series):
                 current_sign = sign_now
                 entry_time = timestamp
                 entry_price = float(execution_series.loc[timestamp])
-                segment_returns = [float(strat_ret.loc[timestamp])]
+                segment_returns = []
         elif sign_now == current_sign:
             segment_returns.append(float(strat_ret.loc[timestamp]))
         else:
+            segment_returns.append(float(strat_ret.loc[timestamp]))
             if segment_returns:
                 trade_return = float(np.prod(1.0 + np.asarray(segment_returns, dtype=float)) - 1.0)
-                exit_time = previous_timestamp if previous_timestamp is not None else timestamp
+                exit_time = timestamp
                 exit_price = float(execution_series.loc[exit_time])
                 trades.append(
                     {
@@ -462,14 +732,12 @@ def _build_trade_ledger(strat_ret, position, execution_series):
                 current_sign = sign_now
                 entry_time = timestamp
                 entry_price = float(execution_series.loc[timestamp])
-                segment_returns = [float(strat_ret.loc[timestamp])]
+                segment_returns = []
             else:
                 current_sign = 0.0
                 entry_time = None
                 entry_price = None
                 segment_returns = []
-
-        previous_timestamp = timestamp
 
     if current_sign != 0.0 and segment_returns:
         trade_return = float(np.prod(1.0 + np.asarray(segment_returns, dtype=float)) - 1.0)
@@ -494,7 +762,8 @@ def _build_trade_ledger(strat_ret, position, execution_series):
 def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equity,
                         fees_paid, slippage_paid, signal_delay_bars, trade_ledger,
                         funding_pnl=0.0, engine="pandas", significance=None,
-                        benchmark_returns=None, benchmark_sharpe=None):
+                        benchmark_returns=None, benchmark_sharpe=None,
+                        execution_report=None):
     prev_equity = equity_curve.shift(1).fillna(equity)
     pnl = equity_curve - prev_equity
 
@@ -561,7 +830,7 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
     funding_paid = max(-float(funding_pnl), 0.0)
     funding_received = max(float(funding_pnl), 0.0)
 
-    return {
+    summary = {
         "engine": engine,
         "starting_equity": _round_metric(equity, 2),
         "ending_equity": _round_metric(equity_curve.iloc[-1], 2),
@@ -605,6 +874,19 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
         "trade_ledger": trade_ledger,
         "equity_curve": equity_curve,
     }
+    if execution_report is not None:
+        summary.update(
+            {
+                "blocked_orders": int(execution_report.get("blocked_orders", 0)),
+                "adjusted_orders": int(execution_report.get("adjusted_orders", 0)),
+                "accepted_orders": int(execution_report.get("accepted_orders", 0)),
+                "blocked_notional_share": execution_report.get("blocked_notional_share", 0.0),
+                "order_rejection_reasons": execution_report.get("order_rejection_reasons", {}),
+                "order_ledger": execution_report.get("order_ledger", pd.DataFrame()),
+                "price_fill_actions": execution_report.get("price_fill_actions", {}),
+            }
+        )
+    return summary
 
 
 def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
@@ -612,18 +894,13 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
                            symbol_filters=None, funding_rates=None,
                            significance=None, benchmark_returns=None,
                            benchmark_sharpe=None, volume=None,
-                           slippage_model=None, orderbook_depth=None):
+                           slippage_model=None, orderbook_depth=None,
+                           execution_report=None):
     if vbt is None or Direction is None or SizeType is None:
         raise ImportError("vectorbt is not installed")
 
-    symbol_filters = dict(symbol_filters or {})
-    tick_size = symbol_filters.get("tick_size")
-    step_size = symbol_filters.get("step_size")
-    max_size = symbol_filters.get("max_qty")
-    min_notional = symbol_filters.get("min_notional")
-
-    valuation_series = _normalize_price_series(close, tick_size=tick_size)
-    execution_series = _normalize_price_series(execution_prices if execution_prices is not None else close, tick_size=tick_size)
+    valuation_series = pd.Series(close, copy=False).astype(float)
+    execution_series = pd.Series(execution_prices if execution_prices is not None else close, index=valuation_series.index).reindex(valuation_series.index).astype(float)
     slippage_rates, turnover = _estimate_slippage_rates(
         position=position,
         equity=equity,
@@ -635,9 +912,6 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
         funding_rates=funding_rates,
         orderbook_depth=orderbook_depth,
     )
-    min_size = None
-    if min_notional is not None and float(min_notional) > 0:
-        min_size = (float(min_notional) / execution_series.replace(0.0, np.nan)).fillna(0.0)
 
     portfolio = vbt.Portfolio.from_orders(
         close=valuation_series,
@@ -647,9 +921,6 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
         price=execution_series,
         fees=fee_rate,
         slippage=slippage_rates,
-        min_size=min_size,
-        max_size=max_size,
-        size_granularity=step_size,
         init_cash=equity,
         freq=valuation_series.index.to_series().diff().median(),
     )
@@ -677,6 +948,7 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
         significance=significance,
         benchmark_returns=benchmark_returns,
         benchmark_sharpe=benchmark_sharpe,
+        execution_report=execution_report,
     )
 
 
@@ -684,10 +956,12 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
                          execution_prices, signal_delay_bars, funding_rates=None,
                          significance=None, benchmark_returns=None,
                          benchmark_sharpe=None, volume=None,
-                         slippage_model=None, orderbook_depth=None):
+                         slippage_model=None, orderbook_depth=None,
+                         execution_report=None):
     valuation_series = pd.Series(close, copy=False).astype(float)
     execution_series = valuation_series if execution_prices is None else pd.Series(execution_prices, index=valuation_series.index).reindex(valuation_series.index).astype(float)
     returns = valuation_series.pct_change().fillna(0.0)
+    held_position = position.shift(1).fillna(0.0)
     slippage_rates, turnover = _estimate_slippage_rates(
         position=position,
         equity=equity,
@@ -703,9 +977,9 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
     slippage = turnover * slippage_rates
     funding_returns = pd.Series(0.0, index=position.index, dtype=float)
     if funding_rates is not None:
-        funding_returns = -position * pd.Series(funding_rates, index=position.index).reindex(position.index).fillna(0.0)
+        funding_returns = -held_position * pd.Series(funding_rates, index=position.index).reindex(position.index).fillna(0.0)
 
-    strat_ret = position * returns + funding_returns - fees - slippage
+    strat_ret = held_position * returns + funding_returns - fees - slippage
     equity_curve = equity * (1.0 + strat_ret).cumprod()
     trade_ledger = _build_trade_ledger(strat_ret, position, execution_series)
     prev_equity = equity_curve.shift(1).fillna(equity)
@@ -724,6 +998,7 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
         significance=significance,
         benchmark_returns=benchmark_returns,
         benchmark_sharpe=benchmark_sharpe,
+        execution_report=execution_report,
     )
 
 
@@ -736,7 +1011,9 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  market="spot", leverage=1.0, allow_short=None, symbol_filters=None,
                  funding_rates=None, significance=None, benchmark_returns=None,
                  benchmark_sharpe=None, volume=None, slippage_model=None,
-                 orderbook_depth=None):
+                 orderbook_depth=None, execution_price_policy="strict",
+                 execution_price_fill_limit=None, valuation_price_policy="drop_rows",
+                 valuation_price_fill_limit=None):
     """Run a backtest through the configured execution adapter.
 
     Parameters
@@ -761,6 +1038,11 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     slippage_model   : str|object|None – one of {"flat", "sqrt_impact", "orderbook"} or a custom estimator implementing estimate(...)
     orderbook_depth  : pd.DataFrame|None – optional L2 depth frame for future order-book-aware slippage models
 
+    execution_price_policy : str – one of {"strict", "ffill", "ffill_with_limit", "drop_rows"}
+    execution_price_fill_limit : int|None – max consecutive execution-price fills when using "ffill_with_limit"
+    valuation_price_policy : str – one of {"strict", "ffill", "ffill_with_limit", "drop_rows"}
+    valuation_price_fill_limit : int|None – max consecutive valuation-price fills when using "ffill_with_limit"
+
     Returns dict with metrics and equity curve.
     """
     close = pd.Series(close, copy=False).astype(float)
@@ -768,25 +1050,95 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     benchmark_returns = _align_benchmark_returns(benchmark_returns, close.index)
     signal_delay_bars = max(0, int(signal_delay_bars))
     allow_short = (market or "spot") != "spot" if allow_short is None else bool(allow_short)
+    symbol_filters = dict(symbol_filters or {})
+    tick_size = symbol_filters.get("tick_size")
+
+    valuation_series, valuation_fill_actions = _normalize_price_series(
+        close,
+        tick_size=tick_size,
+        fill_policy=valuation_price_policy,
+        fill_limit=valuation_price_fill_limit,
+        return_diagnostics=True,
+        series_name="valuation",
+    )
+    execution_input = execution_prices if execution_prices is not None else close
+    execution_series, execution_fill_actions = _normalize_price_series(
+        execution_input,
+        tick_size=tick_size,
+        fill_policy=execution_price_policy,
+        fill_limit=execution_price_fill_limit,
+        return_diagnostics=True,
+        series_name="execution",
+    )
+
+    valid_mask = pd.Series(True, index=close.index, dtype=bool)
+    if valuation_price_policy == "drop_rows":
+        valid_mask &= valuation_series.notna()
+    elif valuation_fill_actions["invalid_rows"] > 0:
+        raise ValueError(
+            f"valuation price policy {valuation_price_policy!r} left {valuation_fill_actions['invalid_rows']} invalid rows"
+        )
+
+    if execution_price_policy == "drop_rows":
+        valid_mask &= execution_series.notna()
+    elif execution_fill_actions["invalid_rows"] > 0:
+        raise ValueError(
+            f"execution price policy {execution_price_policy!r} left {execution_fill_actions['invalid_rows']} invalid rows"
+        )
+
+    dropped_rows = int((~valid_mask).sum())
+    valuation_fill_actions["dropped_rows"] = dropped_rows
+    execution_fill_actions["dropped_rows"] = dropped_rows
+
+    if dropped_rows > 0:
+        close = close.loc[valid_mask]
+        signal_series = signal_series.loc[valid_mask]
+        valuation_series = valuation_series.loc[valid_mask]
+        execution_series = execution_series.loc[valid_mask]
+        if benchmark_returns is not None:
+            benchmark_returns = benchmark_returns.loc[valid_mask]
+        if funding_rates is not None:
+            funding_rates = pd.Series(funding_rates, copy=False).reindex(valid_mask.index).loc[valid_mask]
+        if volume is not None:
+            volume = pd.Series(volume, copy=False).reindex(valid_mask.index).loc[valid_mask]
+
+    if valuation_series.empty or execution_series.empty:
+        raise ValueError("price normalization removed all rows from the backtest")
+
     position = _normalize_position_targets(
         signal_series.shift(signal_delay_bars).fillna(0.0),
         leverage=leverage,
         allow_short=allow_short,
     )
+    execution_report = _build_execution_contract(
+        close=valuation_series,
+        requested_position=position,
+        equity=equity,
+        execution_prices=execution_series,
+        symbol_filters=symbol_filters,
+        market=market,
+    )
+    execution_report["price_fill_actions"] = {
+        "execution": execution_fill_actions,
+        "valuation": valuation_fill_actions,
+    }
+    valuation_series = execution_report["valuation_series"]
+    execution_series = execution_report["execution_series"]
+    executable_position = execution_report["position"]
 
     selected_engine = (engine or "vectorbt").lower()
     if selected_engine == "vectorbt":
         try:
             return _run_vectorbt_backtest(
-                close=close,
-                position=position,
+                close=valuation_series,
+                position=executable_position,
                 equity=equity,
                 fee_rate=fee_rate,
                 slippage_rate=slippage_rate,
-                execution_prices=execution_prices,
+                execution_prices=execution_series,
                 signal_delay_bars=signal_delay_bars,
                 allow_short=allow_short,
-                symbol_filters=symbol_filters,
+                symbol_filters=None,
                 funding_rates=funding_rates,
                 significance=significance,
                 benchmark_returns=benchmark_returns,
@@ -794,17 +1146,18 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                 volume=volume,
                 slippage_model=slippage_model,
                 orderbook_depth=orderbook_depth,
+                execution_report=execution_report,
             )
         except ImportError:
             selected_engine = "pandas"
 
     return _run_pandas_backtest(
-        close=close,
-        position=position,
+        close=valuation_series,
+        position=executable_position,
         equity=equity,
         fee_rate=fee_rate,
         slippage_rate=slippage_rate,
-        execution_prices=execution_prices,
+        execution_prices=execution_series,
         signal_delay_bars=signal_delay_bars,
         funding_rates=funding_rates,
         significance=significance,
@@ -813,4 +1166,5 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         volume=volume,
         slippage_model=slippage_model,
         orderbook_depth=orderbook_depth,
+        execution_report=execution_report,
     )

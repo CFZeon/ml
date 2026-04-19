@@ -2,7 +2,7 @@ import unittest
 
 import pandas as pd
 
-from core.data import _COLUMNS, _prepare_frame
+from core.data import _COLUMNS, _parse_symbol_filters, _prepare_frame
 from core import FlatSlippageModel, SquareRootImpactModel, join_custom_data, run_backtest
 from core.slippage import OrderBookImpactModel
 
@@ -36,6 +36,49 @@ class DataBacktestAdapterTest(unittest.TestCase):
         self.assertIn("taker_buy_quote_vol", prepared.columns)
         self.assertAlmostEqual(float(prepared.iloc[0]["taker_buy_base_vol"]), 0.0, places=6)
         self.assertAlmostEqual(float(prepared.iloc[0]["taker_buy_quote_vol"]), 0.0, places=6)
+
+    def test_parse_symbol_filters_preserves_extended_binance_rules(self):
+        payload = {
+            "symbol": "BTCUSDT",
+            "filters": [
+                {"filterType": "PRICE_FILTER", "minPrice": "10", "maxPrice": "1000000", "tickSize": "0.01"},
+                {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "50", "stepSize": "0.001"},
+                {"filterType": "MARKET_LOT_SIZE", "minQty": "0.01", "maxQty": "25", "stepSize": "0.01"},
+                {"filterType": "MIN_NOTIONAL", "minNotional": "10", "applyToMarket": True, "avgPriceMins": 5},
+                {
+                    "filterType": "NOTIONAL",
+                    "minNotional": "12",
+                    "maxNotional": "1000",
+                    "applyMinToMarket": False,
+                    "applyMaxToMarket": True,
+                    "avgPriceMins": 1,
+                },
+                {"filterType": "PERCENT_PRICE", "multiplierUp": "1.2", "multiplierDown": "0.8", "avgPriceMins": 5},
+                {
+                    "filterType": "PERCENT_PRICE_BY_SIDE",
+                    "bidMultiplierUp": "1.1",
+                    "bidMultiplierDown": "0.9",
+                    "askMultiplierUp": "1.3",
+                    "askMultiplierDown": "0.7",
+                    "avgPriceMins": 1,
+                },
+                {"filterType": "MAX_POSITION", "maxPosition": "5"},
+                {"filterType": "TRAILING_DELTA", "minTrailingAboveDelta": 10, "maxTrailingAboveDelta": 2000},
+            ],
+        }
+
+        parsed = _parse_symbol_filters(payload)
+
+        self.assertAlmostEqual(float(parsed["tick_size"]), 0.01, places=6)
+        self.assertAlmostEqual(float(parsed["market_step_size"]), 0.01, places=6)
+        self.assertTrue(parsed["min_notional_apply_to_market"])
+        self.assertFalse(parsed["notional_apply_min_to_market"])
+        self.assertAlmostEqual(float(parsed["max_notional"]), 1000.0, places=6)
+        self.assertAlmostEqual(float(parsed["percent_price"]["multiplier_up"]), 1.2, places=6)
+        self.assertAlmostEqual(float(parsed["percent_price_by_side"]["ask_multiplier_down"]), 0.7, places=6)
+        self.assertAlmostEqual(float(parsed["max_position"]), 5.0, places=6)
+        self.assertIn("TRAILING_DELTA", parsed["unsupported_filters"])
+        self.assertIn("LOT_SIZE", parsed["raw_filters"])
 
     def test_slippage_sqrt_model_increases_with_volume_ratio(self):
         index = pd.date_range("2026-03-09", periods=4, freq="1h", tz="UTC")
@@ -172,6 +215,183 @@ class DataBacktestAdapterTest(unittest.TestCase):
         self.assertIn("slippage_paid", result)
         self.assertIn("statistical_significance", result)
         self.assertFalse(result["statistical_significance"]["enabled"])
+
+    def test_execution_parity_rejects_same_min_notional_order_in_both_engines(self):
+        index = pd.date_range("2026-03-12", periods=5, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 100.5, 101.0, 101.5, 102.0], index=index)
+        signals = pd.Series([0.0, 0.05, 0.05, 0.0, 0.0], index=index)
+        filters = {"tick_size": 0.1, "step_size": 0.01, "min_notional": 1_000.0}
+
+        pandas_result = run_backtest(
+            close=close,
+            signals=signals,
+            equity=1_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="pandas",
+            symbol_filters=filters,
+        )
+        vectorbt_result = run_backtest(
+            close=close,
+            signals=signals,
+            equity=1_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="vectorbt",
+            symbol_filters=filters,
+        )
+
+        self.assertEqual(pandas_result["blocked_orders"], 2)
+        self.assertEqual(vectorbt_result["blocked_orders"], 2)
+        self.assertEqual(pandas_result["order_rejection_reasons"], {"min_notional": 2})
+        self.assertEqual(vectorbt_result["order_rejection_reasons"], {"min_notional": 2})
+        self.assertAlmostEqual(float(pandas_result["ending_equity"]), 1_000.0, places=6)
+        self.assertAlmostEqual(float(vectorbt_result["ending_equity"]), 1_000.0, places=6)
+        self.assertEqual(int(pandas_result["closed_trades"]), 0)
+        self.assertEqual(int(vectorbt_result["closed_trades"]), 0)
+
+    def test_execution_parity_matches_flip_trade_counts(self):
+        index = pd.date_range("2026-03-12", periods=6, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 102.0, 101.0, 99.0, 98.0, 100.0], index=index)
+        signals = pd.Series([0.0, 1.0, 1.0, -1.0, -1.0, 0.0], index=index)
+
+        pandas_result = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="pandas",
+            allow_short=True,
+        )
+        vectorbt_result = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="vectorbt",
+            allow_short=True,
+        )
+
+        self.assertEqual(int(pandas_result["closed_trades"]), int(vectorbt_result["closed_trades"]))
+        self.assertEqual(int(pandas_result["total_trades"]), int(vectorbt_result["total_trades"]))
+        self.assertEqual(int(pandas_result["blocked_orders"]), 0)
+        self.assertEqual(int(vectorbt_result["blocked_orders"]), 0)
+        self.assertAlmostEqual(float(pandas_result["ending_equity"]), float(vectorbt_result["ending_equity"]), places=2)
+
+    def test_execution_validator_rejects_percent_price_in_both_engines(self):
+        index = pd.date_range("2026-03-12", periods=4, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 130.0, 130.0, 130.0], index=index)
+        signals = pd.Series([0.0, 1.0, 0.0, 0.0], index=index)
+        filters = {
+            "percent_price": {"multiplier_up": 1.1, "multiplier_down": 0.9, "avg_price_mins": 0},
+            "weighted_average_price": 100.0,
+        }
+
+        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="pandas", symbol_filters=filters)
+        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="vectorbt", symbol_filters=filters)
+
+        self.assertEqual(pandas_result["order_rejection_reasons"], {"percent_price": 1})
+        self.assertEqual(vectorbt_result["order_rejection_reasons"], {"percent_price": 1})
+        self.assertEqual(int(pandas_result["blocked_orders"]), 1)
+        self.assertEqual(int(vectorbt_result["blocked_orders"]), 1)
+        self.assertGreater(float(pandas_result["blocked_notional_share"]), 0.0)
+        self.assertGreater(float(vectorbt_result["blocked_notional_share"]), 0.0)
+
+    def test_execution_validator_applies_market_lot_size_before_both_engines(self):
+        index = pd.date_range("2026-03-12", periods=4, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 100.0, 100.0, 100.0], index=index)
+        signals = pd.Series([0.0, 0.67, 0.0, 0.0], index=index)
+        filters = {"market_min_qty": 1.0, "market_max_qty": 5.0, "market_step_size": 1.0}
+
+        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="pandas", symbol_filters=filters)
+        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="vectorbt", symbol_filters=filters)
+
+        self.assertEqual(int(pandas_result["adjusted_orders"]), 1)
+        self.assertEqual(int(vectorbt_result["adjusted_orders"]), 1)
+        self.assertEqual(str(pandas_result["order_ledger"].iloc[0]["reason"]), "market_lot_size")
+        self.assertEqual(str(vectorbt_result["order_ledger"].iloc[0]["reason"]), "market_lot_size")
+        self.assertAlmostEqual(float(pandas_result["order_ledger"].iloc[0]["executed_position"]), 0.5, places=6)
+        self.assertAlmostEqual(float(vectorbt_result["order_ledger"].iloc[0]["executed_position"]), 0.5, places=6)
+
+    def test_execution_validator_applies_notional_cap_before_both_engines(self):
+        index = pd.date_range("2026-03-12", periods=4, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 100.0, 100.0, 100.0], index=index)
+        signals = pd.Series([0.0, 1.0, 0.0, 0.0], index=index)
+        filters = {"max_notional": 500.0, "notional_apply_max_to_market": True}
+
+        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="pandas", symbol_filters=filters)
+        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="vectorbt", symbol_filters=filters)
+
+        self.assertEqual(int(pandas_result["adjusted_orders"]), 1)
+        self.assertEqual(int(vectorbt_result["adjusted_orders"]), 1)
+        self.assertEqual(str(pandas_result["order_ledger"].iloc[0]["reason"]), "max_notional")
+        self.assertEqual(str(vectorbt_result["order_ledger"].iloc[0]["reason"]), "max_notional")
+        self.assertAlmostEqual(float(pandas_result["order_ledger"].iloc[0]["executed_position"]), 0.5, places=6)
+        self.assertAlmostEqual(float(vectorbt_result["order_ledger"].iloc[0]["executed_position"]), 0.5, places=6)
+
+    def test_execution_validator_applies_spot_max_position_before_both_engines(self):
+        index = pd.date_range("2026-03-12", periods=5, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 100.0, 100.0, 100.0, 100.0], index=index)
+        signals = pd.Series([0.0, 1.0, 1.0, 0.0, 0.0], index=index)
+        filters = {"max_position": 4.0, "step_size": 1.0, "max_qty": 10.0}
+
+        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="pandas", market="spot", symbol_filters=filters)
+        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="vectorbt", market="spot", symbol_filters=filters)
+
+        self.assertAlmostEqual(float(pandas_result["order_ledger"].iloc[0]["executed_position"]), 0.4, places=6)
+        self.assertAlmostEqual(float(vectorbt_result["order_ledger"].iloc[0]["executed_position"]), 0.4, places=6)
+        self.assertEqual(pandas_result["order_rejection_reasons"], {"max_position": 1})
+        self.assertEqual(vectorbt_result["order_rejection_reasons"], {"max_position": 1})
+        self.assertEqual(int(pandas_result["blocked_orders"]), 1)
+        self.assertEqual(int(vectorbt_result["blocked_orders"]), 1)
+
+    def test_missing_leading_execution_prices_do_not_backfill_from_future(self):
+        index = pd.date_range("2026-03-12", periods=4, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 101.0, 102.0, 103.0], index=index)
+        execution_prices = pd.Series([float("nan"), 101.0, 102.0, 103.0], index=index, dtype="float")
+        signals = pd.Series([0.0, 1.0, 0.0, 0.0], index=index)
+
+        with self.assertRaisesRegex(ValueError, "execution price policy"):
+            run_backtest(
+                close=close,
+                signals=signals,
+                equity=10_000.0,
+                fee_rate=0.0,
+                slippage_rate=0.0,
+                signal_delay_bars=0,
+                engine="pandas",
+                execution_prices=execution_prices,
+                execution_price_policy="strict",
+            )
+
+    def test_execution_prices_can_only_forward_fill_causally_when_enabled(self):
+        index = pd.date_range("2026-03-12", periods=5, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 101.0, 102.0, 103.0, 104.0], index=index)
+        execution_prices = pd.Series([100.0, 101.0, float("nan"), 103.0, 104.0], index=index, dtype="float")
+        signals = pd.Series([0.0, 1.0, 1.0, 0.0, 0.0], index=index)
+
+        result = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="pandas",
+            execution_prices=execution_prices,
+            execution_price_policy="ffill_with_limit",
+            execution_price_fill_limit=1,
+        )
+
+        self.assertEqual(int(result["price_fill_actions"]["execution"]["forward_filled_rows"]), 1)
+        self.assertEqual(int(result["price_fill_actions"]["execution"]["invalid_rows"]), 0)
+        self.assertEqual(int(result["price_fill_actions"]["execution"]["leading_missing_rows"]), 0)
 
     def test_backtest_with_sqrt_slippage_produces_lower_returns(self):
         index = pd.date_range("2026-03-13", periods=10, freq="1h", tz="UTC")

@@ -153,6 +153,7 @@ class _AutoMLDummyPipeline:
                     "avg_selected_features": 1.0,
                     "folds": [],
                 },
+                "bootstrap": {"model_type": self.config.get("model", {}).get("type", "gbm"), "used_in_any_fold": False, "warning_count": 0, "folds": []},
                 "purging": [],
                 "signal_tuning": [],
                 "oos_avg_win": 0.02,
@@ -304,6 +305,7 @@ class _ScenarioAutoMLPipeline(_AutoMLDummyPipeline):
                     "avg_selected_features": 1.0,
                     "folds": [],
                 },
+                "bootstrap": {"model_type": self.config.get("model", {}).get("type", "gbm"), "used_in_any_fold": False, "warning_count": 0, "folds": []},
                 "purging": [],
                 "signal_tuning": [],
                 "oos_avg_win": 0.02,
@@ -392,6 +394,86 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
 
         self.assertGreater(accurate_score, profitable_score)
 
+    def test_risk_adjusted_after_costs_uses_backtest_and_gates_classification_quality(self):
+        strong_backtest = {
+            "net_profit_pct": 0.12,
+            "sharpe_ratio": 1.8,
+            "max_drawdown": -0.05,
+            "total_trades": 18,
+            "bar_count": 72,
+            "statistical_significance": {
+                "metrics": {
+                    "sharpe_ratio": {"confidence_interval": {"lower": 0.7, "upper": 2.6}},
+                }
+            },
+        }
+        weak_classifier = {
+            "avg_accuracy": 0.48,
+            "avg_directional_accuracy": 0.48,
+            "avg_log_loss": 0.22,
+            "avg_brier_score": 0.12,
+            "avg_calibration_error": 0.04,
+        }
+        acceptable_classifier = {
+            "avg_accuracy": 0.58,
+            "avg_directional_accuracy": 0.58,
+            "avg_log_loss": 0.24,
+            "avg_brier_score": 0.13,
+            "avg_calibration_error": 0.05,
+        }
+
+        rejected_score = compute_objective_value(
+            "risk_adjusted_after_costs",
+            weak_classifier,
+            strong_backtest,
+            {"objective_gates": {"min_directional_accuracy": 0.55, "min_trade_count": 1}},
+        )
+        accepted_score = compute_objective_value(
+            "risk_adjusted_after_costs",
+            acceptable_classifier,
+            strong_backtest,
+            {"objective_gates": {"min_directional_accuracy": 0.55, "min_trade_count": 1}},
+        )
+
+        self.assertEqual(rejected_score, float("-inf"))
+        self.assertGreater(accepted_score, 0.0)
+
+    def test_risk_adjusted_after_costs_can_use_confidence_lower_bound(self):
+        training = {
+            "avg_accuracy": 0.60,
+            "avg_directional_accuracy": 0.60,
+            "avg_log_loss": 0.22,
+            "avg_brier_score": 0.12,
+            "avg_calibration_error": 0.05,
+        }
+        backtest = {
+            "net_profit_pct": 0.10,
+            "sharpe_ratio": 2.0,
+            "max_drawdown": -0.05,
+            "total_trades": 12,
+            "bar_count": 120,
+            "statistical_significance": {
+                "metrics": {
+                    "sharpe_ratio": {"confidence_interval": {"lower": 0.8, "upper": 2.9}},
+                }
+            },
+        }
+
+        point_estimate_score = compute_objective_value(
+            "risk_adjusted_after_costs",
+            training,
+            backtest,
+            {"objective_gates": {"min_trade_count": 1}, "objective_use_confidence_lower_bound": False},
+        )
+        lower_bound_score = compute_objective_value(
+            "risk_adjusted_after_costs",
+            training,
+            backtest,
+            {"objective_gates": {"min_trade_count": 1}, "objective_use_confidence_lower_bound": True},
+        )
+
+        self.assertGreater(point_estimate_score, lower_bound_score)
+
     def test_compute_objective_value_can_apply_deflated_sharpe_penalty(self):
         raw_score = compute_objective_value("sharpe_ratio", {}, {"sharpe_ratio": 2.5})
         penalized_score = compute_objective_value(
@@ -467,6 +549,8 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
         self.assertIn("overfitting_diagnostics", summary)
         self.assertTrue(summary["overfitting_diagnostics"]["enabled"])
         self.assertFalse(summary["overfitting_diagnostics"]["pbo"]["enabled"])
+        self.assertIn("bootstrap", summary["best_training"])
+        self.assertFalse(summary["best_training"]["bootstrap"]["used_in_any_fold"])
         self.assertTrue(summary["validation_holdout"]["enabled"])
         self.assertEqual(int(summary["validation_holdout"]["search_rows"]), 72)
         self.assertEqual(int(summary["validation_holdout"]["validation_rows"]), 24)
@@ -480,6 +564,184 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
         self.assertEqual(int(summary["locked_holdout"]["aligned_holdout_rows"]), 24)
         self.assertEqual(int(summary["locked_holdout"]["backtest"]["total_trades"]), 24)
         self.assertFalse(summary["locked_holdout"]["holdout_warning"])
+
+    def test_default_objective_prefers_better_after_cost_backtest(self):
+        raw = _build_market_frame(100)
+        storage_path = _make_storage_path()
+
+        _ScenarioAutoMLPipeline.reset()
+        _ScenarioAutoMLPipeline.full_rows = len(raw)
+        _ScenarioAutoMLPipeline.metrics_by_variant = {
+            "rf": {
+                "search": {
+                    "directional_accuracy": 0.72,
+                    "log_loss": 0.20,
+                    "calibration_error": 0.04,
+                    "sharpe_ratio": -0.4,
+                    "returns": [-0.0010, 0.0003, -0.0011, 0.0002],
+                },
+                "validation": {
+                    "directional_accuracy": 0.72,
+                    "log_loss": 0.20,
+                    "calibration_error": 0.04,
+                    "sharpe_ratio": -0.5,
+                    "returns": [-0.0012, 0.0002, -0.0011, 0.0001],
+                },
+                "holdout": {
+                    "directional_accuracy": 0.72,
+                    "log_loss": 0.20,
+                    "calibration_error": 0.04,
+                    "sharpe_ratio": -0.3,
+                    "returns": [-0.0009, 0.0002, -0.0008, 0.0001],
+                },
+            },
+            "gbm": {
+                "search": {
+                    "directional_accuracy": 0.58,
+                    "log_loss": 0.28,
+                    "calibration_error": 0.08,
+                    "sharpe_ratio": 1.2,
+                    "returns": [0.0012, 0.0008, 0.0013, 0.0009],
+                },
+                "validation": {
+                    "directional_accuracy": 0.58,
+                    "log_loss": 0.28,
+                    "calibration_error": 0.08,
+                    "sharpe_ratio": 1.4,
+                    "returns": [0.0014, 0.0010, 0.0015, 0.0011],
+                },
+                "holdout": {
+                    "directional_accuracy": 0.58,
+                    "log_loss": 0.28,
+                    "calibration_error": 0.08,
+                    "sharpe_ratio": 1.1,
+                    "returns": [0.0010, 0.0007, 0.0011, 0.0008],
+                },
+            },
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 2,
+                    "seed": 37,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_fraction": 0.2,
+                    "locked_holdout_min_search_rows": 40,
+                    "enable_pruning": False,
+                    "minimum_dsr_threshold": None,
+                    "storage": storage_path,
+                    "study_name": "automl_trading_first_default_test",
+                    "selection_policy": {"min_validation_trade_count": 1, "require_locked_holdout_pass": False},
+                },
+                "model": {"type": "rf"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        variants = [{"model": {"type": "rf"}}, {"model": {"type": "gbm"}}]
+        with mock.patch("core.automl._sample_trial_overrides", side_effect=lambda trial, _: variants[trial.number]):
+            summary = run_automl_study(
+                base_pipeline,
+                pipeline_class=_ScenarioAutoMLPipeline,
+                trial_step_classes=[],
+            )
+
+        self.assertEqual(summary["objective"], "risk_adjusted_after_costs")
+        self.assertEqual(summary["best_overrides"]["model"]["type"], "gbm")
+        self.assertTrue(summary["best_objective_diagnostics"]["classification_gates"]["passed"])
+
+    def test_explicit_accuracy_first_override_still_works(self):
+        raw = _build_market_frame(100)
+        storage_path = _make_storage_path()
+
+        _ScenarioAutoMLPipeline.reset()
+        _ScenarioAutoMLPipeline.full_rows = len(raw)
+        _ScenarioAutoMLPipeline.metrics_by_variant = {
+            "rf": {
+                "search": {
+                    "directional_accuracy": 0.72,
+                    "log_loss": 0.20,
+                    "calibration_error": 0.04,
+                    "sharpe_ratio": -0.4,
+                    "returns": [-0.0010, 0.0003, -0.0011, 0.0002],
+                },
+                "validation": {
+                    "directional_accuracy": 0.72,
+                    "log_loss": 0.20,
+                    "calibration_error": 0.04,
+                    "sharpe_ratio": -0.5,
+                    "returns": [-0.0012, 0.0002, -0.0011, 0.0001],
+                },
+                "holdout": {
+                    "directional_accuracy": 0.72,
+                    "log_loss": 0.20,
+                    "calibration_error": 0.04,
+                    "sharpe_ratio": -0.3,
+                    "returns": [-0.0009, 0.0002, -0.0008, 0.0001],
+                },
+            },
+            "gbm": {
+                "search": {
+                    "directional_accuracy": 0.58,
+                    "log_loss": 0.28,
+                    "calibration_error": 0.08,
+                    "sharpe_ratio": 1.2,
+                    "returns": [0.0012, 0.0008, 0.0013, 0.0009],
+                },
+                "validation": {
+                    "directional_accuracy": 0.58,
+                    "log_loss": 0.28,
+                    "calibration_error": 0.08,
+                    "sharpe_ratio": 1.4,
+                    "returns": [0.0014, 0.0010, 0.0015, 0.0011],
+                },
+                "holdout": {
+                    "directional_accuracy": 0.58,
+                    "log_loss": 0.28,
+                    "calibration_error": 0.08,
+                    "sharpe_ratio": 1.1,
+                    "returns": [0.0010, 0.0007, 0.0011, 0.0008],
+                },
+            },
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 2,
+                    "objective": "accuracy_first",
+                    "seed": 41,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_fraction": 0.2,
+                    "locked_holdout_min_search_rows": 40,
+                    "enable_pruning": False,
+                    "minimum_dsr_threshold": None,
+                    "storage": storage_path,
+                    "study_name": "automl_accuracy_override_test",
+                    "selection_policy": {"min_validation_trade_count": 1, "require_locked_holdout_pass": False},
+                },
+                "model": {"type": "rf"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        variants = [{"model": {"type": "rf"}}, {"model": {"type": "gbm"}}]
+        with mock.patch("core.automl._sample_trial_overrides", side_effect=lambda trial, _: variants[trial.number]):
+            summary = run_automl_study(
+                base_pipeline,
+                pipeline_class=_ScenarioAutoMLPipeline,
+                trial_step_classes=[],
+            )
+
+        self.assertEqual(summary["objective"], "accuracy_first")
+        self.assertEqual(summary["best_overrides"]["model"]["type"], "rf")
 
     def test_two_stage_holdout_validation_used_for_ranking(self):
         raw = _build_market_frame(100)

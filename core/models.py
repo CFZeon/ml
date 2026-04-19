@@ -1,6 +1,7 @@
 """Training, meta-labeling, validation splitters, regime detection, model store."""
 
 import pickle
+import warnings
 from itertools import combinations
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .labeling import sequential_bootstrap
 from .slippage import _estimate_reference_trade_slippage_rates
 
 
@@ -138,6 +140,9 @@ def build_model(model_type="gbm", model_params=None):
             class_weight=model_params.get("class_weight", None),
             random_state=int(model_params.get("random_state", 42)),
             n_jobs=int(model_params.get("n_jobs", -1)),
+            bootstrap=bool(model_params.get("bootstrap", True)),
+            oob_score=bool(model_params.get("oob_score", False)),
+            max_samples=model_params.get("max_samples"),
         )
 
     if model_type == "gbm":
@@ -169,7 +174,47 @@ def build_model(model_type="gbm", model_params=None):
     raise ValueError(f"Unknown model_type={model_type!r}. Choose from ['rf', 'gbm', 'logistic']")
 
 
-def train_model(X, y, sample_weight=None, model_type="gbm", model_params=None):
+def _as_weight_series(sample_weight, index):
+    if sample_weight is None:
+        return None
+    if isinstance(sample_weight, pd.Series):
+        return sample_weight.reindex(index).astype(float)
+    return pd.Series(np.asarray(sample_weight, dtype=float), index=index, dtype=float)
+
+
+def _resolve_rf_sampling_report(model_params, sampling_metadata):
+    model_params = dict(model_params or {})
+    sampling_metadata = dict(sampling_metadata or {})
+    seq_config = dict(sampling_metadata.get("sequential_bootstrap") or {})
+    random_state = seq_config.get("random_state", model_params.get("random_state", 42))
+    mean_uniqueness = sampling_metadata.get("mean_uniqueness")
+    mean_uniqueness = float(mean_uniqueness) if mean_uniqueness is not None else None
+    uniqueness_threshold = float(seq_config.get("uniqueness_threshold", 0.90))
+    enabled = bool(seq_config.get("enabled", True))
+    high_concurrency = bool(mean_uniqueness is not None and mean_uniqueness < uniqueness_threshold)
+    return {
+        "sequential_bootstrap_enabled": enabled,
+        "sequential_bootstrap_used": False,
+        "reason": "not_applicable",
+        "warning": None,
+        "mean_uniqueness": mean_uniqueness,
+        "uniqueness_threshold": uniqueness_threshold,
+        "high_concurrency": high_concurrency,
+        "random_state": int(random_state) if random_state is not None else None,
+        "bootstrap_sample_size": int(seq_config.get("n_samples")) if seq_config.get("n_samples") is not None else None,
+    }
+
+
+def train_model(
+    X,
+    y,
+    sample_weight=None,
+    model_type="gbm",
+    model_params=None,
+    sampling_metadata=None,
+    return_report=False,
+    emit_warnings=True,
+):
     """Train a classifier.
 
     Parameters
@@ -178,11 +223,74 @@ def train_model(X, y, sample_weight=None, model_type="gbm", model_params=None):
     y : pd.Series           – labels (may include 0 = abstain)
     sample_weight : pd.Series or None
     model_type : str        – "rf" | "gbm" | "logistic"
+    sampling_metadata : dict or None
+        Optional fold-local label metadata and uniqueness diagnostics used to
+        activate sequential bootstrapping for RandomForest training.
 
     Returns the fitted model.
     """
-    model = build_model(model_type=model_type, model_params=model_params)
-    sw = sample_weight.values if sample_weight is not None else None
+    model_params = dict(model_params or {})
+    sampling_report = {
+        "sequential_bootstrap_enabled": False,
+        "sequential_bootstrap_used": False,
+        "reason": "not_applicable",
+        "warning": None,
+        "mean_uniqueness": None,
+        "uniqueness_threshold": None,
+        "high_concurrency": False,
+        "random_state": model_params.get("random_state", 42),
+        "bootstrap_sample_size": None,
+    }
+
+    X_train = X
+    y_train = y
+    sw_series = _as_weight_series(sample_weight, X.index)
+    fit_model_params = dict(model_params)
+
+    if model_type == "rf":
+        sampling_report = _resolve_rf_sampling_report(model_params, sampling_metadata)
+        if sampling_report["high_concurrency"]:
+            if sampling_report["sequential_bootstrap_enabled"]:
+                labels = (sampling_metadata or {}).get("labels")
+                close = (sampling_metadata or {}).get("close")
+                n_samples = sampling_report["bootstrap_sample_size"] or len(X)
+                if labels is None or close is None or len(labels) == 0 or len(close) == 0:
+                    sampling_report["reason"] = "missing_sampling_metadata"
+                    sampling_report["warning"] = (
+                        "RandomForest received high-concurrency labels without label metadata for sequential bootstrapping."
+                    )
+                else:
+                    bootstrap_idx = sequential_bootstrap(
+                        labels,
+                        close,
+                        n_samples=n_samples,
+                        random_state=sampling_report["random_state"],
+                    )
+                    if len(bootstrap_idx) > 0:
+                        X_train = X.iloc[bootstrap_idx]
+                        y_train = y.iloc[bootstrap_idx]
+                        if sw_series is not None:
+                            sw_series = sw_series.iloc[bootstrap_idx]
+                        fit_model_params["bootstrap"] = False
+                        fit_model_params["oob_score"] = False
+                        sampling_report["sequential_bootstrap_used"] = True
+                        sampling_report["reason"] = "high_concurrency_resampled"
+                        sampling_report["bootstrap_sample_size"] = int(len(bootstrap_idx))
+                    else:
+                        sampling_report["reason"] = "empty_bootstrap_sample"
+            else:
+                sampling_report["reason"] = "disabled_on_high_concurrency"
+                sampling_report["warning"] = (
+                    "RandomForest is training on high-concurrency labels with sequential bootstrap disabled."
+                )
+        else:
+            sampling_report["reason"] = "uniqueness_above_threshold"
+
+        if sampling_report["warning"] and emit_warnings:
+            warnings.warn(sampling_report["warning"], RuntimeWarning)
+
+    model = build_model(model_type=model_type, model_params=fit_model_params)
+    sw = sw_series.values if sw_series is not None else None
     fit_kwargs = {}
     if sw is not None:
         fit_kwargs["sample_weight"] = sw
@@ -190,7 +298,9 @@ def train_model(X, y, sample_weight=None, model_type="gbm", model_params=None):
             fit_kwargs["model__sample_weight"] = sw
             fit_kwargs.pop("sample_weight", None)
 
-    model.fit(X, y, **fit_kwargs)
+    model.fit(X_train, y_train, **fit_kwargs)
+    if return_report:
+        return model, sampling_report
     return model
 
 

@@ -264,7 +264,7 @@ def _resolve_backtest_valuation_close(pipeline, index):
         futures_context = pipeline.state.get("futures_context") or {}
         mark_frame = futures_context.get("mark_price")
         if mark_frame is not None and not mark_frame.empty and "mark_close" in mark_frame.columns:
-            valuation_series = mark_frame["mark_close"].reindex(index).ffill().bfill()
+            valuation_series = mark_frame["mark_close"].reindex(index)
     return valuation_series
 
 
@@ -380,6 +380,10 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "significance": significance_config,
         "benchmark_returns": benchmark_returns,
         "benchmark_sharpe": significance_config.get("benchmark_sharpe") if isinstance(significance_config, dict) else None,
+        "execution_price_policy": backtest_config.get("execution_price_policy", "strict"),
+        "execution_price_fill_limit": backtest_config.get("execution_price_fill_limit"),
+        "valuation_price_policy": backtest_config.get("valuation_price_policy", "drop_rows"),
+        "valuation_price_fill_limit": backtest_config.get("valuation_price_fill_limit"),
     }
 
 
@@ -703,6 +707,27 @@ def _compute_fold_sample_weights(labels, close):
 
     weights = sample_weights_by_uniqueness(labels, close_window)
     return weights.reindex(labels.index).fillna(1.0)
+
+
+def _build_training_sampling_metadata(labels, close, uniqueness_weights, model_config):
+    if labels is None or labels.empty:
+        return None
+
+    close_window = _close_window_for_labels(close, labels)
+    uniqueness_weights = pd.Series(uniqueness_weights, copy=False).reindex(labels.index).fillna(1.0)
+    seq_config = dict(model_config.get("sequential_bootstrap", {}))
+    return {
+        "labels": labels.copy(),
+        "close": close_window,
+        "uniqueness_weights": uniqueness_weights,
+        "mean_uniqueness": float(uniqueness_weights.mean()) if len(uniqueness_weights) > 0 else None,
+        "sequential_bootstrap": {
+            "enabled": bool(seq_config.get("enabled", True)),
+            "uniqueness_threshold": float(seq_config.get("uniqueness_threshold", 0.90)),
+            "n_samples": seq_config.get("n_samples"),
+            "random_state": int(seq_config.get("random_state", model_config.get("random_state", 42))),
+        },
+    }
 
 
 def _resolve_stationarity_screening_config(pipeline):
@@ -1225,7 +1250,7 @@ def _score_signal_state(backtest, signal_config):
     return score
 
 
-def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None, trade_outcome_builder=None, context_frame=None):
+def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None, close=None, trade_outcome_builder=None, context_frame=None):
     inner_predictions = []
     inner_probabilities = []
     inner_truth = []
@@ -1270,12 +1295,23 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
                 continue
         w_inner_train = _combine_class_balance_weights(y_inner_train, w_inner_train)
 
+        sampling_metadata = None
+        if close is not None:
+            sampling_metadata = _build_training_sampling_metadata(
+                inner_labels_train.loc[X_inner_train.index] if inner_labels_train is not None else None,
+                close,
+                sample_weights.loc[X_inner_train.index],
+                model_config,
+            )
+
         inner_model = train_model(
             X_inner_train,
             y_inner_train,
             sample_weight=w_inner_train,
             model_type=model_config.get("type", "gbm"),
             model_params=model_config.get("params"),
+            sampling_metadata=sampling_metadata,
+            emit_warnings=False,
         )
 
         inner_pred = pd.Series(inner_model.predict(X_inner_test), index=X_inner_test.index)
@@ -1330,11 +1366,12 @@ class FetchDataStep(PipelineStep):
         futures_context_config = dict(config.pop("futures_context", {}) or {})
         cross_asset_context_config = dict(config.pop("cross_asset_context", {}) or {})
         custom_data_config = list(config.pop("custom_data", []) or [])
+        config.pop("return_report", None)
 
         market = config.get("market", "spot")
         cache_dir = config.get("cache_dir", ".cache")
 
-        market_data = fetch_binance_bars(**config)
+        market_data, integrity_report = fetch_binance_bars(**config, return_report=True)
         data = market_data.copy()
         custom_data_report = []
         if custom_data_config:
@@ -1343,6 +1380,7 @@ class FetchDataStep(PipelineStep):
         pipeline.state["raw_data"] = market_data
         pipeline.state["data"] = data.copy()
         pipeline.state["custom_data_report"] = custom_data_report
+        pipeline.state["data_integrity_report"] = integrity_report
 
         try:
             pipeline.state["symbol_filters"] = fetch_binance_symbol_filters(
@@ -1744,6 +1782,7 @@ class TrainModelsStep(PipelineStep):
         fold_stationarity = []
         fold_purging = []
         fold_regime = []
+        fold_bootstrap = []
         last_model = None
         last_meta = None
         last_primary_calibrator = None
@@ -1927,19 +1966,36 @@ class TrainModelsStep(PipelineStep):
             X_train_primary = X_fit_model
             y_train_primary = y_fit
             w_train_primary = w_fit
+            labels_train_primary = labels_fit.loc[X_fit_model.index]
             if binary_primary:
                 binary_mask = y_fit.ne(0)
                 X_train_primary = X_fit_model.loc[binary_mask]
                 y_train_primary = y_fit.loc[binary_mask]
                 w_train_primary = w_fit.loc[binary_mask]
+                labels_train_primary = labels_fit.loc[binary_mask]
             w_train_primary = _combine_class_balance_weights(y_train_primary, w_train_primary)
 
-            model = train_model(
+            sampling_metadata = _build_training_sampling_metadata(
+                labels_train_primary,
+                close_all,
+                w_fit.loc[X_train_primary.index],
+                config,
+            )
+            model, bootstrap_report = train_model(
                 X_train_primary,
                 y_train_primary,
                 sample_weight=w_train_primary,
                 model_type=config.get("type", "gbm"),
                 model_params=config.get("params"),
+                sampling_metadata=sampling_metadata,
+                return_report=True,
+            )
+            fold_bootstrap.append(
+                {
+                    "fold": fold,
+                    "split_id": split_id,
+                    **bootstrap_report,
+                }
             )
 
             metrics = evaluate_model(model, X_test_model, y_test)
@@ -1980,6 +2036,7 @@ class TrainModelsStep(PipelineStep):
                 w_fit,
                 config,
                 labels=labels_fit,
+                close=close_all,
                 trade_outcome_builder=lambda predictions, cutoff_timestamp=X_train.index[-1]: _build_execution_trade_outcomes(
                     pipeline,
                     predictions,
@@ -2339,6 +2396,12 @@ class TrainModelsStep(PipelineStep):
                 "mode": "fold_local",
                 "avg_selected_features": round(float(np.mean([row["selected_features"] for row in fold_feature_selection])), 2),
                 "folds": fold_feature_selection,
+            },
+            "bootstrap": {
+                "model_type": config.get("type", "gbm"),
+                "used_in_any_fold": any(row.get("sequential_bootstrap_used", False) for row in fold_bootstrap),
+                "warning_count": int(sum(1 for row in fold_bootstrap if row.get("warning"))),
+                "folds": fold_bootstrap,
             },
             "purging": fold_purging,
             "signal_tuning": fold_signal_tuning,

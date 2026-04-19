@@ -5,8 +5,9 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from core import ResearchPipeline, detect_regime
+from core import ResearchPipeline, detect_regime, sequential_bootstrap
 from core.features import FeatureSelectionResult
+from core.models import train_model
 from core.pipeline import SignalsStep, _FoldScopedPipeline
 
 
@@ -95,6 +96,133 @@ class RegimeLeakageControlsTest(unittest.TestCase):
                 return {}
 
         return FakePipeline(X, training)
+
+    @staticmethod
+    def _make_overlapping_labels(index):
+        starts = index[:5]
+        return pd.DataFrame(
+            {
+                "label": [1, -1, 1, -1, 1],
+                "t1": [index[3], index[4], index[5], index[6], index[7]],
+            },
+            index=starts,
+        )
+
+    def test_sequential_bootstrap_is_deterministic_with_fixed_seed(self):
+        index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")
+        labels = self._make_overlapping_labels(index)
+        close = pd.Series(np.linspace(100.0, 101.0, len(index)), index=index)
+
+        first = sequential_bootstrap(labels, close, n_samples=8, random_state=17)
+        second = sequential_bootstrap(labels, close, n_samples=8, random_state=17)
+        third = sequential_bootstrap(labels, close, n_samples=8, random_state=23)
+
+        np.testing.assert_array_equal(first, second)
+        self.assertFalse(np.array_equal(first, third))
+
+    def test_random_forest_uses_sequential_bootstrap_under_high_concurrency(self):
+        index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")
+        X = pd.DataFrame({"feature": np.linspace(-1.0, 1.0, 5)}, index=index[:5])
+        y = pd.Series([0, 1, 0, 1, 0], index=X.index)
+        sample_weight = pd.Series(1.0, index=X.index)
+        labels = self._make_overlapping_labels(index).reindex(X.index)
+        close = pd.Series(np.linspace(100.0, 101.0, len(index)), index=index)
+
+        sampling_metadata = {
+            "labels": labels,
+            "close": close,
+            "mean_uniqueness": 0.35,
+            "sequential_bootstrap": {"enabled": True, "uniqueness_threshold": 0.90, "random_state": 11},
+        }
+
+        with patch("core.models.sequential_bootstrap", return_value=np.array([4, 3, 2, 1, 0])) as bootstrap_mock:
+            model, report = train_model(
+                X,
+                y,
+                sample_weight=sample_weight,
+                model_type="rf",
+                model_params={"n_estimators": 8, "max_depth": 2, "random_state": 5},
+                sampling_metadata=sampling_metadata,
+                return_report=True,
+            )
+
+        bootstrap_mock.assert_called_once()
+        self.assertTrue(report["sequential_bootstrap_used"])
+        self.assertEqual(report["reason"], "high_concurrency_resampled")
+        self.assertFalse(model.bootstrap)
+
+    def test_random_forest_warns_when_high_concurrency_sequential_bootstrap_is_disabled(self):
+        index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")
+        X = pd.DataFrame({"feature": np.linspace(-1.0, 1.0, 5)}, index=index[:5])
+        y = pd.Series([0, 1, 0, 1, 0], index=X.index)
+        sample_weight = pd.Series(1.0, index=X.index)
+        labels = self._make_overlapping_labels(index).reindex(X.index)
+        close = pd.Series(np.linspace(100.0, 101.0, len(index)), index=index)
+
+        sampling_metadata = {
+            "labels": labels,
+            "close": close,
+            "mean_uniqueness": 0.35,
+            "sequential_bootstrap": {"enabled": False, "uniqueness_threshold": 0.90, "random_state": 11},
+        }
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _, report = train_model(
+                X,
+                y,
+                sample_weight=sample_weight,
+                model_type="rf",
+                model_params={"n_estimators": 8, "max_depth": 2, "random_state": 5},
+                sampling_metadata=sampling_metadata,
+                return_report=True,
+            )
+
+        self.assertFalse(report["sequential_bootstrap_used"])
+        self.assertEqual(report["reason"], "disabled_on_high_concurrency")
+        self.assertTrue(any("high-concurrency labels" in str(item.message) for item in caught))
+
+    def test_training_summary_reports_sequential_bootstrap_usage(self):
+        raw = self._make_raw(n=220, seed=9)
+
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "indicators": [],
+                "features": {"lags": [1, 3], "frac_diff_d": 0.4, "rolling_window": 20},
+                "labels": {"kind": "fixed_horizon", "horizon": 4, "threshold": 0.0001},
+                "model": {
+                    "type": "rf",
+                    "cv_method": "walk_forward",
+                    "n_splits": 1,
+                    "gap": 0,
+                    "params": {"n_estimators": 8, "max_depth": 3, "random_state": 7},
+                    "sequential_bootstrap": {"enabled": True, "uniqueness_threshold": 1.1, "random_state": 13},
+                },
+                "feature_selection": {"enabled": False},
+                "signals": {"avg_win": 0.02, "avg_loss": 0.02},
+                "backtest": {"use_open_execution": False, "signal_delay_bars": 1},
+            }
+        )
+        pipeline.state["raw_data"] = raw
+        pipeline.state["data"] = raw.copy()
+        pipeline.build_features()
+        pipeline.build_labels()
+        pipeline.align_data()
+
+        with patch(
+            "core.models.sequential_bootstrap",
+            side_effect=lambda labels, close, n_samples=None, random_state=None: np.resize(
+                np.arange(len(labels), dtype=int),
+                int(n_samples or len(labels)),
+            ),
+        ):
+            training = pipeline.train_models()
+
+        self.assertTrue(training["bootstrap"]["used_in_any_fold"])
+        self.assertGreaterEqual(len(training["bootstrap"]["folds"]), 1)
+        self.assertIn("mean_uniqueness", training["bootstrap"]["folds"][0])
+        self.assertTrue(training["bootstrap"]["folds"][0]["sequential_bootstrap_used"])
 
     # ------------------------------------------------------------------
     # Existing: fit_features freeze test (now uses HMM)

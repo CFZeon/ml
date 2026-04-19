@@ -166,6 +166,13 @@ def print_training_summary(training):
             "  avg selected : "
             f"{_format_metric(feature_selection.get('avg_selected_features'), digits=2)}"
         )
+    bootstrap = training.get("bootstrap", {})
+    if bootstrap:
+        print(
+            "  bootstrap    : "
+            f"used={bootstrap.get('used_in_any_fold')}  "
+            f"warnings={bootstrap.get('warning_count', 0)}"
+        )
     fallback_scope = training.get("fallback_inference", {})
     if fallback_scope:
         print(
@@ -391,6 +398,30 @@ def print_automl_summary(automl):
             f"mdd={_format_metric(best_backtest.get('max_drawdown'), percent=True)}  "
             f"trades={best_backtest.get('total_trades')}"
         )
+
+    best_objective = automl.get("best_objective_diagnostics") or {}
+    if best_objective:
+        parts = [
+            f"score={_format_metric(best_objective.get('raw_score'))}",
+        ]
+        if best_objective.get("primary_metric"):
+            parts.append(
+                f"{best_objective['primary_metric']}={_format_metric(best_objective['components'].get(best_objective['primary_metric']))}"
+            )
+        if best_objective.get("primary_metric_source"):
+            parts.append(f"source={best_objective.get('primary_metric_source')}")
+        if best_objective.get("benchmark_reference") not in (None, 0.0):
+            parts.append(f"benchmark={_format_metric(best_objective.get('benchmark_reference'))}")
+        print(f"  objective det: {'  '.join(parts)}")
+
+        gates = best_objective.get("classification_gates") or {}
+        if gates.get("enabled"):
+            failed = gates.get("failed") or []
+            print(
+                "  objective gate: "
+                f"passed={gates.get('passed')}  "
+                f"failed={failed if failed else 'none'}"
+            )
 
     best_overfitting = automl.get("best_overfitting", {}).get("deflated_sharpe", {})
     if best_overfitting:

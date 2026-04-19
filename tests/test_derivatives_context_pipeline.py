@@ -184,6 +184,38 @@ class DerivativesContextPipelineTest(unittest.TestCase):
         self.assertNotIn("close_fracdiff_lag1", aligned["X"].columns)
         self.assertNotIn("close_fracdiff_lag3", aligned["X"].columns)
 
+    def test_mark_valuation_strict_policy_rejects_missing_leading_prices(self):
+        index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        futures_context = _make_futures_context(index, raw_data["close"].to_numpy())
+        futures_context["mark_price"] = futures_context["mark_price"].copy()
+        futures_context["mark_price"].iloc[0, futures_context["mark_price"].columns.get_loc("mark_close")] = np.nan
+
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h", "market": "um_futures"},
+                "backtest": {
+                    "engine": "pandas",
+                    "use_open_execution": False,
+                    "valuation_price": "mark",
+                    "valuation_price_policy": "strict",
+                    "execution_price_policy": "strict",
+                },
+                "indicators": [],
+                "features": {},
+                "labels": {"kind": "fixed_horizon", "horizon": 3, "threshold": 0.0},
+            }
+        )
+        pipeline.state["raw_data"] = raw_data
+        pipeline.state["futures_context"] = futures_context
+        pipeline.state["signals"] = {
+            "continuous_signals": pd.Series([0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], index=index),
+            "signals": pd.Series([0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], index=index),
+        }
+
+        with self.assertRaisesRegex(ValueError, "valuation price policy"):
+            pipeline.run_backtest()
+
 
 if __name__ == "__main__":
     unittest.main()

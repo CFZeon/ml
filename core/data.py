@@ -9,7 +9,9 @@ intervals and ISO week for sub-hour intervals.
 """
 
 import io
+import random
 import re
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +46,16 @@ _OUTPUT_COLUMNS = [
     "open", "high", "low", "close", "volume", "quote_volume", "trades",
     "taker_buy_base_vol", "taker_buy_quote_vol",
 ]
+_DEFAULT_RETRY_POLICY = {
+    "max_retries": 3,
+    "backoff_factor": 0.5,
+    "backoff_max": 8.0,
+    "backoff_jitter": 0.1,
+    "retry_statuses": {429, 500, 502, 503, 504},
+    "retry_after_max": 30.0,
+    "timeout": 30,
+}
+_VALID_GAP_POLICIES = {"fail", "warn", "flag", "drop_windows"}
 
 
 @dataclass(frozen=True)
@@ -269,17 +281,109 @@ def _has_all_expected_rows(frame, interval, start, end):
     return expected.difference(window.index).empty
 
 
-def _download_archive(url, session):
-    print(f"  Fetching {url} ...")
-    response = session.get(url, timeout=30)
-    if response.status_code == 404:
-        return None
-    response.raise_for_status()
+def _resolve_retry_policy(retry_policy=None):
+    resolved = {**_DEFAULT_RETRY_POLICY, **dict(retry_policy or {})}
+    resolved["max_retries"] = max(0, int(resolved.get("max_retries", 0)))
+    resolved["backoff_factor"] = max(0.0, float(resolved.get("backoff_factor", 0.0)))
+    resolved["backoff_max"] = max(0.0, float(resolved.get("backoff_max", 0.0)))
+    resolved["backoff_jitter"] = max(0.0, float(resolved.get("backoff_jitter", 0.0)))
+    resolved["retry_after_max"] = max(0.0, float(resolved.get("retry_after_max", 0.0)))
+    resolved["retry_statuses"] = {int(status) for status in resolved.get("retry_statuses", set())}
+    resolved["timeout"] = float(resolved.get("timeout", 30))
+    return resolved
 
-    with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-        with zf.open(zf.namelist()[0]) as handle:
-            raw = pd.read_csv(handle, header=None, names=_COLUMNS)
-    return _prepare_frame(raw)
+
+def _parse_retry_after_seconds(response, retry_after_max):
+    header_value = response.headers.get("Retry-After") if response is not None else None
+    if header_value in (None, ""):
+        return None
+    try:
+        return min(float(header_value), float(retry_after_max))
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry_delay_seconds(attempt_number, retry_policy, response=None):
+    retry_after = _parse_retry_after_seconds(response, retry_policy["retry_after_max"])
+    if retry_after is not None:
+        return retry_after
+    if attempt_number <= 1:
+        base_delay = 0.0
+    else:
+        base_delay = retry_policy["backoff_factor"] * (2 ** (attempt_number - 2))
+    if retry_policy["backoff_jitter"] > 0.0:
+        base_delay += random.uniform(0.0, retry_policy["backoff_jitter"])
+    return min(base_delay, retry_policy["backoff_max"])
+
+
+def _missing_segments(missing_index, interval):
+    missing_index = pd.DatetimeIndex(missing_index)
+    if missing_index.empty:
+        return []
+
+    delta = _interval_timedelta(interval)
+    segments = []
+    start = missing_index[0]
+    previous = missing_index[0]
+    count = 1
+
+    for timestamp in missing_index[1:]:
+        contiguous = delta is not None and timestamp - previous == delta
+        if contiguous:
+            previous = timestamp
+            count += 1
+            continue
+        segments.append({"start": start, "end": previous, "count": count})
+        start = timestamp
+        previous = timestamp
+        count = 1
+
+    segments.append({"start": start, "end": previous, "count": count})
+    return segments
+
+
+def _download_archive(url, session, retry_policy=None):
+    retry_policy = _resolve_retry_policy(retry_policy)
+    attempt = 0
+
+    while True:
+        attempt += 1
+        print(f"  Fetching {url} (attempt {attempt}) ...")
+        try:
+            response = session.get(url, timeout=retry_policy["timeout"])
+        except requests.RequestException as exc:
+            if attempt > retry_policy["max_retries"] + 1:
+                raise
+            delay = _retry_delay_seconds(attempt, retry_policy)
+            if delay > 0.0:
+                time.sleep(delay)
+            continue
+
+        if response.status_code == 404:
+            return None, {
+                "url": url,
+                "status": "not_found",
+                "http_status": 404,
+                "attempts": attempt,
+                "retry_count": max(0, attempt - 1),
+            }
+        if response.status_code in retry_policy["retry_statuses"] and attempt <= retry_policy["max_retries"]:
+            delay = _retry_delay_seconds(attempt, retry_policy, response=response)
+            if delay > 0.0:
+                time.sleep(delay)
+            continue
+        response.raise_for_status()
+
+        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+            with zf.open(zf.namelist()[0]) as handle:
+                raw = pd.read_csv(handle, header=None, names=_COLUMNS)
+        return _prepare_frame(raw), {
+            "url": url,
+            "status": "downloaded",
+            "http_status": int(response.status_code),
+            "attempts": attempt,
+            "retry_count": max(0, attempt - 1),
+        }
 
 
 def _monthly_archive_url(symbol, interval, period, market="spot"):
@@ -298,54 +402,143 @@ def _daily_archive_url(symbol, interval, day, market="spot"):
     )
 
 
-def _fetch_daily_range(symbol, interval, period, session, market="spot"):
+def _fetch_daily_range(symbol, interval, period, session, market="spot", retry_policy=None):
     frames = []
+    download_reports = []
     available_end = min(period.end, pd.Timestamp.now(tz="UTC").normalize())
     for day in pd.date_range(period.start, available_end, freq="1D", inclusive="left"):
-        frame = _download_archive(_daily_archive_url(symbol, interval, day, market=market), session)
+        frame, report = _download_archive(
+            _daily_archive_url(symbol, interval, day, market=market),
+            session,
+            retry_policy=retry_policy,
+        )
+        download_reports.append(report)
         if frame is not None and not frame.empty:
             frames.append(frame)
-    return _merge_frames(frames)
+    return _merge_frames(frames), {
+        "source": "daily",
+        "downloads": download_reports,
+        "retry_count": sum(report.get("retry_count", 0) for report in download_reports),
+    }
 
 
-def _fetch_period(symbol, interval, period, session, market="spot"):
+def _fetch_period(symbol, interval, period, session, market="spot", retry_policy=None):
     if not _uses_weekly_cache(interval):
-        monthly_frame = _download_archive(_monthly_archive_url(symbol, interval, period, market=market), session)
+        monthly_frame, monthly_report = _download_archive(
+            _monthly_archive_url(symbol, interval, period, market=market),
+            session,
+            retry_policy=retry_policy,
+        )
         if monthly_frame is not None:
-            return monthly_frame
+            return monthly_frame, {
+                "source": "monthly",
+                "downloads": [monthly_report],
+                "retry_count": monthly_report.get("retry_count", 0),
+            }
 
-    return _fetch_daily_range(symbol, interval, period, session, market=market)
+        daily_frame, daily_report = _fetch_daily_range(
+            symbol,
+            interval,
+            period,
+            session,
+            market=market,
+            retry_policy=retry_policy,
+        )
+        return daily_frame, {
+            "source": "daily_fallback",
+            "downloads": [monthly_report, *daily_report["downloads"]],
+            "retry_count": monthly_report.get("retry_count", 0) + daily_report.get("retry_count", 0),
+        }
+
+    return _fetch_daily_range(symbol, interval, period, session, market=market, retry_policy=retry_policy)
 
 
-def _load_period(symbol, interval, period, request_start, request_end, cache_dir, session, market="spot"):
+def _load_period(symbol, interval, period, request_start, request_end, cache_dir, session,
+                 market="spot", retry_policy=None):
     cache_file = _cache_path(cache_dir, symbol, interval, period, market=market) if cache_dir else None
     cached = _read_cache(cache_file) if cache_file is not None else None
     window_start, window_end = _period_window(period, request_start, request_end)
+    expected = _expected_index(window_start, window_end, interval)
 
     if _has_all_expected_rows(cached, interval, window_start, window_end):
         if cache_file is not None:
             print(f"  Loading cached {period.kind[:-2]} {period.key} from {cache_file}")
-        return cached
+        window = cached[(cached.index >= window_start) & (cached.index < window_end)] if cached is not None else pd.DataFrame(columns=_OUTPUT_COLUMNS)
+        return cached, {
+            "period_kind": period.kind,
+            "period_key": period.key,
+            "window_start": window_start,
+            "window_end": window_end,
+            "expected_rows": int(len(expected)),
+            "observed_rows": int(len(window)),
+            "missing_rows": 0,
+            "missing_segments": [],
+            "status": "complete",
+            "used_cache": True,
+            "refreshed": False,
+            "retry_count": 0,
+            "downloads": [],
+            "dropped_window": False,
+        }
 
     if cache_file is not None:
         action = "Refreshing" if cached is not None and not cached.empty else "Building"
         print(f"  {action} {period.kind} cache {period.key}")
 
-    refreshed = _fetch_period(symbol, interval, period, session, market=market)
+    refreshed, fetch_report = _fetch_period(symbol, interval, period, session, market=market, retry_policy=retry_policy)
     merged = _merge_frames([cached, refreshed])
 
     if cache_file is not None:
         _write_cache(cache_file, merged)
 
-    if not _has_all_expected_rows(merged, interval, window_start, window_end):
-        print(f"  WARNING: {period.key} still has missing candles after refresh")
+    window = merged[(merged.index >= window_start) & (merged.index < window_end)]
+    missing_index = expected.difference(window.index)
+    return merged, {
+        "period_kind": period.kind,
+        "period_key": period.key,
+        "window_start": window_start,
+        "window_end": window_end,
+        "expected_rows": int(len(expected)),
+        "observed_rows": int(len(window)),
+        "missing_rows": int(len(missing_index)),
+        "missing_segments": _missing_segments(missing_index, interval),
+        "status": "complete" if missing_index.empty else "incomplete",
+        "used_cache": cached is not None and not cached.empty,
+        "refreshed": True,
+        "retry_count": int(fetch_report.get("retry_count", 0)),
+        "downloads": fetch_report.get("downloads", []),
+        "dropped_window": False,
+    }
 
-    return merged
+
+def _build_integrity_report(df, interval, start_dt, end_dt, market, symbol, gap_policy, period_reports):
+    expected = _expected_index(start_dt, end_dt, interval)
+    observed = pd.DataFrame(df).copy()
+    observed = observed[(observed.index >= start_dt) & (observed.index < end_dt)] if not observed.empty else observed
+    missing_index = expected.difference(observed.index) if not expected.empty else pd.DatetimeIndex([], tz="UTC")
+    status = "complete" if missing_index.empty else "incomplete"
+    if any(report.get("dropped_window") for report in period_reports):
+        status = "dropped_windows" if missing_index.size > 0 else "complete"
+    return {
+        "symbol": symbol,
+        "market": market,
+        "interval": interval,
+        "gap_policy": gap_policy,
+        "expected_rows": int(len(expected)),
+        "observed_rows": int(len(observed)),
+        "missing_rows": int(len(missing_index)),
+        "missing_segments": _missing_segments(missing_index, interval),
+        "status": status,
+        "retry_count": int(sum(report.get("retry_count", 0) for report in period_reports)),
+        "periods": period_reports,
+    }
 
 
 def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
                          start="2024-01-01", end="2024-03-01",
-                         cache_dir=".cache", market="spot", futures_type=None):
+                         cache_dir=".cache", market="spot", futures_type=None,
+                         gap_policy="warn", retry_policy=None,
+                         return_report=False):
     """Load spot or futures klines from Binance Vision with periodized local cache files.
 
     Parameters
@@ -357,6 +550,9 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
 
     market : str – "spot", "um_futures", or "cm_futures"
     futures_type : str or None – backward-compatible alias for futures family
+    gap_policy : str – one of {"fail", "warn", "flag", "drop_windows"}
+    retry_policy : dict or None – bounded download retry/backoff settings
+    return_report : bool – when True, return (dataframe, integrity_report)
 
     Returns
     -------
@@ -364,30 +560,61 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
         open, high, low, close, volume, quote_volume, trades
     """
     market = _normalize_market(market, futures_type=futures_type)
+    if gap_policy not in _VALID_GAP_POLICIES:
+        raise ValueError(f"Unsupported gap_policy={gap_policy!r}")
     start_dt = _parse_bound(start)
     end_dt = _parse_bound(end)
     if end_dt <= start_dt:
         raise ValueError(f"Expected start < end, got start={start!r} end={end!r}")
 
     period_frames = []
+    period_reports = []
     with requests.Session() as session:
         for period in _iter_cache_periods(start_dt, end_dt, interval):
-            period_frames.append(
-                _load_period(symbol, interval, period, start_dt, end_dt, cache_dir, session, market=market)
+            period_frame, period_report = _load_period(
+                symbol,
+                interval,
+                period,
+                start_dt,
+                end_dt,
+                cache_dir,
+                session,
+                market=market,
+                retry_policy=retry_policy,
             )
+            if period_report["missing_rows"] > 0:
+                if gap_policy == "fail":
+                    raise RuntimeError(
+                        f"Incomplete data window for {symbol} {interval} {period_report['period_key']}: "
+                        f"{period_report['missing_rows']} candles missing"
+                    )
+                if gap_policy == "warn":
+                    print(f"  WARNING: {period_report['period_key']} still has missing candles after refresh")
+                if gap_policy == "drop_windows":
+                    period_report["dropped_window"] = True
+                    period_frame = period_frame.iloc[0:0]
+
+            period_frames.append(period_frame)
+            period_reports.append(period_report)
 
     df = _merge_frames(period_frames)
     df = df[(df.index >= start_dt) & (df.index < end_dt)]
+    integrity_report = _build_integrity_report(df, interval, start_dt, end_dt, market, symbol, gap_policy, period_reports)
+    df.attrs["integrity_report"] = integrity_report
 
     if df.empty:
         raise RuntimeError(f"No data fetched for {symbol} {interval} [{start}, {end})")
 
+    if return_report:
+        return df, integrity_report
     return df
 
 
 def fetch_binance_bars(symbol="BTCUSDT", interval="1h",
                        start="2024-01-01", end="2024-03-01",
-                       cache_dir=".cache", market="spot", futures_type=None):
+                       cache_dir=".cache", market="spot", futures_type=None,
+                       gap_policy="warn", retry_policy=None,
+                       return_report=False):
     """Unified market-data entrypoint for Binance Vision spot and futures bars."""
     return fetch_binance_vision(
         symbol=symbol,
@@ -397,6 +624,9 @@ def fetch_binance_bars(symbol="BTCUSDT", interval="1h",
         cache_dir=cache_dir,
         market=market,
         futures_type=futures_type,
+        gap_policy=gap_policy,
+        retry_policy=retry_policy,
+        return_report=return_report,
     )
 
 
@@ -529,22 +759,78 @@ def _symbol_filters_cache_path(cache_dir, market, symbol):
     return Path(cache_dir) / _normalize_market(market) / "symbol_filters" / f"{symbol}.pkl"
 
 
+def _coerce_filter_float(value):
+    if value in (None, ""):
+        return None
+    coerced = float(value)
+    return coerced if pd.notna(coerced) else None
+
+
+def _coerce_filter_int(value):
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def _coerce_filter_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return bool(value)
+
+
 def _parse_symbol_filters(payload):
     filters = payload.get("filters", [])
-    parsed = {"symbol": payload.get("symbol")}
+    parsed = {
+        "symbol": payload.get("symbol"),
+        "raw_filters": {},
+        "unsupported_filters": {},
+    }
     for item in filters:
         filter_type = item.get("filterType")
+        parsed["raw_filters"][filter_type] = dict(item)
         if filter_type == "PRICE_FILTER":
-            parsed["tick_size"] = float(item.get("tickSize", 0.0))
-        elif filter_type in {"LOT_SIZE", "MARKET_LOT_SIZE"}:
-            parsed.setdefault("step_size", float(item.get("stepSize", 0.0)))
-            parsed.setdefault("min_qty", float(item.get("minQty", 0.0)))
-            parsed.setdefault("max_qty", float(item.get("maxQty", 0.0)))
+            parsed["min_price"] = _coerce_filter_float(item.get("minPrice"))
+            parsed["max_price"] = _coerce_filter_float(item.get("maxPrice"))
+            parsed["tick_size"] = _coerce_filter_float(item.get("tickSize"))
+        elif filter_type == "LOT_SIZE":
+            parsed["step_size"] = _coerce_filter_float(item.get("stepSize"))
+            parsed["min_qty"] = _coerce_filter_float(item.get("minQty"))
+            parsed["max_qty"] = _coerce_filter_float(item.get("maxQty"))
+        elif filter_type == "MARKET_LOT_SIZE":
+            parsed["market_step_size"] = _coerce_filter_float(item.get("stepSize"))
+            parsed["market_min_qty"] = _coerce_filter_float(item.get("minQty"))
+            parsed["market_max_qty"] = _coerce_filter_float(item.get("maxQty"))
         elif filter_type == "MIN_NOTIONAL":
-            parsed["min_notional"] = float(item.get("minNotional", 0.0))
+            parsed["min_notional"] = _coerce_filter_float(item.get("minNotional"))
+            parsed["min_notional_apply_to_market"] = _coerce_filter_bool(item.get("applyToMarket", True))
+            parsed["min_notional_avg_price_mins"] = _coerce_filter_int(item.get("avgPriceMins", 0))
         elif filter_type == "NOTIONAL":
-            parsed.setdefault("min_notional", float(item.get("minNotional", 0.0)))
-            parsed["max_notional"] = float(item.get("maxNotional", 0.0))
+            parsed["notional_min_notional"] = _coerce_filter_float(item.get("minNotional"))
+            parsed.setdefault("min_notional", parsed["notional_min_notional"])
+            parsed["max_notional"] = _coerce_filter_float(item.get("maxNotional"))
+            parsed["notional_apply_min_to_market"] = _coerce_filter_bool(item.get("applyMinToMarket", True))
+            parsed["notional_apply_max_to_market"] = _coerce_filter_bool(item.get("applyMaxToMarket", True))
+            parsed["notional_avg_price_mins"] = _coerce_filter_int(item.get("avgPriceMins", 0))
+        elif filter_type == "PERCENT_PRICE":
+            parsed["percent_price"] = {
+                "multiplier_up": _coerce_filter_float(item.get("multiplierUp")),
+                "multiplier_down": _coerce_filter_float(item.get("multiplierDown")),
+                "avg_price_mins": _coerce_filter_int(item.get("avgPriceMins", 0)),
+            }
+        elif filter_type == "PERCENT_PRICE_BY_SIDE":
+            parsed["percent_price_by_side"] = {
+                "bid_multiplier_up": _coerce_filter_float(item.get("bidMultiplierUp")),
+                "bid_multiplier_down": _coerce_filter_float(item.get("bidMultiplierDown")),
+                "ask_multiplier_up": _coerce_filter_float(item.get("askMultiplierUp")),
+                "ask_multiplier_down": _coerce_filter_float(item.get("askMultiplierDown")),
+                "avg_price_mins": _coerce_filter_int(item.get("avgPriceMins", 0)),
+            }
+        elif filter_type == "MAX_POSITION":
+            parsed["max_position"] = _coerce_filter_float(item.get("maxPosition"))
+        else:
+            parsed["unsupported_filters"][filter_type] = dict(item)
     return parsed
 
 

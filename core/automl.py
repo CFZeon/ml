@@ -86,11 +86,36 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
 
 _NORMAL_DIST = NormalDist()
 _EULER_MASCHERONI = 0.5772156649015329
-_BACKTEST_OBJECTIVES = {"sharpe_ratio", "net_profit_pct", "profit_factor", "calmar_ratio"}
+_BACKTEST_OBJECTIVES = {
+    "sharpe_ratio",
+    "net_profit_pct",
+    "profit_factor",
+    "calmar_ratio",
+    "risk_adjusted_after_costs",
+    "benchmark_excess_sharpe",
+    "net_profit_pct_vs_benchmark",
+}
+_CLASSIFICATION_OBJECTIVES = {
+    "directional_accuracy",
+    "accuracy_first",
+    "neg_log_loss",
+    "log_loss",
+    "neg_brier_score",
+    "brier_score",
+    "neg_calibration_error",
+    "calibration_error",
+}
 
 
 def _normalize_objective_name(objective_name):
-    objective_name = (objective_name or "accuracy_first").lower()
+    objective_name = (objective_name or "risk_adjusted_after_costs").lower()
+    aliases = {
+        "composite": "accuracy_first",
+        "trading_first": "risk_adjusted_after_costs",
+        "after_cost_sharpe": "risk_adjusted_after_costs",
+    }
+    if objective_name in aliases:
+        return aliases[objective_name]
     if objective_name == "composite":
         return "accuracy_first"
     return objective_name
@@ -98,7 +123,7 @@ def _normalize_objective_name(objective_name):
 
 def _resolve_study_name(base_config, automl_config):
     data_config = base_config.get("data", {})
-    objective = _normalize_objective_name(automl_config.get("objective", "accuracy_first"))
+    objective = _normalize_objective_name(automl_config.get("objective", "risk_adjusted_after_costs"))
     study_name = automl_config.get("study_name") or (
         f"{data_config.get('symbol', 'symbol')}_{data_config.get('interval', 'interval')}_{objective}"
     )
@@ -341,6 +366,7 @@ def _build_study_storage_path(base_config, automl_config):
 
 def _summarize_training(training):
     feature_selection = training.get("feature_selection") or {}
+    bootstrap = training.get("bootstrap") or {}
     return {
         "avg_accuracy": training.get("avg_accuracy"),
         "avg_f1_macro": training.get("avg_f1_macro"),
@@ -354,6 +380,12 @@ def _summarize_training(training):
             "enabled": bool(feature_selection.get("enabled", False)),
             "avg_input_features": feature_selection.get("avg_input_features"),
             "avg_selected_features": feature_selection.get("avg_selected_features"),
+        },
+        "bootstrap": {
+            "model_type": bootstrap.get("model_type"),
+            "used_in_any_fold": bootstrap.get("used_in_any_fold"),
+            "warning_count": bootstrap.get("warning_count"),
+            "folds": bootstrap.get("folds", []),
         },
         "fold_count": len(training.get("fold_metrics", [])),
     }
@@ -373,6 +405,8 @@ def _summarize_backtest(backtest):
         "ending_equity",
     ]
     summary = {key: backtest.get(key) for key in keys}
+    equity_curve = backtest.get("equity_curve")
+    summary["bar_count"] = int(len(equity_curve)) if isinstance(equity_curve, pd.Series) else None
     if backtest.get("statistical_significance") is not None:
         summary["statistical_significance"] = backtest.get("statistical_significance")
     return summary
@@ -551,14 +585,13 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
     report["aligned_holdout_rows"] = int(split["aligned_test_rows"])
     report["training"] = _json_ready(_summarize_training(training))
     report["backtest"] = _json_ready(_summarize_backtest(backtest))
-    report["raw_objective_value"] = float(
-        compute_objective_value(
-            base_config.get("automl", {}).get("objective", "accuracy_first"),
-            training,
-            backtest,
-            base_config.get("automl", {}),
-        )
+    report["objective_diagnostics"] = _build_objective_diagnostics(
+        base_config.get("automl", {}).get("objective", "risk_adjusted_after_costs"),
+        report["training"],
+        report["backtest"],
+        base_config.get("automl", {}),
     )
+    report["raw_objective_value"] = float(report["objective_diagnostics"]["final_score"])
     sharpe_ci_lower = _extract_sharpe_ci_lower(report["backtest"])
     report["holdout_warning"] = bool(sharpe_ci_lower is not None and sharpe_ci_lower < 0.0)
     return report
@@ -639,18 +672,20 @@ def _build_evaluation_record(training, backtest, objective_name, automl_config, 
     backtest_summary = _json_ready(_summarize_backtest(backtest))
     returns = _extract_backtest_returns(backtest)
     period_sharpe = _compute_period_sharpe(returns)
-    raw_objective_value = compute_objective_value(
+    objective_diagnostics = _build_objective_diagnostics(
         objective_name,
         training_summary,
         backtest_summary,
         automl_config,
     )
+    raw_objective_value = float(objective_diagnostics["final_score"])
     record = {
         "training": training_summary,
         "backtest": backtest_summary,
         "returns": returns,
         "period_sharpe": period_sharpe,
         "raw_objective_value": float(raw_objective_value),
+        "objective_diagnostics": objective_diagnostics,
     }
     if split is not None:
         record["split"] = {
@@ -670,6 +705,7 @@ def _build_trial_record(overrides, search_record, validation_record=None):
         "backtest": validation_record["backtest"],
         "returns": validation_record["returns"],
         "period_sharpe": validation_record["period_sharpe"],
+        "objective_diagnostics": validation_record.get("objective_diagnostics"),
         "raw_objective_value": float(validation_record["raw_objective_value"]),
         "search_raw_objective_value": float(search_record["raw_objective_value"]),
     }
@@ -1327,11 +1363,13 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "training": record.get("search", {}).get("training"),
             "backtest": record.get("search", {}).get("backtest"),
             "raw_objective_value": record.get("search", {}).get("raw_objective_value"),
+            "objective_diagnostics": record.get("search", {}).get("objective_diagnostics"),
         }
         validation_metrics = {
             "training": record.get("validation", {}).get("training"),
             "backtest": record.get("validation", {}).get("backtest"),
             "raw_objective_value": record.get("validation", {}).get("raw_objective_value"),
+            "objective_diagnostics": record.get("validation", {}).get("objective_diagnostics"),
             "split": _json_ready(record.get("validation", {}).get("split")),
         }
 
@@ -1370,8 +1408,13 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 or dsr_reason not in {"insufficient_track_record", "unavailable_sharpe"}
             )
         )
+        objective_diagnostics = validation_metrics.get("objective_diagnostics") or {}
+        objective_gate_passed = bool(
+            (objective_diagnostics.get("classification_gates") or {}).get("passed", True)
+        )
         eligibility_checks = {
             "minimum_dsr": bool(meets_minimum_dsr_threshold or not dsr_gate_applies),
+            "objective_constraints": objective_gate_passed,
             "validation_trade_count": bool(
                 validation_trade_count >= selection_policy.get("min_validation_trade_count", 0)
             ),
@@ -1397,6 +1440,8 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         eligibility_reasons = []
         if not eligibility_checks["minimum_dsr"]:
             eligibility_reasons.append("deflated_sharpe_below_threshold")
+        if not eligibility_checks["objective_constraints"]:
+            eligibility_reasons.append("objective_constraints_failed")
         if not eligibility_checks["validation_trade_count"]:
             eligibility_reasons.append("validation_trade_count_below_minimum")
         if not eligibility_checks["complexity"]:
@@ -1419,6 +1464,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 "selection_value": float(selection_value),
                 "search_metrics": search_metrics,
                 "validation_metrics": validation_metrics,
+                "objective_diagnostics": objective_diagnostics,
                 "meets_minimum_dsr_threshold": meets_minimum_dsr_threshold,
                 "overfitting": {"deflated_sharpe": deflated_sharpe},
                 "model_family": model_family,
@@ -1508,40 +1554,220 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
     }
 
 
-def compute_objective_value(objective_name, training, backtest, automl_config=None, overfitting_context=None):
-    """Compute the scalar objective value used by the AutoML study."""
+def _resolve_objective_gates(automl_config, objective_name):
+    objective_name = _normalize_objective_name(objective_name)
+    gate_config = copy.deepcopy((automl_config or {}).get("objective_gates") or {})
+    default_enabled = objective_name in {
+        "risk_adjusted_after_costs",
+        "benchmark_excess_sharpe",
+        "net_profit_pct_vs_benchmark",
+    }
+    enabled = bool(gate_config.get("enabled", default_enabled))
+    if not enabled:
+        return {
+            "enabled": False,
+            "min_directional_accuracy": None,
+            "max_log_loss": None,
+            "max_calibration_error": None,
+            "min_trade_count": None,
+        }
+    return {
+        "enabled": True,
+        "min_directional_accuracy": _coerce_float(gate_config.get("min_directional_accuracy", 0.45)),
+        "max_log_loss": _coerce_float(gate_config.get("max_log_loss", 1.0)),
+        "max_calibration_error": _coerce_float(gate_config.get("max_calibration_error", 0.35)),
+        "min_trade_count": int(gate_config.get("min_trade_count", 5)),
+    }
+
+
+def _build_gate_result(name, value, minimum=None, maximum=None):
+    passed = True
+    if minimum is not None:
+        passed = value is not None and value >= minimum
+    if maximum is not None:
+        passed = passed and value is not None and value <= maximum
+    return {
+        "name": name,
+        "value": value,
+        "minimum": minimum,
+        "maximum": maximum,
+        "passed": bool(passed),
+    }
+
+
+def _evaluate_objective_gates(training, backtest, automl_config, objective_name):
+    gates = _resolve_objective_gates(automl_config, objective_name)
+    report = {
+        "enabled": bool(gates.get("enabled", False)),
+        "passed": True,
+        "failed": [],
+        "checks": {},
+    }
+    if not report["enabled"]:
+        return report
+
+    directional_accuracy = _resolve_metric(training, "avg_directional_accuracy", fallback="avg_accuracy")
+    log_loss_value = _resolve_metric(training, "avg_log_loss")
+    calibration_error = _resolve_metric(training, "avg_calibration_error")
+    trade_count = _coerce_float((backtest or {}).get("total_trades"))
+
+    checks = {
+        "directional_accuracy": _build_gate_result(
+            "directional_accuracy",
+            directional_accuracy,
+            minimum=gates.get("min_directional_accuracy"),
+        ),
+        "log_loss": _build_gate_result(
+            "log_loss",
+            log_loss_value,
+            maximum=gates.get("max_log_loss"),
+        ),
+        "calibration_error": _build_gate_result(
+            "calibration_error",
+            calibration_error,
+            maximum=gates.get("max_calibration_error"),
+        ),
+        "trade_count": _build_gate_result(
+            "trade_count",
+            trade_count,
+            minimum=float(gates.get("min_trade_count")) if gates.get("min_trade_count") is not None else None,
+        ),
+    }
+    report["checks"] = checks
+    report["failed"] = [name for name, payload in checks.items() if not payload["passed"]]
+    report["passed"] = not report["failed"]
+    return report
+
+
+def _get_significance_payload(backtest, metric_name):
+    significance = (backtest or {}).get("statistical_significance") or {}
+    metrics = significance.get("metrics") or {}
+    return metrics.get(metric_name) or {}
+
+
+def _resolve_metric_value_with_significance(backtest, metric_name, use_lower_bound=False):
+    point_estimate = _coerce_float((backtest or {}).get(metric_name))
+    metric_payload = _get_significance_payload(backtest, metric_name)
+    confidence_interval = metric_payload.get("confidence_interval") or {}
+    lower_bound = _coerce_float(confidence_interval.get("lower"))
+
+    if use_lower_bound and lower_bound is not None:
+        return lower_bound, "confidence_lower_bound", lower_bound
+    return point_estimate if point_estimate is not None else 0.0, "point_estimate", lower_bound
+
+
+def _resolve_benchmark_reference(backtest, objective_name, automl_config):
+    objective_name = _normalize_objective_name(objective_name)
+    significance = (backtest or {}).get("statistical_significance") or {}
+    if objective_name == "benchmark_excess_sharpe":
+        benchmark_value = _coerce_float(significance.get("benchmark_sharpe_ratio"))
+        if benchmark_value is None:
+            benchmark_value = _coerce_float((automl_config or {}).get("benchmark_sharpe"))
+        return benchmark_value
+    if objective_name == "net_profit_pct_vs_benchmark":
+        benchmark_value = _coerce_float((backtest or {}).get("benchmark_net_profit_pct"))
+        if benchmark_value is None:
+            benchmark_value = _coerce_float((automl_config or {}).get("benchmark_net_profit_pct"))
+        return benchmark_value
+    return None
+
+
+def _compute_turnover_ratio(backtest):
+    trade_count = _coerce_float((backtest or {}).get("total_trades"))
+    bar_count = _coerce_float((backtest or {}).get("bar_count"))
+    if trade_count is None or bar_count is None or bar_count <= 0.0:
+        return None
+    return float(min(trade_count / bar_count, 5.0))
+
+
+def _build_objective_diagnostics(objective_name, training, backtest, automl_config=None):
     automl_config = automl_config or {}
     objective_name = _normalize_objective_name(objective_name)
+    gate_report = _evaluate_objective_gates(training, backtest, automl_config, objective_name)
 
     directional_accuracy = _resolve_metric(training, "avg_directional_accuracy", fallback="avg_accuracy") or 0.0
     log_loss_value = _resolve_metric(training, "avg_log_loss")
     brier_score_value = _resolve_metric(training, "avg_brier_score")
     calibration_error = _resolve_metric(training, "avg_calibration_error")
+    avg_accuracy = _resolve_metric(training, "avg_accuracy") or directional_accuracy
+    net_profit_pct = _coerce_float((backtest or {}).get("net_profit_pct")) or 0.0
+    max_drawdown = abs(_coerce_float((backtest or {}).get("max_drawdown")) or 0.0)
+    turnover_ratio = _compute_turnover_ratio(backtest) or 0.0
+
+    diagnostics = {
+        "objective_name": objective_name,
+        "classification_gates": gate_report,
+        "components": {},
+        "raw_score": None,
+        "final_score": None,
+        "primary_metric": None,
+        "primary_metric_source": None,
+        "primary_metric_lower_bound": None,
+        "benchmark_reference": None,
+    }
 
     if objective_name == "directional_accuracy":
         raw_score = float(directional_accuracy)
+        diagnostics["components"] = {"directional_accuracy": float(directional_accuracy)}
     elif objective_name in {"neg_log_loss", "log_loss"}:
         raw_score = float(-(log_loss_value if log_loss_value is not None else 1e6))
+        diagnostics["components"] = {"log_loss": log_loss_value}
     elif objective_name in {"neg_brier_score", "brier_score"}:
         raw_score = float(-(brier_score_value if brier_score_value is not None else 1e6))
+        diagnostics["components"] = {"brier_score": brier_score_value}
     elif objective_name in {"neg_calibration_error", "calibration_error"}:
         raw_score = float(-(calibration_error if calibration_error is not None else 1e6))
+        diagnostics["components"] = {"calibration_error": calibration_error}
     elif objective_name == "net_profit_pct":
-        raw_score = float(backtest.get("net_profit_pct", 0.0))
+        raw_score = float(net_profit_pct)
+        diagnostics["components"] = {"net_profit_pct": float(net_profit_pct)}
     elif objective_name == "sharpe_ratio":
-        raw_score = float(backtest.get("sharpe_ratio", 0.0))
+        raw_score = float(_coerce_float((backtest or {}).get("sharpe_ratio")) or 0.0)
+        diagnostics["components"] = {"sharpe_ratio": float(raw_score)}
     elif objective_name == "profit_factor":
-        profit_factor = backtest.get("profit_factor", 0.0)
+        profit_factor = (backtest or {}).get("profit_factor", 0.0)
         if not np.isfinite(profit_factor):
             raw_score = float(automl_config.get("profit_factor_cap", 5.0))
         else:
             raw_score = float(profit_factor)
+        diagnostics["components"] = {"profit_factor": float(raw_score)}
     elif objective_name == "calmar_ratio":
-        raw_score = float(backtest.get("calmar_ratio", 0.0))
+        raw_score = float(_coerce_float((backtest or {}).get("calmar_ratio")) or 0.0)
+        diagnostics["components"] = {"calmar_ratio": float(raw_score)}
+    elif objective_name in {"risk_adjusted_after_costs", "benchmark_excess_sharpe", "net_profit_pct_vs_benchmark"}:
+        metric_name = "sharpe_ratio"
+        if objective_name == "net_profit_pct_vs_benchmark":
+            metric_name = "net_profit_pct"
+        primary_metric, primary_source, primary_lower = _resolve_metric_value_with_significance(
+            backtest,
+            metric_name,
+            use_lower_bound=bool(automl_config.get("objective_use_confidence_lower_bound", False)),
+        )
+        benchmark_reference = _resolve_benchmark_reference(backtest, objective_name, automl_config)
+        benchmark_reference = benchmark_reference if benchmark_reference is not None else 0.0
+        drawdown_penalty = float(automl_config.get("objective_drawdown_penalty", 2.0)) * max_drawdown
+        turnover_penalty = float(automl_config.get("objective_turnover_penalty", 0.25)) * turnover_ratio
+        net_profit_bonus = float(automl_config.get("objective_net_profit_weight", 0.5)) * net_profit_pct
+        raw_score = float(primary_metric) - float(benchmark_reference) + net_profit_bonus - drawdown_penalty - turnover_penalty
+        diagnostics.update(
+            {
+                "primary_metric": metric_name,
+                "primary_metric_source": primary_source,
+                "primary_metric_lower_bound": primary_lower,
+                "benchmark_reference": benchmark_reference,
+                "components": {
+                    metric_name: float(primary_metric),
+                    "benchmark_reference": float(benchmark_reference),
+                    "net_profit_pct": float(net_profit_pct),
+                    "drawdown_penalty": float(drawdown_penalty),
+                    "turnover_ratio": float(turnover_ratio),
+                    "turnover_penalty": float(turnover_penalty),
+                },
+            }
+        )
     else:
         score = automl_config.get("weight_directional_accuracy", 100.0) * directional_accuracy
-        score += automl_config.get("weight_accuracy", 5.0) * (_resolve_metric(training, "avg_accuracy") or directional_accuracy)
-
+        score += automl_config.get("weight_accuracy", 5.0) * avg_accuracy
         if log_loss_value is not None:
             score -= automl_config.get("weight_log_loss", 1.0) * log_loss_value
         if brier_score_value is not None:
@@ -1549,6 +1775,23 @@ def compute_objective_value(objective_name, training, backtest, automl_config=No
         if calibration_error is not None:
             score -= automl_config.get("weight_calibration_error", 0.5) * calibration_error
         raw_score = float(score)
+        diagnostics["components"] = {
+            "directional_accuracy": float(directional_accuracy),
+            "accuracy": float(avg_accuracy),
+            "log_loss": log_loss_value,
+            "brier_score": brier_score_value,
+            "calibration_error": calibration_error,
+        }
+
+    diagnostics["raw_score"] = float(raw_score)
+    diagnostics["final_score"] = float(raw_score if gate_report["passed"] else float("-inf"))
+    return diagnostics
+
+
+def compute_objective_value(objective_name, training, backtest, automl_config=None, overfitting_context=None):
+    """Compute the scalar objective value used by the AutoML study."""
+    diagnostics = _build_objective_diagnostics(objective_name, training, backtest, automl_config or {})
+    raw_score = float(diagnostics["final_score"])
 
     if overfitting_context and overfitting_context.get("apply_penalty"):
         deflated_sharpe = overfitting_context.get("deflated_sharpe_ratio")
@@ -1672,7 +1915,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     storage_url = f"sqlite:///{storage_path.as_posix()}"
     study_name = _resolve_study_name(base_config, automl_config)
     sampler = TPESampler(seed=automl_config.get("seed", 42))
-    objective_name = _normalize_objective_name(automl_config.get("objective", "accuracy_first"))
+    objective_name = _normalize_objective_name(automl_config.get("objective", "risk_adjusted_after_costs"))
 
     full_state_bundle = _build_state_bundle(base_pipeline)
     holdout_plan = _resolve_holdout_plan(full_state_bundle["raw_data"], automl_config)
@@ -1727,6 +1970,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 "training": search_record["training"],
                 "backtest": search_record["backtest"],
                 "raw_objective_value": float(search_record["raw_objective_value"]),
+                "objective_diagnostics": search_record.get("objective_diagnostics"),
             },
         )
         trial.set_user_attr("search_raw_objective_value", float(search_record["raw_objective_value"]))
@@ -1775,6 +2019,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 "training": record["training"],
                 "backtest": record["backtest"],
                 "raw_objective_value": value,
+                "objective_diagnostics": record.get("objective_diagnostics"),
                 "split": _json_ready(record.get("validation", {}).get("split")),
             },
         )
@@ -1954,6 +2199,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 "backtest": report["backtest"],
                 "search_metrics": report["search_metrics"],
                 "validation_metrics": report["validation_metrics"],
+                "objective_diagnostics": report.get("objective_diagnostics"),
                 "meets_minimum_dsr_threshold": report["meets_minimum_dsr_threshold"],
                 "trial_complexity_score": report["trial_complexity_score"],
                 "feature_count_ratio": report.get("feature_count_ratio"),
@@ -1984,6 +2230,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "best_backtest": best_trial_report["backtest"],
         "best_training": best_trial_report["training"],
         "best_overfitting": best_trial_report["overfitting"],
+        "best_objective_diagnostics": best_trial_report.get("objective_diagnostics"),
         "best_selection_policy": {
             "trial_complexity_score": best_trial_report["trial_complexity_score"],
             "feature_count_ratio": best_trial_report.get("feature_count_ratio"),
