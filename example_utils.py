@@ -101,6 +101,9 @@ def print_feature_selection_summary(selection):
         f"max_features={report.get('max_features') or 'auto'}  "
         f"min_mi={report.get('min_mi_threshold')}"
     )
+    family_summary = report.get("input_family_summary", {})
+    if family_summary.get("selected_family_counts"):
+        print(f"  families     : {family_summary['selected_family_counts']}")
 
 
 def print_weight_summary(weights):
@@ -166,6 +169,12 @@ def print_training_summary(training):
             "  avg selected : "
             f"{_format_metric(feature_selection.get('avg_selected_features'), digits=2)}"
         )
+        if feature_selection.get("selected_families"):
+            print(f"  families     : {feature_selection.get('selected_families')}")
+        if feature_selection.get("avg_selected_family_counts"):
+            print(f"  avg fam cnt  : {feature_selection.get('avg_selected_family_counts')}")
+        if feature_selection.get("endogenous_only_selected_all_folds"):
+            print("  family mode  : endogenous-only selected in every fold")
     bootstrap = training.get("bootstrap", {})
     if bootstrap:
         print(
@@ -184,6 +193,25 @@ def print_training_summary(training):
     if training.get("last_signal_params"):
         print(f"  tuned signals: {training['last_signal_params']}")
 
+    fold_stability = training.get("fold_stability", {})
+    if fold_stability.get("metrics"):
+        primary_metric = fold_stability.get("primary_metric")
+        primary_stats = fold_stability.get("metrics", {}).get(primary_metric, {})
+        if primary_metric and primary_stats:
+            print(
+                "  stability    : "
+                f"{primary_metric} cv={_format_metric(primary_stats.get('cv'), digits=6)}  "
+                f"range=[{_format_metric(primary_stats.get('min'), digits=6)}, {_format_metric(primary_stats.get('max'), digits=6)}]"
+            )
+        if fold_stability.get("worst_fold_sharpe") is not None:
+            print(f"  worst sharpe : {_format_metric(fold_stability.get('worst_fold_sharpe'), digits=6)}")
+        if fold_stability.get("worst_fold_net_profit_pct") is not None:
+            print(f"  worst return : {_format_metric(fold_stability.get('worst_fold_net_profit_pct'), digits=6, percent=True)}")
+        if fold_stability.get("max_drawdown_dispersion") is not None:
+            print(f"  dd dispersion: {_format_metric(fold_stability.get('max_drawdown_dispersion'), digits=6)}")
+        if fold_stability.get("policy_enabled"):
+            print(f"  stability ok : {fold_stability.get('passed')}  reasons={fold_stability.get('reasons', [])}")
+
     block_diag = training.get("feature_block_diagnostics", {})
     if block_diag.get("summary"):
         print("  top blocks   :")
@@ -193,6 +221,26 @@ def print_training_summary(training):
                 f"{block['block']}: f1_drop={_format_metric(block.get('avg_f1_drop'), digits=6)}  "
                 f"acc_drop={_format_metric(block.get('avg_accuracy_drop'), digits=6)}  "
                 f"native={_format_metric(block.get('avg_native_importance'), digits=6)}"
+            )
+
+    family_diag = training.get("feature_family_diagnostics", {})
+    if family_diag.get("summary"):
+        print("  top families :")
+        for family in family_diag["summary"][:5]:
+            print(
+                "    "
+                f"{family['family']}: f1_drop={_format_metric(family.get('avg_f1_drop'), digits=6)}  "
+                f"acc_drop={_format_metric(family.get('avg_accuracy_drop'), digits=6)}  "
+                f"native={_format_metric(family.get('avg_native_importance'), digits=6)}"
+            )
+    if family_diag.get("bundles"):
+        print("  family bundles:")
+        for bundle in family_diag["bundles"][:4]:
+            print(
+                "    "
+                f"{bundle['bundle']}: f1_drop={_format_metric(bundle.get('avg_f1_drop_vs_full'), digits=6)}  "
+                f"acc_drop={_format_metric(bundle.get('avg_accuracy_drop_vs_full'), digits=6)}  "
+                f"families={bundle.get('families')}"
             )
 
 
@@ -308,6 +356,29 @@ def print_backtest_summary(backtest):
             "  dd duration  : "
             f"{backtest.get('max_drawdown_duration_bars')} bars "
             f"({backtest.get('max_drawdown_duration')})"
+        )
+    if backtest.get("account_model") == "futures_margin":
+        print(
+            "  futures acct : "
+            f"mode={backtest.get('futures_margin_mode')}  "
+            f"brackets={backtest.get('futures_bracket_count')}"
+        )
+        print(
+            "  liquidations : "
+            f"count={backtest.get('liquidation_event_count')}  "
+            f"fees={_format_metric(backtest.get('liquidation_fee_paid'), money=True)}"
+        )
+        print(
+            "  margin risk  : "
+            f"max_ratio={_format_metric(backtest.get('max_margin_ratio'), digits=6)}  "
+            f"warn={backtest.get('bars_above_margin_warning')} bars "
+            f"({_format_metric(backtest.get('bars_above_margin_warning_rate'), percent=True)})"
+        )
+        print(
+            "  leverage use : "
+            f"avg={_format_metric(backtest.get('avg_realized_leverage'), digits=6)}  "
+            f"max={_format_metric(backtest.get('max_realized_leverage'), digits=6)}  "
+            f"capped={backtest.get('leverage_cap_adjustments')}"
         )
     metric_ranges = backtest.get("metric_ranges") or {}
     if metric_ranges:

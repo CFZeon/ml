@@ -5,10 +5,12 @@
 
 from .data import (
     fetch_binance_bars,
+    fetch_binance_futures_contract_spec,
     fetch_binance_symbol_filters,
     fetch_binance_vision,
     join_custom_data,
     join_custom_dataset,
+    load_futures_leverage_brackets,
     load_custom_dataset,
 )
 from .context import (

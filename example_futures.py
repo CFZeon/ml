@@ -76,13 +76,39 @@ def main():
                 "fee_rate": 0.0004,
                 "slippage_rate": 0.0002,
                 "slippage_model": "sqrt_impact",
-                "engine": "vectorbt",
+                "engine": "pandas",
                 "valuation_price": "mark",
                 "apply_funding": True,
                 "allow_short": True,
                 "leverage": 1.5,
                 "use_open_execution": True,
                 "signal_delay_bars": 1,
+                "futures_account": {
+                    "enabled": True,
+                    "margin_mode": "isolated",
+                    "warning_margin_ratio": 0.8,
+                    "leverage_brackets_data": {
+                        "symbol": "BTCUSDT",
+                        "brackets": [
+                            {
+                                "bracket": 1,
+                                "initial_leverage": 20.0,
+                                "notional_floor": 0.0,
+                                "notional_cap": 50_000.0,
+                                "maint_margin_ratio": 0.02,
+                                "cum": 0.0,
+                            },
+                            {
+                                "bracket": 2,
+                                "initial_leverage": 10.0,
+                                "notional_floor": 50_000.0,
+                                "notional_cap": 250_000.0,
+                                "maint_margin_ratio": 0.04,
+                                "cum": 0.0,
+                            },
+                        ],
+                    },
+                },
             },
         }
     )
@@ -91,12 +117,20 @@ def main():
     data = pipeline.fetch_data()
     filters = pipeline.state.get("symbol_filters", {})
     futures_context = pipeline.state.get("futures_context", {})
+    contract_spec = pipeline.state.get("futures_contract_spec", {})
     print(f"  rows         : {len(data)}")
     print(f"  range        : {data.index[0]} -> {data.index[-1]}")
     print(
         "  symbol filters: "
         f"tick={filters.get('tick_size')}  step={filters.get('step_size')}  min_notional={filters.get('min_notional')}"
     )
+    if contract_spec:
+        print(
+            "  contract spec : "
+            f"margin={contract_spec.get('margin_asset')}  "
+            f"liq_fee={contract_spec.get('liquidation_fee_rate')}  "
+            f"take_bound={contract_spec.get('market_take_bound')}"
+        )
     print(f"  futures context tables: {sorted(futures_context)}")
 
     print_section(sep, 2, "Running indicators")
@@ -105,8 +139,10 @@ def main():
 
     print_section(sep, 3, "Building features and screening stationarity")
     features = pipeline.build_features()
+    family_summary = pipeline.state.get("feature_family_summary", {})
     stationarity = pipeline.check_stationarity()
     print(f"  feature count : {features.shape[1]}")
+    print(f"  families      : {family_summary.get('selected_family_counts', {})}")
     print_stationarity_summary(stationarity)
 
     print_section(sep, 4, "Previewing regime features")

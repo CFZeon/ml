@@ -2,7 +2,13 @@ import unittest
 
 import pandas as pd
 
-from core.data import _COLUMNS, _parse_symbol_filters, _prepare_frame
+from core.data import (
+    _COLUMNS,
+    _normalize_futures_leverage_brackets,
+    _parse_futures_contract_spec,
+    _parse_symbol_filters,
+    _prepare_frame,
+)
 from core import FlatSlippageModel, SquareRootImpactModel, join_custom_data, run_backtest
 from core.slippage import OrderBookImpactModel
 
@@ -79,6 +85,67 @@ class DataBacktestAdapterTest(unittest.TestCase):
         self.assertAlmostEqual(float(parsed["max_position"]), 5.0, places=6)
         self.assertIn("TRAILING_DELTA", parsed["unsupported_filters"])
         self.assertIn("LOT_SIZE", parsed["raw_filters"])
+
+    def test_parse_futures_contract_spec_extracts_liquidation_metadata(self):
+        payload = {
+            "symbol": "BTCUSDT",
+            "pair": "BTCUSDT",
+            "contractType": "PERPETUAL",
+            "baseAsset": "BTC",
+            "quoteAsset": "USDT",
+            "marginAsset": "USDT",
+            "status": "TRADING",
+            "contractSize": "1",
+            "liquidationFee": "0.0125",
+            "marketTakeBound": "0.30",
+            "triggerProtect": "0.15",
+            "pricePrecision": 2,
+            "quantityPrecision": 3,
+            "onboardDate": 1704067200000,
+            "deliveryDate": 4133404800000,
+        }
+
+        spec = _parse_futures_contract_spec(payload, market="um_futures")
+
+        self.assertEqual(spec["symbol"], "BTCUSDT")
+        self.assertEqual(spec["market"], "um_futures")
+        self.assertEqual(spec["margin_asset"], "USDT")
+        self.assertAlmostEqual(float(spec["contract_size"]), 1.0, places=6)
+        self.assertAlmostEqual(float(spec["liquidation_fee_rate"]), 0.0125, places=6)
+        self.assertAlmostEqual(float(spec["market_take_bound"]), 0.30, places=6)
+        self.assertIsNotNone(spec["onboard_date"])
+        self.assertIsNotNone(spec["delivery_date"])
+
+    def test_normalize_futures_leverage_brackets_accepts_binance_shape(self):
+        payload = {
+            "symbol": "BTCUSDT",
+            "notionalCoef": 1.0,
+            "brackets": [
+                {
+                    "bracket": 1,
+                    "initialLeverage": 75,
+                    "notionalFloor": 0,
+                    "notionalCap": 10000,
+                    "maintMarginRatio": 0.0065,
+                    "cum": 0,
+                },
+                {
+                    "bracket": 2,
+                    "initialLeverage": 50,
+                    "notionalFloor": 10000,
+                    "notionalCap": 50000,
+                    "maintMarginRatio": 0.01,
+                    "cum": 65,
+                },
+            ],
+        }
+
+        normalized = _normalize_futures_leverage_brackets(payload, symbol="BTCUSDT", market="um_futures")
+
+        self.assertEqual(normalized["symbol"], "BTCUSDT")
+        self.assertEqual(len(normalized["brackets"]), 2)
+        self.assertAlmostEqual(float(normalized["brackets"][0]["initial_leverage"]), 75.0, places=6)
+        self.assertAlmostEqual(float(normalized["brackets"][1]["maint_margin_ratio"]), 0.01, places=6)
 
     def test_slippage_sqrt_model_increases_with_volume_ratio(self):
         index = pd.date_range("2026-03-09", periods=4, freq="1h", tz="UTC")
@@ -177,6 +244,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
                     "timestamp_column": "timestamp",
                     "availability_column": "available_at",
                     "prefix": "sent",
+                    "max_feature_age": "45m",
                 }
             ],
         )
@@ -184,7 +252,83 @@ class DataBacktestAdapterTest(unittest.TestCase):
         self.assertTrue(pd.isna(joined.loc[index[0], "sent_sentiment"]))
         self.assertAlmostEqual(float(joined.loc[index[1], "sent_sentiment"]), 0.25, places=6)
         self.assertAlmostEqual(float(joined.loc[index[2], "sent_sentiment"]), 0.75, places=6)
+        self.assertTrue(pd.isna(joined.loc[index[3], "sent_sentiment"]))
         self.assertEqual(reports[0]["joined_columns"], ["sent_sentiment"])
+        self.assertEqual(int(reports[0]["stale_hit_count"]), 1)
+        self.assertEqual(reports[0]["max_feature_age"], pd.Timedelta("45m"))
+        self.assertEqual(reports[0]["median_feature_age"], pd.Timedelta("30m"))
+        self.assertFalse(reports[0]["fallback_assumption_used"])
+
+    def test_custom_join_requires_explicit_availability_or_opt_in(self):
+        index = pd.date_range("2026-03-10", periods=2, freq="1h", tz="UTC")
+        base = pd.DataFrame(
+            {"close": [100.0, 101.0]},
+            index=index,
+        )
+        custom_frame = pd.DataFrame(
+            {
+                "timestamp": [index[0]],
+                "sentiment": [0.25],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "availability_column"):
+            join_custom_data(
+                base,
+                [
+                    {
+                        "name": "sentiment_feed",
+                        "frame": custom_frame,
+                        "timestamp_column": "timestamp",
+                        "prefix": "sent",
+                    }
+                ],
+            )
+
+    def test_exact_match_defaults_change_when_event_time_availability_is_assumed(self):
+        index = pd.date_range("2026-03-10", periods=1, freq="1h", tz="UTC")
+        base = pd.DataFrame(
+            {"close": [100.0]},
+            index=index,
+        )
+        custom_frame = pd.DataFrame(
+            {
+                "timestamp": [index[0]],
+                "sentiment": [0.25],
+            }
+        )
+
+        assumed_joined, assumed_report = join_custom_data(
+            base,
+            [
+                {
+                    "name": "assumed_feed",
+                    "frame": custom_frame,
+                    "timestamp_column": "timestamp",
+                    "assume_event_time_is_available_time": True,
+                    "prefix": "assumed",
+                }
+            ],
+        )
+        explicit_joined, explicit_report = join_custom_data(
+            base,
+            [
+                {
+                    "name": "explicit_feed",
+                    "frame": custom_frame.assign(available_at=custom_frame["timestamp"]),
+                    "timestamp_column": "timestamp",
+                    "availability_column": "available_at",
+                    "prefix": "explicit",
+                }
+            ],
+        )
+
+        self.assertTrue(pd.isna(assumed_joined.loc[index[0], "assumed_sentiment"]))
+        self.assertFalse(assumed_report[0]["allow_exact_matches"])
+        self.assertTrue(assumed_report[0]["fallback_assumption_used"])
+        self.assertAlmostEqual(float(explicit_joined.loc[index[0], "explicit_sentiment"]), 0.25, places=6)
+        self.assertTrue(explicit_report[0]["allow_exact_matches"])
+        self.assertFalse(explicit_report[0]["fallback_assumption_used"])
 
     def test_vectorbt_backtest_adapter_supports_futures_execution_inputs(self):
         index = pd.date_range("2026-03-12", periods=6, freq="1h", tz="UTC")
@@ -215,6 +359,108 @@ class DataBacktestAdapterTest(unittest.TestCase):
         self.assertIn("slippage_paid", result)
         self.assertIn("statistical_significance", result)
         self.assertFalse(result["statistical_significance"]["enabled"])
+
+    def test_futures_account_liquidation_triggers_on_large_adverse_move(self):
+        index = pd.date_range("2026-03-12", periods=5, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 100.0, 60.0, 60.0, 60.0], index=index)
+        signals = pd.Series([0.5, 0.5, 0.5, 0.0, 0.0], index=index)
+
+        result = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="pandas",
+            market="um_futures",
+            allow_short=True,
+            leverage=3.0,
+            futures_account={
+                "enabled": True,
+                "margin_mode": "isolated",
+                "warning_margin_ratio": 0.8,
+                "liquidation_fee_rate": 0.01,
+                "leverage_brackets": {
+                    "symbol": "BTCUSDT",
+                    "brackets": [
+                        {
+                            "bracket": 1,
+                            "initial_leverage": 3.0,
+                            "notional_floor": 0.0,
+                            "notional_cap": 1_000_000.0,
+                            "maint_margin_ratio": 0.05,
+                            "cum": 0.0,
+                        }
+                    ],
+                },
+            },
+        )
+
+        self.assertEqual(result["account_model"], "futures_margin")
+        self.assertEqual(result["futures_margin_mode"], "isolated")
+        self.assertGreater(int(result["liquidation_event_count"]), 0)
+        self.assertFalse(result["liquidation_events"].empty)
+        self.assertIn("margin_ratio_series", result)
+        self.assertIn("position_notional_series", result)
+        self.assertGreater(float(result["max_margin_ratio"]), 1.0)
+        self.assertGreater(int(result["bars_above_margin_warning"]), 0)
+        self.assertGreater(float(result["liquidation_fee_paid"]), 0.0)
+
+    def test_futures_account_isolated_and_cross_produce_different_outcomes(self):
+        index = pd.date_range("2026-03-12", periods=5, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 100.0, 60.0, 60.0, 60.0], index=index)
+        signals = pd.Series([0.5, 0.5, 0.5, 0.0, 0.0], index=index)
+        futures_account = {
+            "enabled": True,
+            "warning_margin_ratio": 0.8,
+            "liquidation_fee_rate": 0.01,
+            "leverage_brackets": {
+                "symbol": "BTCUSDT",
+                "brackets": [
+                    {
+                        "bracket": 1,
+                        "initial_leverage": 3.0,
+                        "notional_floor": 0.0,
+                        "notional_cap": 1_000_000.0,
+                        "maint_margin_ratio": 0.05,
+                        "cum": 0.0,
+                    }
+                ],
+            },
+        }
+
+        isolated = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="pandas",
+            market="um_futures",
+            allow_short=True,
+            leverage=3.0,
+            futures_account={**futures_account, "margin_mode": "isolated"},
+        )
+        cross = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="pandas",
+            market="um_futures",
+            allow_short=True,
+            leverage=3.0,
+            futures_account={**futures_account, "margin_mode": "cross"},
+        )
+
+        self.assertGreater(int(isolated["liquidation_event_count"]), 0)
+        self.assertEqual(int(cross["liquidation_event_count"]), 0)
+        self.assertGreater(float(isolated["ending_equity"]), float(cross["ending_equity"]))
+        self.assertGreater(float(cross["max_margin_ratio"]), 0.0)
 
     def test_execution_parity_rejects_same_min_notional_order_in_both_engines(self):
         index = pd.date_range("2026-03-12", periods=5, freq="1h", tz="UTC")

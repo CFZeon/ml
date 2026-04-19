@@ -7,7 +7,7 @@ from unittest import mock
 import numpy as np
 import pandas as pd
 
-from core.automl import compute_cpcv_pbo, compute_objective_value, run_automl_study
+from core.automl import _build_trial_return_frame, compute_cpcv_pbo, compute_objective_value, run_automl_study
 
 
 def _build_market_frame(rows):
@@ -250,32 +250,42 @@ class _ScenarioAutoMLPipeline(_AutoMLDummyPipeline):
             log_loss = float(scenario.get("log_loss", 0.2))
             brier_score = float(scenario.get("brier_score", 0.1))
             calibration_error = float(scenario.get("calibration_error", 0.05))
-            probability_frame = pd.DataFrame({-1: 0.2, 0: 0.0, 1: 0.8}, index=oos_index)
-            signal_strength = pd.Series(1.0, index=oos_index)
-            training = {
-                "fold_metrics": [
-                    {
-                        "accuracy": directional_accuracy,
-                        "f1_macro": directional_accuracy,
-                        "directional_accuracy": directional_accuracy,
-                        "directional_f1_macro": directional_accuracy,
-                        "log_loss": log_loss,
-                        "brier_score": brier_score,
-                        "calibration_error": calibration_error,
-                    }
-                ],
-                "avg_accuracy": directional_accuracy,
-                "avg_f1_macro": directional_accuracy,
-                "avg_directional_accuracy": directional_accuracy,
-                "avg_directional_f1_macro": directional_accuracy,
-                "avg_log_loss": log_loss,
-                "avg_brier_score": brier_score,
-                "avg_calibration_error": calibration_error,
-                "headline_metrics": {
+            fold_metrics = copy.deepcopy(scenario.get("fold_metrics") or [
+                {
+                    "accuracy": directional_accuracy,
+                    "f1_macro": directional_accuracy,
                     "directional_accuracy": directional_accuracy,
+                    "directional_f1_macro": directional_accuracy,
                     "log_loss": log_loss,
                     "brier_score": brier_score,
                     "calibration_error": calibration_error,
+                }
+            ])
+            fold_backtests = copy.deepcopy(scenario.get("fold_backtests") or [])
+
+            def _avg_metric(rows, key, fallback=None):
+                values = [float(row[key]) for row in rows if row.get(key) is not None]
+                if values:
+                    return float(np.mean(values))
+                return fallback
+
+            probability_frame = pd.DataFrame({-1: 0.2, 0: 0.0, 1: 0.8}, index=oos_index)
+            signal_strength = pd.Series(1.0, index=oos_index)
+            training = {
+                "fold_metrics": fold_metrics,
+                "fold_backtests": fold_backtests,
+                "avg_accuracy": _avg_metric(fold_metrics, "accuracy", directional_accuracy),
+                "avg_f1_macro": _avg_metric(fold_metrics, "f1_macro", directional_accuracy),
+                "avg_directional_accuracy": _avg_metric(fold_metrics, "directional_accuracy", directional_accuracy),
+                "avg_directional_f1_macro": _avg_metric(fold_metrics, "directional_f1_macro", directional_accuracy),
+                "avg_log_loss": _avg_metric(fold_metrics, "log_loss", log_loss),
+                "avg_brier_score": _avg_metric(fold_metrics, "brier_score", brier_score),
+                "avg_calibration_error": _avg_metric(fold_metrics, "calibration_error", calibration_error),
+                "headline_metrics": {
+                    "directional_accuracy": _avg_metric(fold_metrics, "directional_accuracy", directional_accuracy),
+                    "log_loss": _avg_metric(fold_metrics, "log_loss", log_loss),
+                    "brier_score": _avg_metric(fold_metrics, "brier_score", brier_score),
+                    "calibration_error": _avg_metric(fold_metrics, "calibration_error", calibration_error),
                 },
                 "last_model": object(),
                 "last_meta": object(),
@@ -298,6 +308,7 @@ class _ScenarioAutoMLPipeline(_AutoMLDummyPipeline):
                 "feature_block_diagnostics": {"summary": [], "top_features": [], "folds": []},
                 "regime": {"mode": "fold_local", "folds": []},
                 "stationarity": {"mode": "fold_local", "folds": []},
+                "fold_stability": copy.deepcopy(scenario.get("fold_stability")),
                 "feature_selection": {
                     "enabled": False,
                     "mode": "fold_local",
@@ -511,6 +522,76 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
 
         self.assertFalse(report["enabled"])
         self.assertEqual(report["reason"], "insufficient_trials")
+
+    def test_build_trial_return_frame_preserves_missing_periods(self):
+        index = pd.date_range("2026-01-01", periods=8, freq="1h", tz="UTC")
+        trial_records = {
+            0: {"returns": pd.Series([0.012, 0.011, 0.013, 0.010, 0.014, 0.012, 0.011, 0.013], index=index)},
+            1: {"returns": pd.Series([0.010, 0.009, 0.011, 0.010, 0.009, 0.010], index=index[[0, 1, 3, 4, 6, 7]])},
+            2: {"returns": pd.Series([0.004, 0.006, 0.005, 0.004, 0.005, 0.004], index=index[[0, 2, 3, 4, 5, 7]])},
+        }
+
+        frame = _build_trial_return_frame(trial_records)
+
+        self.assertEqual(frame.shape, (8, 3))
+        self.assertTrue(pd.isna(frame.loc[index[2], 1]))
+        self.assertTrue(pd.isna(frame.loc[index[1], 2]))
+        self.assertGreater(int(frame.isna().sum().sum()), 0)
+
+    def test_compute_cpcv_pbo_strict_intersection_reports_overlap_diagnostics(self):
+        index = pd.date_range("2026-01-01", periods=8, freq="1h", tz="UTC")
+        trial_returns = pd.DataFrame(
+            {
+                0: [0.012, 0.011, 0.013, 0.010, 0.014, 0.012, 0.011, 0.013],
+                1: [0.010, 0.009, np.nan, 0.010, 0.011, np.nan, 0.009, 0.010],
+                2: [0.004, np.nan, 0.006, 0.005, 0.004, 0.005, np.nan, 0.004],
+            },
+            index=index,
+        )
+
+        report = compute_cpcv_pbo(
+            trial_returns,
+            n_blocks=2,
+            test_blocks=1,
+            min_block_size=2,
+            overlap_policy="strict_intersection",
+            min_overlap_fraction=0.4,
+        )
+
+        self.assertTrue(report["enabled"])
+        self.assertEqual(report["overlap_policy"], "strict_intersection")
+        self.assertEqual(report["path_rows"], 8)
+        self.assertEqual(report["strict_overlap_rows"], 4)
+        self.assertAlmostEqual(float(report["strict_overlap_fraction"]), 0.5, places=6)
+        self.assertEqual(int(report["excluded_low_overlap_split_count"]), 0)
+
+    def test_compute_cpcv_pbo_pairwise_overlap_excludes_weak_comparisons(self):
+        index = pd.date_range("2026-01-01", periods=12, freq="1h", tz="UTC")
+        trial_returns = pd.DataFrame(
+            {
+                0: [0.012, 0.011, 0.013, 0.012, 0.011, 0.010, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+                1: [np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.008, 0.009, 0.007, 0.008, 0.009, 0.007],
+                2: [0.005, 0.004, 0.006, 0.005, 0.004, 0.006, 0.005, 0.004, 0.006, 0.005, 0.004, 0.006],
+            },
+            index=index,
+        )
+
+        report = compute_cpcv_pbo(
+            trial_returns,
+            n_blocks=4,
+            test_blocks=2,
+            min_block_size=2,
+            overlap_policy="pairwise_overlap",
+            min_overlap_fraction=0.4,
+            min_overlap_observations=2,
+        )
+
+        self.assertFalse(report["enabled"])
+        self.assertEqual(report["reason"], "no_valid_splits")
+        self.assertEqual(report["overlap_policy"], "pairwise_overlap")
+        self.assertGreater(int(report["excluded_low_overlap_split_count"]), 0)
+        self.assertGreater(int(report["excluded_low_overlap_trial_pairs"]), 0)
+        self.assertLess(float(report["pairwise_overlap_min_fraction"]), 0.4)
 
     def test_run_automl_study_propagates_state_and_reports_locked_holdout(self):
         raw = _build_market_frame(120)
@@ -1130,6 +1211,124 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
         self.assertIn("parameter_fragility_above_limit", rejected_trial["selection_policy"]["eligibility_reasons"])
         self.assertAlmostEqual(float(summary["best_selection_policy"]["param_fragility_score"]), 0.04, places=6)
 
+    def test_selection_policy_rejects_unstable_top_candidate(self):
+        raw = _build_market_frame(100)
+        storage_path = _make_storage_path()
+
+        _ScenarioAutoMLPipeline.reset()
+        _ScenarioAutoMLPipeline.full_rows = len(raw)
+        _ScenarioAutoMLPipeline.metrics_by_variant = {
+            "rf": {
+                "search": {"sharpe_ratio": 2.1, "returns": [0.0019, 0.0015, 0.0020, 0.0016]},
+                "validation": {
+                    "sharpe_ratio": 1.9,
+                    "returns": [0.0017, 0.0013, 0.0018, 0.0014],
+                    "fold_stability": {
+                        "enabled": True,
+                        "policy_enabled": True,
+                        "primary_metric": "directional_accuracy",
+                        "passed": False,
+                        "reasons": ["directional_accuracy_cv_above_limit"],
+                        "metrics": {
+                            "directional_accuracy": {
+                                "count": 3,
+                                "mean": 0.62,
+                                "std": 0.19,
+                                "median": 0.66,
+                                "min": 0.39,
+                                "max": 0.81,
+                                "cv": 0.3064516129,
+                            }
+                        },
+                        "worst_fold_sharpe": 0.12,
+                        "worst_fold_net_profit_pct": -0.018,
+                        "max_drawdown_dispersion": 0.11,
+                    },
+                },
+                "holdout": {"sharpe_ratio": 1.3, "returns": [0.0011, 0.0008, 0.0012, 0.0009]},
+            },
+            "gbm": {
+                "search": {"sharpe_ratio": 1.7, "returns": [0.0015, 0.0011, 0.0016, 0.0012]},
+                "validation": {
+                    "sharpe_ratio": 1.6,
+                    "returns": [0.0014, 0.0010, 0.0015, 0.0011],
+                    "fold_stability": {
+                        "enabled": True,
+                        "policy_enabled": True,
+                        "primary_metric": "directional_accuracy",
+                        "passed": True,
+                        "reasons": [],
+                        "metrics": {
+                            "directional_accuracy": {
+                                "count": 3,
+                                "mean": 0.58,
+                                "std": 0.03,
+                                "median": 0.58,
+                                "min": 0.55,
+                                "max": 0.61,
+                                "cv": 0.0517241379,
+                            }
+                        },
+                        "worst_fold_sharpe": 0.74,
+                        "worst_fold_net_profit_pct": 0.012,
+                        "max_drawdown_dispersion": 0.02,
+                    },
+                },
+                "holdout": {"sharpe_ratio": 1.4, "returns": [0.0012, 0.0009, 0.0013, 0.0010]},
+            },
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "validation": {
+                    "stability_policy": {
+                        "enabled": True,
+                        "cv_metric": "directional_accuracy",
+                        "max_cv": 0.15,
+                    }
+                },
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 2,
+                    "objective": "sharpe_ratio",
+                    "seed": 37,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_fraction": 0.2,
+                    "locked_holdout_min_search_rows": 40,
+                    "enable_pruning": False,
+                    "storage": storage_path,
+                    "study_name": "automl_stability_gate_test",
+                    "selection_policy": {
+                        "min_validation_trade_count": 1,
+                        "require_locked_holdout_pass": False,
+                        "require_fold_stability_pass": True,
+                    },
+                },
+                "model": {"type": "rf"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        variants = [
+            {"model": {"type": "rf"}},
+            {"model": {"type": "gbm"}},
+        ]
+        with mock.patch("core.automl._sample_trial_overrides", side_effect=lambda trial, _: variants[trial.number]):
+            summary = run_automl_study(
+                base_pipeline,
+                pipeline_class=_ScenarioAutoMLPipeline,
+                trial_step_classes=[],
+            )
+
+        self.assertEqual(summary["best_overrides"]["model"]["type"], "gbm")
+        rejected_trial = next(trial for trial in summary["top_trials"] if trial["model_family"] == "rf")
+        self.assertFalse(rejected_trial["selection_policy"]["eligible"])
+        self.assertIn("fold_stability_failed", rejected_trial["selection_policy"]["eligibility_reasons"])
+        self.assertFalse(rejected_trial["fold_stability"]["passed"])
+        self.assertTrue(summary["best_selection_policy"]["fold_stability"]["passed"])
+
     def test_selection_policy_summary_exposes_gap_complexity_and_fragility(self):
         raw = _build_market_frame(120)
         storage_path = _make_storage_path()
@@ -1191,10 +1390,12 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
             )
 
         self.assertIn("trial_complexity_score", summary["best_selection_policy"])
+        self.assertIn("fold_stability", summary["best_selection_policy"])
         self.assertIn("generalization_gap", summary["best_selection_policy"])
         self.assertIn("param_fragility_score", summary["best_selection_policy"])
         self.assertIsNotNone(summary["best_selection_policy"]["generalization_gap"]["search_to_validation"])
         self.assertIsNotNone(summary["top_trials"][0]["trial_complexity_score"])
+        self.assertIn("fold_stability", summary["top_trials"][0])
         self.assertIsNotNone(summary["top_trials"][0]["param_fragility_score"])
 
 

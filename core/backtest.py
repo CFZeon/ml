@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from .slippage import _estimate_slippage_rates
+from .slippage import _estimate_slippage_rates, _estimate_trade_notional_slippage_rates
 
 try:  # pragma: no cover - optional dependency exercised in integration tests
     import vectorbt as vbt
@@ -657,6 +657,361 @@ def _compute_funding_cash(position, funding_rates, equity_curve):
     return prev_equity * (-position.astype(float) * funding)
 
 
+def _normalize_futures_account_config(futures_account=None, market="spot", leverage=1.0,
+                                      contract_spec=None, leverage_brackets=None):
+    normalized_market = str(market or "spot").lower()
+    configured = dict(futures_account or {})
+    if contract_spec is not None and configured.get("contract_spec") is None:
+        configured["contract_spec"] = contract_spec
+    if leverage_brackets is not None and configured.get("leverage_brackets") is None:
+        configured["leverage_brackets"] = leverage_brackets
+
+    enabled = configured.get("enabled")
+    if enabled is None:
+        enabled = normalized_market != "spot" and bool(configured)
+    if not enabled:
+        return None
+
+    margin_mode = str(configured.get("margin_mode", "isolated")).lower()
+    if margin_mode not in {"isolated", "cross"}:
+        raise ValueError("futures_account.margin_mode must be 'isolated' or 'cross'")
+
+    bracket_payload = configured.get("leverage_brackets") or {}
+    if isinstance(bracket_payload, dict):
+        bracket_rows = list(bracket_payload.get("brackets", []) or [])
+        notional_coef = float(bracket_payload.get("notional_coef", bracket_payload.get("notionalCoef", 1.0)) or 1.0)
+    else:
+        bracket_rows = list(bracket_payload or [])
+        notional_coef = 1.0
+
+    contract_payload = dict(configured.get("contract_spec") or {})
+    liquidation_fee_rate = configured.get("liquidation_fee_rate")
+    if liquidation_fee_rate is None:
+        liquidation_fee_rate = contract_payload.get("liquidation_fee_rate", 0.0)
+
+    return {
+        "enabled": True,
+        "market": normalized_market,
+        "margin_mode": margin_mode,
+        "configured_leverage": max(1.0, float(configured.get("leverage", leverage))),
+        "warning_margin_ratio": max(0.0, float(configured.get("warning_margin_ratio", 0.8))),
+        "maintenance_margin_ratio": max(0.0, float(configured.get("maintenance_margin_ratio", 0.0))),
+        "maintenance_amount": max(0.0, float(configured.get("maintenance_amount", 0.0))),
+        "liquidation_fee_rate": max(0.0, float(liquidation_fee_rate or 0.0)),
+        "allow_reentry_after_liquidation": bool(configured.get("allow_reentry_after_liquidation", False)),
+        "contract_spec": contract_payload,
+        "leverage_brackets": bracket_rows,
+        "notional_coef": notional_coef,
+    }
+
+
+def _resolve_futures_leverage_bracket(notional, futures_account):
+    brackets = list((futures_account or {}).get("leverage_brackets") or [])
+    if not brackets:
+        return None
+
+    scaled_notional = max(float(notional), 0.0)
+    coef = float((futures_account or {}).get("notional_coef", 1.0) or 1.0)
+    if coef > 0.0:
+        scaled_notional /= coef
+
+    fallback = brackets[-1]
+    for bracket in brackets:
+        floor = bracket.get("notional_floor")
+        cap = bracket.get("notional_cap")
+        if floor is not None and scaled_notional < float(floor) - 1e-12:
+            continue
+        fallback = bracket
+        if cap is None or scaled_notional <= float(cap) + 1e-12:
+            return bracket
+    return fallback
+
+
+def _resolve_futures_leverage_cap(notional, futures_account):
+    configured_leverage = max(1.0, float((futures_account or {}).get("configured_leverage", 1.0)))
+    bracket = _resolve_futures_leverage_bracket(notional, futures_account)
+    if bracket is None:
+        return configured_leverage, None
+
+    bracket_leverage = bracket.get("initial_leverage")
+    if bracket_leverage is None or bracket_leverage <= 0.0:
+        return configured_leverage, bracket
+    return min(configured_leverage, float(bracket_leverage)), bracket
+
+
+def _compute_futures_maintenance_margin(notional, futures_account, bracket=None):
+    notional = max(float(notional), 0.0)
+    if notional <= 0.0:
+        return 0.0
+
+    if bracket is None:
+        bracket = _resolve_futures_leverage_bracket(notional, futures_account)
+    if bracket is not None:
+        ratio = float(bracket.get("maint_margin_ratio") or 0.0)
+        cum = float(bracket.get("cum") or 0.0)
+    else:
+        ratio = float((futures_account or {}).get("maintenance_margin_ratio", 0.0) or 0.0)
+        cum = float((futures_account or {}).get("maintenance_amount", 0.0) or 0.0)
+    return notional * ratio + cum
+
+
+def _cap_futures_target_position(target_position, account_equity, futures_account):
+    requested = float(target_position)
+    if not np.isfinite(requested):
+        requested = 0.0
+
+    requested_abs = abs(requested)
+    configured_leverage = max(1.0, float((futures_account or {}).get("configured_leverage", 1.0)))
+    capped_abs = min(requested_abs, configured_leverage)
+    bracket = None
+
+    for _ in range(4):
+        leverage_cap, bracket = _resolve_futures_leverage_cap(max(capped_abs * max(float(account_equity), 0.0), 0.0), futures_account)
+        leverage_cap = max(1.0, float(leverage_cap))
+        if capped_abs <= leverage_cap + 1e-12:
+            break
+        capped_abs = leverage_cap
+
+    capped = float(np.sign(requested) * capped_abs)
+    return capped, {
+        "requested_position": requested,
+        "capped_position": capped,
+        "adjusted": capped_abs < requested_abs - 1e-12,
+        "bracket": bracket,
+        "leverage_cap": max(1.0, float(_resolve_futures_leverage_cap(capped_abs * max(float(account_equity), 0.0), futures_account)[0])),
+    }
+
+
+def _build_futures_trade_notional(position, equity_curve):
+    position = pd.Series(position, copy=False).astype(float)
+    prev_equity = pd.Series(equity_curve, index=position.index).shift(1).fillna(float(equity_curve.iloc[0]))
+    turnover = position.diff().abs().fillna(position.abs())
+    return prev_equity * turnover
+
+
+def _run_futures_account_backtest(close, position, equity, fee_rate, slippage_rate,
+                                  execution_prices, signal_delay_bars, market,
+                                  futures_account, funding_rates=None,
+                                  significance=None, benchmark_returns=None,
+                                  benchmark_sharpe=None, volume=None,
+                                  slippage_model=None, orderbook_depth=None,
+                                  execution_report=None):
+    valuation_series = pd.Series(close, copy=False).astype(float)
+    execution_series = valuation_series if execution_prices is None else pd.Series(
+        execution_prices, index=valuation_series.index
+    ).reindex(valuation_series.index).astype(float)
+    requested_position = pd.Series(position, index=valuation_series.index, copy=False).reindex(valuation_series.index).fillna(0.0).astype(float)
+    aligned_funding = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    if funding_rates is not None:
+        aligned_funding = pd.Series(funding_rates, index=valuation_series.index).reindex(valuation_series.index).fillna(0.0).astype(float)
+
+    requested_trade_notional = _build_futures_trade_notional(
+        requested_position,
+        pd.Series(float(equity), index=valuation_series.index, dtype=float),
+    )
+    slippage_rates = _estimate_trade_notional_slippage_rates(
+        trade_notional=requested_trade_notional,
+        execution_series=execution_series,
+        slippage_rate=slippage_rate,
+        slippage_model=slippage_model,
+        volume=volume,
+        orderbook_depth=orderbook_depth,
+    )
+
+    actual_position = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    equity_curve = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    strat_ret = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    unrealized_pnl_series = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    position_notional_series = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    initial_margin_series = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    maintenance_margin_series = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    margin_balance_series = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    margin_ratio_series = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    leverage_cap_series = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    realized_leverage_series = pd.Series(0.0, index=valuation_series.index, dtype=float)
+
+    liquidation_rows = []
+    leverage_adjustment_rows = []
+    warning_ratio = float(futures_account.get("warning_margin_ratio", 0.8))
+    margin_mode = futures_account.get("margin_mode", "isolated")
+
+    prev_equity = float(equity)
+    previous_position = 0.0
+    isolated_margin_posted = 0.0
+    total_fees_paid = 0.0
+    total_slippage_paid = 0.0
+    total_funding_pnl = 0.0
+    total_liquidation_fees = 0.0
+    bars_above_warning = 0
+
+    for loc, timestamp in enumerate(valuation_series.index):
+        price_now = float(valuation_series.iloc[loc])
+        total_equity_before_trade = prev_equity
+        funding_cash = 0.0
+        unrealized_pnl = 0.0
+        observed_notional = 0.0
+        observed_initial_margin = 0.0
+        observed_maintenance_margin = 0.0
+        observed_margin_balance = 0.0
+        observed_margin_ratio = 0.0
+        liquidation_triggered = False
+
+        if loc > 0 and abs(previous_position) > 1e-12 and prev_equity > 0.0:
+            price_prev = float(valuation_series.iloc[loc - 1])
+            price_return = 0.0 if price_prev <= 0.0 else (price_now / price_prev) - 1.0
+            observed_notional = abs(previous_position) * prev_equity * max(1.0 + price_return, 0.0)
+            leverage_cap, active_bracket = _resolve_futures_leverage_cap(observed_notional, futures_account)
+            leverage_cap = max(1.0, float(leverage_cap))
+            observed_initial_margin = observed_notional / leverage_cap
+            unrealized_pnl = prev_equity * previous_position * price_return
+            funding_cash = prev_equity * (-previous_position * float(aligned_funding.iloc[loc]))
+            total_funding_pnl += funding_cash
+
+            if margin_mode == "isolated":
+                free_collateral = max(prev_equity - isolated_margin_posted, 0.0)
+                observed_margin_balance = isolated_margin_posted + unrealized_pnl + funding_cash
+                total_equity_before_trade = free_collateral + observed_margin_balance
+            else:
+                total_equity_before_trade = prev_equity + unrealized_pnl + funding_cash
+                observed_margin_balance = total_equity_before_trade
+
+            observed_maintenance_margin = _compute_futures_maintenance_margin(
+                observed_notional,
+                futures_account,
+                bracket=active_bracket,
+            )
+            observed_margin_ratio = _safe_ratio(
+                observed_maintenance_margin,
+                max(observed_margin_balance, 1e-12),
+                default=float("inf"),
+            ) if observed_notional > 0.0 else 0.0
+
+            if observed_margin_ratio >= warning_ratio:
+                bars_above_warning += 1
+
+            if observed_notional > 0.0 and observed_margin_balance <= observed_maintenance_margin + 1e-12:
+                liquidation_triggered = True
+                liquidation_fee = observed_notional * float(futures_account.get("liquidation_fee_rate", 0.0))
+                total_liquidation_fees += liquidation_fee
+                if margin_mode == "isolated":
+                    total_equity_before_trade = free_collateral + max(observed_margin_balance - liquidation_fee, 0.0)
+                else:
+                    total_equity_before_trade = max(total_equity_before_trade - liquidation_fee, 0.0)
+                liquidation_rows.append(
+                    {
+                        "timestamp": timestamp,
+                        "margin_mode": margin_mode,
+                        "position_before": float(previous_position),
+                        "mark_price": price_now,
+                        "position_notional": observed_notional,
+                        "margin_balance": observed_margin_balance,
+                        "maintenance_margin": observed_maintenance_margin,
+                        "margin_ratio": observed_margin_ratio,
+                        "liquidation_fee": liquidation_fee,
+                        "equity_after_liquidation": total_equity_before_trade,
+                    }
+                )
+                previous_position = 0.0
+                isolated_margin_posted = 0.0
+
+        requested_target = float(requested_position.iloc[loc])
+        if liquidation_triggered and not futures_account.get("allow_reentry_after_liquidation", False):
+            requested_target = 0.0
+
+        capped_target, cap_meta = _cap_futures_target_position(
+            requested_target,
+            max(total_equity_before_trade, 0.0),
+            futures_account,
+        )
+        if cap_meta.get("adjusted"):
+            leverage_adjustment_rows.append(
+                {
+                    "timestamp": timestamp,
+                    "requested_position": cap_meta.get("requested_position"),
+                    "capped_position": cap_meta.get("capped_position"),
+                    "leverage_cap": cap_meta.get("leverage_cap"),
+                }
+            )
+
+        turnover = abs(capped_target - previous_position)
+        fee_cash = max(prev_equity, 0.0) * turnover * float(fee_rate)
+        slippage_cash = max(prev_equity, 0.0) * turnover * float(slippage_rates.iloc[loc])
+        total_fees_paid += fee_cash
+        total_slippage_paid += slippage_cash
+        ending_equity = max(total_equity_before_trade - fee_cash - slippage_cash, 0.0)
+
+        post_notional = abs(capped_target) * ending_equity
+        post_leverage_cap, _ = _resolve_futures_leverage_cap(post_notional, futures_account)
+        post_leverage_cap = max(1.0, float(post_leverage_cap))
+        if margin_mode == "isolated" and post_notional > 0.0 and ending_equity > 0.0:
+            isolated_margin_posted = min(post_notional / post_leverage_cap, ending_equity)
+        else:
+            isolated_margin_posted = 0.0
+
+        actual_position.iloc[loc] = float(capped_target)
+        equity_curve.iloc[loc] = float(ending_equity)
+        strat_ret.iloc[loc] = float((ending_equity / prev_equity) - 1.0) if prev_equity > 0.0 else 0.0
+        unrealized_pnl_series.iloc[loc] = float(unrealized_pnl)
+        position_notional_series.iloc[loc] = float(observed_notional if observed_notional > 0.0 else post_notional)
+        initial_margin_series.iloc[loc] = float(observed_initial_margin if observed_initial_margin > 0.0 else (post_notional / post_leverage_cap if post_notional > 0.0 else 0.0))
+        maintenance_margin_series.iloc[loc] = float(observed_maintenance_margin)
+        margin_balance_series.iloc[loc] = float(observed_margin_balance if observed_margin_balance > 0.0 else (ending_equity if margin_mode == "cross" and post_notional > 0.0 else 0.0))
+        margin_ratio_series.iloc[loc] = float(observed_margin_ratio)
+        leverage_cap_series.iloc[loc] = float(post_leverage_cap if post_notional > 0.0 else futures_account.get("configured_leverage", 1.0))
+        realized_leverage_series.iloc[loc] = float(abs(capped_target))
+
+        prev_equity = float(ending_equity)
+        previous_position = float(capped_target)
+
+    trade_ledger = _build_trade_ledger(strat_ret, actual_position, execution_series)
+    execution_summary = dict(execution_report or {})
+    if leverage_adjustment_rows:
+        execution_summary["adjusted_orders"] = int(execution_summary.get("adjusted_orders", 0)) + len(leverage_adjustment_rows)
+    futures_account_report = {
+        "account_model": "futures_margin",
+        "futures_margin_mode": margin_mode,
+        "futures_contract": futures_account.get("contract_spec") or {},
+        "futures_bracket_count": int(len(futures_account.get("leverage_brackets") or [])),
+        "liquidation_event_count": int(len(liquidation_rows)),
+        "liquidation_fee_paid": _round_metric(total_liquidation_fees, 2),
+        "liquidation_events": pd.DataFrame(liquidation_rows),
+        "margin_ratio_series": margin_ratio_series,
+        "margin_balance_series": margin_balance_series,
+        "maintenance_margin_series": maintenance_margin_series,
+        "initial_margin_series": initial_margin_series,
+        "position_notional_series": position_notional_series,
+        "unrealized_pnl_series": unrealized_pnl_series,
+        "realized_leverage_series": realized_leverage_series,
+        "max_margin_ratio": _round_metric(float(margin_ratio_series.max()) if len(margin_ratio_series) > 0 else 0.0, 6),
+        "warning_margin_ratio": float(warning_ratio),
+        "bars_above_margin_warning": int(bars_above_warning),
+        "bars_above_margin_warning_rate": _round_metric(float((margin_ratio_series >= warning_ratio).mean()) if len(margin_ratio_series) > 0 else 0.0, 6),
+        "max_realized_leverage": _round_metric(float(realized_leverage_series.max()) if len(realized_leverage_series) > 0 else 0.0, 6),
+        "avg_realized_leverage": _round_metric(float(realized_leverage_series.mean()) if len(realized_leverage_series) > 0 else 0.0, 6),
+        "leverage_cap_adjustments": int(len(leverage_adjustment_rows)),
+        "leverage_cap_adjustment_log": pd.DataFrame(leverage_adjustment_rows),
+    }
+
+    return _summarize_backtest(
+        equity_curve=equity_curve,
+        strat_ret=strat_ret,
+        position=actual_position,
+        execution_series=execution_series,
+        equity=equity,
+        fees_paid=total_fees_paid,
+        slippage_paid=total_slippage_paid,
+        signal_delay_bars=signal_delay_bars,
+        trade_ledger=trade_ledger,
+        funding_pnl=total_funding_pnl,
+        engine="pandas",
+        significance=significance,
+        benchmark_returns=benchmark_returns,
+        benchmark_sharpe=benchmark_sharpe,
+        execution_report=execution_summary,
+        futures_account_report=futures_account_report,
+    )
+
+
 def _max_drawdown_duration(equity_curve, peak):
     if not isinstance(equity_curve.index, pd.DatetimeIndex):
         return 0, pd.Timedelta(0)
@@ -763,7 +1118,7 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
                         fees_paid, slippage_paid, signal_delay_bars, trade_ledger,
                         funding_pnl=0.0, engine="pandas", significance=None,
                         benchmark_returns=None, benchmark_sharpe=None,
-                        execution_report=None):
+                        execution_report=None, futures_account_report=None):
     prev_equity = equity_curve.shift(1).fillna(equity)
     pnl = equity_curve - prev_equity
 
@@ -886,6 +1241,8 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
                 "price_fill_actions": execution_report.get("price_fill_actions", {}),
             }
         )
+    if futures_account_report is not None:
+        summary.update(dict(futures_account_report))
     return summary
 
 
@@ -1013,7 +1370,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  benchmark_sharpe=None, volume=None, slippage_model=None,
                  orderbook_depth=None, execution_price_policy="strict",
                  execution_price_fill_limit=None, valuation_price_policy="drop_rows",
-                 valuation_price_fill_limit=None):
+                 valuation_price_fill_limit=None, futures_account=None,
+                 futures_contract=None, futures_leverage_brackets=None):
     """Run a backtest through the configured execution adapter.
 
     Parameters
@@ -1125,6 +1483,34 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     valuation_series = execution_report["valuation_series"]
     execution_series = execution_report["execution_series"]
     executable_position = execution_report["position"]
+
+    resolved_futures_account = _normalize_futures_account_config(
+        futures_account=futures_account,
+        market=market,
+        leverage=leverage,
+        contract_spec=futures_contract,
+        leverage_brackets=futures_leverage_brackets,
+    )
+    if resolved_futures_account is not None:
+        return _run_futures_account_backtest(
+            close=valuation_series,
+            position=executable_position,
+            equity=equity,
+            fee_rate=fee_rate,
+            slippage_rate=slippage_rate,
+            execution_prices=execution_series,
+            signal_delay_bars=signal_delay_bars,
+            market=market,
+            futures_account=resolved_futures_account,
+            funding_rates=funding_rates,
+            significance=significance,
+            benchmark_returns=benchmark_returns,
+            benchmark_sharpe=benchmark_sharpe,
+            volume=volume,
+            slippage_model=slippage_model,
+            orderbook_depth=orderbook_depth,
+            execution_report=execution_report,
+        )
 
     selected_engine = (engine or "vectorbt").lower()
     if selected_engine == "vectorbt":

@@ -1,6 +1,6 @@
 """Feature engineering: fractional differentiation, stationarity, derived features."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -9,6 +9,18 @@ from statsmodels.tsa.stattools import adfuller
 
 BASE_COLUMNS = {"open", "high", "low", "close", "volume", "quote_volume", "trades"}
 DEFAULT_STATIONARITY_TRANSFORM_ORDER = ("log_diff", "pct_change", "diff", "zscore", "frac_diff")
+ENDOGENOUS_FEATURE_FAMILIES = frozenset({"endogenous_price", "indicator"})
+CONTEXT_FEATURE_FAMILIES = frozenset({"futures_context", "cross_asset", "custom_exogenous"})
+_INDICATOR_BLOCKS = frozenset({"rsi", "macd", "bollinger", "atr", "fvg", "generic_indicator", "indicator_interactions"})
+_BLOCK_TO_FAMILY = {
+    "price_volume": "endogenous_price",
+    "multi_timeframe": "endogenous_price",
+    "regime": "endogenous_price",
+    "futures_context": "futures_context",
+    "cross_asset_context": "cross_asset",
+    "exogenous_context": "custom_exogenous",
+    "custom_exogenous": "custom_exogenous",
+}
 
 
 @dataclass
@@ -22,13 +34,62 @@ class FeatureBlock:
 class BuiltFeatureSet:
     frame: pd.DataFrame
     feature_blocks: dict[str, str]
+    feature_families: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class FeatureScreeningResult:
     frame: pd.DataFrame
     feature_blocks: dict[str, str]
-    report: dict
+    report: dict = field(default_factory=dict)
+    feature_families: dict[str, str] = field(default_factory=dict)
+
+
+def resolve_feature_family(block_name):
+    normalized = str(block_name or "unknown")
+    if normalized in ENDOGENOUS_FEATURE_FAMILIES or normalized in CONTEXT_FEATURE_FAMILIES:
+        return normalized
+    if normalized in _INDICATOR_BLOCKS:
+        return "indicator"
+    if normalized.startswith("custom") or normalized.startswith("exo"):
+        return "custom_exogenous"
+    return _BLOCK_TO_FAMILY.get(normalized, "unknown")
+
+
+def derive_feature_families(feature_blocks, columns=None):
+    blocks = dict(feature_blocks or {})
+    selected_columns = list(columns) if columns is not None else list(blocks)
+    return {
+        column: resolve_feature_family(blocks.get(column, "unknown"))
+        for column in selected_columns
+    }
+
+
+def summarize_feature_families(feature_blocks, columns=None):
+    feature_families = derive_feature_families(feature_blocks, columns=columns)
+    counts = pd.Series(list(feature_families.values()), dtype="object")
+    family_counts = {}
+    if not counts.empty:
+        family_counts = {
+            family: int(count)
+            for family, count in counts.value_counts().sort_index().items()
+        }
+
+    selected_families = sorted(family_counts)
+    context_families = sorted(
+        family
+        for family in selected_families
+        if family in CONTEXT_FEATURE_FAMILIES
+    )
+    return {
+        "feature_count": int(len(feature_families)),
+        "selected_families": selected_families,
+        "selected_family_counts": family_counts,
+        "context_families": context_families,
+        "context_feature_count": int(sum(family_counts.get(family, 0) for family in CONTEXT_FEATURE_FAMILIES)),
+        "endogenous_only": bool(selected_families) and set(selected_families).issubset(ENDOGENOUS_FEATURE_FAMILIES),
+        "feature_families": feature_families,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -428,13 +489,13 @@ def _extract_exogenous_numeric_features(df, excluded_columns, rolling_window=20)
         if column not in excluded_columns and pd.api.types.is_numeric_dtype(df[column])
     ]
     if not exogenous_columns:
-        return _as_feature_block(pd.DataFrame(index=df.index), [], block_name="exogenous_context")
+        return _as_feature_block(pd.DataFrame(index=df.index), [], block_name="custom_exogenous")
 
     result = type(
         "ExogenousContextResult",
         (),
         {
-            "kind": "exogenous_context",
+            "kind": "custom_exogenous",
             "metadata": {"output_columns": exogenous_columns},
         },
     )()
@@ -610,6 +671,7 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None,
     reference_features = features if fit_features is None else fit_features.reindex(columns=features.columns)
     if not config.get("enabled", True):
         blocks = dict(feature_blocks or {})
+        family_summary = summarize_feature_families(blocks, columns=features.columns)
         summary = {
             "enabled": False,
             "total_features": int(features.shape[1]),
@@ -622,11 +684,19 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None,
             "dropped_unrepaired": 0,
             "transform_usage": {},
             "block_feature_counts": {},
+            "family_feature_counts": family_summary["selected_family_counts"],
         }
         return FeatureScreeningResult(
             frame=features.copy(),
             feature_blocks=blocks,
-            report={"summary": summary, "features": {}, "transformed_features": [], "dropped_features": []},
+            feature_families=family_summary["feature_families"],
+            report={
+                "summary": summary,
+                "family_summary": family_summary,
+                "features": {},
+                "transformed_features": [],
+                "dropped_features": [],
+            },
         )
 
     significance = config.get("significance", 0.05)
@@ -793,13 +863,22 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None,
             for block, count in block_counts.value_counts().sort_index().items()
         }
 
+    family_summary = summarize_feature_families(kept_blocks, columns=screened.columns)
+    summary["family_feature_counts"] = family_summary["selected_family_counts"]
+
     report = {
         "summary": summary,
+        "family_summary": family_summary,
         "features": reports,
         "transformed_features": transformed_features,
         "dropped_features": dropped_features,
     }
-    return FeatureScreeningResult(frame=screened, feature_blocks=kept_blocks, report=report)
+    return FeatureScreeningResult(
+        frame=screened,
+        feature_blocks=kept_blocks,
+        feature_families=family_summary["feature_families"],
+        report=report,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -810,7 +889,8 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None,
 class FeatureSelectionResult:
     frame: pd.DataFrame
     feature_blocks: dict[str, str]
-    report: dict
+    report: dict = field(default_factory=dict)
+    feature_families: dict[str, str] = field(default_factory=dict)
 
 
 def select_features(features, y, feature_blocks=None, config=None):
@@ -834,10 +914,18 @@ def select_features(features, y, feature_blocks=None, config=None):
     feature_blocks = dict(feature_blocks or {})
 
     if not config.get("enabled", True):
+        family_summary = summarize_feature_families(feature_blocks, columns=features.columns)
         return FeatureSelectionResult(
             frame=features.copy(),
             feature_blocks=dict(feature_blocks),
-            report={"enabled": False, "input_features": features.shape[1], "selected_features": features.shape[1]},
+            feature_families=family_summary["feature_families"],
+            report={
+                "enabled": False,
+                "input_features": features.shape[1],
+                "selected_features": features.shape[1],
+                "input_family_summary": family_summary,
+                "selected_family_summary": family_summary,
+            },
         )
 
     common = features.index.intersection(y.index)
@@ -849,11 +937,19 @@ def select_features(features, y, feature_blocks=None, config=None):
     y_clean = y_aligned.loc[clean_mask]
 
     if X_clean.empty or len(X_clean) < 50:
+        family_summary = summarize_feature_families(feature_blocks, columns=features.columns)
         return FeatureSelectionResult(
             frame=features.copy(),
             feature_blocks=dict(feature_blocks),
-            report={"enabled": True, "input_features": features.shape[1], "selected_features": features.shape[1],
-                    "error": "insufficient_clean_rows"},
+            feature_families=family_summary["feature_families"],
+            report={
+                "enabled": True,
+                "input_features": features.shape[1],
+                "selected_features": features.shape[1],
+                "error": "insufficient_clean_rows",
+                "input_family_summary": family_summary,
+                "selected_family_summary": family_summary,
+            },
         )
 
     X_filled = X_clean.fillna(0.0)
@@ -874,6 +970,8 @@ def select_features(features, y, feature_blocks=None, config=None):
 
     selected_blocks = {col: feature_blocks.get(col, "unknown") for col in selected_columns}
     selected_frame = features[selected_columns].copy()
+    input_family_summary = summarize_feature_families(feature_blocks, columns=features.columns)
+    selected_family_summary = summarize_feature_families(selected_blocks, columns=selected_columns)
 
     report = {
         "enabled": True,
@@ -883,8 +981,15 @@ def select_features(features, y, feature_blocks=None, config=None):
         "min_mi_threshold": min_mi,
         "top_mi_scores": {col: round(float(mi_series[col]), 6) for col in selected_columns[:20]},
         "dropped_columns": [col for col in features.columns if col not in selected_columns],
+        "input_family_summary": input_family_summary,
+        "selected_family_summary": selected_family_summary,
     }
-    return FeatureSelectionResult(frame=selected_frame, feature_blocks=selected_blocks, report=report)
+    return FeatureSelectionResult(
+        frame=selected_frame,
+        feature_blocks=selected_blocks,
+        feature_families=selected_family_summary["feature_families"],
+        report=report,
+    )
 
 
 def build_feature_set(
@@ -973,7 +1078,8 @@ def build_feature_set(
         lags=lags,
         feature_blocks=feature_blocks,
     )
-    return BuiltFeatureSet(frame=features, feature_blocks=feature_blocks)
+    feature_families = derive_feature_families(feature_blocks, columns=features.columns)
+    return BuiltFeatureSet(frame=features, feature_blocks=feature_blocks, feature_families=feature_families)
 
 
 # ---------------------------------------------------------------------------

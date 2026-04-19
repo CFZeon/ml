@@ -15,8 +15,21 @@ from .context import (
     fetch_binance_futures_context,
     fetch_context_symbol_bars,
 )
-from .data import fetch_binance_bars, fetch_binance_symbol_filters, join_custom_data
-from .features import build_feature_set, check_stationarity, screen_features_for_stationarity, select_features
+from .data import (
+    fetch_binance_bars,
+    fetch_binance_futures_contract_spec,
+    fetch_binance_symbol_filters,
+    join_custom_data,
+    load_futures_leverage_brackets,
+)
+from .features import (
+    build_feature_set,
+    check_stationarity,
+    derive_feature_families,
+    screen_features_for_stationarity,
+    select_features,
+    summarize_feature_families,
+)
 from .indicators import run_indicators
 from .labeling import (
     fixed_horizon_labels,
@@ -31,11 +44,13 @@ from .models import (
     ConstantProbabilityModel,
     build_meta_feature_frame,
     compute_feature_block_diagnostics,
+    compute_feature_family_diagnostics,
     detect_regime,
     evaluate_model,
     fit_binary_probability_calibrator,
     predict_probability_frame,
     summarize_feature_block_diagnostics,
+    summarize_feature_family_diagnostics,
     train_meta_model,
     train_model,
     walk_forward_split,
@@ -341,6 +356,43 @@ def _resolve_backtest_funding_rates(pipeline, index):
     return funding_frame["funding_rate"].reindex(index).fillna(0.0)
 
 
+def _resolve_backtest_futures_account(pipeline):
+    market = _resolve_backtest_market(pipeline)
+    if market == "spot":
+        return None
+
+    backtest_config = pipeline.section("backtest") or {}
+    configured = dict(backtest_config.get("futures_account", {}) or {})
+    if not configured:
+        return None
+
+    if configured.get("contract_spec") is None and pipeline.state.get("futures_contract_spec"):
+        configured["contract_spec"] = pipeline.state.get("futures_contract_spec")
+
+    cached_brackets = pipeline.state.get("futures_leverage_brackets")
+    if configured.get("leverage_brackets") is None:
+        if cached_brackets is not None:
+            configured["leverage_brackets"] = cached_brackets
+        else:
+            leverage_brackets_data = configured.get("leverage_brackets_data")
+            leverage_brackets_path = configured.get("leverage_brackets_path")
+            use_signed_endpoint = bool(configured.get("use_signed_leverage_brackets", False))
+            if leverage_brackets_data is not None or leverage_brackets_path is not None or use_signed_endpoint:
+                loaded_brackets = load_futures_leverage_brackets(
+                    symbol=pipeline.section("data").get("symbol", "BTCUSDT"),
+                    market=market,
+                    brackets=leverage_brackets_data,
+                    path=leverage_brackets_path,
+                    cache_dir=pipeline.section("data").get("cache_dir", ".cache"),
+                    use_signed_endpoint=use_signed_endpoint,
+                    api_key=configured.get("api_key"),
+                    api_secret=configured.get("api_secret"),
+                )
+                configured["leverage_brackets"] = loaded_brackets
+                pipeline.state["futures_leverage_brackets"] = loaded_brackets
+    return configured
+
+
 def _resolve_backtest_runtime_kwargs(pipeline, index):
     backtest_config = pipeline.section("backtest")
     market = _resolve_backtest_market(pipeline)
@@ -367,6 +419,8 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
                 benchmark_returns = pd.Series(frame[benchmark_price_column], copy=False).reindex(index).pct_change().fillna(0.0)
                 break
 
+    futures_account = _resolve_backtest_futures_account(pipeline)
+
     return {
         "engine": backtest_config.get("engine", "vectorbt"),
         "market": market,
@@ -384,6 +438,9 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "execution_price_fill_limit": backtest_config.get("execution_price_fill_limit"),
         "valuation_price_policy": backtest_config.get("valuation_price_policy", "drop_rows"),
         "valuation_price_fill_limit": backtest_config.get("valuation_price_fill_limit"),
+        "futures_account": futures_account,
+        "futures_contract": pipeline.state.get("futures_contract_spec"),
+        "futures_leverage_brackets": pipeline.state.get("futures_leverage_brackets"),
     }
 
 
@@ -602,13 +659,13 @@ def _align_and_drop_invalid_rows(X, y, labels=None, sample_weights=None):
     return X, y_series, label_frame, weight_series
 
 
-def _drop_all_nan_feature_columns(X, feature_blocks=None):
+def _drop_all_nan_feature_columns(X, feature_blocks=None, feature_families=None):
     if X is None or X.empty:
-        return X, dict(feature_blocks or {}), []
+        return X, dict(feature_blocks or {}), dict(feature_families or {}), []
 
     all_nan_columns = [column for column in X.columns if X[column].notna().sum() == 0]
     if not all_nan_columns:
-        return X, dict(feature_blocks or {}), []
+        return X, dict(feature_blocks or {}), dict(feature_families or {}), []
 
     filtered_X = X.drop(columns=all_nan_columns)
     filtered_blocks = {
@@ -616,7 +673,42 @@ def _drop_all_nan_feature_columns(X, feature_blocks=None):
         for column, block_name in dict(feature_blocks or {}).items()
         if column in filtered_X.columns
     }
-    return filtered_X, filtered_blocks, all_nan_columns
+    filtered_families = {
+        column: family_name
+        for column, family_name in dict(feature_families or {}).items()
+        if column in filtered_X.columns
+    }
+    return filtered_X, filtered_blocks, filtered_families, all_nan_columns
+
+
+def _summarize_fold_family_selection(fold_feature_selection):
+    if not fold_feature_selection:
+        return {
+            "selected_families": [],
+            "avg_selected_family_counts": {},
+            "endogenous_only_selected_any_fold": False,
+            "endogenous_only_selected_all_folds": False,
+        }
+
+    family_counts = {}
+    selected_families = set()
+    endogenous_flags = []
+    for row in fold_feature_selection:
+        family_summary = dict(row.get("family_summary") or {})
+        selected_families.update(family_summary.get("selected_families", []))
+        endogenous_flags.append(bool(family_summary.get("endogenous_only")))
+        for family, count in dict(family_summary.get("selected_family_counts", {})).items():
+            family_counts.setdefault(family, []).append(float(count))
+
+    return {
+        "selected_families": sorted(selected_families),
+        "avg_selected_family_counts": {
+            family: round(float(np.mean(counts)), 2)
+            for family, counts in sorted(family_counts.items())
+        },
+        "endogenous_only_selected_any_fold": any(endogenous_flags),
+        "endogenous_only_selected_all_folds": all(endogenous_flags),
+    }
 
 
 def _purge_overlapping_training_rows(X, y, labels, cutoff_timestamp, sample_weights=None):
@@ -921,6 +1013,139 @@ def _average_fold_metric(fold_metrics, key):
     if not values:
         return None
     return round(float(np.mean(values)), 4)
+
+
+def _resolve_validation_stability_policy(pipeline):
+    validation_config = pipeline.section("validation") or {}
+    configured = dict(validation_config.get("stability_policy", {}) or {})
+    if not configured and pipeline.section("model").get("stability_policy"):
+        configured = dict(pipeline.section("model").get("stability_policy") or {})
+
+    enabled = bool(configured.get("enabled", bool(configured)))
+    return {
+        "enabled": enabled,
+        "cv_metric": str(configured.get("cv_metric", "directional_accuracy")),
+        "max_cv": None if configured.get("max_cv") is None else float(configured.get("max_cv")),
+        "min_worst_fold_sharpe": (
+            None if configured.get("min_worst_fold_sharpe") is None else float(configured.get("min_worst_fold_sharpe"))
+        ),
+        "min_worst_fold_net_profit_pct": (
+            None
+            if configured.get("min_worst_fold_net_profit_pct") is None
+            else float(configured.get("min_worst_fold_net_profit_pct"))
+        ),
+        "max_drawdown_dispersion": (
+            None if configured.get("max_drawdown_dispersion") is None else float(configured.get("max_drawdown_dispersion"))
+        ),
+        "min_fold_count": max(2, int(configured.get("min_fold_count", 2))),
+    }
+
+
+def _compute_fold_metric_stats(rows, key):
+    values = [float(row[key]) for row in rows if row.get(key) is not None and np.isfinite(row.get(key))]
+    if not values:
+        return None
+
+    array = np.asarray(values, dtype=float)
+    std = float(np.std(array, ddof=1)) if len(array) > 1 else 0.0
+    mean = float(np.mean(array))
+    cv = None if abs(mean) <= 1e-12 else float(std / abs(mean))
+    return {
+        "count": int(len(array)),
+        "mean": round(mean, 6),
+        "std": round(std, 6),
+        "median": round(float(np.median(array)), 6),
+        "min": round(float(np.min(array)), 6),
+        "max": round(float(np.max(array)), 6),
+        "cv": None if cv is None else round(cv, 6),
+    }
+
+
+def _build_fold_stability_summary(fold_metrics, fold_backtests, policy=None):
+    metric_rows = list(fold_metrics or [])
+    backtest_rows = list(fold_backtests or [])
+    resolved_policy = dict(policy or {})
+
+    metrics = {}
+    for key in [
+        "accuracy",
+        "f1_macro",
+        "directional_accuracy",
+        "directional_f1_macro",
+        "log_loss",
+        "brier_score",
+        "calibration_error",
+    ]:
+        stats = _compute_fold_metric_stats(metric_rows, key)
+        if stats is not None:
+            metrics[key] = stats
+
+    for key in ["sharpe_ratio", "net_profit_pct", "max_drawdown", "total_trades"]:
+        stats = _compute_fold_metric_stats(backtest_rows, key)
+        if stats is not None:
+            metrics[key] = stats
+
+    primary_metric = resolved_policy.get("cv_metric") or "directional_accuracy"
+    if primary_metric not in metrics:
+        if "directional_accuracy" in metrics:
+            primary_metric = "directional_accuracy"
+        elif "accuracy" in metrics:
+            primary_metric = "accuracy"
+        elif metrics:
+            primary_metric = next(iter(metrics))
+
+    reasons = []
+    passed = True
+    fold_count = int(max(len(metric_rows), len(backtest_rows)))
+    if resolved_policy.get("enabled"):
+        if fold_count < int(resolved_policy.get("min_fold_count", 2)):
+            reasons.append("insufficient_folds")
+            passed = False
+
+        max_cv = resolved_policy.get("max_cv")
+        primary_stats = metrics.get(primary_metric, {})
+        primary_cv = primary_stats.get("cv")
+        if max_cv is not None and (primary_cv is None or not np.isfinite(primary_cv) or primary_cv > max_cv):
+            reasons.append(f"{primary_metric}_cv_above_limit")
+            passed = False
+
+        min_worst_fold_sharpe = resolved_policy.get("min_worst_fold_sharpe")
+        worst_fold_sharpe = metrics.get("sharpe_ratio", {}).get("min")
+        if min_worst_fold_sharpe is not None and (
+            worst_fold_sharpe is None or worst_fold_sharpe < min_worst_fold_sharpe
+        ):
+            reasons.append("worst_fold_sharpe_below_minimum")
+            passed = False
+
+        min_worst_fold_net_profit_pct = resolved_policy.get("min_worst_fold_net_profit_pct")
+        worst_fold_net_profit_pct = metrics.get("net_profit_pct", {}).get("min")
+        if min_worst_fold_net_profit_pct is not None and (
+            worst_fold_net_profit_pct is None or worst_fold_net_profit_pct < min_worst_fold_net_profit_pct
+        ):
+            reasons.append("worst_fold_net_profit_pct_below_minimum")
+            passed = False
+
+        max_drawdown_dispersion = resolved_policy.get("max_drawdown_dispersion")
+        drawdown_dispersion = metrics.get("max_drawdown", {}).get("std")
+        if max_drawdown_dispersion is not None and (
+            drawdown_dispersion is None or drawdown_dispersion > max_drawdown_dispersion
+        ):
+            reasons.append("max_drawdown_dispersion_above_limit")
+            passed = False
+
+    return {
+        "enabled": True,
+        "policy_enabled": bool(resolved_policy.get("enabled", False)),
+        "policy": resolved_policy,
+        "fold_count": fold_count,
+        "primary_metric": primary_metric,
+        "metrics": metrics,
+        "passed": passed,
+        "reasons": reasons,
+        "worst_fold_sharpe": metrics.get("sharpe_ratio", {}).get("min"),
+        "worst_fold_net_profit_pct": metrics.get("net_profit_pct", {}).get("min"),
+        "max_drawdown_dispersion": metrics.get("max_drawdown", {}).get("std"),
+    }
 
 
 def _position_size_from_profitability(probability, avg_win, avg_loss, signal_config):
@@ -1391,6 +1616,16 @@ class FetchDataStep(PipelineStep):
         except Exception:
             pipeline.state["symbol_filters"] = {}
 
+        if market != "spot":
+            try:
+                pipeline.state["futures_contract_spec"] = fetch_binance_futures_contract_spec(
+                    symbol=config.get("symbol", "BTCUSDT"),
+                    market=market,
+                    cache_dir=cache_dir,
+                )
+            except Exception:
+                pipeline.state["futures_contract_spec"] = {}
+
         if futures_context_config.get("enabled", True):
             pipeline.state["futures_context"] = fetch_binance_futures_context(
                 symbol=config.get("symbol", "BTCUSDT"),
@@ -1499,6 +1734,7 @@ class FeaturesStep(PipelineStep):
         )
         features = feature_set.frame
         feature_blocks = dict(feature_set.feature_blocks)
+        feature_families = dict(feature_set.feature_families)
 
         futures_context_block = build_futures_context_feature_block(
             raw_data,
@@ -1532,6 +1768,8 @@ class FeaturesStep(PipelineStep):
                 for column in features.columns
             }
 
+        feature_families = derive_feature_families(feature_blocks, columns=features.columns)
+
         screening_result = screen_features_for_stationarity(
             features,
             feature_blocks=feature_blocks,
@@ -1543,8 +1781,11 @@ class FeaturesStep(PipelineStep):
 
         pipeline.state["raw_features"] = features
         pipeline.state["feature_blocks_raw"] = feature_blocks
+        pipeline.state["feature_families_raw"] = feature_families
         pipeline.state["feature_screening"] = screening_report
         pipeline.state["feature_blocks"] = feature_blocks
+        pipeline.state["feature_families"] = feature_families
+        pipeline.state["feature_family_summary"] = summarize_feature_families(feature_blocks, columns=features.columns)
         pipeline.state["features"] = features
         return features
 
@@ -1681,13 +1922,18 @@ class AlignDataStep(PipelineStep):
         labels = pipeline.require("labels")
         label_column = pipeline.section("labels").get("label_column", "label")
         feature_blocks = pipeline.state.get("feature_blocks", {})
+        feature_families = pipeline.state.get("feature_families") or derive_feature_families(feature_blocks)
 
         common = features.index.intersection(labels.index)
         X = features.loc[common].copy()
         y = labels.loc[common, label_column].copy()
         labels_aligned = labels.loc[common].copy()
 
-        X, feature_blocks, dropped_columns = _drop_all_nan_feature_columns(X, feature_blocks)
+        X, feature_blocks, feature_families, dropped_columns = _drop_all_nan_feature_columns(
+            X,
+            feature_blocks,
+            feature_families,
+        )
 
         mask = X.notna().all(axis=1) & y.notna()
         X = X.loc[mask]
@@ -1695,6 +1941,8 @@ class AlignDataStep(PipelineStep):
         labels_aligned = labels_aligned.loc[mask]
 
         pipeline.state["feature_blocks"] = feature_blocks
+        pipeline.state["feature_families"] = feature_families
+        pipeline.state["feature_family_summary"] = summarize_feature_families(feature_blocks, columns=X.columns)
         if dropped_columns:
             report = dict(pipeline.state.get("feature_screening", {}))
             report.setdefault("alignment", {})["dropped_all_nan_columns"] = dropped_columns
@@ -1721,6 +1969,10 @@ class FeatureSelectionStep(PipelineStep):
             "max_features": config.get("max_features"),
             "min_mi_threshold": float(config.get("min_mi_threshold", 0.0)),
             "note": "Supervised feature selection is applied inside each validation split.",
+            "input_family_summary": summarize_feature_families(
+                pipeline.state.get("feature_blocks", {}),
+                columns=X.columns,
+            ),
         }
         pipeline.state["feature_selection"] = report
         return type("FeatureSelectionPreview", (), {"report": report})()
@@ -1758,6 +2010,7 @@ class TrainModelsStep(PipelineStep):
         shrinkage_alpha = float(signal_config.get("shrinkage_alpha", 0.5))
         close_all = raw_data["close"]
         validation_method = _resolve_validation_method(config)
+        stability_policy = _resolve_validation_stability_policy(pipeline)
         validation_details = {"method": validation_method}
         if validation_method == "cpcv":
             validation_details.update(
@@ -1776,7 +2029,9 @@ class TrainModelsStep(PipelineStep):
             )
 
         fold_metrics = []
+        fold_backtests = []
         fold_block_diagnostics = []
+        fold_family_diagnostics = []
         fold_feature_selection = []
         fold_signal_tuning = []
         fold_stationarity = []
@@ -1949,6 +2204,8 @@ class TrainModelsStep(PipelineStep):
                     else:
                         selected_columns = list(X_fit.columns)
 
+            family_summary = summarize_feature_families(fold_feature_blocks, columns=selected_columns)
+
             X_fit_model = X_fit.loc[:, selected_columns]
             X_test_model = X_test.loc[:, selected_columns]
             X_val_model = X_val.loc[:, selected_columns] if X_val is not None else None
@@ -1960,6 +2217,8 @@ class TrainModelsStep(PipelineStep):
                     "input_features": int(X_train.shape[1]),
                     "selected_features": int(len(selected_columns)),
                     "top_mi_scores": (selection_result.report.get("top_mi_scores", {}) if selection_result is not None else {}),
+                    "family_summary": family_summary,
+                    "endogenous_only_selected": family_summary.get("endogenous_only", False),
                 }
             )
 
@@ -2175,6 +2434,16 @@ class TrainModelsStep(PipelineStep):
                 baseline_metrics=metrics,
             )
             fold_block_diagnostics.append(block_diagnostics)
+            fold_family_diagnostics.append(
+                compute_feature_family_diagnostics(
+                    model,
+                    X_train_primary,
+                    X_test_model,
+                    y_test,
+                    feature_blocks=fold_feature_blocks,
+                    baseline_metrics=metrics,
+                )
+            )
 
             X_meta_test = build_meta_feature_frame(
                 test_primary_preds,
@@ -2204,7 +2473,38 @@ class TrainModelsStep(PipelineStep):
                 kelly_trade_count=prior_oos_trade_count,
             )
 
+            fold_backtest = None
+            fold_close = _resolve_backtest_valuation_close(pipeline, X_test_model.index)
+            if fold_close is not None and len(fold_close) > 0:
+                fold_execution_prices = _resolve_backtest_execution_prices(pipeline, X_test_model.index)
+                fold_backtest = run_backtest(
+                    close=fold_close.loc[signal_state["continuous_signals"].index],
+                    signals=signal_state["continuous_signals"],
+                    equity=backtest_config.get("equity", 10_000.0),
+                    fee_rate=backtest_config.get("fee_rate", 0.001),
+                    slippage_rate=backtest_config.get("slippage_rate", 0.0),
+                    signal_delay_bars=_resolve_signal_delay_bars(backtest_config),
+                    execution_prices=(
+                        fold_execution_prices.loc[signal_state["continuous_signals"].index]
+                        if fold_execution_prices is not None
+                        else None
+                    ),
+                    **(_resolve_backtest_runtime_kwargs(pipeline, X_test_model.index) or {}),
+                )
+
             fold_metrics.append(metrics)
+            if fold_backtest is not None:
+                fold_backtests.append(
+                    {
+                        "fold": fold,
+                        "split_id": split_id,
+                        "validation_method": validation_method,
+                        "net_profit_pct": fold_backtest.get("net_profit_pct"),
+                        "sharpe_ratio": fold_backtest.get("sharpe_ratio"),
+                        "max_drawdown": fold_backtest.get("max_drawdown"),
+                        "total_trades": fold_backtest.get("total_trades"),
+                    }
+                )
             fold_signal_tuning.append(
                 {
                     "fold": fold,
@@ -2314,7 +2614,15 @@ class TrainModelsStep(PipelineStep):
             oos_continuous_signals = None
             oos_signals = None
         feature_diagnostics = summarize_feature_block_diagnostics(fold_block_diagnostics)
+        feature_family_diagnostics = summarize_feature_family_diagnostics(fold_family_diagnostics)
+        feature_family_selection = _summarize_fold_family_selection(fold_feature_selection)
+        fold_stability = _build_fold_stability_summary(
+            fold_metrics,
+            fold_backtests,
+            policy=stability_policy,
+        )
         validation_details["split_count"] = int(len(fold_metrics))
+        validation_details["stability_policy"] = stability_policy
 
         # Estimate avg_win / avg_loss from OOS execution-aligned trade outcomes
         oos_avg_win = None
@@ -2342,6 +2650,8 @@ class TrainModelsStep(PipelineStep):
             "avg_brier_score": avg_brier_score,
             "avg_calibration_error": avg_calibration_error,
             "validation": validation_details,
+            "fold_backtests": fold_backtests,
+            "fold_stability": fold_stability,
             "headline_metrics": {
                 "directional_accuracy": avg_directional_accuracy if avg_directional_accuracy is not None else avg_accuracy,
                 "log_loss": avg_log_loss,
@@ -2383,6 +2693,7 @@ class TrainModelsStep(PipelineStep):
             "oos_continuous_signals": oos_continuous_signals,
             "oos_signals": oos_signals,
             "feature_block_diagnostics": feature_diagnostics,
+            "feature_family_diagnostics": feature_family_diagnostics,
             "regime": {
                 "mode": "fold_local",
                 "folds": fold_regime,
@@ -2395,6 +2706,10 @@ class TrainModelsStep(PipelineStep):
                 "enabled": bool(selection_config.get("enabled", True)),
                 "mode": "fold_local",
                 "avg_selected_features": round(float(np.mean([row["selected_features"] for row in fold_feature_selection])), 2),
+                "selected_families": feature_family_selection["selected_families"],
+                "avg_selected_family_counts": feature_family_selection["avg_selected_family_counts"],
+                "endogenous_only_selected_any_fold": feature_family_selection["endogenous_only_selected_any_fold"],
+                "endogenous_only_selected_all_folds": feature_family_selection["endogenous_only_selected_all_folds"],
                 "folds": fold_feature_selection,
             },
             "bootstrap": {

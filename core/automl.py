@@ -387,6 +387,7 @@ def _summarize_training(training):
             "warning_count": bootstrap.get("warning_count"),
             "folds": bootstrap.get("folds", []),
         },
+        "fold_stability": training.get("fold_stability"),
         "fold_count": len(training.get("fold_metrics", [])),
     }
 
@@ -621,6 +622,9 @@ def _resolve_overfitting_control(automl_config=None):
             "test_blocks": pbo_config.get("test_blocks"),
             "min_block_size": int(pbo_config.get("min_block_size", 5)),
             "metric": str(pbo_config.get("metric", "sharpe_ratio")).lower(),
+            "overlap_policy": str(pbo_config.get("overlap_policy", "strict_intersection")).lower(),
+            "min_overlap_fraction": float(pbo_config.get("min_overlap_fraction", 0.5)),
+            "min_overlap_observations": pbo_config.get("min_overlap_observations"),
         },
     }
 
@@ -726,6 +730,7 @@ def _resolve_selection_policy(automl_config=None):
             "max_feature_count_ratio": float("inf"),
             "max_trials_per_model_family": int(1e9),
             "local_perturbation_limit": 0,
+            "require_fold_stability_pass": False,
         }
     return {
         "enabled": True,
@@ -738,6 +743,20 @@ def _resolve_selection_policy(automl_config=None):
         "max_feature_count_ratio": float(policy.get("max_feature_count_ratio", 1.0)),
         "max_trials_per_model_family": int(policy.get("max_trials_per_model_family", 64)),
         "local_perturbation_limit": int(policy.get("local_perturbation_limit", 8)),
+        "require_fold_stability_pass": bool(policy.get("require_fold_stability_pass", True)),
+    }
+
+
+def _resolve_fold_stability_gate(training_summary, selection_policy):
+    stability = dict((training_summary or {}).get("fold_stability") or {})
+    policy_enabled = bool(stability.get("policy_enabled", False))
+    applies = bool(selection_policy.get("require_fold_stability_pass", True) and policy_enabled)
+    return {
+        "policy_enabled": policy_enabled,
+        "applies": applies,
+        "passed": bool(stability.get("passed", True)),
+        "reasons": list(stability.get("reasons", [])),
+        "summary": stability,
     }
 
 
@@ -1193,8 +1212,54 @@ def _build_trial_return_frame(trial_records):
 
     aligned = {}
     for trial_number, returns in clipped.items():
-        aligned[trial_number] = returns.reindex(common_index).fillna(0.0).astype(float)
+        aligned[trial_number] = returns.reindex(common_index).astype(float)
     return pd.DataFrame(aligned, index=common_index)
+
+
+def _summarize_pairwise_overlap(coverage_frame, min_overlap_fraction=0.0, min_overlap_observations=0):
+    coverage = pd.DataFrame(coverage_frame, copy=False).fillna(False).astype(bool)
+    overlap_counts = []
+    overlap_fractions = []
+    insufficient_pairs = 0
+
+    for left, right in combinations(list(coverage.columns), 2):
+        left_mask = coverage[left]
+        right_mask = coverage[right]
+        union_count = int((left_mask | right_mask).sum())
+        if union_count <= 0:
+            continue
+
+        overlap_count = int((left_mask & right_mask).sum())
+        overlap_fraction = float(overlap_count / union_count)
+        overlap_counts.append(overlap_count)
+        overlap_fractions.append(overlap_fraction)
+        if overlap_count < int(min_overlap_observations) or overlap_fraction < float(min_overlap_fraction):
+            insufficient_pairs += 1
+
+    if not overlap_counts:
+        return {
+            "pair_count": 0,
+            "min_count": None,
+            "median_count": None,
+            "max_count": None,
+            "min_fraction": None,
+            "median_fraction": None,
+            "max_fraction": None,
+            "insufficient_pair_count": 0,
+            "sufficient": False,
+        }
+
+    return {
+        "pair_count": int(len(overlap_counts)),
+        "min_count": int(np.min(overlap_counts)),
+        "median_count": float(np.median(overlap_counts)),
+        "max_count": int(np.max(overlap_counts)),
+        "min_fraction": float(np.min(overlap_fractions)),
+        "median_fraction": float(np.median(overlap_fractions)),
+        "max_fraction": float(np.max(overlap_fractions)),
+        "insufficient_pair_count": int(insufficient_pairs),
+        "sufficient": bool(insufficient_pairs == 0),
+    }
 
 
 def _estimate_effective_trial_count(trial_return_frame):
@@ -1234,11 +1299,23 @@ def _score_return_window(returns, metric="sharpe_ratio"):
     return float(series.mean() / volatility)
 
 
-def compute_cpcv_pbo(trial_return_frame, n_blocks=8, test_blocks=None, min_block_size=5, metric="sharpe_ratio"):
+def compute_cpcv_pbo(
+    trial_return_frame,
+    n_blocks=8,
+    test_blocks=None,
+    min_block_size=5,
+    metric="sharpe_ratio",
+    overlap_policy="strict_intersection",
+    min_overlap_fraction=0.5,
+    min_overlap_observations=None,
+):
     report = {
         "enabled": False,
         "reason": None,
         "metric": (metric or "sharpe_ratio").lower(),
+        "overlap_policy": str(overlap_policy or "strict_intersection").lower(),
+        "min_overlap_fraction": float(min_overlap_fraction),
+        "min_overlap_observations": None if min_overlap_observations is None else int(min_overlap_observations),
         "trial_count": int(getattr(trial_return_frame, "shape", [0, 0])[1]) if trial_return_frame is not None else 0,
         "path_rows": int(getattr(trial_return_frame, "shape", [0, 0])[0]) if trial_return_frame is not None else 0,
         "block_count": 0,
@@ -1250,15 +1327,69 @@ def compute_cpcv_pbo(trial_return_frame, n_blocks=8, test_blocks=None, min_block
         "lambda_min": None,
         "lambda_max": None,
         "oos_top_half_rate": None,
+        "strict_overlap_rows": 0,
+        "strict_overlap_fraction": None,
+        "pairwise_overlap_min_fraction": None,
+        "pairwise_overlap_median_fraction": None,
+        "pairwise_overlap_max_fraction": None,
+        "pairwise_overlap_min_count": None,
+        "pairwise_overlap_median_count": None,
+        "pairwise_overlap_max_count": None,
+        "excluded_low_overlap_split_count": 0,
+        "excluded_low_overlap_trial_pairs": 0,
     }
 
     if trial_return_frame is None or trial_return_frame.empty or trial_return_frame.shape[1] < 2:
         report["reason"] = "insufficient_trials"
         return report
 
-    frame = trial_return_frame.astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    overlap_policy = report["overlap_policy"]
+    if overlap_policy not in {"strict_intersection", "pairwise_overlap", "zero_fill_debug"}:
+        report["reason"] = "unknown_overlap_policy"
+        return report
+
+    if min_overlap_observations is None:
+        min_overlap_observations = max(2, int(min_block_size))
+        report["min_overlap_observations"] = int(min_overlap_observations)
+
+    raw_frame = trial_return_frame.astype(float).replace([np.inf, -np.inf], np.nan)
+    raw_frame = raw_frame.dropna(axis=1, how="all")
+    if raw_frame.shape[1] < 2:
+        report["reason"] = "insufficient_trials"
+        return report
+
+    coverage = raw_frame.notna()
+    strict_overlap_rows = int(coverage.all(axis=1).sum())
+    report["strict_overlap_rows"] = strict_overlap_rows
+    report["strict_overlap_fraction"] = (
+        float(strict_overlap_rows / len(raw_frame))
+        if len(raw_frame) > 0
+        else None
+    )
+    overlap_summary = _summarize_pairwise_overlap(
+        coverage,
+        min_overlap_fraction=min_overlap_fraction,
+        min_overlap_observations=min_overlap_observations,
+    )
+    report["pairwise_overlap_min_fraction"] = overlap_summary["min_fraction"]
+    report["pairwise_overlap_median_fraction"] = overlap_summary["median_fraction"]
+    report["pairwise_overlap_max_fraction"] = overlap_summary["max_fraction"]
+    report["pairwise_overlap_min_count"] = overlap_summary["min_count"]
+    report["pairwise_overlap_median_count"] = overlap_summary["median_count"]
+    report["pairwise_overlap_max_count"] = overlap_summary["max_count"]
+
+    if overlap_policy == "strict_intersection":
+        if report["strict_overlap_fraction"] is not None and report["strict_overlap_fraction"] < float(min_overlap_fraction):
+            report["reason"] = "insufficient_overlap"
+            return report
+        frame = raw_frame.loc[coverage.all(axis=1)].copy()
+    elif overlap_policy == "pairwise_overlap":
+        frame = raw_frame.copy()
+    else:
+        frame = raw_frame.fillna(0.0).astype(float)
+
     if len(frame) < max(2, int(min_block_size) * 2):
-        report["reason"] = "insufficient_rows"
+        report["reason"] = "insufficient_overlap" if overlap_policy != "zero_fill_debug" else "insufficient_rows"
         return report
 
     block_count = int(max(2, min(int(n_blocks), len(frame))))
@@ -1282,11 +1413,30 @@ def compute_cpcv_pbo(trial_return_frame, n_blocks=8, test_blocks=None, min_block
 
     lambda_values = []
     logit_values = []
+    excluded_low_overlap_split_count = 0
+    excluded_low_overlap_trial_pairs = 0
     for test_combo in combinations(range(len(blocks)), test_block_count):
         test_positions = np.concatenate([blocks[idx] for idx in test_combo])
         train_positions = np.concatenate([blocks[idx] for idx in range(len(blocks)) if idx not in test_combo])
         if len(train_positions) == 0 or len(test_positions) == 0:
             continue
+
+        if overlap_policy == "pairwise_overlap":
+            train_overlap = _summarize_pairwise_overlap(
+                frame.iloc[train_positions].notna(),
+                min_overlap_fraction=min_overlap_fraction,
+                min_overlap_observations=min_overlap_observations,
+            )
+            test_overlap = _summarize_pairwise_overlap(
+                frame.iloc[test_positions].notna(),
+                min_overlap_fraction=min_overlap_fraction,
+                min_overlap_observations=min_overlap_observations,
+            )
+            excluded_pairs = int(train_overlap["insufficient_pair_count"] + test_overlap["insufficient_pair_count"])
+            if not train_overlap["sufficient"] or not test_overlap["sufficient"]:
+                excluded_low_overlap_split_count += 1
+                excluded_low_overlap_trial_pairs += excluded_pairs
+                continue
 
         in_sample_scores = frame.iloc[train_positions].apply(_score_return_window, metric=metric)
         out_of_sample_scores = frame.iloc[test_positions].apply(_score_return_window, metric=metric)
@@ -1303,6 +1453,14 @@ def compute_cpcv_pbo(trial_return_frame, n_blocks=8, test_blocks=None, min_block
         logit_values.append(float(np.log(relative_rank / (1.0 - relative_rank))))
 
     if not lambda_values:
+        report.update(
+            {
+                "block_count": int(len(blocks)),
+                "test_block_count": int(test_block_count),
+                "excluded_low_overlap_split_count": int(excluded_low_overlap_split_count),
+                "excluded_low_overlap_trial_pairs": int(excluded_low_overlap_trial_pairs),
+            }
+        )
         report["reason"] = "no_valid_splits"
         return report
 
@@ -1320,6 +1478,8 @@ def compute_cpcv_pbo(trial_return_frame, n_blocks=8, test_blocks=None, min_block
             "lambda_min": float(np.min(lambda_array)),
             "lambda_max": float(np.max(lambda_array)),
             "oos_top_half_rate": float(np.mean(lambda_array > 0.5)),
+            "excluded_low_overlap_split_count": int(excluded_low_overlap_split_count),
+            "excluded_low_overlap_trial_pairs": int(excluded_low_overlap_trial_pairs),
         }
     )
     return report
@@ -1400,6 +1560,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         )
         validation_trade_count = int((validation_metrics.get("backtest") or {}).get("total_trades") or 0)
         model_family = complexity["model_family"]
+        fold_stability_gate = _resolve_fold_stability_gate(validation_metrics.get("training") or {}, selection_policy)
         dsr_reason = deflated_sharpe.get("reason")
         dsr_gate_applies = bool(
             minimum_dsr_threshold is not None
@@ -1433,6 +1594,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 model_family_counts.get(model_family, 0)
                 <= selection_policy.get("max_trials_per_model_family", np.inf)
             ),
+            "fold_stability": bool(fold_stability_gate["passed"] or not fold_stability_gate["applies"]),
             "param_fragility": None,
             "locked_holdout": None,
             "locked_holdout_gap": None,
@@ -1452,6 +1614,8 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             eligibility_reasons.append("search_validation_gap_above_limit")
         if not eligibility_checks["model_family_trial_count"]:
             eligibility_reasons.append("model_family_trial_count_above_limit")
+        if not eligibility_checks["fold_stability"]:
+            eligibility_reasons.append("fold_stability_failed")
 
         trial_reports.append(
             {
@@ -1475,6 +1639,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                     "search_to_validation": search_gap,
                     "validation_to_locked_holdout": None,
                 },
+                "fold_stability": fold_stability_gate["summary"],
                 "param_fragility_score": None,
                 "param_fragility": None,
                 "locked_holdout": None,
@@ -1504,6 +1669,9 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             test_blocks=pbo_config["test_blocks"],
             min_block_size=pbo_config["min_block_size"],
             metric=pbo_config["metric"],
+            overlap_policy=pbo_config["overlap_policy"],
+            min_overlap_fraction=pbo_config["min_overlap_fraction"],
+            min_overlap_observations=pbo_config["min_overlap_observations"],
         )
     else:
         pbo_report = {
@@ -2168,6 +2336,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "selection_value": float(best_trial_report["selection_value"]),
         "trial_complexity_score": float(best_trial_report["trial_complexity_score"]),
         "feature_count_ratio": best_trial_report.get("feature_count_ratio"),
+        "fold_stability": best_trial_report.get("fold_stability"),
         "param_fragility_score": best_trial_report.get("param_fragility_score"),
         "generalization_gap": best_trial_report.get("generalization_gap"),
         "eligibility_reasons": best_trial_report["selection_policy"].get("eligibility_reasons", []),
@@ -2203,6 +2372,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 "meets_minimum_dsr_threshold": report["meets_minimum_dsr_threshold"],
                 "trial_complexity_score": report["trial_complexity_score"],
                 "feature_count_ratio": report.get("feature_count_ratio"),
+                "fold_stability": report.get("fold_stability"),
                 "generalization_gap": report.get("generalization_gap"),
                 "param_fragility_score": report.get("param_fragility_score"),
                 "param_fragility": report.get("param_fragility"),
@@ -2234,6 +2404,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "best_selection_policy": {
             "trial_complexity_score": best_trial_report["trial_complexity_score"],
             "feature_count_ratio": best_trial_report.get("feature_count_ratio"),
+            "fold_stability": best_trial_report.get("fold_stability"),
             "generalization_gap": best_trial_report.get("generalization_gap"),
             "param_fragility_score": best_trial_report.get("param_fragility_score"),
             "param_fragility": best_trial_report.get("param_fragility"),

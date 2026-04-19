@@ -1,9 +1,12 @@
+import io
 import unittest
+from contextlib import redirect_stdout
 
 import numpy as np
 import pandas as pd
 
 from core import ResearchPipeline, cpcv_split
+from example_utils import print_training_summary
 
 
 def _make_raw(n=320, seed=0, start="2026-01-01"):
@@ -123,6 +126,63 @@ class CPCVValidationTest(unittest.TestCase):
         self.assertIsInstance(training["oos_predictions"], pd.Series)
         self.assertGreater(len(training["oos_predictions"]), 0)
         self.assertEqual(signals["signal_source"], "walk_forward_oos")
+
+    def test_train_models_emits_fold_stability_diagnostics(self):
+        raw = _make_raw(n=320, seed=19)
+        pipeline = _make_pipeline(
+            raw,
+            {
+                "type": "gbm",
+                "n_blocks": 4,
+                "test_blocks": 2,
+                "validation_fraction": 0.2,
+                "meta_n_splits": 2,
+            },
+        )
+
+        training = pipeline.train_models()
+
+        self.assertGreaterEqual(len(training["fold_backtests"]), 1)
+        stability = training["fold_stability"]
+        self.assertTrue(stability["enabled"])
+        self.assertFalse(stability["policy_enabled"])
+        self.assertIn("directional_accuracy", stability["metrics"])
+        self.assertIn("sharpe_ratio", stability["metrics"])
+
+        directional_values = np.asarray(
+            [row["directional_accuracy"] for row in training["fold_metrics"] if row.get("directional_accuracy") is not None],
+            dtype=float,
+        )
+        expected_std = float(np.std(directional_values, ddof=1)) if len(directional_values) > 1 else 0.0
+        expected_cv = expected_std / abs(float(np.mean(directional_values))) if abs(float(np.mean(directional_values))) > 1e-12 else None
+        self.assertAlmostEqual(float(stability["metrics"]["directional_accuracy"]["std"]), expected_std, places=6)
+        if expected_cv is not None:
+            self.assertAlmostEqual(float(stability["metrics"]["directional_accuracy"]["cv"]), expected_cv, places=6)
+
+        worst_sharpe = min(float(row["sharpe_ratio"]) for row in training["fold_backtests"] if row.get("sharpe_ratio") is not None)
+        self.assertAlmostEqual(float(stability["worst_fold_sharpe"]), worst_sharpe, places=6)
+
+    def test_print_training_summary_displays_stability_diagnostics(self):
+        raw = _make_raw(n=320, seed=23)
+        pipeline = _make_pipeline(
+            raw,
+            {
+                "type": "gbm",
+                "n_blocks": 4,
+                "test_blocks": 2,
+                "validation_fraction": 0.2,
+                "meta_n_splits": 2,
+            },
+        )
+
+        training = pipeline.train_models()
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            print_training_summary(training)
+
+        output = buffer.getvalue()
+        self.assertIn("stability", output)
+        self.assertIn("worst sharpe", output)
 
 
 if __name__ == "__main__":

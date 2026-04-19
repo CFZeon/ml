@@ -71,6 +71,7 @@ def main():
                         "timestamp_column": "timestamp",
                         "availability_column": "available_at",
                         "prefix": "exo",
+                        "max_feature_age": "6h",
                     }
                 ],
             },
@@ -131,6 +132,9 @@ def main():
     print(f"  rows          : {len(data)}")
     print(f"  joined cols   : {custom_report['joined_columns']}")
     print(f"  join coverage : {custom_report['coverage']:.2%}")
+    print(f"  stale hits    : {custom_report['stale_hit_count']}")
+    print(f"  median age    : {custom_report['median_feature_age']}")
+    print(f"  max age       : {custom_report['max_feature_age_observed']}")
     print(f"  raw exogenous : {exogenous_columns}")
 
     print_section(sep, 3, "Running indicators")
@@ -139,7 +143,9 @@ def main():
 
     print_section(sep, 4, "Building features and screening stationarity")
     features = pipeline.build_features()
+    family_summary = pipeline.state.get("feature_family_summary", {})
     print(f"  feature count : {features.shape[1]}")
+    print(f"  families      : {family_summary.get('selected_family_counts', {})}")
     feature_columns = [column for column in features.columns if column.startswith("exo_")]
     print(f"  exogenous fts : {feature_columns[:10]}")
     stationarity = pipeline.check_stationarity()

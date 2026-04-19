@@ -9,13 +9,19 @@ intervals and ISO week for sub-hour intervals.
 """
 
 import io
+import hashlib
+import hmac
+import json
+import os
 import random
 import re
 import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlencode
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -64,6 +70,9 @@ class CustomDataset:
     frame: pd.DataFrame
     availability_column: str
     source_path: str | None = None
+    availability_is_assumed: bool = False
+    default_allow_exact_matches: bool = True
+    max_feature_age: pd.Timedelta | None = None
 
 
 @dataclass(frozen=True)
@@ -206,6 +215,21 @@ def _write_cache(path, frame):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
     frame.to_pickle(temp_path)
+    temp_path.replace(path)
+
+
+def _read_object_cache(path):
+    if path is None or not path.exists():
+        return None
+    return pd.read_pickle(path)
+
+
+def _write_object_cache(path, payload):
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    pd.to_pickle(payload, temp_path)
     temp_path.replace(path)
 
 
@@ -650,7 +674,9 @@ def _prefix_columns(columns, prefix):
 
 def load_custom_dataset(path=None, frame=None, name=None, file_format=None,
                         timestamp_column="timestamp", availability_column=None,
-                        value_columns=None, prefix=None, start=None, end=None):
+                        assume_event_time_is_available_time=False,
+                        value_columns=None, prefix=None, start=None, end=None,
+                        max_feature_age=None):
     """Load a point-in-time safe custom dataset with explicit availability timestamps."""
     if frame is None:
         if path is None:
@@ -659,9 +685,16 @@ def load_custom_dataset(path=None, frame=None, name=None, file_format=None,
     else:
         raw = pd.DataFrame(frame).copy()
 
-    availability_column = availability_column or timestamp_column
+    availability_is_assumed = False
     if timestamp_column not in raw.columns:
         raise ValueError(f"Custom data missing timestamp column {timestamp_column!r}")
+    if availability_column is None:
+        if not assume_event_time_is_available_time:
+            raise ValueError(
+                "Custom data requires an explicit availability_column unless assume_event_time_is_available_time=True"
+            )
+        availability_column = timestamp_column
+        availability_is_assumed = True
     if availability_column not in raw.columns:
         raise ValueError(f"Custom data missing availability column {availability_column!r}")
 
@@ -686,13 +719,18 @@ def load_custom_dataset(path=None, frame=None, name=None, file_format=None,
     ])
     rename_map = _prefix_columns(selected_value_columns, dataset_prefix)
 
-    selected = prepared[[timestamp_column, availability_column] + selected_value_columns].copy()
-    selected = selected.rename(columns={**rename_map, timestamp_column: "event_timestamp", availability_column: "available_at"})
+    selected = prepared[selected_value_columns].copy()
+    selected.insert(0, "event_timestamp", prepared[timestamp_column].to_numpy())
+    selected.insert(1, "available_at", prepared[availability_column].to_numpy())
+    selected = selected.rename(columns=rename_map)
     return CustomDataset(
         name=dataset_name,
         frame=selected.reset_index(drop=True),
         availability_column="available_at",
         source_path=str(path) if path is not None else None,
+        availability_is_assumed=availability_is_assumed,
+        default_allow_exact_matches=not availability_is_assumed,
+        max_feature_age=_parse_optional_tolerance(max_feature_age),
     )
 
 
@@ -702,13 +740,60 @@ def _parse_optional_tolerance(value):
     return pd.Timedelta(value)
 
 
-def join_custom_dataset(base_frame, dataset, tolerance=None, allow_exact_matches=True):
+_CUSTOM_DATASET_LOAD_KEYS = {
+    "path",
+    "frame",
+    "name",
+    "file_format",
+    "timestamp_column",
+    "availability_column",
+    "assume_event_time_is_available_time",
+    "value_columns",
+    "prefix",
+    "start",
+    "end",
+    "max_feature_age",
+}
+
+
+def _custom_join_report_defaults(dataset, joined_columns, allow_exact_matches):
+    return {
+        "name": dataset.name,
+        "source_path": dataset.source_path,
+        "joined_columns": joined_columns,
+        "coverage": 0.0,
+        "matched_row_count": 0,
+        "stale_hit_count": 0,
+        "stale_hit_rate": 0.0,
+        "median_feature_age": None,
+        "max_feature_age_observed": None,
+        "max_feature_age": dataset.max_feature_age,
+        "fallback_assumption_used": bool(dataset.availability_is_assumed),
+        "fallback_assumption_rows": 0,
+        "fallback_assumption_rate": 0.0,
+        "allow_exact_matches": bool(allow_exact_matches),
+    }
+
+
+def join_custom_dataset(base_frame, dataset, tolerance=None, allow_exact_matches=None, return_report=False):
     """Point-in-time join a custom dataset onto market data using availability timestamps."""
     base = pd.DataFrame(base_frame).copy()
     if not isinstance(base.index, pd.DatetimeIndex):
         raise ValueError("Base frame index must be a DatetimeIndex for point-in-time joins")
+    feature_columns = [
+        column for column in dataset.frame.columns
+        if column not in {"event_timestamp", dataset.availability_column}
+    ]
+
+    effective_max_feature_age = dataset.max_feature_age
+    if tolerance is not None:
+        effective_max_feature_age = _parse_optional_tolerance(tolerance)
+    if allow_exact_matches is None:
+        allow_exact_matches = dataset.default_allow_exact_matches
+
     if dataset.frame.empty:
-        return base
+        report = _custom_join_report_defaults(dataset, feature_columns, allow_exact_matches)
+        return (base, report) if return_report else base
 
     anchor = pd.DataFrame({"decision_time": pd.DatetimeIndex(base.index)}).sort_values("decision_time")
     custom = dataset.frame.sort_values(dataset.availability_column)
@@ -719,13 +804,51 @@ def join_custom_dataset(base_frame, dataset, tolerance=None, allow_exact_matches
         right_on=dataset.availability_column,
         direction="backward",
         allow_exact_matches=allow_exact_matches,
-        tolerance=_parse_optional_tolerance(tolerance),
     )
+
+    matched_mask = joined[dataset.availability_column].notna()
+    feature_age = pd.Series(pd.NaT, index=joined.index, dtype="timedelta64[ns]")
+    if matched_mask.any():
+        feature_age.loc[matched_mask] = joined.loc[matched_mask, "decision_time"] - joined.loc[matched_mask, dataset.availability_column]
+
+    stale_mask = pd.Series(False, index=joined.index, dtype=bool)
+    if effective_max_feature_age is not None:
+        stale_mask = matched_mask & feature_age.gt(effective_max_feature_age)
+        if stale_mask.any():
+            for column in ["event_timestamp", dataset.availability_column, *feature_columns]:
+                if column not in joined.columns:
+                    continue
+                null_value = pd.NaT if pd.api.types.is_datetime64_any_dtype(joined[column]) else np.nan
+                joined.loc[stale_mask, column] = null_value
+
+    matched_after_ttl_mask = matched_mask & ~stale_mask
+    matched_feature_age = feature_age.loc[matched_after_ttl_mask] if matched_after_ttl_mask.any() else pd.Series(dtype="timedelta64[ns]")
+
     joined = joined.set_index("decision_time")
     joined.index.name = base.index.name
     if dataset.availability_column in joined.columns:
         joined = joined.drop(columns=[dataset.availability_column])
-    return base.join(joined)
+
+    coverage = float(joined[feature_columns].notna().all(axis=1).mean()) if feature_columns else 0.0
+    fallback_rows = int(matched_after_ttl_mask.sum()) if dataset.availability_is_assumed else 0
+    report = {
+        "name": dataset.name,
+        "source_path": dataset.source_path,
+        "joined_columns": feature_columns,
+        "coverage": coverage,
+        "matched_row_count": int(matched_after_ttl_mask.sum()),
+        "stale_hit_count": int(stale_mask.sum()),
+        "stale_hit_rate": float(stale_mask.mean()) if len(stale_mask) > 0 else 0.0,
+        "median_feature_age": matched_feature_age.median() if not matched_feature_age.empty else None,
+        "max_feature_age_observed": matched_feature_age.max() if not matched_feature_age.empty else None,
+        "max_feature_age": effective_max_feature_age,
+        "fallback_assumption_used": bool(dataset.availability_is_assumed),
+        "fallback_assumption_rows": fallback_rows,
+        "fallback_assumption_rate": (fallback_rows / len(base)) if len(base) > 0 else 0.0,
+        "allow_exact_matches": bool(allow_exact_matches),
+    }
+    result = base.join(joined)
+    return (result, report) if return_report else result
 
 
 def join_custom_data(base_frame, datasets):
@@ -733,23 +856,16 @@ def join_custom_data(base_frame, datasets):
     joined = pd.DataFrame(base_frame).copy()
     reports = []
     for config in datasets or []:
-        dataset = load_custom_dataset(**config)
-        joined = join_custom_dataset(
+        dataset_kwargs = {key: value for key, value in config.items() if key in _CUSTOM_DATASET_LOAD_KEYS}
+        dataset = load_custom_dataset(**dataset_kwargs)
+        joined, report = join_custom_dataset(
             joined,
             dataset,
             tolerance=config.get("tolerance"),
-            allow_exact_matches=config.get("allow_exact_matches", True),
+            allow_exact_matches=config.get("allow_exact_matches"),
+            return_report=True,
         )
-        joined_columns = [column for column in dataset.frame.columns if column not in {"event_timestamp"}]
-        coverage = float(joined[[column for column in joined_columns if column in joined.columns]].notna().all(axis=1).mean()) if joined_columns else 0.0
-        reports.append(
-            {
-                "name": dataset.name,
-                "source_path": dataset.source_path,
-                "joined_columns": [column for column in joined_columns if column in joined.columns],
-                "coverage": coverage,
-            }
-        )
+        reports.append(report)
     return joined, reports
 
 
@@ -757,6 +873,12 @@ def _symbol_filters_cache_path(cache_dir, market, symbol):
     if cache_dir is None:
         return None
     return Path(cache_dir) / _normalize_market(market) / "symbol_filters" / f"{symbol}.pkl"
+
+
+def _futures_metadata_cache_path(cache_dir, market, symbol, namespace):
+    if cache_dir is None:
+        return None
+    return Path(cache_dir) / _normalize_market(market) / "futures_metadata" / namespace / f"{symbol}.pkl"
 
 
 def _coerce_filter_float(value):
@@ -834,11 +956,10 @@ def _parse_symbol_filters(payload):
     return parsed
 
 
-def fetch_binance_symbol_filters(symbol, market="spot", cache_dir=".cache"):
-    """Fetch Binance symbol execution filters for spot or futures markets."""
+def _fetch_exchange_info_symbol_payload(symbol, market="spot", cache_dir=".cache"):
     normalized_market = _normalize_market(market)
-    cache_path = _symbol_filters_cache_path(cache_dir, normalized_market, symbol)
-    cached = _read_cache(cache_path) if cache_path is not None else None
+    cache_path = _futures_metadata_cache_path(cache_dir, normalized_market, symbol, "exchange_info")
+    cached = _read_object_cache(cache_path)
     if cached is not None:
         return cached
 
@@ -855,7 +976,188 @@ def fetch_binance_symbol_filters(symbol, market="spot", cache_dir=".cache"):
     symbols = payload.get("symbols", [])
     if not symbols:
         raise RuntimeError(f"No exchangeInfo filters returned for {symbol} on {normalized_market}")
-    filters = _parse_symbol_filters(symbols[0])
+    symbol_payload = dict(symbols[0])
+    _write_object_cache(cache_path, symbol_payload)
+    return symbol_payload
+
+
+def _parse_futures_contract_spec(payload, market="um_futures"):
+    normalized_market = _normalize_market(market)
+    if normalized_market == "spot":
+        raise ValueError("Futures contract specs are only available for futures markets")
+
+    return {
+        "symbol": payload.get("symbol"),
+        "pair": payload.get("pair") or payload.get("symbol"),
+        "market": normalized_market,
+        "contract_type": payload.get("contractType"),
+        "base_asset": payload.get("baseAsset"),
+        "quote_asset": payload.get("quoteAsset"),
+        "margin_asset": payload.get("marginAsset") or payload.get("quoteAsset"),
+        "status": payload.get("status"),
+        "contract_size": _coerce_filter_float(payload.get("contractSize")) or 1.0,
+        "liquidation_fee_rate": _coerce_filter_float(payload.get("liquidationFee")),
+        "market_take_bound": _coerce_filter_float(payload.get("marketTakeBound")),
+        "trigger_protect": _coerce_filter_float(payload.get("triggerProtect")),
+        "price_precision": _coerce_filter_int(payload.get("pricePrecision")),
+        "quantity_precision": _coerce_filter_int(payload.get("quantityPrecision")),
+        "base_asset_precision": _coerce_filter_int(payload.get("baseAssetPrecision")),
+        "quote_precision": _coerce_filter_int(payload.get("quotePrecision")),
+        "onboard_date": (
+            pd.to_datetime(int(payload.get("onboardDate")), unit="ms", utc=True)
+            if payload.get("onboardDate") not in (None, "") else None
+        ),
+        "delivery_date": (
+            pd.to_datetime(int(payload.get("deliveryDate")), unit="ms", utc=True)
+            if payload.get("deliveryDate") not in (None, "") else None
+        ),
+    }
+
+
+def _normalize_futures_leverage_brackets(payload, symbol=None, market="um_futures"):
+    normalized_market = _normalize_market(market)
+    if normalized_market == "spot":
+        raise ValueError("Futures leverage brackets are only available for futures markets")
+
+    selected_symbol = symbol
+    notional_coef = 1.0
+    bracket_rows = payload
+
+    if isinstance(payload, dict):
+        if "brackets" in payload:
+            selected_symbol = payload.get("symbol", selected_symbol)
+            notional_coef = float(payload.get("notionalCoef", 1.0) or 1.0)
+            bracket_rows = payload.get("brackets", [])
+        else:
+            bracket_rows = [payload]
+    elif isinstance(payload, list) and payload and isinstance(payload[0], dict) and "brackets" in payload[0]:
+        candidates = payload
+        if selected_symbol is not None:
+            match = next((row for row in candidates if row.get("symbol") == selected_symbol), None)
+            if match is None:
+                raise ValueError(f"No leverage bracket payload found for symbol {selected_symbol!r}")
+            payload = match
+        else:
+            payload = candidates[0]
+        selected_symbol = payload.get("symbol", selected_symbol)
+        notional_coef = float(payload.get("notionalCoef", 1.0) or 1.0)
+        bracket_rows = payload.get("brackets", [])
+
+    normalized_rows = []
+    for row in bracket_rows or []:
+        normalized_rows.append(
+            {
+                "bracket": _coerce_filter_int(row.get("bracket")) or len(normalized_rows) + 1,
+                "initial_leverage": _coerce_filter_float(
+                    row.get("initialLeverage", row.get("initial_leverage", row.get("maxLeverage")))
+                ) or 1.0,
+                "notional_floor": _coerce_filter_float(row.get("notionalFloor", row.get("notional_floor"))),
+                "notional_cap": _coerce_filter_float(row.get("notionalCap", row.get("notional_cap"))),
+                "qty_floor": _coerce_filter_float(row.get("qtyFloor", row.get("qty_floor"))),
+                "qty_cap": _coerce_filter_float(row.get("qtyCap", row.get("qty_cap"))),
+                "maint_margin_ratio": _coerce_filter_float(
+                    row.get("maintMarginRatio", row.get("maint_margin_ratio"))
+                ) or 0.0,
+                "cum": _coerce_filter_float(row.get("cum")) or 0.0,
+            }
+        )
+
+    normalized_rows.sort(
+        key=lambda row: (
+            row.get("notional_floor") if row.get("notional_floor") is not None else -np.inf,
+            row.get("notional_cap") if row.get("notional_cap") is not None else np.inf,
+        )
+    )
+
+    return {
+        "symbol": selected_symbol,
+        "market": normalized_market,
+        "notional_coef": float(notional_coef),
+        "brackets": normalized_rows,
+    }
+
+
+def _signed_request_json(base_url, endpoint, params, api_key, api_secret, timeout=30):
+    query_params = {**dict(params or {}), "timestamp": int(time.time() * 1000)}
+    query = urlencode(sorted(query_params.items()))
+    signature = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {"X-MBX-APIKEY": api_key}
+    with requests.Session() as session:
+        response = session.get(
+            f"{base_url}{endpoint}",
+            params={**query_params, "signature": signature},
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def fetch_binance_futures_contract_spec(symbol, market="um_futures", cache_dir=".cache"):
+    """Fetch normalized futures-only contract metadata from exchangeInfo."""
+    normalized_market = _normalize_market(market)
+    if normalized_market == "spot":
+        raise ValueError("Futures contract specs are only available for futures markets")
+
+    cache_path = _futures_metadata_cache_path(cache_dir, normalized_market, symbol, "contract_spec")
+    cached = _read_object_cache(cache_path)
+    if cached is not None:
+        return cached
+
+    payload = _fetch_exchange_info_symbol_payload(symbol, market=normalized_market, cache_dir=cache_dir)
+    contract_spec = _parse_futures_contract_spec(payload, market=normalized_market)
+    _write_object_cache(cache_path, contract_spec)
+    return contract_spec
+
+
+def load_futures_leverage_brackets(symbol, market="um_futures", brackets=None, path=None,
+                                   cache_dir=".cache", use_signed_endpoint=False,
+                                   api_key=None, api_secret=None):
+    """Load normalized leverage brackets from config, cache, or the signed Binance endpoint."""
+    normalized_market = _normalize_market(market)
+    if normalized_market == "spot":
+        raise ValueError("Futures leverage brackets are only available for futures markets")
+
+    cache_path = _futures_metadata_cache_path(cache_dir, normalized_market, symbol, "leverage_brackets")
+    if brackets is None and path is None and not use_signed_endpoint:
+        return _read_object_cache(cache_path)
+
+    payload = None
+    if brackets is not None:
+        payload = brackets
+    elif path is not None:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    else:
+        resolved_key = api_key or os.getenv("BINANCE_API_KEY") or os.getenv("BINANCE_FAPI_KEY")
+        resolved_secret = api_secret or os.getenv("BINANCE_API_SECRET") or os.getenv("BINANCE_FAPI_SECRET")
+        if not resolved_key or not resolved_secret:
+            raise ValueError("Signed leverage-bracket fetch requires api_key/api_secret or Binance API env vars")
+        endpoint = "/fapi/v1/leverageBracket" if normalized_market == "um_futures" else "/dapi/v1/leverageBracket"
+        payload = _signed_request_json(
+            base_url=_rest_base_url(normalized_market),
+            endpoint=endpoint,
+            params={"symbol": symbol},
+            api_key=resolved_key,
+            api_secret=resolved_secret,
+            timeout=30,
+        )
+
+    normalized = _normalize_futures_leverage_brackets(payload, symbol=symbol, market=normalized_market)
+    _write_object_cache(cache_path, normalized)
+    return normalized
+
+
+def fetch_binance_symbol_filters(symbol, market="spot", cache_dir=".cache"):
+    """Fetch Binance symbol execution filters for spot or futures markets."""
+    normalized_market = _normalize_market(market)
+    cache_path = _symbol_filters_cache_path(cache_dir, normalized_market, symbol)
+    cached = _read_cache(cache_path) if cache_path is not None else None
+    if cached is not None:
+        return cached
+
+    payload = _fetch_exchange_info_symbol_payload(symbol, market=normalized_market, cache_dir=cache_dir)
+    filters = _parse_symbol_filters(payload)
     if cache_path is not None:
         _write_cache(cache_path, filters)
     return filters

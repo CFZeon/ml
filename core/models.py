@@ -13,6 +13,7 @@ from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .features import ENDOGENOUS_FEATURE_FAMILIES, resolve_feature_family
 from .labeling import sequential_bootstrap
 from .slippage import _estimate_reference_trade_slippage_rates
 
@@ -893,6 +894,144 @@ def compute_feature_block_diagnostics(model, X_train, X_test, y_test, feature_bl
     }
 
 
+def _replace_columns_with_train_medians(frame, columns, train_medians):
+    if not columns:
+        return frame
+
+    updated = frame.copy()
+    replacement = train_medians.reindex(columns).fillna(0.0).to_numpy()
+    updated.loc[:, columns] = replacement
+    return updated
+
+
+def _family_bundle_specs(present_families):
+    present = set(present_families)
+    endogenous_families = {family for family in present if family in ENDOGENOUS_FEATURE_FAMILIES}
+    specs = []
+
+    if endogenous_families:
+        specs.append(("endogenous_only", endogenous_families))
+    if "futures_context" in present:
+        specs.append(("endogenous_plus_futures", endogenous_families | {"futures_context"}))
+    if "cross_asset" in present:
+        specs.append(("endogenous_plus_cross_asset", endogenous_families | {"cross_asset"}))
+    if "custom_exogenous" in present:
+        specs.append(("endogenous_plus_custom", endogenous_families | {"custom_exogenous"}))
+    if present:
+        specs.append(("full_context", present))
+
+    deduped = []
+    seen = set()
+    for name, families in specs:
+        family_key = tuple(sorted(families))
+        if not families or family_key in seen:
+            continue
+        seen.add(family_key)
+        deduped.append((name, families))
+    return deduped
+
+
+def compute_feature_family_diagnostics(model, X_train, X_test, y_test, feature_blocks, baseline_metrics=None):
+    """Measure feature-family contribution and context bundle dependence."""
+    baseline_metrics = dict(baseline_metrics or evaluate_model(model, X_test, y_test))
+    feature_blocks = dict(feature_blocks or {})
+    feature_families = {
+        column: resolve_feature_family(feature_blocks.get(column, "unknown"))
+        for column in X_test.columns
+    }
+    native_importance = get_feature_importance(model, list(X_test.columns))
+    family_columns = {}
+
+    for column in X_test.columns:
+        family = feature_families.get(column, "unknown")
+        family_columns.setdefault(family, []).append(column)
+
+    train_medians = X_train.median(numeric_only=True)
+    families = []
+    for family_name, columns in sorted(family_columns.items()):
+        ablated_metrics = evaluate_model(
+            model,
+            _replace_columns_with_train_medians(X_test, columns, train_medians),
+            y_test,
+        )
+        family_info = {
+            "family": family_name,
+            "feature_count": len(columns),
+            "native_importance": round(float(native_importance.reindex(columns).fillna(0.0).sum()), 6),
+            "accuracy_drop": round(
+                float(baseline_metrics.get("accuracy", 0.0) - ablated_metrics.get("accuracy", 0.0)),
+                6,
+            ),
+            "f1_drop": round(
+                float(baseline_metrics.get("f1_macro", 0.0) - ablated_metrics.get("f1_macro", 0.0)),
+                6,
+            ),
+            "log_loss_increase": None,
+        }
+        if "log_loss" in baseline_metrics and "log_loss" in ablated_metrics:
+            family_info["log_loss_increase"] = round(
+                float(ablated_metrics["log_loss"] - baseline_metrics["log_loss"]),
+                6,
+            )
+        families.append(family_info)
+
+    families.sort(
+        key=lambda item: (
+            item.get("f1_drop", 0.0),
+            item.get("accuracy_drop", 0.0),
+            item.get("native_importance", 0.0),
+        ),
+        reverse=True,
+    )
+
+    bundles = []
+    for bundle_name, allowed_families in _family_bundle_specs(family_columns):
+        kept_columns = [
+            column
+            for column in X_test.columns
+            if feature_families.get(column, "unknown") in allowed_families
+        ]
+        masked_columns = [column for column in X_test.columns if column not in kept_columns]
+        bundle_metrics = baseline_metrics if not masked_columns else evaluate_model(
+            model,
+            _replace_columns_with_train_medians(X_test, masked_columns, train_medians),
+            y_test,
+        )
+        bundles.append(
+            {
+                "bundle": bundle_name,
+                "families": sorted(allowed_families),
+                "feature_count": len(kept_columns),
+                "accuracy": round(float(bundle_metrics.get("accuracy", 0.0)), 6),
+                "f1_macro": round(float(bundle_metrics.get("f1_macro", 0.0)), 6),
+                "accuracy_drop_vs_full": round(
+                    float(baseline_metrics.get("accuracy", 0.0) - bundle_metrics.get("accuracy", 0.0)),
+                    6,
+                ),
+                "f1_drop_vs_full": round(
+                    float(baseline_metrics.get("f1_macro", 0.0) - bundle_metrics.get("f1_macro", 0.0)),
+                    6,
+                ),
+            }
+        )
+
+    bundles.sort(
+        key=lambda item: (
+            item.get("f1_drop_vs_full", 0.0),
+            item.get("accuracy_drop_vs_full", 0.0),
+        )
+    )
+
+    selected_families = sorted(family_columns)
+    return {
+        "baseline_metrics": baseline_metrics,
+        "families": families,
+        "bundles": bundles,
+        "selected_families": selected_families,
+        "endogenous_only_selected": bool(selected_families) and set(selected_families).issubset(ENDOGENOUS_FEATURE_FAMILIES),
+    }
+
+
 def summarize_feature_block_diagnostics(fold_diagnostics):
     """Aggregate block diagnostics across walk-forward folds."""
     if not fold_diagnostics:
@@ -980,6 +1119,131 @@ def summarize_feature_block_diagnostics(fold_diagnostics):
         "summary": summary_rows,
         "top_features": top_features,
         "folds": fold_diagnostics,
+    }
+
+
+def summarize_feature_family_diagnostics(fold_diagnostics):
+    """Aggregate feature-family diagnostics across validation folds."""
+    if not fold_diagnostics:
+        return {
+            "summary": [],
+            "bundles": [],
+            "folds": [],
+            "selected_families": [],
+            "endogenous_only_selected_any_fold": False,
+            "endogenous_only_selected_all_folds": False,
+        }
+
+    family_totals = {}
+    bundle_totals = {}
+    selected_families = set()
+    endogenous_flags = []
+
+    for diagnostics in fold_diagnostics:
+        selected_families.update(diagnostics.get("selected_families", []))
+        endogenous_flags.append(bool(diagnostics.get("endogenous_only_selected")))
+
+        for family_info in diagnostics.get("families", []):
+            family_name = family_info["family"]
+            summary = family_totals.setdefault(
+                family_name,
+                {
+                    "family": family_name,
+                    "feature_count": family_info["feature_count"],
+                    "folds": 0,
+                    "native_importance": [],
+                    "accuracy_drop": [],
+                    "f1_drop": [],
+                    "log_loss_increase": [],
+                },
+            )
+            summary["feature_count"] = max(summary["feature_count"], family_info["feature_count"])
+            summary["folds"] += 1
+            summary["native_importance"].append(family_info.get("native_importance", 0.0))
+            summary["accuracy_drop"].append(family_info.get("accuracy_drop", 0.0))
+            summary["f1_drop"].append(family_info.get("f1_drop", 0.0))
+            if family_info.get("log_loss_increase") is not None:
+                summary["log_loss_increase"].append(family_info["log_loss_increase"])
+
+        for bundle_info in diagnostics.get("bundles", []):
+            bundle_name = bundle_info["bundle"]
+            summary = bundle_totals.setdefault(
+                bundle_name,
+                {
+                    "bundle": bundle_name,
+                    "families": bundle_info.get("families", []),
+                    "feature_count": bundle_info["feature_count"],
+                    "folds": 0,
+                    "accuracy": [],
+                    "f1_macro": [],
+                    "accuracy_drop_vs_full": [],
+                    "f1_drop_vs_full": [],
+                },
+            )
+            summary["families"] = bundle_info.get("families", summary["families"])
+            summary["feature_count"] = max(summary["feature_count"], bundle_info["feature_count"])
+            summary["folds"] += 1
+            summary["accuracy"].append(bundle_info.get("accuracy", 0.0))
+            summary["f1_macro"].append(bundle_info.get("f1_macro", 0.0))
+            summary["accuracy_drop_vs_full"].append(bundle_info.get("accuracy_drop_vs_full", 0.0))
+            summary["f1_drop_vs_full"].append(bundle_info.get("f1_drop_vs_full", 0.0))
+
+    summary_rows = []
+    for family_name, totals in family_totals.items():
+        summary_rows.append(
+            {
+                "family": family_name,
+                "feature_count": totals["feature_count"],
+                "folds": totals["folds"],
+                "avg_native_importance": round(float(np.mean(totals["native_importance"])), 6),
+                "avg_accuracy_drop": round(float(np.mean(totals["accuracy_drop"])), 6),
+                "avg_f1_drop": round(float(np.mean(totals["f1_drop"])), 6),
+                "avg_log_loss_increase": (
+                    round(float(np.mean(totals["log_loss_increase"])), 6)
+                    if totals["log_loss_increase"]
+                    else None
+                ),
+            }
+        )
+
+    summary_rows.sort(
+        key=lambda item: (
+            item.get("avg_f1_drop", 0.0),
+            item.get("avg_accuracy_drop", 0.0),
+            item.get("avg_native_importance", 0.0),
+        ),
+        reverse=True,
+    )
+
+    bundle_rows = []
+    for bundle_name, totals in bundle_totals.items():
+        bundle_rows.append(
+            {
+                "bundle": bundle_name,
+                "families": totals["families"],
+                "feature_count": totals["feature_count"],
+                "folds": totals["folds"],
+                "avg_accuracy": round(float(np.mean(totals["accuracy"])), 6),
+                "avg_f1_macro": round(float(np.mean(totals["f1_macro"])), 6),
+                "avg_accuracy_drop_vs_full": round(float(np.mean(totals["accuracy_drop_vs_full"])), 6),
+                "avg_f1_drop_vs_full": round(float(np.mean(totals["f1_drop_vs_full"])), 6),
+            }
+        )
+
+    bundle_rows.sort(
+        key=lambda item: (
+            item.get("avg_f1_drop_vs_full", 0.0),
+            item.get("avg_accuracy_drop_vs_full", 0.0),
+        )
+    )
+
+    return {
+        "summary": summary_rows,
+        "bundles": bundle_rows,
+        "folds": fold_diagnostics,
+        "selected_families": sorted(selected_families),
+        "endogenous_only_selected_any_fold": any(endogenous_flags),
+        "endogenous_only_selected_all_folds": all(endogenous_flags),
     }
 
 
