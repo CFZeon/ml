@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 
+from .execution import resolve_liquidity_inputs
 from .slippage import _estimate_slippage_rates, _estimate_trade_notional_slippage_rates
 
 try:  # pragma: no cover - optional dependency exercised in integration tests
@@ -1239,6 +1240,7 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
                 "order_rejection_reasons": execution_report.get("order_rejection_reasons", {}),
                 "order_ledger": execution_report.get("order_ledger", pd.DataFrame()),
                 "price_fill_actions": execution_report.get("price_fill_actions", {}),
+                "liquidity_report": execution_report.get("liquidity_report", {}),
             }
         )
     if futures_account_report is not None:
@@ -1371,6 +1373,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  orderbook_depth=None, execution_price_policy="strict",
                  execution_price_fill_limit=None, valuation_price_policy="drop_rows",
                  valuation_price_fill_limit=None, futures_account=None,
+                 liquidity_lag_bars=1,
                  futures_contract=None, futures_leverage_brackets=None):
     """Run a backtest through the configured execution adapter.
 
@@ -1395,6 +1398,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     volume           : pd.Series|array|None – bar volume aligned to the backtest index; required for non-flat slippage models
     slippage_model   : str|object|None – one of {"flat", "sqrt_impact", "orderbook"} or a custom estimator implementing estimate(...)
     orderbook_depth  : pd.DataFrame|None – optional L2 depth frame for future order-book-aware slippage models
+    liquidity_lag_bars : int – lag applied to bar-volume liquidity inputs before cost estimation
 
     execution_price_policy : str – one of {"strict", "ffill", "ffill_with_limit", "drop_rows"}
     execution_price_fill_limit : int|None – max consecutive execution-price fills when using "ffill_with_limit"
@@ -1463,6 +1467,16 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     if valuation_series.empty or execution_series.empty:
         raise ValueError("price normalization removed all rows from the backtest")
 
+    liquidity_inputs = resolve_liquidity_inputs(
+        index=execution_series.index,
+        volume=volume,
+        orderbook_depth=orderbook_depth,
+        slippage_model=slippage_model,
+        liquidity_lag_bars=liquidity_lag_bars,
+    )
+    volume = liquidity_inputs["volume"]
+    orderbook_depth = liquidity_inputs["orderbook_depth"]
+
     position = _normalize_position_targets(
         signal_series.shift(signal_delay_bars).fillna(0.0),
         leverage=leverage,
@@ -1480,6 +1494,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         "execution": execution_fill_actions,
         "valuation": valuation_fill_actions,
     }
+    execution_report["liquidity_report"] = liquidity_inputs["diagnostics"]
     valuation_series = execution_report["valuation_series"]
     execution_series = execution_report["execution_series"]
     executable_position = execution_report["position"]

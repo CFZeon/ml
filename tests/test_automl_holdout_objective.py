@@ -7,6 +7,7 @@ from unittest import mock
 import numpy as np
 import pandas as pd
 
+import core.automl as automl_module
 from core.automl import _build_trial_return_frame, compute_cpcv_pbo, compute_objective_value, run_automl_study
 
 
@@ -221,6 +222,18 @@ class _ScenarioAutoMLPipeline(_AutoMLDummyPipeline):
             threshold_key = str(threshold)
             if threshold_key in type(self).metrics_by_variant:
                 return threshold_key
+
+        max_holding = self.config.get("labels", {}).get("max_holding")
+        if max_holding is not None:
+            max_holding_key = str(max_holding)
+            if max_holding_key in type(self).metrics_by_variant:
+                return max_holding_key
+
+        max_features = self.config.get("feature_selection", {}).get("max_features")
+        if max_features is not None:
+            max_features_key = str(max_features)
+            if max_features_key in type(self).metrics_by_variant:
+                return max_features_key
 
         model_type = self.config.get("model", {}).get("type")
         if model_type is not None:
@@ -646,6 +659,45 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
         self.assertEqual(int(summary["locked_holdout"]["backtest"]["total_trades"]), 24)
         self.assertFalse(summary["locked_holdout"]["holdout_warning"])
 
+    def test_default_automl_search_space_excludes_signal_policy_knobs(self):
+        self.assertNotIn("signals", automl_module.DEFAULT_AUTOML_SEARCH_SPACE)
+
+    def test_run_automl_study_rejects_signal_policy_search_space(self):
+        raw = _build_market_frame(80)
+        storage_path = _make_storage_path()
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 1,
+                    "objective": "accuracy_first",
+                    "seed": 11,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_fraction": 0.2,
+                    "locked_holdout_min_search_rows": 32,
+                    "storage": storage_path,
+                    "study_name": "automl_signal_policy_rejection_test",
+                    "search_space": {
+                        "signals": {
+                            "threshold": {"type": "categorical", "choices": [0.01, 0.02]},
+                        }
+                    },
+                },
+                "model": {"type": "gbm"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "signal-policy search is disabled"):
+            run_automl_study(
+                base_pipeline,
+                pipeline_class=_AutoMLDummyPipeline,
+                trial_step_classes=[],
+            )
+
     def test_default_objective_prefers_better_after_cost_backtest(self):
         raw = _build_market_frame(100)
         storage_path = _make_storage_path()
@@ -993,7 +1045,7 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
 
         with mock.patch(
             "core.automl._sample_trial_overrides",
-            side_effect=lambda trial, _: {"signals": {"threshold": float(trial.number)}},
+            side_effect=lambda trial, _: {"labels": {"pt_sl": (2.0, 2.0), "max_holding": float(trial.number)}},
         ):
             summary = run_automl_study(
                 base_pipeline,
@@ -1052,6 +1104,129 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
             )
 
         self.assertTrue(summary["locked_holdout"]["holdout_warning"])
+
+    def test_locked_holdout_is_evaluated_once_after_selection_freeze(self):
+        raw = _build_market_frame(100)
+        storage_path = _make_storage_path()
+
+        _ScenarioAutoMLPipeline.reset()
+        _ScenarioAutoMLPipeline.full_rows = len(raw)
+        _ScenarioAutoMLPipeline.metrics_by_variant = {
+            "rf": {
+                "search": {"sharpe_ratio": 2.2, "returns": [0.0018, 0.0014, 0.0019, 0.0015]},
+                "validation": {"sharpe_ratio": 2.0, "returns": [0.0017, 0.0013, 0.0018, 0.0014]},
+                "holdout": {
+                    "sharpe_ratio": 0.2,
+                    "returns": [0.0008, -0.0007, 0.0006, -0.0005],
+                    "ci_lower": -0.1,
+                    "ci_upper": 0.4,
+                },
+            },
+            "gbm": {
+                "search": {"sharpe_ratio": 1.8, "returns": [0.0015, 0.0011, 0.0016, 0.0012]},
+                "validation": {"sharpe_ratio": 1.7, "returns": [0.0014, 0.0010, 0.0015, 0.0011]},
+                "holdout": {"sharpe_ratio": 1.6, "returns": [0.0013, 0.0009, 0.0014, 0.0010]},
+            },
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 2,
+                    "objective": "sharpe_ratio",
+                    "seed": 43,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_fraction": 0.2,
+                    "locked_holdout_min_search_rows": 40,
+                    "enable_pruning": False,
+                    "storage": storage_path,
+                    "study_name": "automl_locked_holdout_freeze_test",
+                    "selection_policy": {
+                        "min_validation_trade_count": 1,
+                        "require_locked_holdout_pass": True,
+                        "min_locked_holdout_score": 0.5,
+                    },
+                },
+                "model": {"type": "rf"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        variants = [{"model": {"type": "rf"}}, {"model": {"type": "gbm"}}]
+        with mock.patch("core.automl._sample_trial_overrides", side_effect=lambda trial, _: variants[trial.number]):
+            with mock.patch("core.automl._evaluate_locked_holdout", wraps=automl_module._evaluate_locked_holdout) as holdout_eval:
+                summary = run_automl_study(
+                    base_pipeline,
+                    pipeline_class=_ScenarioAutoMLPipeline,
+                    trial_step_classes=[],
+                )
+
+        self.assertEqual(holdout_eval.call_count, 1)
+        self.assertEqual(summary["best_overrides"]["model"]["type"], "rf")
+        self.assertFalse(summary["promotion_ready"])
+        self.assertIn("locked_holdout_failed", summary["promotion_reasons"])
+        self.assertEqual(int(summary["locked_holdout"]["access_count"]), 1)
+        self.assertTrue(summary["locked_holdout"]["evaluated_once"])
+        self.assertTrue(summary["locked_holdout"]["evaluated_after_freeze"])
+        self.assertTrue(summary["best_selection_policy"]["selection_policy"]["frozen"])
+        self.assertFalse(summary["best_selection_policy"]["selection_policy"]["holdout_consulted_for_selection"])
+
+    def test_selection_freeze_summary_records_candidate_hash_and_holdout_diagnostics(self):
+        raw = _build_market_frame(120)
+        storage_path = _make_storage_path()
+
+        _ScenarioAutoMLPipeline.reset()
+        _ScenarioAutoMLPipeline.full_rows = len(raw)
+        _ScenarioAutoMLPipeline.metrics_by_variant = {
+            "gbm": {
+                "search": {"sharpe_ratio": 1.3, "returns": [0.0014, 0.0010, 0.0015, 0.0011]},
+                "validation": {"sharpe_ratio": 1.2, "returns": [0.0013, 0.0009, 0.0014, 0.0010]},
+                "holdout": {"sharpe_ratio": 1.1, "returns": [0.0012, 0.0008, 0.0013, 0.0009]},
+            },
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 1,
+                    "objective": "sharpe_ratio",
+                    "seed": 47,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_bars": 24,
+                    "locked_holdout_min_search_rows": 48,
+                    "enable_pruning": False,
+                    "storage": storage_path,
+                    "study_name": "automl_selection_snapshot_test",
+                },
+                "model": {"type": "gbm"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        with mock.patch("core.automl._sample_trial_overrides", side_effect=lambda trial, _: {"model": {"type": "gbm"}}):
+            summary = run_automl_study(
+                base_pipeline,
+                pipeline_class=_ScenarioAutoMLPipeline,
+                trial_step_classes=[],
+            )
+
+        self.assertEqual(summary["selection_freeze"]["trial_number"], int(summary["best_trial_number"]))
+        self.assertEqual(
+            summary["selection_freeze"]["candidate_hash"],
+            summary["locked_holdout"]["frozen_candidate_hash"],
+        )
+        self.assertEqual(
+            summary["overfitting_diagnostics"]["selection_freeze"]["candidate_hash"],
+            summary["selection_freeze"]["candidate_hash"],
+        )
+        self.assertTrue(summary["overfitting_diagnostics"]["holdout_evaluated_once"])
+        self.assertTrue(summary["overfitting_diagnostics"]["holdout_evaluated_after_freeze"])
 
     def test_selection_policy_rejects_excess_complexity(self):
         raw = _build_market_frame(100)
@@ -1336,20 +1511,10 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
         _ScenarioAutoMLPipeline.reset()
         _ScenarioAutoMLPipeline.full_rows = len(raw)
         _ScenarioAutoMLPipeline.metrics_by_variant = {
-            "0.01": {
-                "search": {"sharpe_ratio": 1.1, "returns": [0.0011, 0.0007, 0.0012, 0.0008]},
-                "validation": {"sharpe_ratio": 1.0, "returns": [0.0010, 0.0006, 0.0011, 0.0007]},
-                "holdout": {"sharpe_ratio": 0.9, "returns": [0.0009, 0.0005, 0.0010, 0.0006]},
-            },
-            "0.02": {
+            "gbm": {
                 "search": {"sharpe_ratio": 1.4, "returns": [0.0014, 0.0010, 0.0015, 0.0011]},
                 "validation": {"sharpe_ratio": 1.2, "returns": [0.0012, 0.0008, 0.0013, 0.0009]},
                 "holdout": {"sharpe_ratio": 1.0, "returns": [0.0010, 0.0007, 0.0011, 0.0008]},
-            },
-            "0.03": {
-                "search": {"sharpe_ratio": 1.0, "returns": [0.0010, 0.0006, 0.0011, 0.0007]},
-                "validation": {"sharpe_ratio": 0.9, "returns": [0.0009, 0.0005, 0.0010, 0.0006]},
-                "holdout": {"sharpe_ratio": 0.8, "returns": [0.0008, 0.0004, 0.0009, 0.0005]},
             },
         }
 
@@ -1367,7 +1532,9 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
                     "enable_pruning": False,
                     "storage": storage_path,
                     "study_name": "automl_selection_policy_summary_test",
-                    "search_space": {"signals": {"threshold": {"type": "categorical", "choices": [0.01, 0.02, 0.03]}}},
+                    "search_space": {
+                        "feature_selection": {"max_features": {"type": "categorical", "choices": [32, 48, 64]}}
+                    },
                     "selection_policy": {
                         "min_validation_trade_count": 1,
                         "require_locked_holdout_pass": False,
@@ -1381,7 +1548,10 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
 
         with mock.patch(
             "core.automl._sample_trial_overrides",
-            side_effect=lambda trial, _: {"signals": {"threshold": 0.02}, "model": {"type": "gbm"}},
+            side_effect=lambda trial, _: {
+                "feature_selection": {"enabled": True, "max_features": 48},
+                "model": {"type": "gbm"},
+            },
         ):
             summary = run_automl_study(
                 base_pipeline,

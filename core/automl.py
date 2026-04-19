@@ -1,6 +1,8 @@
 """AutoML search helpers for the research pipeline."""
 
 import copy
+import hashlib
+import json
 from itertools import combinations
 from pathlib import Path
 from statistics import NormalDist
@@ -73,13 +75,6 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
                 "c": {"type": "float", "low": 0.01, "high": 10.0, "log": True},
             },
         },
-    },
-    "signals": {
-        "threshold": {"type": "categorical", "choices": [0.01, 0.02, 0.03, 0.05]},
-        "fraction": {"type": "categorical", "choices": [0.25, 0.5, 0.75]},
-        "edge_threshold": {"type": "categorical", "choices": [0.03, 0.05, 0.08, 0.12]},
-        "meta_threshold": {"type": "categorical", "choices": [0.5, 0.55, 0.6, 0.65]},
-        "tuning_min_trades": {"type": "categorical", "choices": [3, 5, 8]},
     },
 }
 
@@ -156,6 +151,42 @@ def _json_ready(value):
         except TypeError:
             pass
     return value
+
+
+def _stable_payload_hash(payload):
+    serialized = json.dumps(
+        _json_ready(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _build_selection_snapshot(best_trial_report):
+    selection_policy = best_trial_report.get("selection_policy") or {}
+    snapshot = {
+        "trial_number": int(best_trial_report["number"]),
+        "trial_params": copy.deepcopy(best_trial_report.get("params") or {}),
+        "frozen_overrides": copy.deepcopy(best_trial_report.get("overrides") or {}),
+        "validation_metrics": copy.deepcopy(best_trial_report.get("validation_metrics") or {}),
+        "eligibility": {
+            "eligible": bool(selection_policy.get("eligible", False)),
+            "eligible_before_post_checks": bool(selection_policy.get("eligible_before_post_checks", False)),
+            "eligibility_checks": copy.deepcopy(selection_policy.get("eligibility_checks") or {}),
+            "eligibility_reasons": list(selection_policy.get("eligibility_reasons") or []),
+        },
+        "selection_value": _coerce_float(best_trial_report.get("selection_value")),
+        "raw_objective_value": _coerce_float(best_trial_report.get("raw_objective_value")),
+        "selection_timestamp": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
+    snapshot["candidate_hash"] = _stable_payload_hash(
+        {
+            "trial_number": snapshot["trial_number"],
+            "trial_params": snapshot["trial_params"],
+            "frozen_overrides": snapshot["frozen_overrides"],
+        }
+    )
+    return _json_ready(snapshot)
 
 
 def _deep_merge(base, updates):
@@ -364,6 +395,30 @@ def _build_study_storage_path(base_config, automl_config):
     return path.resolve()
 
 
+def _validate_signal_policy_search_space(search_space):
+    signal_space = copy.deepcopy((search_space or {}).get("signals") or {})
+    if not signal_space:
+        return
+
+    disallowed_keys = ", ".join(sorted(signal_space))
+    raise ValueError(
+        "AutoML signal-policy search is disabled. Remove automl.search_space.signals entries "
+        f"({disallowed_keys}) and keep signal policy outside the search space."
+    )
+
+
+def _validate_trial_overrides(overrides):
+    signal_overrides = copy.deepcopy((overrides or {}).get("signals") or {})
+    if not signal_overrides:
+        return
+
+    disallowed_keys = ", ".join(sorted(signal_overrides))
+    raise ValueError(
+        "AutoML signal-policy overrides are disabled. Remove signals overrides from trial sampling "
+        f"({disallowed_keys}) and keep signal policy outside the search space."
+    )
+
+
 def _summarize_training(training):
     feature_selection = training.get("feature_selection") or {}
     bootstrap = training.get("bootstrap") or {}
@@ -532,6 +587,50 @@ def _build_validation_holdout_report(best_trial_report, holdout_plan):
     report["selection_value"] = best_trial_report.get("selection_value")
     report["meets_minimum_dsr_threshold"] = best_trial_report.get("meets_minimum_dsr_threshold")
     return report
+
+
+def _decorate_locked_holdout_report(locked_holdout_report, selection_snapshot, access_count):
+    report = copy.deepcopy(locked_holdout_report or {})
+    report["access_count"] = int(access_count)
+    report["evaluated_once"] = bool(report.get("enabled") and access_count == 1)
+    report["evaluated_after_freeze"] = bool(report.get("enabled") and selection_snapshot is not None)
+    report["frozen_candidate_hash"] = (selection_snapshot or {}).get("candidate_hash")
+    return report
+
+
+def _build_locked_holdout_promotion_report(selection_policy, best_trial_report, locked_holdout_report):
+    holdout_gap = _build_generalization_gap_report(
+        best_trial_report.get("raw_objective_value"),
+        (locked_holdout_report or {}).get("raw_objective_value"),
+    )
+    require_locked_holdout_pass = bool(selection_policy.get("require_locked_holdout_pass", False))
+    holdout_value = _coerce_float((locked_holdout_report or {}).get("raw_objective_value"))
+    locked_holdout_pass = True
+    if (locked_holdout_report or {}).get("enabled"):
+        locked_holdout_pass = bool(
+            holdout_value is not None
+            and holdout_value >= selection_policy.get("min_locked_holdout_score", 0.0)
+            and not locked_holdout_report.get("holdout_warning", False)
+        )
+    locked_holdout_gap_pass = bool(
+        not require_locked_holdout_pass
+        or (holdout_gap.get("normalized_degradation") or 0.0)
+        <= selection_policy.get("max_generalization_gap", np.inf)
+    )
+
+    promotion_reasons = []
+    if require_locked_holdout_pass and not locked_holdout_pass:
+        promotion_reasons.append("locked_holdout_failed")
+    if not locked_holdout_gap_pass:
+        promotion_reasons.append("validation_holdout_gap_above_limit")
+
+    return {
+        "generalization_gap": holdout_gap,
+        "locked_holdout_pass": locked_holdout_pass,
+        "locked_holdout_gap_pass": locked_holdout_gap_pass,
+        "promotion_ready": not promotion_reasons,
+        "promotion_reasons": promotion_reasons,
+    }
 
 
 def _extract_sharpe_ci_lower(backtest_summary):
@@ -949,7 +1048,6 @@ def _generate_local_perturbations(overrides, search_space, limit=8):
     seen = set()
 
     candidates = [
-        (("signals", "threshold"), ((search_space.get("signals") or {}).get("threshold"))),
         (("feature_selection", "max_features"), ((search_space.get("feature_selection") or {}).get("max_features"))),
         (("labels", "max_holding"), ((search_space.get("labels") or {}).get("max_holding"))),
     ]
@@ -1647,6 +1745,10 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                     "enabled": bool(selection_policy.get("enabled", True)),
                     "eligible_before_post_checks": not eligibility_reasons,
                     "eligible": None,
+                    "promotion_ready": None,
+                    "promotion_reasons": [],
+                    "frozen": False,
+                    "holdout_consulted_for_selection": False,
                     "eligibility_checks": eligibility_checks,
                     "eligibility_reasons": eligibility_reasons,
                 },
@@ -2055,15 +2157,6 @@ def _sample_trial_overrides(trial, search_space):
             }
         overrides["model"] = model_overrides
 
-    signal_space = search_space.get("signals", {})
-    if signal_space:
-        signal_overrides = {}
-        for key in ["threshold", "fraction", "edge_threshold", "meta_threshold", "tuning_min_trades"]:
-            if key in signal_space:
-                signal_overrides[key] = _sample_from_spec(trial, f"signals.{key}", signal_space[key])
-        if signal_overrides:
-            overrides["signals"] = signal_overrides
-
     return overrides
 
 
@@ -2078,6 +2171,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     automl_config = copy.deepcopy(base_config.get("automl", {}))
     search_space = copy.deepcopy(DEFAULT_AUTOML_SEARCH_SPACE)
     _deep_merge(search_space, automl_config.get("search_space", {}))
+    _validate_signal_policy_search_space(search_space)
 
     storage_path = _build_study_storage_path(base_config, automl_config)
     storage_url = f"sqlite:///{storage_path.as_posix()}"
@@ -2108,6 +2202,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
 
     def objective(trial):
         overrides = _sample_trial_overrides(trial, search_space)
+        _validate_trial_overrides(overrides)
         try:
             search_training, search_backtest = _execute_trial_candidate(
                 base_config,
@@ -2278,45 +2373,6 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         if not fragility.get("passed", True):
             policy_report["eligibility_reasons"].append("parameter_fragility_above_limit")
 
-        if holdout_plan["enabled"]:
-            locked_holdout_report = _evaluate_locked_holdout(
-                base_config=base_config,
-                best_overrides=report["overrides"],
-                pipeline_class=pipeline_class,
-                trial_step_classes=trial_step_classes,
-                full_state_bundle=full_state_bundle,
-                holdout_plan=holdout_plan,
-            )
-            holdout_gap = _build_generalization_gap_report(
-                report["raw_objective_value"],
-                locked_holdout_report.get("raw_objective_value"),
-            )
-            report["locked_holdout"] = locked_holdout_report
-            report["generalization_gap"]["validation_to_locked_holdout"] = holdout_gap
-
-            locked_holdout_pass = True
-            if selection_policy.get("require_locked_holdout_pass", True):
-                holdout_value = _coerce_float(locked_holdout_report.get("raw_objective_value"))
-                locked_holdout_pass = bool(
-                    holdout_value is not None
-                    and holdout_value >= selection_policy.get("min_locked_holdout_score", 0.0)
-                    and not locked_holdout_report.get("holdout_warning", False)
-                )
-            locked_holdout_gap_pass = bool(
-                not selection_policy.get("require_locked_holdout_pass", False)
-                or (holdout_gap.get("normalized_degradation") or 0.0)
-                <= selection_policy.get("max_generalization_gap", np.inf)
-            )
-            policy_report["eligibility_checks"]["locked_holdout"] = locked_holdout_pass
-            policy_report["eligibility_checks"]["locked_holdout_gap"] = locked_holdout_gap_pass
-            if selection_policy.get("require_locked_holdout_pass", True) and not locked_holdout_pass:
-                policy_report["eligibility_reasons"].append("locked_holdout_failed")
-            if not locked_holdout_gap_pass:
-                policy_report["eligibility_reasons"].append("validation_holdout_gap_above_limit")
-        else:
-            policy_report["eligibility_checks"]["locked_holdout"] = True
-            policy_report["eligibility_checks"]["locked_holdout_gap"] = True
-
         policy_report["eligible"] = not policy_report["eligibility_reasons"]
         if policy_report["eligible"]:
             best_trial_report = report
@@ -2329,6 +2385,8 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     best_optuna_trial = study.best_trial
     best_overrides = copy.deepcopy(best_trial_report["overrides"])
     best_overrides_summary = _json_ready(_clone_value(best_overrides))
+    best_trial_report["selection_policy"]["frozen"] = True
+    selection_snapshot = _build_selection_snapshot(best_trial_report)
 
     selection_report["diagnostics"]["promoted_trial"] = {
         "number": int(best_trial_report["number"]),
@@ -2340,12 +2398,17 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "param_fragility_score": best_trial_report.get("param_fragility_score"),
         "generalization_gap": best_trial_report.get("generalization_gap"),
         "eligibility_reasons": best_trial_report["selection_policy"].get("eligibility_reasons", []),
+        "candidate_hash": selection_snapshot.get("candidate_hash"),
+        "selection_timestamp": selection_snapshot.get("selection_timestamp"),
     }
+    selection_report["diagnostics"]["selection_freeze"] = selection_snapshot
 
     validation_holdout = _build_validation_holdout_report(best_trial_report, holdout_plan)
 
+    locked_holdout_access_count = 0
     locked_holdout = best_trial_report.get("locked_holdout")
     if locked_holdout is None:
+        locked_holdout_access_count += int(bool(holdout_plan.get("enabled", False)))
         locked_holdout = _evaluate_locked_holdout(
             base_config=base_config,
             best_overrides=best_overrides,
@@ -2354,6 +2417,34 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             full_state_bundle=full_state_bundle,
             holdout_plan=holdout_plan,
         )
+    locked_holdout = _decorate_locked_holdout_report(
+        locked_holdout,
+        selection_snapshot=selection_snapshot,
+        access_count=locked_holdout_access_count,
+    )
+    post_selection_holdout = _build_locked_holdout_promotion_report(
+        selection_policy,
+        best_trial_report,
+        locked_holdout,
+    )
+    best_trial_report["locked_holdout"] = locked_holdout
+    best_trial_report["generalization_gap"]["validation_to_locked_holdout"] = post_selection_holdout["generalization_gap"]
+    best_trial_report["selection_policy"]["eligibility_checks"]["locked_holdout"] = post_selection_holdout[
+        "locked_holdout_pass"
+    ]
+    best_trial_report["selection_policy"]["eligibility_checks"]["locked_holdout_gap"] = post_selection_holdout[
+        "locked_holdout_gap_pass"
+    ]
+    best_trial_report["selection_policy"]["promotion_ready"] = post_selection_holdout["promotion_ready"]
+    best_trial_report["selection_policy"]["promotion_reasons"] = post_selection_holdout["promotion_reasons"]
+    best_trial_report["selection_policy"]["holdout_consulted_for_selection"] = False
+    selection_report["diagnostics"]["holdout_access_count"] = int(locked_holdout_access_count)
+    selection_report["diagnostics"]["holdout_evaluated_once"] = bool(locked_holdout.get("evaluated_once", False))
+    selection_report["diagnostics"]["holdout_evaluated_after_freeze"] = bool(
+        locked_holdout.get("evaluated_after_freeze", False)
+    )
+    selection_report["diagnostics"]["promotion_ready"] = bool(post_selection_holdout["promotion_ready"])
+    selection_report["diagnostics"]["promotion_reasons"] = list(post_selection_holdout["promotion_reasons"])
 
     top_trials = []
     for report in selection_report["trial_reports"][:5]:
@@ -2410,8 +2501,11 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             "param_fragility": best_trial_report.get("param_fragility"),
             "selection_policy": best_trial_report.get("selection_policy"),
         },
+        "selection_freeze": selection_snapshot,
         "validation_holdout": validation_holdout,
         "locked_holdout": locked_holdout,
+        "promotion_ready": bool(post_selection_holdout["promotion_ready"]),
+        "promotion_reasons": list(post_selection_holdout["promotion_reasons"]),
         "overfitting_diagnostics": selection_report["diagnostics"],
         "top_trials": top_trials,
         "trial_count": len(completed_trials),

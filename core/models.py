@@ -13,6 +13,7 @@ from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .execution import resolve_liquidity_inputs
 from .features import ENDOGENOUS_FEATURE_FAMILIES, resolve_feature_family
 from .labeling import sequential_bootstrap
 from .slippage import _estimate_reference_trade_slippage_rates
@@ -502,7 +503,8 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
                                   fee_rate=0.0, slippage_rate=0.0,
                                   funding_rates=None, cutoff_timestamp=None,
                                   equity=10_000.0, volume=None,
-                                  slippage_model=None, orderbook_depth=None):
+                                  slippage_model=None, orderbook_depth=None,
+                                  liquidity_lag_bars=1):
     """Build execution-aligned trade outcomes for a directional prediction series.
 
     Outcomes are computed using the same delayed, bar-by-bar return semantics as
@@ -528,13 +530,20 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
     cutoff = pd.Timestamp(cutoff_timestamp) if cutoff_timestamp is not None else None
     execution_returns = execution_series.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
     fee_cost_rate = 2.0 * float(fee_rate)
+    liquidity_inputs = resolve_liquidity_inputs(
+        index=execution_series.index,
+        volume=volume,
+        orderbook_depth=orderbook_depth,
+        slippage_model=slippage_model,
+        liquidity_lag_bars=liquidity_lag_bars,
+    )
     slippage_bar_rates = _estimate_reference_trade_slippage_rates(
         equity=equity,
         execution_series=execution_series,
         slippage_rate=slippage_rate,
         slippage_model=slippage_model,
-        volume=volume,
-        orderbook_depth=orderbook_depth,
+        volume=liquidity_inputs["volume"],
+        orderbook_depth=liquidity_inputs["orderbook_depth"],
     )
 
     rows = []

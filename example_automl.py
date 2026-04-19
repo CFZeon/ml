@@ -61,6 +61,7 @@ def main():
                 "meta_n_splits": 2,
             },
             "signals": {
+                "policy_mode": "validation_calibrated",
                 "avg_win": 0.02,
                 "avg_loss": 0.02,
                 "shrinkage_alpha": 0.5,

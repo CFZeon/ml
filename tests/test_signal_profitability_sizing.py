@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from core import ResearchPipeline, build_execution_outcome_frame, build_trade_outcome_frame
-from core.pipeline import _build_signal_state, _compute_theory_thresholds, _estimate_trade_outcome_stats
+from core.pipeline import SignalPolicyBuilder, _build_signal_state, _compute_theory_thresholds, _estimate_trade_outcome_stats
 
 
 class SignalProfitabilitySizingTest(unittest.TestCase):
@@ -275,6 +275,52 @@ class SignalProfitabilitySizingTest(unittest.TestCase):
 
         self.assertAlmostEqual(float(thresholds["params"]["threshold"]), 0.005, places=6)
 
+    def test_signal_policy_builder_validation_calibrated_uses_validation_trade_outcomes(self):
+        trade_outcomes = pd.DataFrame(
+            {
+                "trade_taken": [1, 1, 0],
+                "round_trip_cost_rate": [0.0040, 0.0060, 0.0],
+            },
+            index=pd.date_range("2026-03-09", periods=3, freq="1h", tz="UTC"),
+        )
+        builder = SignalPolicyBuilder(
+            {"policy_mode": "validation_calibrated", "threshold": 0.0, "edge_threshold": 0.0, "fraction": 1.0},
+            {"fee_rate": 0.0, "slippage_rate": 0.0},
+        )
+
+        report = builder.build(
+            avg_win=0.03,
+            avg_loss=0.02,
+            trade_outcomes=trade_outcomes,
+            calibration_context={"source": "validation_trade_outcomes", "calibration_rows": 3},
+        )
+
+        self.assertEqual(report["mode"], "validation_calibrated")
+        self.assertEqual(report["policy_quality"]["source"], "validation_trade_outcomes")
+        self.assertTrue(report["policy_quality"]["used_trade_outcomes"])
+        self.assertAlmostEqual(float(report["params"]["threshold"]), 0.005, places=6)
+
+    def test_signal_policy_builder_frozen_manual_preserves_manual_policy(self):
+        builder = SignalPolicyBuilder(
+            {
+                "policy_mode": "frozen_manual",
+                "threshold": 0.07,
+                "edge_threshold": 0.11,
+                "meta_threshold": 0.61,
+                "fraction": 0.4,
+            },
+            {"fee_rate": 0.001, "slippage_rate": 0.001},
+        )
+
+        report = builder.build(avg_win=0.03, avg_loss=0.02)
+
+        self.assertEqual(report["mode"], "frozen_manual")
+        self.assertEqual(report["policy_quality"]["source"], "frozen_manual")
+        self.assertAlmostEqual(float(report["params"]["threshold"]), 0.07, places=6)
+        self.assertAlmostEqual(float(report["params"]["edge_threshold"]), 0.11, places=6)
+        self.assertAlmostEqual(float(report["params"]["meta_threshold"]), 0.61, places=6)
+        self.assertAlmostEqual(float(report["params"]["fraction"]), 0.4, places=6)
+
     def test_pipeline_oos_avg_win_loss_ignore_label_gross_return(self):
         index = pd.date_range("2026-03-10", periods=220, freq="1h", tz="UTC")
         steps = np.linspace(0.0, 1.0, len(index))
@@ -343,7 +389,13 @@ class SignalProfitabilitySizingTest(unittest.TestCase):
 
         self.assertAlmostEqual(float(training["oos_avg_win"]), expected_avg_win, places=6)
         self.assertAlmostEqual(float(training["oos_avg_loss"]), expected_avg_loss, places=6)
-        self.assertGreaterEqual(float(training["last_signal_params"]["threshold"]), 0.001)
+        self.assertIn("signal_policy", training)
+        self.assertEqual(training["signal_policy"]["mode"], "validation_calibrated")
+        self.assertGreaterEqual(len(training["signal_policy"]["folds"]), 1)
+        self.assertEqual(
+            training["signal_policy"]["last_policy_quality"]["source"],
+            "validation_unavailable_static_fallback",
+        )
 
 
 if __name__ == "__main__":

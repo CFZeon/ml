@@ -20,6 +20,7 @@ from .context import (
     build_cross_asset_context_feature_block,
     build_multi_timeframe_context_feature_block,
 )
+from .execution import LiquidityInputResolver, resolve_liquidity_inputs
 from .indicators import (
     Indicator,
     IndicatorResult,
@@ -68,6 +69,7 @@ from .labeling import (
     sample_weights_by_uniqueness,
     sequential_bootstrap,
 )
+from .lookahead import run_lookahead_analysis
 from .slippage import FlatSlippageModel, OrderBookImpactModel, SlippageModel, SquareRootImpactModel
 from .models import (
     build_execution_outcome_frame,

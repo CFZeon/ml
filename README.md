@@ -23,6 +23,8 @@ The repo now includes:
 - uniqueness weighting and sequential bootstrap support
 - explicit regime detection and context features
 - AutoML with validation/holdout separation, CPCV/PBO diagnostics, DSR reporting, fragility checks, and stability gating
+- a baseline-vs-prefix lookahead provocation harness for detecting future-informed features, labels, probabilities, signals, and execution inputs
+- a causal liquidity resolver that shifts bar-volume inputs, validates L2 snapshot timestamps, and records liquidity provenance in backtest outputs
 - pandas and vectorbt execution adapters behind a shared order-validation contract
 - futures backtests with funding, mark-price valuation, leverage-bracket caps, isolated/cross margin modes, and liquidation events
 
@@ -35,7 +37,9 @@ The repo now includes:
 - `core/models.py`: model training, diagnostics, validation helpers
 - `core/automl.py`: Optuna-backed search, ranking, holdout logic, and overfitting diagnostics
 - `core/backtest.py`: execution-aware backtests, slippage models, and futures margin/liquidation simulation
+- `core/execution/liquidity.py`: causal bar-volume and order-book liquidity input resolution
 - `core/pipeline.py`: stepwise research pipeline orchestration
+- `core/lookahead.py`: baseline-plus-prefix replay audit for lookahead bias provocation
 - `example.py`, `example_fvg.py`, `example_custom_data.py`, `example_futures.py`, `example_automl.py`: runnable end-to-end examples
 - `tests/`: regression coverage for validation, joins, execution semantics, AutoML governance, and futures behavior
 
@@ -132,6 +136,7 @@ Current safeguards include:
 - walk-forward and CPCV validation paths
 - purging-aware training flow for overlapping labels
 - fold-local regime and stationarity fitting
+- prefix-only replay audits that compare baseline outputs against truncated reruns at sampled decision timestamps
 - holdout-aware AutoML promotion
 - deflated Sharpe and PBO diagnostics
 - fold-stability reporting with optional rejection gates

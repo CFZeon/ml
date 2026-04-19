@@ -343,6 +343,14 @@ def _resolve_backtest_slippage_model(pipeline):
     raise TypeError("backtest.slippage_model must be a supported string alias or implement estimate(...)")
 
 
+def _resolve_backtest_liquidity_lag_bars(pipeline):
+    backtest_config = pipeline.section("backtest")
+    configured = backtest_config.get("liquidity_lag_bars")
+    if configured is None:
+        return 1
+    return max(0, int(configured))
+
+
 def _resolve_backtest_funding_rates(pipeline, index):
     backtest_config = pipeline.section("backtest")
     market = _resolve_backtest_market(pipeline)
@@ -429,6 +437,7 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "symbol_filters": pipeline.state.get("symbol_filters"),
         "funding_rates": _resolve_backtest_funding_rates(pipeline, index),
         "volume": raw_data["volume"].reindex(index).fillna(0.0) if "volume" in raw_data.columns else None,
+        "liquidity_lag_bars": _resolve_backtest_liquidity_lag_bars(pipeline),
         "slippage_model": _resolve_backtest_slippage_model(pipeline),
         "orderbook_depth": pipeline.state.get("orderbook_depth"),
         "significance": significance_config,
@@ -946,6 +955,7 @@ def _build_execution_trade_outcomes(pipeline, predictions, holding_bars, cutoff_
         volume=runtime_kwargs.get("volume"),
         slippage_model=runtime_kwargs.get("slippage_model"),
         orderbook_depth=runtime_kwargs.get("orderbook_depth"),
+        liquidity_lag_bars=runtime_kwargs.get("liquidity_lag_bars", 1),
     )
 
 
@@ -1301,24 +1311,115 @@ def _compute_theory_thresholds(avg_win, avg_loss, backtest_config, signal_config
     return {"params": params}
 
 
-def _resolve_signal_threshold_grid(signal_config):
-    def _grid(key, fallback):
-        values = signal_config.get(key)
-        if values is None:
-            values = fallback
-        return sorted({round(float(value), 6) for value in values})
-
-    threshold_default = float(signal_config.get("threshold", 0.03))
-    edge_default = float(signal_config.get("edge_threshold", 0.05))
-    meta_default = float(signal_config.get("meta_threshold", 0.55))
-    fraction_default = float(signal_config.get("fraction", 0.5))
-
-    return {
-        "threshold": _grid("threshold_grid", [0.0, 0.005, 0.01, threshold_default, 0.03]),
-        "edge_threshold": _grid("edge_threshold_grid", [0.0, 0.03, edge_default, 0.08]),
-        "meta_threshold": _grid("meta_threshold_grid", [0.5, meta_default, 0.6, 0.65]),
-        "fraction": _grid("fraction_grid", [0.25, fraction_default, 0.75]),
+def _resolve_signal_policy_mode(signal_config):
+    mode = str((signal_config or {}).get("policy_mode", "validation_calibrated")).lower()
+    aliases = {
+        "theory": "theory_only",
+        "manual": "frozen_manual",
+        "validation": "validation_calibrated",
     }
+    mode = aliases.get(mode, mode)
+    valid_modes = {"theory_only", "validation_calibrated", "frozen_manual"}
+    if mode not in valid_modes:
+        raise ValueError(
+            "signals.policy_mode must be one of ['theory_only', 'validation_calibrated', 'frozen_manual']"
+        )
+    return mode
+
+
+def _extend_signal_policy_params(params, signal_config):
+    extended = dict(params)
+    extended["fraction"] = float(signal_config.get("fraction", extended.get("fraction", 0.5)))
+    extended["min_trades_for_kelly"] = int(signal_config.get("min_trades_for_kelly", 30))
+    extended["max_kelly_fraction"] = float(signal_config.get("max_kelly_fraction", 0.5))
+    extended["policy_mode"] = _resolve_signal_policy_mode(signal_config)
+    return extended
+
+
+class SignalPolicyBuilder:
+    def __init__(self, signal_config, backtest_config):
+        self.signal_config = dict(signal_config or {})
+        self.backtest_config = dict(backtest_config or {})
+        self.mode = _resolve_signal_policy_mode(self.signal_config)
+
+    def build(self, avg_win, avg_loss, trade_outcomes=None, calibration_context=None):
+        calibration_context = dict(calibration_context or {})
+        applied_trade_outcomes = None
+
+        if self.mode == "frozen_manual":
+            report = self._build_frozen_manual_policy(avg_win, avg_loss)
+            source = "frozen_manual"
+        elif self.mode == "theory_only":
+            report = _compute_theory_thresholds(
+                avg_win=avg_win,
+                avg_loss=avg_loss,
+                backtest_config=self.backtest_config,
+                signal_config=self.signal_config,
+                trade_outcomes=None,
+            )
+            source = "static_cost_math"
+        else:
+            applied_trade_outcomes = trade_outcomes
+            report = _compute_theory_thresholds(
+                avg_win=avg_win,
+                avg_loss=avg_loss,
+                backtest_config=self.backtest_config,
+                signal_config=self.signal_config,
+                trade_outcomes=applied_trade_outcomes,
+            )
+            source = calibration_context.get("source") or (
+                "validation_trade_outcomes"
+                if applied_trade_outcomes is not None and not applied_trade_outcomes.empty
+                else "validation_unavailable_static_fallback"
+            )
+
+        params = _extend_signal_policy_params(report["params"], self.signal_config)
+        break_even_prob = float(avg_loss) / max(float(avg_win) + float(avg_loss), 1e-12)
+        policy_quality = {
+            "mode": self.mode,
+            "source": source,
+            "avg_win_used": float(avg_win),
+            "avg_loss_used": float(avg_loss),
+            "break_even_profit_prob": float(break_even_prob),
+            "round_trip_cost_rate": float(
+                _resolve_round_trip_cost_rate(
+                    self.backtest_config,
+                    trade_outcomes=applied_trade_outcomes if self.mode == "validation_calibrated" else None,
+                )
+            ),
+            "used_trade_outcomes": bool(applied_trade_outcomes is not None and not applied_trade_outcomes.empty),
+            "calibration_rows": int(calibration_context.get("calibration_rows", 0)),
+            "kelly_trade_count": calibration_context.get("kelly_trade_count"),
+        }
+        for key, value in calibration_context.items():
+            if key not in policy_quality:
+                policy_quality[key] = value
+
+        return {
+            "mode": self.mode,
+            "params": params,
+            "policy_quality": policy_quality,
+        }
+
+    def _build_frozen_manual_policy(self, avg_win, avg_loss):
+        break_even_prob = float(avg_loss) / max(float(avg_win) + float(avg_loss), 1e-12)
+        meta_threshold = float(self.signal_config.get("meta_threshold", max(0.5, round(break_even_prob, 6))))
+        profitability_threshold = self.signal_config.get("profitability_threshold")
+        if profitability_threshold is None:
+            if self.signal_config.get("sizing_mode", "expected_utility") == "kelly":
+                profitability_threshold = meta_threshold
+            else:
+                profitability_threshold = break_even_prob
+
+        return {
+            "params": {
+                "threshold": float(self.signal_config.get("threshold", 0.03)),
+                "edge_threshold": float(self.signal_config.get("edge_threshold", 0.05)),
+                "meta_threshold": meta_threshold,
+                "profitability_threshold": float(profitability_threshold),
+                "fraction": float(self.signal_config.get("fraction", 0.5)),
+            }
+        }
 
 
 def _build_signal_state(
@@ -2001,6 +2102,7 @@ class TrainModelsStep(PipelineStep):
         selection_config = pipeline.section("feature_selection")
         signal_config = pipeline.section("signals")
         backtest_config = pipeline.section("backtest")
+        signal_policy_builder = SignalPolicyBuilder(signal_config, backtest_config)
         feature_blocks = pipeline.state.get("feature_blocks", {})
         stationarity_config = _resolve_stationarity_screening_config(pipeline)
         binary_primary = config.get("binary_primary", True)
@@ -2008,6 +2110,15 @@ class TrainModelsStep(PipelineStep):
         default_avg_win = float(signal_config.get("avg_win", 0.02))
         default_avg_loss = float(signal_config.get("avg_loss", 0.02))
         shrinkage_alpha = float(signal_config.get("shrinkage_alpha", 0.5))
+        default_signal_policy = signal_policy_builder.build(
+            default_avg_win,
+            default_avg_loss,
+            calibration_context={
+                "source": "static_defaults",
+                "calibration_rows": 0,
+                "kelly_trade_count": 0,
+            },
+        )
         close_all = raw_data["close"]
         validation_method = _resolve_validation_method(config)
         stability_policy = _resolve_validation_stability_policy(pipeline)
@@ -2033,7 +2144,7 @@ class TrainModelsStep(PipelineStep):
         fold_block_diagnostics = []
         fold_family_diagnostics = []
         fold_feature_selection = []
-        fold_signal_tuning = []
+        fold_signal_policy = []
         fold_stationarity = []
         fold_purging = []
         fold_regime = []
@@ -2045,14 +2156,8 @@ class TrainModelsStep(PipelineStep):
         last_selected_columns = list(X.columns)
         last_regime_fit_index = X.index[:0]
         last_test_index = X.index[:0]
-        last_signal_params = {
-            "threshold": float(signal_config.get("threshold", 0.03)),
-            "edge_threshold": float(signal_config.get("edge_threshold", 0.05)),
-            "meta_threshold": float(signal_config.get("meta_threshold", 0.55)),
-            "fraction": float(signal_config.get("fraction", 0.5)),
-            "min_trades_for_kelly": int(signal_config.get("min_trades_for_kelly", 30)),
-            "max_kelly_fraction": float(signal_config.get("max_kelly_fraction", 0.5)),
-        }
+        last_signal_params = dict(default_signal_policy["params"])
+        last_signal_policy = dict(default_signal_policy["policy_quality"])
         last_avg_win = default_avg_win
         last_avg_loss = default_avg_loss
         last_kelly_trade_count = 0
@@ -2272,12 +2377,6 @@ class TrainModelsStep(PipelineStep):
             meta_calibrator = None
             prior_oos_trade_outcomes = pd.concat(oos_trade_outcomes).sort_index() if oos_trade_outcomes else pd.DataFrame()
             prior_oos_trade_count = _count_realized_trades(prior_oos_trade_outcomes)
-            fit_trade_outcomes = _build_execution_trade_outcomes(
-                pipeline,
-                pd.Series(model.predict(X_fit_model), index=X_fit_model.index),
-                holding_bars=holding_bars,
-                cutoff_timestamp=X_fit_model.index[-1],
-            )
             # Extract regime / volatility context columns for meta-model enrichment.
             # Cap at 8 columns to avoid the context overshadowing the primary signal.
             _META_CTX_PREFIXES = ("regime", "trend_regime", "volatility_regime", "liquidity_regime")
@@ -2309,17 +2408,23 @@ class TrainModelsStep(PipelineStep):
             fold_avg_loss = default_avg_loss
             sizing_trade_outcomes = None
             sizing_stats_source = "defaults"
-
-            tuning = _compute_theory_thresholds(
+            signal_policy_context = {
+                "source": (
+                    "validation_unavailable_static_fallback"
+                    if signal_policy_builder.mode == "validation_calibrated"
+                    else "static_cost_math"
+                ),
+                "calibration_rows": 0,
+                "kelly_trade_count": int(prior_oos_trade_count),
+            }
+            signal_policy_report = signal_policy_builder.build(
                 avg_win=fold_avg_win,
                 avg_loss=fold_avg_loss,
-                backtest_config=backtest_config,
-                signal_config=signal_config,
-                trade_outcomes=fit_trade_outcomes,
+                trade_outcomes=None,
+                calibration_context=signal_policy_context,
             )
-            tuned_signal_params = dict(tuning["params"])
-            tuning_backtest = None
-            tuning_score = None
+            tuned_signal_params = dict(signal_policy_report["params"])
+            policy_backtest = None
             if X_val_model is not None and not X_val_model.empty:
                 val_primary_preds = pd.Series(model.predict(X_val_model), index=X_val_model.index)
                 val_primary_probs_raw = predict_probability_frame(model, X_val_model)
@@ -2368,15 +2473,20 @@ class TrainModelsStep(PipelineStep):
                 )
                 sizing_stats_source = "validation_shrunk" if not prior_oos_trade_outcomes.empty else "validation"
 
-                tuning = _compute_theory_thresholds(
+                signal_policy_context = {
+                    "source": "validation_trade_outcomes",
+                    "calibration_rows": int(len(X_val_model)),
+                    "kelly_trade_count": int(prior_oos_trade_count),
+                }
+                signal_policy_report = signal_policy_builder.build(
                     avg_win=fold_avg_win,
                     avg_loss=fold_avg_loss,
-                    backtest_config=backtest_config,
-                    signal_config=signal_config,
-                    trade_outcomes=sizing_trade_outcomes,
+                    trade_outcomes=sizing_trade_outcomes if signal_policy_builder.mode == "validation_calibrated" else None,
+                    calibration_context=signal_policy_context,
                 )
-                tuned_signal_params = dict(tuning["params"])
-                # Single diagnostic backtest on validation data — no parameter selection
+                tuned_signal_params = dict(signal_policy_report["params"])
+                # Single diagnostic backtest on validation data. This is reporting only,
+                # not a second search loop over policy parameters.
                 val_signal_state = _build_signal_state(
                     val_primary_preds,
                     val_primary_probs,
@@ -2389,7 +2499,7 @@ class TrainModelsStep(PipelineStep):
                 )
                 val_close_for_bt = _resolve_backtest_valuation_close(pipeline, X_val_model.index)
                 if val_close_for_bt is not None and len(val_close_for_bt) > 0:
-                    tuning_backtest = run_backtest(
+                    policy_backtest = run_backtest(
                         close=val_close_for_bt.loc[val_signal_state["continuous_signals"].index],
                         signals=val_signal_state["continuous_signals"],
                         equity=backtest_config.get("equity", 10_000.0),
@@ -2405,7 +2515,6 @@ class TrainModelsStep(PipelineStep):
                         ),
                         **(_resolve_backtest_runtime_kwargs(pipeline, X_val_model.index) or {}),
                     )
-                    tuning_score = _score_signal_state(tuning_backtest, signal_config) if tuning_backtest is not None else None
             elif not prior_oos_trade_outcomes.empty:
                 sizing_trade_outcomes = prior_oos_trade_outcomes
                 fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats(
@@ -2414,14 +2523,18 @@ class TrainModelsStep(PipelineStep):
                     default_avg_loss,
                 )
                 sizing_stats_source = "prior_oos_pooled"
-                tuning = _compute_theory_thresholds(
+                signal_policy_context = {
+                    "source": "prior_oos_trade_outcomes",
+                    "calibration_rows": int(len(sizing_trade_outcomes)),
+                    "kelly_trade_count": int(prior_oos_trade_count),
+                }
+                signal_policy_report = signal_policy_builder.build(
                     avg_win=fold_avg_win,
                     avg_loss=fold_avg_loss,
-                    backtest_config=backtest_config,
-                    signal_config=signal_config,
-                    trade_outcomes=sizing_trade_outcomes,
+                    trade_outcomes=sizing_trade_outcomes if signal_policy_builder.mode == "validation_calibrated" else None,
+                    calibration_context=signal_policy_context,
                 )
-                tuned_signal_params = dict(tuning["params"])
+                tuned_signal_params = dict(signal_policy_report["params"])
 
             test_primary_probs = _apply_primary_probability_calibrator(test_primary_probs_raw, primary_calibrator)
 
@@ -2505,20 +2618,33 @@ class TrainModelsStep(PipelineStep):
                         "total_trades": fold_backtest.get("total_trades"),
                     }
                 )
-            fold_signal_tuning.append(
+            fold_signal_policy.append(
                 {
                     "fold": fold,
                     "split_id": split_id,
+                    "mode": signal_policy_report["mode"],
                     "params": tuned_signal_params,
-                    "score": tuning_score,
+                    "policy_quality": {
+                        **signal_policy_report["policy_quality"],
+                        "diagnostic_backtest": (
+                            {
+                                "net_profit_pct": policy_backtest.get("net_profit_pct"),
+                                "sharpe_ratio": policy_backtest.get("sharpe_ratio"),
+                                "max_drawdown": policy_backtest.get("max_drawdown"),
+                                "total_trades": policy_backtest.get("total_trades"),
+                            }
+                            if policy_backtest is not None
+                            else None
+                        ),
+                    },
                     "backtest": (
                         {
-                            "net_profit_pct": tuning_backtest.get("net_profit_pct"),
-                            "sharpe_ratio": tuning_backtest.get("sharpe_ratio"),
-                            "max_drawdown": tuning_backtest.get("max_drawdown"),
-                            "total_trades": tuning_backtest.get("total_trades"),
+                            "net_profit_pct": policy_backtest.get("net_profit_pct"),
+                            "sharpe_ratio": policy_backtest.get("sharpe_ratio"),
+                            "max_drawdown": policy_backtest.get("max_drawdown"),
+                            "total_trades": policy_backtest.get("total_trades"),
                         }
-                        if tuning_backtest is not None
+                        if policy_backtest is not None
                         else None
                     ),
                 }
@@ -2553,6 +2679,7 @@ class TrainModelsStep(PipelineStep):
                     "kelly_trade_count": signal_state["kelly_trade_count"],
                     "used_flat_kelly_fallback": signal_state["used_flat_kelly_fallback"],
                     "signal_params": {**fold_signal_config},
+                    "signal_policy": dict(signal_policy_report["policy_quality"]),
                     "sizing_stats_source": sizing_stats_source,
                 }
             )
@@ -2564,6 +2691,7 @@ class TrainModelsStep(PipelineStep):
             last_regime_fit_index = X_fit.index.copy()
             last_test_index = X_test_model.index.copy()
             last_signal_params = {**fold_signal_config}
+            last_signal_policy = dict(signal_policy_report["policy_quality"])
             last_avg_win = fold_avg_win
             last_avg_loss = fold_avg_loss
             last_kelly_trade_count = prior_oos_trade_count
@@ -2677,6 +2805,12 @@ class TrainModelsStep(PipelineStep):
                 "aligned_safe_row_count": int(len(aligned_safe_index)),
             },
             "last_signal_params": last_signal_params,
+            "signal_policy": {
+                "mode": _resolve_signal_policy_mode(signal_config),
+                "folds": fold_signal_policy,
+                "last_policy_quality": last_signal_policy,
+                "last_policy_params": last_signal_params,
+            },
             "last_avg_win": last_avg_win,
             "last_avg_loss": last_avg_loss,
             "last_kelly_trade_count": int(last_kelly_trade_count),
@@ -2719,7 +2853,7 @@ class TrainModelsStep(PipelineStep):
                 "folds": fold_bootstrap,
             },
             "purging": fold_purging,
-            "signal_tuning": fold_signal_tuning,
+            "signal_tuning": fold_signal_policy,
             "oos_avg_win": oos_avg_win,
             "oos_avg_loss": oos_avg_loss,
             "oos_trade_count": int(oos_trade_count),
@@ -2785,6 +2919,7 @@ class SignalsStep(PipelineStep):
                         "kelly_trade_count": path.get("kelly_trade_count"),
                         "used_flat_kelly_fallback": path.get("used_flat_kelly_fallback", False),
                         "tuned_params": path.get("signal_params", {}),
+                        "signal_policy": path.get("signal_policy"),
                     }
                 )
 
@@ -2793,6 +2928,7 @@ class SignalsStep(PipelineStep):
                 "path_count": int(len(path_results)),
                 "paths": path_results,
                 "signal_tuning": training.get("signal_tuning", []),
+                "signal_policy": training.get("signal_policy"),
                 "tuned_params": training.get("last_signal_params", {}),
                 "signal_source": "cpcv_oos_paths",
                 "fallback_scope": fallback_scope,
@@ -2844,6 +2980,7 @@ class SignalsStep(PipelineStep):
                 "kelly_trade_count": int(training.get("oos_trade_count", 0)),
                 "used_flat_kelly_fallback": False,
                 "signal_tuning": training.get("signal_tuning", []),
+                "signal_policy": training.get("signal_policy"),
                 "tuned_params": training.get("last_signal_params", {}),
                 "signal_source": "walk_forward_oos",
                 "fallback_scope": fallback_scope,
@@ -2878,6 +3015,7 @@ class SignalsStep(PipelineStep):
                 )
                 result["signal_source"] = "post_final_training_fallback_empty"
                 result["fallback_scope"] = fallback_scope
+                result["signal_policy"] = training.get("signal_policy")
                 pipeline.state["signals"] = result
                 return result
 
@@ -2943,6 +3081,7 @@ class SignalsStep(PipelineStep):
         )
         result["signal_source"] = signal_source
         result["fallback_scope"] = fallback_scope
+        result["signal_policy"] = training.get("signal_policy")
         pipeline.state["signals"] = result
         return result
 
