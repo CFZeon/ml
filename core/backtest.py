@@ -3,8 +3,18 @@
 import numpy as np
 import pandas as pd
 
-from .execution import resolve_liquidity_inputs
-from .slippage import _estimate_slippage_rates, _estimate_trade_notional_slippage_rates
+from .execution import (
+    NautilusExecutionAdapter,
+    OrderIntent,
+    resolve_execution_policy,
+    resolve_liquidity_inputs,
+)
+from .slippage import (
+    _estimate_fill_event_costs,
+    _estimate_slippage_rates,
+    _estimate_trade_notional_slippage_rates,
+)
+from .universe import apply_symbol_lifecycle_policy, build_symbol_lifecycle_frame
 
 try:  # pragma: no cover - optional dependency exercised in integration tests
     import vectorbt as vbt
@@ -254,8 +264,8 @@ def _validate_order_intent(side, order_type, price, quantity, current_quantity,
     }
 
 
-def _build_execution_contract(close, requested_position, equity, execution_prices=None,
-                              symbol_filters=None, market="spot"):
+def _build_legacy_execution_contract(close, requested_position, equity, execution_prices=None,
+                                     symbol_filters=None, market="spot"):
     symbol_filters = dict(symbol_filters or {})
     valuation_series = pd.Series(close, copy=False).astype(float)
     raw_execution = execution_prices if execution_prices is not None else close
@@ -361,6 +371,412 @@ def _build_execution_contract(close, requested_position, equity, execution_price
         "blocked_orders": int((order_ledger.get("status") == "rejected").sum()) if not order_ledger.empty else 0,
         "adjusted_orders": int((order_ledger.get("status") == "adjusted").sum()) if not order_ledger.empty else 0,
         "accepted_orders": int((order_ledger.get("status") == "accepted").sum()) if not order_ledger.empty else 0,
+        "blocked_notional_share": _round_metric(_safe_ratio(blocked_notional, total_requested_notional), 6),
+        "order_rejection_reasons": (
+            order_ledger.loc[order_ledger["status"] == "rejected", "reason"].value_counts().to_dict()
+            if not order_ledger.empty
+            else {}
+        ),
+    }
+
+
+def _build_execution_contract(close, requested_position, equity, execution_prices=None,
+                              symbol_filters=None, market="spot", volume=None,
+                              execution_policy=None):
+    policy = resolve_execution_policy(execution_policy)
+    if policy.adapter == "legacy":
+        report = _build_legacy_execution_contract(
+            close,
+            requested_position,
+            equity,
+            execution_prices=execution_prices,
+            symbol_filters=symbol_filters,
+            market=market,
+        )
+        requested_total = float(report["order_ledger"].get("requested_notional", pd.Series(dtype=float)).sum()) if not report["order_ledger"].empty else 0.0
+        executed_total = float(report["order_ledger"].get("executed_notional", pd.Series(dtype=float)).sum()) if not report["order_ledger"].empty else 0.0
+        report["order_intents"] = report["order_ledger"].copy()
+        report["execution_adapter"] = "legacy"
+        report["execution_backend"] = "legacy"
+        report["execution_policy"] = policy.to_dict()
+        report["partial_fill_orders"] = 0
+        report["cancelled_orders"] = 0
+        report["unfilled_notional"] = max(0.0, requested_total - executed_total)
+        report["fill_ratio"] = _round_metric(_safe_ratio(executed_total, requested_total), 6)
+        return report
+
+    symbol_filters = dict(symbol_filters or {})
+    valuation_series = pd.Series(close, copy=False).astype(float)
+    raw_execution = execution_prices if execution_prices is not None else close
+    execution_series = pd.Series(raw_execution, index=valuation_series.index).reindex(valuation_series.index).astype(float)
+    requested_position = pd.Series(requested_position, index=valuation_series.index).reindex(valuation_series.index).fillna(0.0).astype(float)
+    if volume is None:
+        volume_series = pd.Series(np.nan, index=valuation_series.index, dtype=float)
+    else:
+        volume_series = (
+            pd.Series(volume, index=valuation_series.index)
+            .reindex(valuation_series.index)
+            .fillna(0.0)
+            .astype(float)
+            .clip(lower=0.0)
+        )
+
+    executable_position = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    order_rows = []
+    intent_rows = []
+    current_position = 0.0
+    current_quantity = 0.0
+    working_equity = float(equity)
+    previous_valuation_price = None
+    pending_order = None
+    adapter_boundary = NautilusExecutionAdapter() if policy.adapter == "nautilus" else None
+    tolerance = 1e-12
+
+    for bar_loc, timestamp in enumerate(valuation_series.index):
+        valuation_price = float(valuation_series.loc[timestamp])
+        execution_price = float(execution_series.loc[timestamp])
+        if previous_valuation_price is not None and previous_valuation_price > 0.0:
+            valuation_return = (valuation_price / previous_valuation_price) - 1.0
+            working_equity *= 1.0 + current_position * valuation_return
+
+        if execution_price <= 0.0 or not np.isfinite(execution_price):
+            if pending_order is not None:
+                order_rows.append(
+                    {
+                        "timestamp": timestamp,
+                        "requested_position": float(pending_order["requested_position"]),
+                        "executed_position": float(current_position),
+                        "previous_position": float(current_position),
+                        "side": pending_order["side"],
+                        "requested_order_quantity": float(pending_order["remaining_quantity"]),
+                        "executed_order_quantity": 0.0,
+                        "requested_notional": float(pending_order["remaining_quantity"] * max(execution_price, 0.0)),
+                        "executed_notional": 0.0,
+                        "execution_price": execution_price,
+                        "status": "cancelled",
+                        "reason": "invalid_execution_price",
+                        "adjustment_reasons": [],
+                    }
+                )
+                pending_order = None
+            executable_position.loc[timestamp] = current_position
+            previous_valuation_price = valuation_price
+            continue
+
+        available_quantity = float(policy.participation_cap * volume_series.loc[timestamp]) if np.isfinite(volume_series.loc[timestamp]) else np.inf
+        if available_quantity < 0.0 or not np.isfinite(available_quantity):
+            available_quantity = np.inf
+
+        desired_position = float(requested_position.loc[timestamp])
+
+        if pending_order is not None:
+            pending_age = bar_loc - int(pending_order["submit_bar"])
+            if not np.isclose(desired_position, pending_order["requested_position"], rtol=1e-9, atol=1e-12) and pending_age >= policy.cancel_replace_bars - 1:
+                remaining_notional = float(pending_order["remaining_quantity"] * execution_price)
+                order_rows.append(
+                    {
+                        "timestamp": timestamp,
+                        "requested_position": float(pending_order["requested_position"]),
+                        "executed_position": float(current_position),
+                        "previous_position": float(current_position),
+                        "side": pending_order["side"],
+                        "requested_order_quantity": float(pending_order["remaining_quantity"]),
+                        "executed_order_quantity": 0.0,
+                        "requested_notional": remaining_notional,
+                        "executed_notional": 0.0,
+                        "execution_price": execution_price,
+                        "status": "cancelled",
+                        "reason": "cancel_replace",
+                        "adjustment_reasons": [],
+                    }
+                )
+                pending_order = None
+
+        if pending_order is not None and available_quantity > tolerance:
+            previous_position = float(current_position)
+            fill_quantity = min(float(pending_order["remaining_quantity"]), available_quantity)
+            validation = _validate_order_intent(
+                side=pending_order["side"],
+                order_type=policy.order_type,
+                price=execution_price,
+                quantity=fill_quantity,
+                current_quantity=current_quantity,
+                symbol_filters=symbol_filters,
+                market=market,
+                weighted_average_price=_resolve_weighted_average_price(symbol_filters, execution_price),
+            )
+            if validation["status"] == "rejected":
+                order_rows.append(
+                    {
+                        "timestamp": timestamp,
+                        "requested_position": float(pending_order["requested_position"]),
+                        "executed_position": float(current_position),
+                        "previous_position": previous_position,
+                        "side": pending_order["side"],
+                        "requested_order_quantity": float(fill_quantity),
+                        "executed_order_quantity": 0.0,
+                        "requested_notional": float(fill_quantity * execution_price),
+                        "executed_notional": 0.0,
+                        "execution_price": execution_price,
+                        "status": "rejected",
+                        "reason": validation["reason"],
+                        "adjustment_reasons": validation.get("adjustment_reasons", []),
+                    }
+                )
+                pending_order = None
+            else:
+                executed_quantity = float(validation["quantity"])
+                executed_notional = float(validation["notional"])
+                signed_delta = executed_quantity if pending_order["side"] == "BUY" else -executed_quantity
+                current_quantity = current_quantity + signed_delta
+                if np.isclose(current_quantity, 0.0, rtol=1e-9, atol=tolerance):
+                    current_quantity = 0.0
+                current_position = current_quantity * execution_price / max(working_equity, 1e-12)
+                if np.isclose(current_position, 0.0, rtol=1e-9, atol=tolerance):
+                    current_position = 0.0
+                pending_order["remaining_quantity"] = max(0.0, float(pending_order["remaining_quantity"]) - executed_quantity)
+                available_quantity = max(0.0, available_quantity - executed_quantity)
+                order_rows.append(
+                    {
+                        "timestamp": timestamp,
+                        "requested_position": float(pending_order["requested_position"]),
+                        "executed_position": float(current_position),
+                        "previous_position": previous_position,
+                        "side": pending_order["side"],
+                        "requested_order_quantity": float(fill_quantity),
+                        "executed_order_quantity": executed_quantity,
+                        "requested_notional": float(fill_quantity * execution_price),
+                        "executed_notional": executed_notional,
+                        "execution_price": execution_price,
+                        "status": "partial_fill" if pending_order["remaining_quantity"] > tolerance else "accepted",
+                        "reason": validation["reason"],
+                        "adjustment_reasons": validation.get("adjustment_reasons", []),
+                    }
+                )
+                pending_age = bar_loc - int(pending_order["submit_bar"])
+                if pending_order["remaining_quantity"] <= tolerance:
+                    pending_order = None
+                elif pending_age >= policy.max_order_age_bars - 1:
+                    order_rows.append(
+                        {
+                            "timestamp": timestamp,
+                            "requested_position": float(pending_order["requested_position"]),
+                            "executed_position": float(current_position),
+                            "previous_position": float(current_position),
+                            "side": pending_order["side"],
+                            "requested_order_quantity": float(pending_order["remaining_quantity"]),
+                            "executed_order_quantity": 0.0,
+                            "requested_notional": float(pending_order["remaining_quantity"] * execution_price),
+                            "executed_notional": 0.0,
+                            "execution_price": execution_price,
+                            "status": "cancelled",
+                            "reason": "max_order_age",
+                            "adjustment_reasons": [],
+                        }
+                    )
+                    pending_order = None
+
+        if pending_order is not None:
+            pending_age = bar_loc - int(pending_order["submit_bar"])
+            if pending_age >= policy.max_order_age_bars - 1:
+                order_rows.append(
+                    {
+                        "timestamp": timestamp,
+                        "requested_position": float(pending_order["requested_position"]),
+                        "executed_position": float(current_position),
+                        "previous_position": float(current_position),
+                        "side": pending_order["side"],
+                        "requested_order_quantity": float(pending_order["remaining_quantity"]),
+                        "executed_order_quantity": 0.0,
+                        "requested_notional": float(pending_order["remaining_quantity"] * execution_price),
+                        "executed_notional": 0.0,
+                        "execution_price": execution_price,
+                        "status": "cancelled",
+                        "reason": "max_order_age",
+                        "adjustment_reasons": [],
+                    }
+                )
+                pending_order = None
+
+        if pending_order is None and not np.isclose(desired_position, current_position, rtol=1e-9, atol=1e-12):
+            desired_quantity = desired_position * max(working_equity, 0.0) / max(execution_price, 1e-12)
+            delta_quantity = desired_quantity - current_quantity
+            side = "BUY" if delta_quantity > 0.0 else "SELL"
+            requested_order_quantity = abs(float(delta_quantity))
+            requested_notional = requested_order_quantity * execution_price
+            if requested_order_quantity > tolerance:
+                intent = OrderIntent(
+                    timestamp=timestamp,
+                    side=side,
+                    order_type=policy.order_type,
+                    time_in_force=policy.time_in_force,
+                    requested_position=desired_position,
+                    previous_position=float(current_position),
+                    requested_order_quantity=float(requested_order_quantity),
+                    requested_notional=float(requested_notional),
+                    execution_price=float(execution_price),
+                    participation_cap=float(policy.participation_cap),
+                    min_fill_ratio=float(policy.min_fill_ratio),
+                    max_order_age_bars=int(policy.max_order_age_bars),
+                    cancel_replace_bars=int(policy.cancel_replace_bars),
+                )
+                intent_rows.append(intent.to_dict())
+                validation = _validate_order_intent(
+                    side=side,
+                    order_type=policy.order_type,
+                    price=execution_price,
+                    quantity=requested_order_quantity,
+                    current_quantity=current_quantity,
+                    symbol_filters=symbol_filters,
+                    market=market,
+                    weighted_average_price=_resolve_weighted_average_price(symbol_filters, execution_price),
+                )
+                base_status = validation["status"]
+                if base_status == "rejected":
+                    order_rows.append(
+                        {
+                            "timestamp": timestamp,
+                            "requested_position": desired_position,
+                            "executed_position": float(current_position),
+                            "previous_position": float(current_position),
+                            "side": side,
+                            "requested_order_quantity": float(requested_order_quantity),
+                            "executed_order_quantity": 0.0,
+                            "requested_notional": float(requested_notional),
+                            "executed_notional": 0.0,
+                            "execution_price": execution_price,
+                            "status": "rejected",
+                            "reason": validation["reason"],
+                            "adjustment_reasons": validation.get("adjustment_reasons", []),
+                        }
+                    )
+                else:
+                    validated_quantity = float(validation["quantity"])
+                    immediately_fillable = min(validated_quantity, available_quantity)
+                    immediate_fill_ratio = _safe_ratio(immediately_fillable, validated_quantity)
+                    if validated_quantity <= tolerance or immediate_fill_ratio < policy.min_fill_ratio - 1e-12:
+                        order_rows.append(
+                            {
+                                "timestamp": timestamp,
+                                "requested_position": desired_position,
+                                "executed_position": float(current_position),
+                                "previous_position": float(current_position),
+                                "side": side,
+                                "requested_order_quantity": float(validated_quantity),
+                                "executed_order_quantity": 0.0,
+                                "requested_notional": float(validated_quantity * execution_price),
+                                "executed_notional": 0.0,
+                                "execution_price": execution_price,
+                                "status": "cancelled",
+                                "reason": "min_fill_ratio",
+                                "adjustment_reasons": validation.get("adjustment_reasons", []),
+                            }
+                        )
+                    else:
+                        executed_quantity = immediately_fillable
+                        executed_notional = executed_quantity * execution_price
+                        previous_position = float(current_position)
+                        if executed_quantity > tolerance:
+                            signed_delta = executed_quantity if side == "BUY" else -executed_quantity
+                            current_quantity = current_quantity + signed_delta
+                            if np.isclose(current_quantity, 0.0, rtol=1e-9, atol=tolerance):
+                                current_quantity = 0.0
+                            current_position = current_quantity * execution_price / max(working_equity, 1e-12)
+                            if np.isclose(current_position, 0.0, rtol=1e-9, atol=tolerance):
+                                current_position = 0.0
+                            available_quantity = max(0.0, available_quantity - executed_quantity)
+                        remaining_quantity = max(0.0, validated_quantity - executed_quantity)
+                        order_rows.append(
+                            {
+                                "timestamp": timestamp,
+                                "requested_position": desired_position,
+                                "executed_position": float(current_position),
+                                "previous_position": previous_position,
+                                "side": side,
+                                "requested_order_quantity": float(validated_quantity),
+                                "executed_order_quantity": float(executed_quantity),
+                                "requested_notional": float(validated_quantity * execution_price),
+                                "executed_notional": float(executed_notional),
+                                "execution_price": execution_price,
+                                "status": "partial_fill" if remaining_quantity > tolerance else base_status,
+                                "reason": validation["reason"],
+                                "adjustment_reasons": validation.get("adjustment_reasons", []),
+                            }
+                        )
+                        if remaining_quantity > tolerance:
+                            if policy.time_in_force == "IOC":
+                                order_rows.append(
+                                    {
+                                        "timestamp": timestamp,
+                                        "requested_position": desired_position,
+                                        "executed_position": float(current_position),
+                                        "previous_position": float(current_position),
+                                        "side": side,
+                                        "requested_order_quantity": float(remaining_quantity),
+                                        "executed_order_quantity": 0.0,
+                                        "requested_notional": float(remaining_quantity * execution_price),
+                                        "executed_notional": 0.0,
+                                        "execution_price": execution_price,
+                                        "status": "cancelled",
+                                        "reason": "ioc_unfilled",
+                                        "adjustment_reasons": [],
+                                    }
+                                )
+                            else:
+                                pending_order = {
+                                    "requested_position": desired_position,
+                                    "side": side,
+                                    "remaining_quantity": float(remaining_quantity),
+                                    "submit_bar": int(bar_loc),
+                                }
+
+        executable_position.loc[timestamp] = float(current_position)
+        previous_valuation_price = valuation_price
+
+    if pending_order is not None and not valuation_series.empty:
+        last_timestamp = valuation_series.index[-1]
+        last_execution_price = float(execution_series.iloc[-1])
+        order_rows.append(
+            {
+                "timestamp": last_timestamp,
+                "requested_position": float(pending_order["requested_position"]),
+                "executed_position": float(current_position),
+                "previous_position": float(current_position),
+                "side": pending_order["side"],
+                "requested_order_quantity": float(pending_order["remaining_quantity"]),
+                "executed_order_quantity": 0.0,
+                "requested_notional": float(pending_order["remaining_quantity"] * last_execution_price),
+                "executed_notional": 0.0,
+                "execution_price": last_execution_price,
+                "status": "cancelled",
+                "reason": "end_of_backtest",
+                "adjustment_reasons": [],
+            }
+        )
+
+    order_ledger = pd.DataFrame(order_rows)
+    order_intents = pd.DataFrame(intent_rows)
+    rejected_mask = order_ledger["status"] == "rejected" if not order_ledger.empty else pd.Series(dtype=bool)
+    total_requested_notional = float(order_intents.get("requested_notional", pd.Series(dtype=float)).sum()) if not order_intents.empty else 0.0
+    blocked_notional = float(order_ledger.loc[rejected_mask, "requested_notional"].sum()) if not order_ledger.empty else 0.0
+    executed_notional = float(order_ledger.get("executed_notional", pd.Series(dtype=float)).sum()) if not order_ledger.empty else 0.0
+    return {
+        "valuation_series": valuation_series,
+        "execution_series": execution_series,
+        "requested_position": requested_position,
+        "position": executable_position,
+        "order_intents": order_intents,
+        "order_ledger": order_ledger,
+        "execution_adapter": policy.adapter,
+        "execution_backend": adapter_boundary.backend if adapter_boundary is not None else policy.adapter,
+        "execution_policy": policy.to_dict(),
+        "blocked_orders": int((order_ledger.get("status") == "rejected").sum()) if not order_ledger.empty else 0,
+        "adjusted_orders": int(((order_ledger.get("status").isin(["adjusted", "partial_fill"])) & order_ledger.get("adjustment_reasons").map(bool)).sum()) if not order_ledger.empty and "adjustment_reasons" in order_ledger else 0,
+        "accepted_orders": int((order_ledger.get("status") == "accepted").sum()) if not order_ledger.empty else 0,
+        "partial_fill_orders": int((order_ledger.get("status") == "partial_fill").sum()) if not order_ledger.empty else 0,
+        "cancelled_orders": int((order_ledger.get("status") == "cancelled").sum()) if not order_ledger.empty else 0,
+        "unfilled_notional": max(0.0, total_requested_notional - executed_notional),
+        "fill_ratio": _round_metric(_safe_ratio(executed_notional, total_requested_notional), 6),
         "blocked_notional_share": _round_metric(_safe_ratio(blocked_notional, total_requested_notional), 6),
         "order_rejection_reasons": (
             order_ledger.loc[order_ledger["status"] == "rejected", "reason"].value_counts().to_dict()
@@ -1236,16 +1652,35 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
                 "blocked_orders": int(execution_report.get("blocked_orders", 0)),
                 "adjusted_orders": int(execution_report.get("adjusted_orders", 0)),
                 "accepted_orders": int(execution_report.get("accepted_orders", 0)),
+                "partial_fill_orders": int(execution_report.get("partial_fill_orders", 0)),
+                "cancelled_orders": int(execution_report.get("cancelled_orders", 0)),
                 "blocked_notional_share": execution_report.get("blocked_notional_share", 0.0),
+                "fill_ratio": execution_report.get("fill_ratio", 0.0),
+                "unfilled_notional": execution_report.get("unfilled_notional", 0.0),
                 "order_rejection_reasons": execution_report.get("order_rejection_reasons", {}),
+                "execution_adapter": execution_report.get("execution_adapter"),
+                "execution_backend": execution_report.get("execution_backend"),
+                "execution_policy": execution_report.get("execution_policy", {}),
+                "execution_cost_report": execution_report.get("execution_cost_report", {}),
+                "order_intents": execution_report.get("order_intents", pd.DataFrame()),
                 "order_ledger": execution_report.get("order_ledger", pd.DataFrame()),
                 "price_fill_actions": execution_report.get("price_fill_actions", {}),
                 "liquidity_report": execution_report.get("liquidity_report", {}),
+                "symbol_lifecycle_report": execution_report.get("symbol_lifecycle_report", {}),
             }
         )
     if futures_account_report is not None:
         summary.update(dict(futures_account_report))
     return summary
+
+
+def _resolve_realized_slippage_paid(cost_report, fallback_total, execution_report=None):
+    lifecycle_report = execution_report.get("symbol_lifecycle_report", {}) if execution_report is not None else {}
+    if lifecycle_report.get("forced_liquidations", 0) > 0 or lifecycle_report.get("dropped_rows", 0) > 0:
+        return float(fallback_total)
+    if isinstance(cost_report, dict) and cost_report.get("total_cost") is not None:
+        return float(cost_report.get("total_cost", fallback_total))
+    return float(fallback_total)
 
 
 def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
@@ -1271,6 +1706,7 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
         funding_rates=funding_rates,
         orderbook_depth=orderbook_depth,
     )
+    cost_report = execution_report.get("execution_cost_report", {}) if execution_report is not None else {}
 
     portfolio = vbt.Portfolio.from_orders(
         close=valuation_series,
@@ -1290,7 +1726,11 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
     adjusted_returns = adjusted_equity.pct_change().fillna(0.0)
     trade_ledger = _vectorbt_trade_ledger(portfolio, valuation_series.index)
     fees_paid = float(portfolio.orders.records_readable["Fees"].sum()) if not portfolio.orders.records_readable.empty else 0.0
-    slippage_paid = float((adjusted_equity.shift(1).fillna(equity) * turnover * slippage_rates).sum())
+    slippage_paid = _resolve_realized_slippage_paid(
+        cost_report,
+        fallback_total=(adjusted_equity.shift(1).fillna(equity) * turnover * slippage_rates).sum(),
+        execution_report=execution_report,
+    )
 
     return _summarize_backtest(
         equity_curve=adjusted_equity,
@@ -1332,6 +1772,7 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
         funding_rates=funding_rates,
         orderbook_depth=orderbook_depth,
     )
+    cost_report = execution_report.get("execution_cost_report", {}) if execution_report is not None else {}
     fees = turnover * fee_rate
     slippage = turnover * slippage_rates
     funding_returns = pd.Series(0.0, index=position.index, dtype=float)
@@ -1349,7 +1790,11 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
         execution_series=execution_series,
         equity=equity,
         fees_paid=float((prev_equity * fees).sum()),
-        slippage_paid=float((prev_equity * slippage).sum()),
+        slippage_paid=_resolve_realized_slippage_paid(
+            cost_report,
+            fallback_total=(prev_equity * slippage).sum(),
+            execution_report=execution_report,
+        ),
         signal_delay_bars=signal_delay_bars,
         trade_ledger=trade_ledger,
         funding_pnl=float((prev_equity * funding_returns).sum()),
@@ -1373,8 +1818,9 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  orderbook_depth=None, execution_price_policy="strict",
                  execution_price_fill_limit=None, valuation_price_policy="drop_rows",
                  valuation_price_fill_limit=None, futures_account=None,
-                 liquidity_lag_bars=1,
-                 futures_contract=None, futures_leverage_brackets=None):
+                 liquidity_lag_bars=1, execution_policy=None,
+                 futures_contract=None, futures_leverage_brackets=None,
+                 symbol_lifecycle=None, symbol_lifecycle_policy=None):
     """Run a backtest through the configured execution adapter.
 
     Parameters
@@ -1399,6 +1845,9 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     slippage_model   : str|object|None – one of {"flat", "sqrt_impact", "orderbook"} or a custom estimator implementing estimate(...)
     orderbook_depth  : pd.DataFrame|None – optional L2 depth frame for future order-book-aware slippage models
     liquidity_lag_bars : int – lag applied to bar-volume liquidity inputs before cost estimation
+    execution_policy : dict|ExecutionPolicy|None – order submission and fill policy for the execution adapter
+    symbol_lifecycle : pd.DataFrame|list[dict]|dict|None – optional symbol halt/delist lifecycle events aligned or alignable to the backtest index
+    symbol_lifecycle_policy : dict|None – lifecycle actions such as {"halt_action": "freeze", "delist_action": "liquidate"}
 
     execution_price_policy : str – one of {"strict", "ffill", "ffill_with_limit", "drop_rows"}
     execution_price_fill_limit : int|None – max consecutive execution-price fills when using "ffill_with_limit"
@@ -1489,12 +1938,64 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         execution_prices=execution_series,
         symbol_filters=symbol_filters,
         market=market,
+        volume=volume,
+        execution_policy=execution_policy,
     )
     execution_report["price_fill_actions"] = {
         "execution": execution_fill_actions,
         "valuation": valuation_fill_actions,
     }
     execution_report["liquidity_report"] = liquidity_inputs["diagnostics"]
+
+    lifecycle_frame = build_symbol_lifecycle_frame(
+        index=execution_report["position"].index,
+        symbol=symbol_filters.get("symbol"),
+        events=symbol_lifecycle,
+    )
+    if lifecycle_frame is not None:
+        executable_position, keep_mask, lifecycle_report = apply_symbol_lifecycle_policy(
+            execution_report["position"],
+            lifecycle_frame,
+            policy=symbol_lifecycle_policy,
+        )
+        execution_report["position"] = executable_position
+        execution_report["symbol_lifecycle_report"] = lifecycle_report
+        execution_report["symbol_lifecycle"] = lifecycle_frame.loc[keep_mask]
+
+        aligned_index = executable_position.index
+        valuation_series = valuation_series.reindex(aligned_index)
+        execution_series = execution_series.reindex(aligned_index)
+        execution_report["valuation_series"] = valuation_series
+        execution_report["execution_series"] = execution_series
+        if benchmark_returns is not None:
+            benchmark_returns = benchmark_returns.reindex(aligned_index)
+        if funding_rates is not None:
+            funding_rates = pd.Series(funding_rates, copy=False).reindex(aligned_index)
+        if volume is not None:
+            volume = pd.Series(volume, copy=False).reindex(aligned_index)
+        if orderbook_depth is not None:
+            orderbook_depth = pd.DataFrame(orderbook_depth).reindex(aligned_index)
+
+        if isinstance(execution_report.get("requested_position"), pd.Series):
+            execution_report["requested_position"] = execution_report["requested_position"].reindex(aligned_index)
+        for key in ["order_intents", "order_ledger"]:
+            frame = execution_report.get(key)
+            if isinstance(frame, pd.DataFrame) and not frame.empty and "timestamp" in frame.columns:
+                execution_report[key] = frame.loc[frame["timestamp"].isin(aligned_index)].copy()
+
+    execution_report["execution_cost_report"] = _estimate_fill_event_costs(
+        order_ledger=execution_report.get("order_ledger", pd.DataFrame()),
+        execution_series=execution_series,
+        slippage_rate=slippage_rate,
+        slippage_model=slippage_model,
+        volume=volume,
+        orderbook_depth=orderbook_depth,
+    )
+    lifecycle_report = execution_report.get("symbol_lifecycle_report", {})
+    if lifecycle_report.get("forced_liquidations", 0) > 0 or lifecycle_report.get("dropped_rows", 0) > 0:
+        execution_report["execution_cost_report"]["coverage_warning"] = (
+            "forced lifecycle actions are summarized via turnover-based slippage rather than fill-event attribution"
+        )
     valuation_series = execution_report["valuation_series"]
     execution_series = execution_report["execution_series"]
     executable_position = execution_report["position"]

@@ -10,6 +10,8 @@ from statistics import NormalDist
 import numpy as np
 import pandas as pd
 
+from .stat_tests import compute_post_selection_inference
+
 try:
     import optuna
     from optuna.samplers import TPESampler
@@ -238,6 +240,12 @@ def _build_state_bundle(base_pipeline):
         "futures_context": _slice_temporal_value(base_pipeline.state.get("futures_context")),
         "cross_asset_context": _slice_temporal_value(base_pipeline.state.get("cross_asset_context")),
         "symbol_filters": copy.deepcopy(base_pipeline.state.get("symbol_filters")),
+        "symbol_lifecycle": _slice_temporal_value(base_pipeline.state.get("symbol_lifecycle")),
+        "universe_policy": copy.deepcopy(base_pipeline.state.get("universe_policy")),
+        "universe_snapshot": _slice_temporal_value(base_pipeline.state.get("universe_snapshot")),
+        "universe_snapshot_meta": copy.deepcopy(base_pipeline.state.get("universe_snapshot_meta")),
+        "eligible_symbols": copy.deepcopy(base_pipeline.state.get("eligible_symbols")),
+        "universe_report": _slice_temporal_value(base_pipeline.state.get("universe_report")),
     }
 
 
@@ -257,6 +265,53 @@ def _build_temporal_state_bundle(full_state_bundle, end_timestamp=None):
             end_timestamp=end_timestamp,
         ),
         "symbol_filters": copy.deepcopy(full_state_bundle.get("symbol_filters")),
+        "symbol_lifecycle": _slice_temporal_value(full_state_bundle.get("symbol_lifecycle"), end_timestamp=end_timestamp),
+        "universe_policy": copy.deepcopy(full_state_bundle.get("universe_policy")),
+        "universe_snapshot": _slice_temporal_value(full_state_bundle.get("universe_snapshot"), end_timestamp=end_timestamp),
+        "universe_snapshot_meta": copy.deepcopy(full_state_bundle.get("universe_snapshot_meta")),
+        "eligible_symbols": copy.deepcopy(full_state_bundle.get("eligible_symbols")),
+        "universe_report": _slice_temporal_value(full_state_bundle.get("universe_report"), end_timestamp=end_timestamp),
+    }
+
+
+def _resolve_stage_gap_defaults(base_config, automl_config):
+    labels_config = base_config.get("labels", {}) or {}
+    backtest_config = base_config.get("backtest", {}) or {}
+    model_config = base_config.get("model", {}) or {}
+
+    label_gap = int(
+        labels_config.get(
+            "max_holding",
+            labels_config.get("horizon", 0),
+        ) or 0
+    )
+    configured_embargo = max(
+        0,
+        int(
+            automl_config.get(
+                "stage_embargo_bars",
+                automl_config.get(
+                    "embargo_bars",
+                    model_config.get("embargo_bars", model_config.get("gap", 0)),
+                ),
+            ) or 0
+        ),
+    )
+    signal_delay = backtest_config.get("signal_delay_bars")
+    if signal_delay is None:
+        signal_delay = 2 if backtest_config.get("use_open_execution", True) else 1
+    signal_delay = max(0, int(signal_delay))
+
+    default_gap = max(label_gap, signal_delay, configured_embargo)
+    search_validation_gap = automl_config.get("search_validation_gap_bars")
+    validation_holdout_gap = automl_config.get("validation_holdout_gap_bars")
+    return {
+        "default_gap_bars": int(default_gap),
+        "search_validation_gap_bars": max(0, int(default_gap if search_validation_gap is None else search_validation_gap)),
+        "validation_holdout_gap_bars": max(0, int(default_gap if validation_holdout_gap is None else validation_holdout_gap)),
+        "label_gap_bars": int(label_gap),
+        "signal_delay_bars": int(signal_delay),
+        "configured_embargo_bars": int(configured_embargo),
     }
 
 
@@ -267,13 +322,21 @@ def _seed_candidate_state(candidate, state_bundle):
         candidate.state[key] = _slice_temporal_value(value)
 
 
-def _resolve_holdout_plan(raw_data, automl_config):
+def _resolve_holdout_plan(raw_data, automl_config, base_config=None):
+    gap_defaults = _resolve_stage_gap_defaults(base_config or {}, automl_config)
     plan = {
         "enabled": False,
         "reason": None,
         "search_rows": int(len(raw_data)),
         "validation_rows": 0,
         "holdout_rows": 0,
+        "search_validation_gap_bars": int(gap_defaults["search_validation_gap_bars"]),
+        "validation_holdout_gap_bars": int(gap_defaults["validation_holdout_gap_bars"]),
+        "default_stage_gap_bars": int(gap_defaults["default_gap_bars"]),
+        "label_gap_bars": int(gap_defaults["label_gap_bars"]),
+        "signal_delay_bars": int(gap_defaults["signal_delay_bars"]),
+        "configured_embargo_bars": int(gap_defaults["configured_embargo_bars"]),
+        "dropped_gap_rows": int(gap_defaults["search_validation_gap_bars"] + gap_defaults["validation_holdout_gap_bars"]),
         "validation_start_timestamp": None,
         "validation_end_timestamp": None,
         "holdout_start_timestamp": None,
@@ -304,7 +367,12 @@ def _resolve_holdout_plan(raw_data, automl_config):
         return plan
 
     min_search_rows = int(automl_config.get("locked_holdout_min_search_rows", 100))
-    shortfall = max(min_search_rows - (len(raw_data) - validation_rows - holdout_rows), 0)
+    search_validation_gap_rows = int(plan["search_validation_gap_bars"])
+    validation_holdout_gap_rows = int(plan["validation_holdout_gap_bars"])
+    shortfall = max(
+        min_search_rows - (len(raw_data) - validation_rows - holdout_rows - search_validation_gap_rows - validation_holdout_gap_rows),
+        0,
+    )
     if shortfall > 0:
         validation_reduction = min(shortfall, max(validation_rows - 1, 0))
         validation_rows -= validation_reduction
@@ -325,14 +393,14 @@ def _resolve_holdout_plan(raw_data, automl_config):
         plan["reason"] = "insufficient_search_rows"
         return plan
 
-    search_rows = int(len(raw_data) - validation_rows - holdout_rows)
+    search_rows = int(len(raw_data) - validation_rows - holdout_rows - search_validation_gap_rows - validation_holdout_gap_rows)
     if search_rows <= 0:
         plan["reason"] = "insufficient_search_rows"
         return plan
 
-    validation_start_index = search_rows
-    validation_end_index = search_rows + validation_rows - 1
-    holdout_start_index = search_rows + validation_rows
+    validation_start_index = search_rows + search_validation_gap_rows
+    validation_end_index = validation_start_index + validation_rows - 1
+    holdout_start_index = validation_end_index + 1 + validation_holdout_gap_rows
     plan.update(
         {
             "enabled": True,
@@ -345,6 +413,18 @@ def _resolve_holdout_plan(raw_data, automl_config):
             "start_timestamp": raw_data.index[holdout_start_index],
             "end_timestamp": raw_data.index[-1],
             "search_end_timestamp": raw_data.index[search_rows - 1],
+            "search_validation_gap_start_timestamp": (
+                raw_data.index[search_rows] if search_validation_gap_rows > 0 else None
+            ),
+            "search_validation_gap_end_timestamp": (
+                raw_data.index[validation_start_index - 1] if search_validation_gap_rows > 0 else None
+            ),
+            "validation_holdout_gap_start_timestamp": (
+                raw_data.index[validation_end_index + 1] if validation_holdout_gap_rows > 0 else None
+            ),
+            "validation_holdout_gap_end_timestamp": (
+                raw_data.index[holdout_start_index - 1] if validation_holdout_gap_rows > 0 else None
+            ),
         }
     )
     return plan
@@ -512,7 +592,9 @@ def _execute_temporal_split_candidate(
     pipeline_class,
     trial_step_classes,
     state_bundle,
-    split_timestamp,
+    train_end_timestamp,
+    test_start_timestamp,
+    excluded_intervals=None,
 ):
     candidate_config = copy.deepcopy(base_config)
     _deep_merge(candidate_config, copy.deepcopy(overrides or {}))
@@ -531,8 +613,20 @@ def _execute_temporal_split_candidate(
     )
 
     aligned_index = candidate.state["X"].index
-    aligned_train_rows = int((aligned_index < split_timestamp).sum())
-    aligned_test_rows = int((aligned_index >= split_timestamp).sum())
+    aligned_mask = (aligned_index <= train_end_timestamp) | (aligned_index >= test_start_timestamp)
+    for interval in excluded_intervals or []:
+        interval_start, interval_end = interval
+        if interval_start is None or interval_end is None:
+            continue
+        aligned_mask &= ~((aligned_index >= interval_start) & (aligned_index <= interval_end))
+    candidate.state["X"] = candidate.state["X"].loc[aligned_mask].copy()
+    candidate.state["y"] = candidate.state["y"].loc[aligned_mask].copy()
+    candidate.state["labels_aligned"] = candidate.state["labels_aligned"].loc[aligned_mask].copy()
+
+    aligned_index = candidate.state["X"].index
+    aligned_train_rows = int((aligned_index <= train_end_timestamp).sum())
+    aligned_test_rows = int((aligned_index >= test_start_timestamp).sum())
+    aligned_gap_rows = int((~aligned_mask).sum())
     if aligned_train_rows <= 0 or aligned_test_rows <= 0:
         raise RuntimeError("Aligned split empty")
 
@@ -555,6 +649,10 @@ def _execute_temporal_split_candidate(
     return candidate.state["training"], candidate.state["backtest"], {
         "aligned_train_rows": int(aligned_train_rows),
         "aligned_test_rows": int(aligned_test_rows),
+        "aligned_gap_rows": int(aligned_gap_rows),
+        "train_end_timestamp": _json_ready(train_end_timestamp),
+        "test_start_timestamp": _json_ready(test_start_timestamp),
+        "excluded_intervals": _json_ready(excluded_intervals or []),
     }
 
 
@@ -566,8 +664,13 @@ def _build_validation_holdout_report(best_trial_report, holdout_plan):
         "end_timestamp": _json_ready(holdout_plan.get("validation_end_timestamp")),
         "search_rows": int(holdout_plan.get("search_rows", 0)),
         "validation_rows": int(holdout_plan.get("validation_rows", 0)),
+        "search_validation_gap_rows": int(holdout_plan.get("search_validation_gap_bars", 0)),
+        "search_validation_gap_start_timestamp": _json_ready(holdout_plan.get("search_validation_gap_start_timestamp")),
+        "search_validation_gap_end_timestamp": _json_ready(holdout_plan.get("search_validation_gap_end_timestamp")),
+        "stage_gap_rows_dropped": int(holdout_plan.get("search_validation_gap_bars", 0)),
         "aligned_search_rows": 0,
         "aligned_validation_rows": 0,
+        "aligned_gap_rows": 0,
         "training": None,
         "backtest": None,
         "raw_objective_value": None,
@@ -581,6 +684,7 @@ def _build_validation_holdout_report(best_trial_report, holdout_plan):
     split = validation_metrics.get("split") or {}
     report["aligned_search_rows"] = int(split.get("aligned_train_rows", 0))
     report["aligned_validation_rows"] = int(split.get("aligned_test_rows", 0))
+    report["aligned_gap_rows"] = int(split.get("aligned_gap_rows", 0))
     report["training"] = validation_metrics.get("training")
     report["backtest"] = validation_metrics.get("backtest")
     report["raw_objective_value"] = validation_metrics.get("raw_objective_value")
@@ -654,9 +758,14 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
         "validation_rows": int(holdout_plan.get("validation_rows", 0)),
         "pre_holdout_rows": int(holdout_plan.get("search_rows", 0) + holdout_plan.get("validation_rows", 0)),
         "holdout_rows": int(holdout_plan.get("holdout_rows", 0)),
+        "validation_holdout_gap_rows": int(holdout_plan.get("validation_holdout_gap_bars", 0)),
+        "validation_holdout_gap_start_timestamp": _json_ready(holdout_plan.get("validation_holdout_gap_start_timestamp")),
+        "validation_holdout_gap_end_timestamp": _json_ready(holdout_plan.get("validation_holdout_gap_end_timestamp")),
+        "stage_gap_rows_dropped": int(holdout_plan.get("dropped_gap_rows", 0)),
         "aligned_search_rows": 0,
         "aligned_pre_holdout_rows": 0,
         "aligned_holdout_rows": 0,
+        "aligned_gap_rows": 0,
         "training": None,
         "backtest": None,
         "raw_objective_value": None,
@@ -672,7 +781,18 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
             pipeline_class,
             trial_step_classes,
             full_state_bundle,
-            holdout_plan["holdout_start_timestamp"],
+            train_end_timestamp=holdout_plan["validation_end_timestamp"],
+            test_start_timestamp=holdout_plan["holdout_start_timestamp"],
+            excluded_intervals=[
+                (
+                    holdout_plan.get("search_validation_gap_start_timestamp"),
+                    holdout_plan.get("search_validation_gap_end_timestamp"),
+                ),
+                (
+                    holdout_plan.get("validation_holdout_gap_start_timestamp"),
+                    holdout_plan.get("validation_holdout_gap_end_timestamp"),
+                ),
+            ],
         )
     except RuntimeError as exc:
         if "Aligned split empty" in str(exc):
@@ -683,6 +803,7 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
     report["aligned_search_rows"] = int(split["aligned_train_rows"])
     report["aligned_pre_holdout_rows"] = int(split["aligned_train_rows"])
     report["aligned_holdout_rows"] = int(split["aligned_test_rows"])
+    report["aligned_gap_rows"] = int(split.get("aligned_gap_rows", 0))
     report["training"] = _json_ready(_summarize_training(training))
     report["backtest"] = _json_ready(_summarize_backtest(backtest))
     report["objective_diagnostics"] = _build_objective_diagnostics(
@@ -702,6 +823,7 @@ def _resolve_overfitting_control(automl_config=None):
     control = copy.deepcopy(automl_config.get("overfitting_control", {}))
     dsr_config = dict(control.get("deflated_sharpe", {}))
     pbo_config = dict(control.get("pbo", {}))
+    post_selection_config = dict(control.get("post_selection", {}))
 
     return {
         "enabled": bool(control.get("enabled", True)),
@@ -724,6 +846,20 @@ def _resolve_overfitting_control(automl_config=None):
             "overlap_policy": str(pbo_config.get("overlap_policy", "strict_intersection")).lower(),
             "min_overlap_fraction": float(pbo_config.get("min_overlap_fraction", 0.5)),
             "min_overlap_observations": pbo_config.get("min_overlap_observations"),
+        },
+        "post_selection": {
+            "enabled": bool(post_selection_config.get("enabled", True)),
+            "require_pass": bool(post_selection_config.get("require_pass", False)),
+            "pass_rule": str(post_selection_config.get("pass_rule", "spa")).lower(),
+            "alpha": float(post_selection_config.get("alpha", 0.05)),
+            "max_candidates": int(post_selection_config.get("max_candidates", 8)),
+            "correlation_threshold": float(post_selection_config.get("correlation_threshold", 0.9)),
+            "min_overlap_fraction": float(post_selection_config.get("min_overlap_fraction", 0.5)),
+            "min_overlap_observations": int(post_selection_config.get("min_overlap_observations", 10)),
+            "overlap_policy": str(post_selection_config.get("overlap_policy", "strict_intersection")).lower(),
+            "bootstrap_samples": int(post_selection_config.get("bootstrap_samples", 300)),
+            "mean_block_length": post_selection_config.get("mean_block_length"),
+            "random_state": int(post_selection_config.get("random_state", 42)),
         },
     }
 
@@ -794,6 +930,9 @@ def _build_evaluation_record(training, backtest, objective_name, automl_config, 
         record["split"] = {
             "aligned_train_rows": int(split.get("aligned_train_rows", 0)),
             "aligned_test_rows": int(split.get("aligned_test_rows", 0)),
+            "aligned_gap_rows": int(split.get("aligned_gap_rows", 0)),
+            "train_end_timestamp": _json_ready(split.get("train_end_timestamp")),
+            "test_start_timestamp": _json_ready(split.get("test_start_timestamp")),
         }
     return record
 
@@ -1092,7 +1231,7 @@ def _evaluate_candidate_fragility(
     pipeline_class,
     trial_step_classes,
     evaluation_state_bundle,
-    evaluation_start_timestamp,
+    evaluation_split,
     objective_name,
     automl_config,
     search_space,
@@ -1131,7 +1270,7 @@ def _evaluate_candidate_fragility(
     evaluated_scores = []
     for perturbation in perturbations:
         try:
-            if evaluation_start_timestamp is None:
+            if evaluation_split is None:
                 training, backtest = _execute_trial_candidate(
                     base_config,
                     perturbation["overrides"],
@@ -1147,7 +1286,9 @@ def _evaluate_candidate_fragility(
                     pipeline_class,
                     trial_step_classes,
                     evaluation_state_bundle,
-                    evaluation_start_timestamp,
+                    train_end_timestamp=evaluation_split["train_end_timestamp"],
+                    test_start_timestamp=evaluation_split["test_start_timestamp"],
+                    excluded_intervals=evaluation_split.get("excluded_intervals"),
                 )
                 evaluation = _build_evaluation_record(
                     training,
@@ -1782,6 +1923,36 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "metric": pbo_config["metric"],
         }
 
+    post_selection_config = control["post_selection"]
+    if control["enabled"] and post_selection_config["enabled"]:
+        post_selection_report = compute_post_selection_inference(
+            trial_reports,
+            trial_return_frame,
+            config=post_selection_config,
+        )
+    else:
+        post_selection_report = {
+            "enabled": False,
+            "reason": "disabled",
+            "require_pass": bool(post_selection_config.get("require_pass", False)),
+            "passed": True,
+        }
+
+    post_selection_required = bool(post_selection_report.get("enabled", False) and post_selection_config.get("require_pass", False))
+    post_selection_gate = bool(post_selection_report.get("passed", True) or not post_selection_required)
+    if post_selection_required and not post_selection_report.get("passed", False):
+        for report in trial_reports:
+            policy = report["selection_policy"]
+            if not policy.get("eligible_before_post_checks", False):
+                continue
+            policy["eligibility_checks"]["post_selection"] = False
+            policy["eligibility_reasons"].append("post_selection_inference_failed")
+            policy["eligible_before_post_checks"] = False
+    else:
+        for report in trial_reports:
+            policy = report["selection_policy"]
+            policy["eligibility_checks"]["post_selection"] = bool(post_selection_gate)
+
     best_trial = trial_reports[0]
     diagnostics = {
         "enabled": control["enabled"],
@@ -1815,6 +1986,10 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "generalization_gap": best_trial.get("generalization_gap"),
         },
         "pbo": pbo_report,
+        "post_selection": post_selection_report,
+        "eligible_trial_count_after_post_selection": int(
+            sum(1 for report in trial_reports if report["selection_policy"].get("eligible_before_post_checks"))
+        ),
     }
     return {
         "selection_metric": selection_metric,
@@ -2180,7 +2355,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     objective_name = _normalize_objective_name(automl_config.get("objective", "risk_adjusted_after_costs"))
 
     full_state_bundle = _build_state_bundle(base_pipeline)
-    holdout_plan = _resolve_holdout_plan(full_state_bundle["raw_data"], automl_config)
+    holdout_plan = _resolve_holdout_plan(full_state_bundle["raw_data"], automl_config, base_config=base_config)
     search_state_bundle = full_state_bundle
     validation_state_bundle = full_state_bundle
     if holdout_plan["enabled"]:
@@ -2251,7 +2426,14 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                     pipeline_class,
                     trial_step_classes,
                     validation_state_bundle,
-                    holdout_plan["validation_start_timestamp"],
+                    train_end_timestamp=holdout_plan["search_end_timestamp"],
+                    test_start_timestamp=holdout_plan["validation_start_timestamp"],
+                    excluded_intervals=[
+                        (
+                            holdout_plan.get("search_validation_gap_start_timestamp"),
+                            holdout_plan.get("search_validation_gap_end_timestamp"),
+                        )
+                    ],
                 )
             except RuntimeError as exc:
                 if (
@@ -2331,7 +2513,14 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                     pipeline_class,
                     trial_step_classes,
                     validation_state_bundle,
-                    holdout_plan["validation_start_timestamp"],
+                    train_end_timestamp=holdout_plan["search_end_timestamp"],
+                    test_start_timestamp=holdout_plan["validation_start_timestamp"],
+                    excluded_intervals=[
+                        (
+                            holdout_plan.get("search_validation_gap_start_timestamp"),
+                            holdout_plan.get("search_validation_gap_end_timestamp"),
+                        )
+                    ],
                 )
                 validation_record = _build_evaluation_record(
                     validation_training,
@@ -2347,7 +2536,18 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     selection_report = _build_trial_selection_report(completed_trials, trial_records, objective_name, automl_config)
     selection_policy = _resolve_selection_policy(automl_config)
     best_trial_report = None
-    evaluation_start_timestamp = holdout_plan["validation_start_timestamp"] if holdout_plan["enabled"] else None
+    evaluation_split = None
+    if holdout_plan["enabled"]:
+        evaluation_split = {
+            "train_end_timestamp": holdout_plan["search_end_timestamp"],
+            "test_start_timestamp": holdout_plan["validation_start_timestamp"],
+            "excluded_intervals": [
+                (
+                    holdout_plan.get("search_validation_gap_start_timestamp"),
+                    holdout_plan.get("search_validation_gap_end_timestamp"),
+                )
+            ],
+        }
     for report in selection_report["trial_reports"]:
         policy_report = report["selection_policy"]
         if not policy_report["eligible_before_post_checks"]:
@@ -2360,7 +2560,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             pipeline_class=pipeline_class,
             trial_step_classes=trial_step_classes,
             evaluation_state_bundle=validation_state_bundle,
-            evaluation_start_timestamp=evaluation_start_timestamp,
+            evaluation_split=evaluation_split,
             objective_name=objective_name,
             automl_config=automl_config,
             search_space=search_space,

@@ -10,7 +10,7 @@ from statsmodels.tsa.stattools import adfuller
 BASE_COLUMNS = {"open", "high", "low", "close", "volume", "quote_volume", "trades"}
 DEFAULT_STATIONARITY_TRANSFORM_ORDER = ("log_diff", "pct_change", "diff", "zscore", "frac_diff")
 ENDOGENOUS_FEATURE_FAMILIES = frozenset({"endogenous_price", "indicator"})
-CONTEXT_FEATURE_FAMILIES = frozenset({"futures_context", "cross_asset", "custom_exogenous"})
+CONTEXT_FEATURE_FAMILIES = frozenset({"futures_context", "cross_asset", "custom_exogenous", "reference_overlay", "cross_venue_composite"})
 _INDICATOR_BLOCKS = frozenset({"rsi", "macd", "bollinger", "atr", "fvg", "generic_indicator", "indicator_interactions"})
 _BLOCK_TO_FAMILY = {
     "price_volume": "endogenous_price",
@@ -18,6 +18,8 @@ _BLOCK_TO_FAMILY = {
     "regime": "endogenous_price",
     "futures_context": "futures_context",
     "cross_asset_context": "cross_asset",
+    "reference_overlay": "reference_overlay",
+    "cross_venue_composite": "cross_venue_composite",
     "exogenous_context": "custom_exogenous",
     "custom_exogenous": "custom_exogenous",
 }
@@ -51,6 +53,10 @@ def resolve_feature_family(block_name):
         return normalized
     if normalized in _INDICATOR_BLOCKS:
         return "indicator"
+    if normalized.startswith("reference") or normalized.startswith("ref_"):
+        return "reference_overlay"
+    if normalized.startswith("composite") or normalized.startswith("cross_venue"):
+        return "cross_venue_composite"
     if normalized.startswith("custom") or normalized.startswith("exo"):
         return "custom_exogenous"
     return _BLOCK_TO_FAMILY.get(normalized, "unknown")

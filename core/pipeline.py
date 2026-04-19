@@ -22,6 +22,12 @@ from .data import (
     join_custom_data,
     load_futures_leverage_brackets,
 )
+from .data_quality import check_data_quality
+from .feature_governance import (
+    derive_feature_metadata,
+    evaluate_feature_portability,
+    filter_feature_metadata,
+)
 from .features import (
     build_feature_set,
     check_stationarity,
@@ -55,7 +61,20 @@ from .models import (
     train_model,
     walk_forward_split,
 )
-from .slippage import FlatSlippageModel, OrderBookImpactModel, SquareRootImpactModel
+from .slippage import (
+    DepthCurveImpactModel,
+    FillAwareCostModel,
+    FlatSlippageModel,
+    OrderBookImpactModel,
+    ProxyImpactModel,
+    SquareRootImpactModel,
+)
+from .reference_data import build_reference_overlay_feature_block
+from .universe import (
+    build_symbol_lifecycle_frame,
+    evaluate_universe_eligibility,
+    load_historical_universe_snapshot,
+)
 
 
 def _default_regime_features(pipeline):
@@ -322,21 +341,29 @@ def _resolve_backtest_slippage_model(pipeline):
     if isinstance(configured, str):
         aliases = {
             "flat": "flat",
+            "proxy": "proxy",
             "sqrt-impact": "sqrt_impact",
             "sqrt_impact": "sqrt_impact",
             "square-root-impact": "sqrt_impact",
             "square_root_impact": "sqrt_impact",
             "orderbook": "orderbook",
             "order_book": "orderbook",
+            "depth": "depth_curve",
+            "depth_curve": "depth_curve",
+            "fill_aware": "fill_aware",
         }
         resolved_name = aliases.get(configured.strip().lower(), configured.strip().lower())
         if resolved_name == "flat":
             return FlatSlippageModel(rate=float(backtest_config.get("slippage_rate", 0.0)))
+        if resolved_name == "proxy":
+            return ProxyImpactModel(adv_window=_resolve_backtest_slippage_adv_window(pipeline))
         if resolved_name == "sqrt_impact":
             return SquareRootImpactModel(adv_window=_resolve_backtest_slippage_adv_window(pipeline))
-        if resolved_name == "orderbook":
+        if resolved_name in {"orderbook", "depth_curve"}:
             return OrderBookImpactModel()
-        raise ValueError("Unsupported backtest.slippage_model. Choose from ['flat', 'sqrt_impact', 'orderbook']")
+        if resolved_name == "fill_aware":
+            return FillAwareCostModel(base_model=ProxyImpactModel(adv_window=_resolve_backtest_slippage_adv_window(pipeline)))
+        raise ValueError("Unsupported backtest.slippage_model. Choose from ['flat', 'proxy', 'sqrt_impact', 'depth_curve', 'fill_aware']")
 
     if hasattr(configured, "estimate"):
         return configured
@@ -349,6 +376,23 @@ def _resolve_backtest_liquidity_lag_bars(pipeline):
     if configured is None:
         return 1
     return max(0, int(configured))
+
+
+def _resolve_backtest_execution_policy(pipeline):
+    backtest_config = pipeline.section("backtest") or {}
+    configured = backtest_config.get("execution_policy")
+    if configured is not None:
+        return configured
+
+    return {
+        "adapter": backtest_config.get("execution_adapter", "nautilus"),
+        "order_type": backtest_config.get("order_type", "market"),
+        "time_in_force": backtest_config.get("time_in_force", "IOC"),
+        "participation_cap": backtest_config.get("participation_cap", 1.0),
+        "min_fill_ratio": backtest_config.get("min_fill_ratio", 0.0),
+        "max_order_age_bars": backtest_config.get("max_order_age_bars", 1),
+        "cancel_replace_bars": backtest_config.get("cancel_replace_bars", 1),
+    }
 
 
 def _resolve_backtest_funding_rates(pipeline, index):
@@ -438,6 +482,7 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "funding_rates": _resolve_backtest_funding_rates(pipeline, index),
         "volume": raw_data["volume"].reindex(index).fillna(0.0) if "volume" in raw_data.columns else None,
         "liquidity_lag_bars": _resolve_backtest_liquidity_lag_bars(pipeline),
+        "execution_policy": _resolve_backtest_execution_policy(pipeline),
         "slippage_model": _resolve_backtest_slippage_model(pipeline),
         "orderbook_depth": pipeline.state.get("orderbook_depth"),
         "significance": significance_config,
@@ -450,6 +495,8 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "futures_account": futures_account,
         "futures_contract": pipeline.state.get("futures_contract_spec"),
         "futures_leverage_brackets": pipeline.state.get("futures_leverage_brackets"),
+        "symbol_lifecycle": pipeline.state.get("symbol_lifecycle"),
+        "symbol_lifecycle_policy": pipeline.state.get("universe_policy"),
     }
 
 
@@ -1689,6 +1736,7 @@ class FetchDataStep(PipelineStep):
 
     def run(self, pipeline):
         config = dict(pipeline.section("data"))
+        universe_config = dict(pipeline.section("universe") or {})
         futures_context_config = dict(config.pop("futures_context", {}) or {})
         cross_asset_context_config = dict(config.pop("cross_asset_context", {}) or {})
         custom_data_config = list(config.pop("custom_data", []) or [])
@@ -1696,6 +1744,70 @@ class FetchDataStep(PipelineStep):
 
         market = config.get("market", "spot")
         cache_dir = config.get("cache_dir", ".cache")
+        primary_symbol = config.get("symbol", "BTCUSDT")
+        context_symbols = list(cross_asset_context_config.get("symbols") or [])
+
+        requested_symbols = [primary_symbol, *context_symbols, *(config.get("symbols") or []), *(universe_config.get("symbols") or [])]
+        requested_symbols = list(dict.fromkeys([symbol for symbol in requested_symbols if symbol]))
+
+        universe_snapshot = None
+        universe_report = None
+        if universe_config or len(requested_symbols) > 1:
+            snapshot_timestamp = universe_config.get("snapshot_timestamp", config.get("start"))
+            universe_snapshot = load_historical_universe_snapshot(
+                snapshot_timestamp=snapshot_timestamp,
+                market=universe_config.get("market", market),
+                cache_dir=universe_config.get("cache_dir", cache_dir),
+                snapshots=universe_config.get("snapshots"),
+                path=universe_config.get("path"),
+                fetch_if_missing=bool(universe_config.get("fetch_if_missing", False)),
+            )
+            universe_report = evaluate_universe_eligibility(
+                universe_snapshot,
+                as_of=snapshot_timestamp,
+                requested_symbols=requested_symbols,
+                min_history_days=universe_config.get(
+                    "min_history_days",
+                    universe_config.get("minimum_history_days", 0),
+                ),
+                min_liquidity=universe_config.get(
+                    "min_liquidity",
+                    universe_config.get("minimum_liquidity"),
+                ),
+            )
+            ineligible_symbols = dict(universe_report.get("ineligible_symbols", {}))
+            if primary_symbol in ineligible_symbols:
+                reasons = ", ".join(ineligible_symbols[primary_symbol])
+                raise ValueError(
+                    f"Primary symbol {primary_symbol!r} is not eligible at the requested universe snapshot: {reasons}"
+                )
+
+            requested_symbol_policy = str(universe_config.get("requested_symbol_policy", "error")).lower()
+            blocked_context_symbols = {
+                symbol: reasons
+                for symbol, reasons in ineligible_symbols.items()
+                if symbol in context_symbols
+            }
+            if blocked_context_symbols and requested_symbol_policy == "error":
+                blocked_summary = "; ".join(
+                    f"{symbol}: {', '.join(reasons)}"
+                    for symbol, reasons in blocked_context_symbols.items()
+                )
+                raise ValueError(
+                    "Cross-symbol study requested symbols that are not eligible at the universe snapshot: "
+                    f"{blocked_summary}"
+                )
+            if blocked_context_symbols and requested_symbol_policy in {"drop", "filter"}:
+                context_symbols = [symbol for symbol in context_symbols if symbol not in blocked_context_symbols]
+
+            pipeline.state["universe_snapshot"] = universe_snapshot.symbols.copy()
+            pipeline.state["universe_snapshot_meta"] = {
+                "snapshot_timestamp": universe_snapshot.snapshot_timestamp,
+                "market": universe_snapshot.market,
+                "source": universe_snapshot.source,
+            }
+            pipeline.state["eligible_symbols"] = list(universe_report.get("eligible_symbols", []))
+            pipeline.state["universe_report"] = universe_report
 
         market_data, integrity_report = fetch_binance_bars(**config, return_report=True)
         data = market_data.copy()
@@ -1710,7 +1822,7 @@ class FetchDataStep(PipelineStep):
 
         try:
             pipeline.state["symbol_filters"] = fetch_binance_symbol_filters(
-                symbol=config.get("symbol", "BTCUSDT"),
+                symbol=primary_symbol,
                 market=market,
                 cache_dir=cache_dir,
             )
@@ -1720,7 +1832,7 @@ class FetchDataStep(PipelineStep):
         if market != "spot":
             try:
                 pipeline.state["futures_contract_spec"] = fetch_binance_futures_contract_spec(
-                    symbol=config.get("symbol", "BTCUSDT"),
+                    symbol=primary_symbol,
                     market=market,
                     cache_dir=cache_dir,
                 )
@@ -1729,7 +1841,7 @@ class FetchDataStep(PipelineStep):
 
         if futures_context_config.get("enabled", True):
             pipeline.state["futures_context"] = fetch_binance_futures_context(
-                symbol=config.get("symbol", "BTCUSDT"),
+                symbol=primary_symbol,
                 interval=config.get("interval", "1h"),
                 start=config.get("start", "2024-01-01"),
                 end=config.get("end", "2024-03-01"),
@@ -1737,7 +1849,21 @@ class FetchDataStep(PipelineStep):
                 include_recent_stats=futures_context_config.get("include_recent_stats", True),
             )
 
-        context_symbols = cross_asset_context_config.get("symbols") or []
+        lifecycle_events = universe_config.get("lifecycle_events")
+        if universe_snapshot is not None or lifecycle_events:
+            lifecycle = build_symbol_lifecycle_frame(
+                index=market_data.index,
+                symbol=primary_symbol,
+                snapshot=universe_snapshot,
+                events=lifecycle_events,
+            )
+            if lifecycle is not None:
+                pipeline.state["symbol_lifecycle"] = lifecycle
+                pipeline.state["universe_policy"] = {
+                    "halt_action": universe_config.get("halt_action", "freeze"),
+                    "delist_action": universe_config.get("delist_action", "liquidate"),
+                }
+
         if context_symbols:
             pipeline.state["cross_asset_context"] = fetch_context_symbol_bars(
                 symbols=context_symbols,
@@ -1747,8 +1873,28 @@ class FetchDataStep(PipelineStep):
                 cache_dir=cross_asset_context_config.get("cache_dir", cache_dir),
                 market=cross_asset_context_config.get("market", market),
             )
+            pipeline.state["cross_asset_context_symbols"] = list(context_symbols)
 
         return data
+
+
+class DataQualityStep(PipelineStep):
+    name = "check_data_quality"
+
+    def run(self, pipeline):
+        raw_data = pipeline.require("raw_data")
+        data = pipeline.require("data")
+        config = pipeline.section("data_quality")
+        result = check_data_quality(raw_data, config=config)
+
+        clean_raw = result.clean_frame
+        clean_index = clean_raw.index
+        pipeline.state["raw_data_original"] = raw_data.copy()
+        pipeline.state["raw_data"] = clean_raw
+        pipeline.state["data"] = data.reindex(clean_index).copy()
+        pipeline.state["data_quality_mask"] = result.quarantine_mask
+        pipeline.state["data_quality_report"] = result.report
+        return clean_raw
 
 
 class IndicatorsStep(PipelineStep):
@@ -1859,6 +2005,17 @@ class FeaturesStep(PipelineStep):
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, multi_timeframe_block)
 
+        reference_overlay_block = build_reference_overlay_feature_block(
+            raw_data,
+            reference_data=(
+                pipeline.state.get("reference_overlay_data")
+                if pipeline.state.get("reference_overlay_data") is not None
+                else pipeline.state.get("reference_data")
+            ),
+            rolling_window=config.get("rolling_window", 20),
+        )
+        features, feature_blocks = _join_feature_block(features, feature_blocks, reference_overlay_block)
+
         for builder in config.get("builders", []):
             built = builder(pipeline, features.copy())
             if built is not None:
@@ -1870,6 +2027,11 @@ class FeaturesStep(PipelineStep):
             }
 
         feature_families = derive_feature_families(feature_blocks, columns=features.columns)
+        feature_metadata = derive_feature_metadata(
+            feature_blocks=feature_blocks,
+            feature_families=feature_families,
+            columns=features.columns,
+        )
 
         screening_result = screen_features_for_stationarity(
             features,
@@ -1883,9 +2045,11 @@ class FeaturesStep(PipelineStep):
         pipeline.state["raw_features"] = features
         pipeline.state["feature_blocks_raw"] = feature_blocks
         pipeline.state["feature_families_raw"] = feature_families
+        pipeline.state["feature_metadata_raw"] = feature_metadata
         pipeline.state["feature_screening"] = screening_report
         pipeline.state["feature_blocks"] = feature_blocks
         pipeline.state["feature_families"] = feature_families
+        pipeline.state["feature_metadata"] = feature_metadata
         pipeline.state["feature_family_summary"] = summarize_feature_families(feature_blocks, columns=features.columns)
         pipeline.state["features"] = features
         return features
@@ -2024,6 +2188,10 @@ class AlignDataStep(PipelineStep):
         label_column = pipeline.section("labels").get("label_column", "label")
         feature_blocks = pipeline.state.get("feature_blocks", {})
         feature_families = pipeline.state.get("feature_families") or derive_feature_families(feature_blocks)
+        feature_metadata = pipeline.state.get("feature_metadata") or derive_feature_metadata(
+            feature_blocks=feature_blocks,
+            feature_families=feature_families,
+        )
 
         common = features.index.intersection(labels.index)
         X = features.loc[common].copy()
@@ -2043,6 +2211,7 @@ class AlignDataStep(PipelineStep):
 
         pipeline.state["feature_blocks"] = feature_blocks
         pipeline.state["feature_families"] = feature_families
+        pipeline.state["feature_metadata"] = filter_feature_metadata(feature_metadata, X.columns)
         pipeline.state["feature_family_summary"] = summarize_feature_families(feature_blocks, columns=X.columns)
         if dropped_columns:
             report = dict(pipeline.state.get("feature_screening", {}))
@@ -2744,6 +2913,16 @@ class TrainModelsStep(PipelineStep):
         feature_diagnostics = summarize_feature_block_diagnostics(fold_block_diagnostics)
         feature_family_diagnostics = summarize_feature_family_diagnostics(fold_family_diagnostics)
         feature_family_selection = _summarize_fold_family_selection(fold_feature_selection)
+        selected_feature_metadata = filter_feature_metadata(
+            pipeline.state.get("feature_metadata") or derive_feature_metadata(pipeline.state.get("feature_blocks", {})),
+            last_selected_columns,
+        )
+        feature_portability_diagnostics = evaluate_feature_portability(
+            selected_feature_metadata,
+            top_features=feature_diagnostics.get("top_features"),
+            family_diagnostics=feature_family_diagnostics,
+            config=pipeline.section("feature_governance"),
+        )
         fold_stability = _build_fold_stability_summary(
             fold_metrics,
             fold_backtests,
@@ -2828,6 +3007,10 @@ class TrainModelsStep(PipelineStep):
             "oos_signals": oos_signals,
             "feature_block_diagnostics": feature_diagnostics,
             "feature_family_diagnostics": feature_family_diagnostics,
+            "feature_portability_diagnostics": feature_portability_diagnostics,
+            "promotion_gates": {
+                "feature_portability": bool(feature_portability_diagnostics.get("promotion_pass", True)),
+            },
             "regime": {
                 "mode": "fold_local",
                 "folds": fold_regime,
@@ -3145,6 +3328,7 @@ class BacktestStep(PipelineStep):
 
 DEFAULT_STEPS = [
     FetchDataStep,
+    DataQualityStep,
     IndicatorsStep,
     AutoMLStep,
     FeaturesStep,
@@ -3186,6 +3370,9 @@ class ResearchPipeline:
 
     def fetch_data(self):
         return self.run_step("fetch_data")
+
+    def check_data_quality(self):
+        return self.run_step("check_data_quality")
 
     def run_indicators(self):
         return self.run_step("run_indicators")

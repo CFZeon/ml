@@ -5,6 +5,7 @@
 
 from .data import (
     fetch_binance_bars,
+    fetch_binance_exchange_info,
     fetch_binance_futures_contract_spec,
     fetch_binance_symbol_filters,
     fetch_binance_vision,
@@ -13,6 +14,7 @@ from .data import (
     load_futures_leverage_brackets,
     load_custom_dataset,
 )
+from .data_quality import DataQualityResult, check_data_quality
 from .context import (
     fetch_binance_futures_context,
     fetch_context_symbol_bars,
@@ -20,7 +22,14 @@ from .context import (
     build_cross_asset_context_feature_block,
     build_multi_timeframe_context_feature_block,
 )
-from .execution import LiquidityInputResolver, resolve_liquidity_inputs
+from .execution import (
+    ExecutionPolicy,
+    LiquidityInputResolver,
+    NautilusExecutionAdapter,
+    OrderIntent,
+    resolve_execution_policy,
+    resolve_liquidity_inputs,
+)
 from .indicators import (
     Indicator,
     IndicatorResult,
@@ -40,6 +49,7 @@ from .pipeline import (
     AlignDataStep,
     AutoMLStep,
     BacktestStep,
+    DataQualityStep,
     DEFAULT_STEPS,
     FeatureSelectionStep,
     FetchDataStep,
@@ -62,6 +72,12 @@ from .features import (
     screen_features_for_stationarity,
     select_features,
 )
+from .feature_governance import (
+    derive_feature_metadata,
+    evaluate_feature_portability,
+    filter_feature_metadata,
+    summarize_feature_portability,
+)
 from .labeling import (
     triple_barrier_labels,
     fixed_horizon_labels,
@@ -70,7 +86,15 @@ from .labeling import (
     sequential_bootstrap,
 )
 from .lookahead import run_lookahead_analysis
-from .slippage import FlatSlippageModel, OrderBookImpactModel, SlippageModel, SquareRootImpactModel
+from .slippage import (
+    DepthCurveImpactModel,
+    FillAwareCostModel,
+    FlatSlippageModel,
+    OrderBookImpactModel,
+    ProxyImpactModel,
+    SlippageModel,
+    SquareRootImpactModel,
+)
 from .models import (
     build_execution_outcome_frame,
     build_trade_outcome_frame,
@@ -84,4 +108,21 @@ from .models import (
     save_model,
     load_model,
 )
+from .stat_tests import (
+    align_post_selection_return_matrix,
+    compute_hansen_spa,
+    compute_post_selection_inference,
+    compute_white_reality_check,
+    select_post_selection_candidates,
+)
 from .backtest import kelly_fraction, run_backtest
+from .reference_data import build_reference_overlay_feature_block
+from .universe import (
+    HistoricalUniverseSnapshot,
+    apply_symbol_lifecycle_policy,
+    build_symbol_lifecycle_frame,
+    evaluate_universe_eligibility,
+    load_historical_universe_snapshot,
+    normalize_universe_snapshot,
+    persist_historical_universe_snapshot,
+)

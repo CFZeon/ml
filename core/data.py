@@ -875,6 +875,12 @@ def _symbol_filters_cache_path(cache_dir, market, symbol):
     return Path(cache_dir) / _normalize_market(market) / "symbol_filters" / f"{symbol}.pkl"
 
 
+def _exchange_info_cache_path(cache_dir, market):
+    if cache_dir is None:
+        return None
+    return Path(cache_dir) / _normalize_market(market) / "exchange_info" / "all.pkl"
+
+
 def _futures_metadata_cache_path(cache_dir, market, symbol, namespace):
     if cache_dir is None:
         return None
@@ -963,22 +969,36 @@ def _fetch_exchange_info_symbol_payload(symbol, market="spot", cache_dir=".cache
     if cached is not None:
         return cached
 
+    payload = fetch_binance_exchange_info(market=normalized_market, cache_dir=cache_dir)
+    symbols = payload.get("symbols", [])
+    symbol_payload = next((dict(item) for item in symbols if item.get("symbol") == symbol), None)
+    if symbol_payload is None:
+        raise RuntimeError(f"No exchangeInfo filters returned for {symbol} on {normalized_market}")
+    _write_object_cache(cache_path, symbol_payload)
+    return symbol_payload
+
+
+def fetch_binance_exchange_info(market="spot", cache_dir=".cache", force_refresh=False):
+    """Fetch the full Binance exchangeInfo payload for a market and cache it locally."""
+    normalized_market = _normalize_market(market)
+    cache_path = _exchange_info_cache_path(cache_dir, normalized_market)
+    if not force_refresh:
+        cached = _read_object_cache(cache_path)
+        if cached is not None:
+            return cached
+
     base_url = _rest_base_url(normalized_market)
     endpoint = "/api/v3/exchangeInfo" if normalized_market == "spot" else (
         "/fapi/v1/exchangeInfo" if normalized_market == "um_futures" else "/dapi/v1/exchangeInfo"
     )
 
     with requests.Session() as session:
-        response = session.get(f"{base_url}{endpoint}", params={"symbol": symbol}, timeout=30)
+        response = session.get(f"{base_url}{endpoint}", timeout=30)
         response.raise_for_status()
         payload = response.json()
 
-    symbols = payload.get("symbols", [])
-    if not symbols:
-        raise RuntimeError(f"No exchangeInfo filters returned for {symbol} on {normalized_market}")
-    symbol_payload = dict(symbols[0])
-    _write_object_cache(cache_path, symbol_payload)
-    return symbol_payload
+    _write_object_cache(cache_path, payload)
+    return payload
 
 
 def _parse_futures_contract_spec(payload, market="um_futures"):

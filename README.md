@@ -22,9 +22,15 @@ The repo now includes:
 - triple-barrier, fixed-horizon, and trend-scanning labels
 - uniqueness weighting and sequential bootstrap support
 - explicit regime detection and context features
-- AutoML with validation/holdout separation, CPCV/PBO diagnostics, DSR reporting, fragility checks, and stability gating
+- AutoML with validation/holdout separation, CPCV/PBO diagnostics, DSR reporting, White RC / Hansen SPA post-selection inference, fragility checks, and stability gating
 - a baseline-vs-prefix lookahead provocation harness for detecting future-informed features, labels, probabilities, signals, and execution inputs
 - a causal liquidity resolver that shifts bar-volume inputs, validates L2 snapshot timestamps, and records liquidity provenance in backtest outputs
+- explicit order-intent and execution-policy objects for backtests, with a legacy full-fill parity path and a default event-style partial-fill/cancel flow
+- a tiered execution cost stack with proxy, L2 depth-curve, and fill-event attribution modes plus stress sweeps
+- feature portability governance with venue-specific tagging, generic reference-overlay hooks, and ablation-based promotion diagnostics
+- a pre-feature data-quality quarantine layer that flags, nulls, drops, or winsorizes suspicious bars and records structured anomaly reports
+- historical universe snapshots that gate cross-symbol studies by listing status, minimum history, and liquidity, plus lifecycle-aware backtest actions for halts and delists
+- explicit cross-stage embargoes between AutoML search, validation, and locked holdout windows so label horizons and execution delays cannot bleed across stage boundaries
 - pandas and vectorbt execution adapters behind a shared order-validation contract
 - futures backtests with funding, mark-price valuation, leverage-bracket caps, isolated/cross margin modes, and liquidation events
 
@@ -37,7 +43,16 @@ The repo now includes:
 - `core/models.py`: model training, diagnostics, validation helpers
 - `core/automl.py`: Optuna-backed search, ranking, holdout logic, and overfitting diagnostics
 - `core/backtest.py`: execution-aware backtests, slippage models, and futures margin/liquidation simulation
+- `core/execution/costs.py`: proxy, depth-aware, and fill-aware execution cost models plus fill-event attribution
+- `core/reference_data.py`: generic reference-overlay feature adapters for future multi-exchange feeds
+- `core/feature_governance.py`: feature portability metadata, summaries, and promotion-gate diagnostics
+- `core/data_quality.py`: bad-print detection, quarantine actions, and structured anomaly reporting before features and labels
+- `core/universe.py`: historical universe snapshots, eligibility gates, and symbol lifecycle handling for halts/delists
+- `core/execution/intents.py`: order-intent data structures emitted before execution simulation
+- `core/execution/policies.py`: execution adapter and fill-policy resolution for backtests
+- `core/execution/nautilus_adapter.py`: NautilusTrader adapter boundary with surrogate fallback metadata
 - `core/execution/liquidity.py`: causal bar-volume and order-book liquidity input resolution
+- `core/stat_tests.py`: White Reality Check, Hansen SPA, and aligned candidate return-matrix helpers
 - `core/pipeline.py`: stepwise research pipeline orchestration
 - `core/lookahead.py`: baseline-plus-prefix replay audit for lookahead bias provocation
 - `example.py`, `example_fvg.py`, `example_custom_data.py`, `example_futures.py`, `example_automl.py`: runnable end-to-end examples
@@ -138,6 +153,7 @@ Current safeguards include:
 - fold-local regime and stationarity fitting
 - prefix-only replay audits that compare baseline outputs against truncated reruns at sampled decision timestamps
 - holdout-aware AutoML promotion
+- explicit search/validation and validation/holdout gaps derived from label horizon, signal delay, and embargo settings
 - deflated Sharpe and PBO diagnostics
 - fold-stability reporting with optional rejection gates
 - execution-aware backtests with slippage, fees, and Binance constraint handling
@@ -150,4 +166,6 @@ Current safeguards include:
 
 ## Current Status
 
-The remaining open backlog item is deployment governance: drift monitoring, local model registry workflow, champion-challenger promotion, and safer artifact persistence.
+The core V1 hardening stack now includes locked holdouts, signal-policy separation, lookahead provocation, causal liquidity inputs, post-selection inference, event-style execution simulation, microstructure-aware costs, venue-portability governance, pre-feature data-quality quarantine, historical universe snapshots for survivorship-aware cross-symbol research, and explicit cross-stage embargoes between search, validation, and locked holdout windows.
+
+Open backlog work remains around safer artifact persistence, regime/feature lifecycle controls, and deployment governance.
