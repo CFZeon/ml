@@ -20,9 +20,17 @@ class NautilusExecutionAdapter:
 
     name = "nautilus"
 
-    def __init__(self):
+    def __init__(self, scenario_schedule=None, scenario_policy=None):
         self.available = bool(NAUTILUS_AVAILABLE)
         self.backend = "nautilus" if self.available else "nautilus_surrogate"
+        self.scenario_schedule = scenario_schedule
+        self.scenario_policy = dict(scenario_policy or {})
+
+    def describe_scenarios(self):
+        return {
+            "configured": self.scenario_schedule is not None,
+            "policy": dict(self.scenario_policy),
+        }
 
 
 __all__ = ["NAUTILUS_AVAILABLE", "NautilusExecutionAdapter"]

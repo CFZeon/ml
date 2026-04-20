@@ -14,6 +14,12 @@ from .slippage import (
     _estimate_slippage_rates,
     _estimate_trade_notional_slippage_rates,
 )
+from .scenarios import (
+    apply_execution_scenarios,
+    apply_scenario_price_policy,
+    build_scenario_schedule,
+    merge_scenario_lifecycle,
+)
 from .universe import apply_symbol_lifecycle_policy, build_symbol_lifecycle_frame
 
 try:  # pragma: no cover - optional dependency exercised in integration tests
@@ -382,7 +388,8 @@ def _build_legacy_execution_contract(close, requested_position, equity, executio
 
 def _build_execution_contract(close, requested_position, equity, execution_prices=None,
                               symbol_filters=None, market="spot", volume=None,
-                              execution_policy=None):
+                              execution_policy=None, scenario_schedule=None,
+                              scenario_policy=None):
     policy = resolve_execution_policy(execution_policy)
     if policy.adapter == "legacy":
         report = _build_legacy_execution_contract(
@@ -429,7 +436,14 @@ def _build_execution_contract(close, requested_position, equity, execution_price
     working_equity = float(equity)
     previous_valuation_price = None
     pending_order = None
-    adapter_boundary = NautilusExecutionAdapter() if policy.adapter == "nautilus" else None
+    adapter_boundary = (
+        NautilusExecutionAdapter(
+            scenario_schedule=scenario_schedule,
+            scenario_policy=scenario_policy,
+        )
+        if policy.adapter == "nautilus"
+        else None
+    )
     tolerance = 1e-12
 
     for bar_loc, timestamp in enumerate(valuation_series.index):
@@ -769,6 +783,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
         "order_ledger": order_ledger,
         "execution_adapter": policy.adapter,
         "execution_backend": adapter_boundary.backend if adapter_boundary is not None else policy.adapter,
+        "execution_adapter_scenarios": adapter_boundary.describe_scenarios() if adapter_boundary is not None else {},
         "execution_policy": policy.to_dict(),
         "blocked_orders": int((order_ledger.get("status") == "rejected").sum()) if not order_ledger.empty else 0,
         "adjusted_orders": int(((order_ledger.get("status").isin(["adjusted", "partial_fill"])) & order_ledger.get("adjustment_reasons").map(bool)).sum()) if not order_ledger.empty and "adjustment_reasons" in order_ledger else 0,
@@ -1666,6 +1681,7 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
                 "order_ledger": execution_report.get("order_ledger", pd.DataFrame()),
                 "price_fill_actions": execution_report.get("price_fill_actions", {}),
                 "liquidity_report": execution_report.get("liquidity_report", {}),
+                "scenario_report": execution_report.get("scenario_report", {}),
                 "symbol_lifecycle_report": execution_report.get("symbol_lifecycle_report", {}),
             }
         )
@@ -1820,7 +1836,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  valuation_price_fill_limit=None, futures_account=None,
                  liquidity_lag_bars=1, execution_policy=None,
                  futures_contract=None, futures_leverage_brackets=None,
-                 symbol_lifecycle=None, symbol_lifecycle_policy=None):
+                 symbol_lifecycle=None, symbol_lifecycle_policy=None,
+                 scenario_schedule=None, scenario_policy=None):
     """Run a backtest through the configured execution adapter.
 
     Parameters
@@ -1848,6 +1865,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     execution_policy : dict|ExecutionPolicy|None – order submission and fill policy for the execution adapter
     symbol_lifecycle : pd.DataFrame|list[dict]|dict|None – optional symbol halt/delist lifecycle events aligned or alignable to the backtest index
     symbol_lifecycle_policy : dict|None – lifecycle actions such as {"halt_action": "freeze", "delist_action": "liquidate"}
+    scenario_schedule : list[dict]|pd.DataFrame|None – venue-state events such as downtime, stale marks, halts, and deleveraging windows
+    scenario_policy : dict|None – scenario responses such as {"downtime_action": "freeze", "stale_mark_action": "reject"}
 
     execution_price_policy : str – one of {"strict", "ffill", "ffill_with_limit", "drop_rows"}
     execution_price_fill_limit : int|None – max consecutive execution-price fills when using "ffill_with_limit"
@@ -1880,6 +1899,13 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         fill_limit=execution_price_fill_limit,
         return_diagnostics=True,
         series_name="execution",
+    )
+    scenario_frame = build_scenario_schedule(close.index, scenario_schedule)
+    valuation_series, execution_series, scenario_report = apply_scenario_price_policy(
+        valuation_series,
+        execution_series,
+        scenario_frame,
+        policy=scenario_policy,
     )
 
     valid_mask = pd.Series(True, index=close.index, dtype=bool)
@@ -1940,17 +1966,32 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         market=market,
         volume=volume,
         execution_policy=execution_policy,
+        scenario_schedule=scenario_frame,
+        scenario_policy=scenario_policy,
     )
     execution_report["price_fill_actions"] = {
         "execution": execution_fill_actions,
         "valuation": valuation_fill_actions,
     }
     execution_report["liquidity_report"] = liquidity_inputs["diagnostics"]
+    execution_report = apply_execution_scenarios(
+        execution_report,
+        scenario_frame.reindex(execution_report["position"].index),
+        policy=scenario_policy,
+    )
+    execution_report["scenario_report"].update(
+        {
+            "stale_mark_action": scenario_report.get("stale_mark_action"),
+            "stale_mark_rejections": scenario_report.get("stale_mark_rejections", 0),
+            "warnings": scenario_report.get("warnings", []),
+        }
+    )
 
-    lifecycle_frame = build_symbol_lifecycle_frame(
+    lifecycle_frame = merge_scenario_lifecycle(
         index=execution_report["position"].index,
+        symbol_lifecycle=symbol_lifecycle,
+        scenario_schedule=scenario_frame.reindex(execution_report["position"].index),
         symbol=symbol_filters.get("symbol"),
-        events=symbol_lifecycle,
     )
     if lifecycle_frame is not None:
         executable_position, keep_mask, lifecycle_report = apply_symbol_lifecycle_policy(

@@ -13,11 +13,12 @@ from ..storage import read_json, read_parquet_frame, write_json, write_parquet_f
 from .manifest import build_feature_schema_hash, build_registry_manifest, flatten_registry_record
 
 
-def evaluate_challenger_promotion(challenger_summary, champion_record=None, drift_report=None, policy=None):
+def evaluate_challenger_promotion(challenger_summary, champion_record=None, drift_report=None, monitoring_report=None, policy=None):
     policy = dict(policy or {})
     minimum_samples = int(policy.get("min_samples", 200))
     minimum_margin = float(policy.get("minimum_score_margin", 0.0))
     require_automl_ready = bool(policy.get("require_automl_promotion_ready", True))
+    require_operational_health = bool(policy.get("require_operational_health", monitoring_report is not None))
 
     challenger = dict(challenger_summary or {})
     champion = dict(champion_record or {})
@@ -50,6 +51,12 @@ def evaluate_challenger_promotion(challenger_summary, champion_record=None, drif
     else:
         drift_guardrails = None
 
+    monitoring_health = None
+    if monitoring_report is not None:
+        monitoring_health = bool((monitoring_report or {}).get("healthy", False))
+        if require_operational_health and not monitoring_health:
+            reasons.append("operational_monitoring_not_healthy")
+
     approved = not reasons
     return {
         "approved": approved,
@@ -57,6 +64,7 @@ def evaluate_challenger_promotion(challenger_summary, champion_record=None, drif
         "sample_count": sample_count,
         "selection_value": challenger_score,
         "drift_guardrails": drift_guardrails,
+        "monitoring_health": monitoring_health,
     }
 
 
@@ -69,27 +77,31 @@ class LocalRegistryStore:
 
     def _read_index(self):
         frame = read_parquet_frame(self.index_path)
+        expected_columns = [
+            "version_id",
+            "symbol",
+            "created_at",
+            "initial_status",
+            "current_status",
+            "version_dir",
+            "artifact_manifest",
+            "meta_artifact_manifest",
+            "feature_schema_hash",
+            "feature_count",
+            "selection_value",
+            "promotion_ready",
+            "latest_drift_report",
+            "latest_monitoring_report",
+            "latest_promotion_report",
+            "locked_holdout_score",
+        ]
         if frame is None or frame.empty:
-            return pd.DataFrame(
-                columns=[
-                    "version_id",
-                    "symbol",
-                    "created_at",
-                    "initial_status",
-                    "current_status",
-                    "version_dir",
-                    "artifact_manifest",
-                    "meta_artifact_manifest",
-                    "feature_schema_hash",
-                    "feature_count",
-                    "selection_value",
-                    "promotion_ready",
-                    "latest_drift_report",
-                    "latest_promotion_report",
-                    "locked_holdout_score",
-                ]
-            )
-        return frame.copy()
+            return pd.DataFrame(columns=expected_columns)
+        frame = frame.copy()
+        for column in expected_columns:
+            if column not in frame.columns:
+                frame[column] = None
+        return frame[expected_columns]
 
     def _write_index(self, frame):
         write_parquet_frame(self.index_path, frame.reset_index(drop=True))
@@ -264,6 +276,22 @@ class LocalRegistryStore:
         index = self._read_index()
         mask = index["version_id"].astype(str) == str(version_id)
         index.loc[mask, "latest_drift_report"] = str(report_path)
+        self._write_index(index)
+        return report_path
+
+    def attach_monitoring_report(self, version_id, monitoring_report, *, symbol=None):
+        row = self._find_row(version_id, symbol=symbol)
+        if row is None:
+            raise FileNotFoundError(f"Registry version {version_id!r} was not found")
+        version_dir = Path(row["version_dir"])
+        monitoring_dir = version_dir / "monitoring"
+        monitoring_dir.mkdir(parents=True, exist_ok=True)
+        report_path = monitoring_dir / f"{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d%H%M%S')}.json"
+        write_json(report_path, monitoring_report)
+
+        index = self._read_index()
+        mask = index["version_id"].astype(str) == str(version_id)
+        index.loc[mask, "latest_monitoring_report"] = str(report_path)
         self._write_index(index)
         return report_path
 

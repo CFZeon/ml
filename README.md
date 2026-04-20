@@ -35,6 +35,8 @@ The repo now includes:
 - safe persistent artifact storage with Parquet/JSON caches and skops-backed model bundles that verify hashes and feature schema before load
 - a local registry with immutable version manifests, champion/challenger rollback flows, offline promotion decisions, and drift-report attachments
 - drift monitoring with PSI/KS feature checks, prediction KL divergence, and ADWIN-backed performance drift hooks with minimum-sample and cooldown guardrails
+- venue-failure scenario schedules for downtime, stale marks, halts, leverage caps, forced deleveraging, and reproducible stress-matrix replays
+- operations-centric monitoring for raw-data freshness, custom-data TTL breaches, L2 snapshot age, feature schema drift, fill-quality deterioration, slippage drift, and inference latency/backlog
 - pandas and vectorbt execution adapters behind a shared order-validation contract
 - futures backtests with funding, mark-price valuation, leverage-bracket caps, isolated/cross margin modes, and liquidation events
 
@@ -46,8 +48,10 @@ The repo now includes:
 - `core/labeling.py`: event labeling and uniqueness weighting helpers
 - `core/models.py`: model training, diagnostics, validation helpers
 - `core/regime.py`: regime feature construction, provenance tracking, endogenous-vs-context ablations, and HMM / explicit regime detection
+- `core/scenarios.py`: venue downtime, stale-mark, halt, deleveraging schedules plus stress-matrix replay helpers
 - `core/automl.py`: Optuna-backed search, ranking, holdout logic, and overfitting diagnostics
 - `core/backtest.py`: execution-aware backtests, slippage models, and futures margin/liquidation simulation
+- `core/monitoring.py`: operational health reports, schema checks, execution-quality drift summaries, and local artifact emission
 - `core/execution/costs.py`: proxy, depth-aware, and fill-aware execution cost models plus fill-event attribution
 - `core/reference_data.py`: generic reference-overlay feature adapters for future multi-exchange feeds
 - `core/feature_governance.py`: feature metadata, admission/retirement rules, portability summaries, and promotion-gate diagnostics
@@ -167,6 +171,8 @@ Current safeguards include:
 - safe artifact loads that fail closed on hash mismatches or feature-schema drift
 - local registry decisions that preserve immutable version manifests while tracking promotion and rollback state separately
 - drift guardrails that require minimum sample thresholds, cooldown windows, and multiple confirming signals before retrain recommendations
+- venue-failure scenario replays that stress downtime, stale-mark, and halt policies before promotion
+- operational monitoring artifacts that can gate promotion on freshness, schema, execution, and latency health
 - deflated Sharpe and PBO diagnostics
 - fold-stability reporting with optional rejection gates
 - execution-aware backtests with slippage, fees, and Binance constraint handling
@@ -179,6 +185,6 @@ Current safeguards include:
 
 ## Current Status
 
-The core V1 hardening stack now includes locked holdouts, signal-policy separation, lookahead provocation, causal liquidity inputs, post-selection inference, event-style execution simulation, microstructure-aware costs, venue-portability plus feature-admission governance, a provenance-aware regime layer redesign, pre-feature data-quality quarantine, historical universe snapshots for survivorship-aware cross-symbol research, explicit cross-stage embargoes between search, validation, and locked holdout windows, safer persistent storage for data/context caches plus model artifacts, and a local registry plus drift-governed promotion flow.
+The core V1.5 hardening stack now includes locked holdouts, signal-policy separation, lookahead provocation, causal liquidity inputs, post-selection inference, event-style execution simulation, microstructure-aware costs, venue-portability plus feature-admission governance, a provenance-aware regime layer redesign, pre-feature data-quality quarantine, historical universe snapshots for survivorship-aware cross-symbol research, explicit cross-stage embargoes between search, validation, and locked holdout windows, safer persistent storage for data/context caches plus model artifacts, a local registry plus drift-governed promotion flow, venue-failure stress scenarios, and operations-centric monitoring artifacts.
 
-Open backlog work remains around regime/feature lifecycle controls and deployment governance.
+The implementation backlog in `IMPROVEMENTS.md` is now complete for the listed V1.5 remediation items.

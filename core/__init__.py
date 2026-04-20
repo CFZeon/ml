@@ -74,6 +74,14 @@ from .regime import (
     summarize_regime_ablation_reports,
     summarize_regime_provenance,
 )
+from .scenarios import (
+    ScenarioEvent,
+    apply_execution_scenarios,
+    apply_scenario_price_policy,
+    build_scenario_schedule,
+    merge_scenario_lifecycle,
+    run_scenario_matrix,
+)
 from .features import (
     build_feature_set,
     build_features,
@@ -100,6 +108,16 @@ from .labeling import (
     sequential_bootstrap,
 )
 from .lookahead import run_lookahead_analysis
+from .monitoring import (
+    build_monitoring_report,
+    evaluate_custom_data_ttl,
+    evaluate_execution_health,
+    evaluate_feature_schema_health,
+    evaluate_inference_health,
+    evaluate_l2_snapshot_age,
+    evaluate_raw_data_freshness,
+    write_monitoring_artifacts,
+)
 from .slippage import (
     DepthCurveImpactModel,
     FillAwareCostModel,

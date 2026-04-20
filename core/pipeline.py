@@ -1,6 +1,7 @@
 """Stepwise research pipeline abstraction for reusable model workflows."""
 
 import copy
+import time
 import warnings
 
 import numpy as np
@@ -63,6 +64,7 @@ from .models import (
     train_model,
     walk_forward_split,
 )
+from .monitoring import build_monitoring_report, write_monitoring_artifacts
 from .regime import (
     build_default_regime_feature_set,
     build_regime_ablation_report,
@@ -507,6 +509,75 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "symbol_lifecycle": pipeline.state.get("symbol_lifecycle"),
         "symbol_lifecycle_policy": pipeline.state.get("universe_policy"),
     }
+
+
+def _resolve_monitoring_reference_index(backtest_reports):
+    if backtest_reports is None:
+        return pd.DatetimeIndex([])
+    reports = [backtest_reports] if isinstance(backtest_reports, dict) else list(backtest_reports)
+    for report in reports:
+        if not isinstance(report, dict):
+            continue
+        equity_curve = report.get("equity_curve")
+        if isinstance(equity_curve, pd.Series) and not equity_curve.empty:
+            return pd.DatetimeIndex(equity_curve.index)
+        order_ledger = report.get("order_ledger")
+        if isinstance(order_ledger, pd.DataFrame) and not order_ledger.empty and "timestamp" in order_ledger.columns:
+            return pd.DatetimeIndex(pd.to_datetime(order_ledger["timestamp"], utc=True))
+    return pd.DatetimeIndex([])
+
+
+def _build_pipeline_operational_monitoring(
+    pipeline,
+    *,
+    backtest_reports=None,
+    expected_feature_columns=None,
+    actual_feature_columns=None,
+    inference_latencies_ms=None,
+    queue_backlog=None,
+    scope="training",
+):
+    monitoring_config = dict(pipeline.section("monitoring") or {})
+    raw_data = pipeline.state.get("raw_data")
+    raw_index = raw_data.index if isinstance(raw_data, (pd.DataFrame, pd.Series)) else pd.DatetimeIndex([])
+    orderbook_depth = pipeline.state.get("orderbook_depth")
+    l2_snapshot_index = orderbook_depth.index if isinstance(orderbook_depth, (pd.DataFrame, pd.Series)) else pd.DatetimeIndex([])
+    reference_index = _resolve_monitoring_reference_index(backtest_reports)
+    if len(reference_index) == 0:
+        reference_index = raw_index
+
+    report = build_monitoring_report(
+        data_index=raw_index,
+        expected_data_end=monitoring_config.get("expected_data_end", raw_index[-1] if len(raw_index) > 0 else None),
+        expected_data_interval=monitoring_config.get("expected_data_interval"),
+        max_data_lag=monitoring_config.get("max_data_lag"),
+        custom_data_report=pipeline.state.get("custom_data_report"),
+        reference_index=reference_index,
+        l2_snapshot_index=l2_snapshot_index,
+        expected_feature_columns=expected_feature_columns or actual_feature_columns,
+        actual_feature_columns=actual_feature_columns,
+        backtest_reports=backtest_reports,
+        baseline_backtest_report=monitoring_config.get("baseline_backtest_report"),
+        inference_latencies_ms=inference_latencies_ms,
+        queue_backlog=queue_backlog,
+        policy=monitoring_config,
+    )
+    if monitoring_config.get("write_reports", True):
+        symbol = pipeline.section("data").get("symbol", "run")
+        timestamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d%H%M%S")
+        report["artifacts"] = write_monitoring_artifacts(
+            report,
+            monitoring_config.get("root_dir", ".cache/monitoring"),
+            run_id=f"{scope}_{symbol}_{timestamp}",
+        )
+    return report
+
+
+def _timed_inference_call(latency_store, func, *args, **kwargs):
+    started_at = time.perf_counter()
+    result = func(*args, **kwargs)
+    latency_store.append((time.perf_counter() - started_at) * 1000.0)
+    return result
 
 
 def _summarize_path_backtests(path_backtests):
@@ -2386,6 +2457,8 @@ class TrainModelsStep(PipelineStep):
         fold_purging = []
         fold_regime = []
         fold_bootstrap = []
+        fold_backtest_reports = []
+        inference_latencies_ms = []
         last_model = None
         last_meta = None
         last_primary_calibrator = None
@@ -2642,8 +2715,16 @@ class TrainModelsStep(PipelineStep):
             if split_meta.get("test_blocks") is not None:
                 metrics["test_blocks"] = split_meta.get("test_blocks")
 
-            test_primary_preds = pd.Series(model.predict(X_test_model), index=X_test_model.index)
-            test_primary_probs_raw = predict_probability_frame(model, X_test_model)
+            test_primary_preds = pd.Series(
+                _timed_inference_call(inference_latencies_ms, model.predict, X_test_model),
+                index=X_test_model.index,
+            )
+            test_primary_probs_raw = _timed_inference_call(
+                inference_latencies_ms,
+                predict_probability_frame,
+                model,
+                X_test_model,
+            )
             test_primary_probs = test_primary_probs_raw.copy()
 
             primary_calibrator = None
@@ -2676,7 +2757,10 @@ class TrainModelsStep(PipelineStep):
                 ),
                 context_frame=meta_context_frame.reindex(X_fit_model.index) if meta_context_frame is not None else None,
             )
-            fit_primary_preds = pd.Series(model.predict(X_fit_model), index=X_fit_model.index)
+            fit_primary_preds = pd.Series(
+                _timed_inference_call(inference_latencies_ms, model.predict, X_fit_model),
+                index=X_fit_model.index,
+            )
             fold_avg_win = default_avg_win
             fold_avg_loss = default_avg_loss
             sizing_trade_outcomes = None
@@ -2699,8 +2783,16 @@ class TrainModelsStep(PipelineStep):
             tuned_signal_params = dict(signal_policy_report["params"])
             policy_backtest = None
             if X_val_model is not None and not X_val_model.empty:
-                val_primary_preds = pd.Series(model.predict(X_val_model), index=X_val_model.index)
-                val_primary_probs_raw = predict_probability_frame(model, X_val_model)
+                val_primary_preds = pd.Series(
+                    _timed_inference_call(inference_latencies_ms, model.predict, X_val_model),
+                    index=X_val_model.index,
+                )
+                val_primary_probs_raw = _timed_inference_call(
+                    inference_latencies_ms,
+                    predict_probability_frame,
+                    model,
+                    X_val_model,
+                )
                 val_primary_probs, primary_calibrator = _calibrate_primary_probability_frame(
                     val_primary_probs_raw,
                     y_val,
@@ -2714,7 +2806,12 @@ class TrainModelsStep(PipelineStep):
                     context=meta_context_frame.reindex(X_val_model.index) if meta_context_frame is not None else None,
                 )
                 val_meta_prob_raw = pd.Series(
-                    _positive_class_probability(meta_model, X_meta_val),
+                    _timed_inference_call(
+                        inference_latencies_ms,
+                        _positive_class_probability,
+                        meta_model,
+                        X_meta_val,
+                    ),
                     index=X_val_model.index,
                 )
                 val_trade_outcomes = _build_execution_trade_outcomes(
@@ -2837,7 +2934,12 @@ class TrainModelsStep(PipelineStep):
                 context=meta_context_frame.reindex(X_test_model.index) if meta_context_frame is not None else None,
             )
             meta_prob_test_raw = pd.Series(
-                _positive_class_probability(meta_model, X_meta_test),
+                _timed_inference_call(
+                    inference_latencies_ms,
+                    _positive_class_probability,
+                    meta_model,
+                    X_meta_test,
+                ),
                 index=X_test_model.index,
             )
             meta_prob_test = pd.Series(
@@ -2880,6 +2982,7 @@ class TrainModelsStep(PipelineStep):
 
             fold_metrics.append(metrics)
             if fold_backtest is not None:
+                fold_backtest_reports.append(fold_backtest)
                 fold_backtests.append(
                     {
                         "fold": fold,
@@ -3031,6 +3134,15 @@ class TrainModelsStep(PipelineStep):
         regime_ablation_summary = summarize_regime_ablation_reports(
             [row.get("ablation") for row in fold_regime]
         )
+        operational_monitoring = _build_pipeline_operational_monitoring(
+            pipeline,
+            backtest_reports=fold_backtest_reports,
+            expected_feature_columns=last_selected_columns,
+            actual_feature_columns=last_selected_columns,
+            inference_latencies_ms=inference_latencies_ms,
+            queue_backlog=[0] * len(inference_latencies_ms),
+            scope="training",
+        )
         fold_stability = _build_fold_stability_summary(
             fold_metrics,
             fold_backtests,
@@ -3122,10 +3234,12 @@ class TrainModelsStep(PipelineStep):
                 "admission_summary": feature_admission_summary,
                 "folds": fold_feature_governance,
             },
+            "operational_monitoring": operational_monitoring,
             "promotion_gates": {
                 "feature_portability": bool(feature_portability_diagnostics.get("promotion_pass", True)),
                 "feature_admission": bool(feature_admission_summary.get("promotion_pass", True)),
                 "regime_stability": bool(regime_ablation_summary.get("promotion_pass", True)),
+                "operational_health": bool(operational_monitoring.get("healthy", True)),
             },
             "regime": {
                 "mode": "fold_local",
@@ -3161,6 +3275,7 @@ class TrainModelsStep(PipelineStep):
             "oos_trade_count": int(oos_trade_count),
         }
         pipeline.state["training"] = training
+        pipeline.state["operational_monitoring"] = operational_monitoring
         return training
 
 
@@ -3425,6 +3540,18 @@ class BacktestStep(PipelineStep):
             backtest = _summarize_path_backtests(path_backtests)
             backtest["paths"] = path_backtests
             backtest["signal_source"] = signal_state.get("signal_source")
+            training = pipeline.state.get("training") or {}
+            feature_frame = pipeline.state.get("X")
+            feature_columns = list(feature_frame.columns) if isinstance(feature_frame, pd.DataFrame) else []
+            monitoring_report = _build_pipeline_operational_monitoring(
+                pipeline,
+                backtest_reports=[row.get("backtest") for row in path_backtests],
+                expected_feature_columns=training.get("last_selected_columns") or feature_columns,
+                actual_feature_columns=training.get("last_selected_columns") or feature_columns,
+                scope="backtest_paths",
+            )
+            backtest["operational_monitoring"] = monitoring_report
+            pipeline.state["operational_monitoring"] = monitoring_report
             pipeline.state["backtest"] = backtest
             return backtest
 
@@ -3441,6 +3568,18 @@ class BacktestStep(PipelineStep):
             execution_prices=execution_prices,
             **_resolve_backtest_runtime_kwargs(pipeline, positions.index),
         )
+        training = pipeline.state.get("training") or {}
+        feature_frame = pipeline.state.get("X")
+        feature_columns = list(feature_frame.columns) if isinstance(feature_frame, pd.DataFrame) else []
+        monitoring_report = _build_pipeline_operational_monitoring(
+            pipeline,
+            backtest_reports=[backtest],
+            expected_feature_columns=training.get("last_selected_columns") or feature_columns,
+            actual_feature_columns=training.get("last_selected_columns") or feature_columns,
+            scope="backtest",
+        )
+        backtest["operational_monitoring"] = monitoring_report
+        pipeline.state["operational_monitoring"] = monitoring_report
         pipeline.state["backtest"] = backtest
         return backtest
 

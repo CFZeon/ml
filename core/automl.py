@@ -504,6 +504,7 @@ def _summarize_training(training):
     feature_selection = training.get("feature_selection") or {}
     bootstrap = training.get("bootstrap") or {}
     feature_governance = training.get("feature_governance") or {}
+    operational_monitoring = training.get("operational_monitoring") or {}
     return {
         "avg_accuracy": training.get("avg_accuracy"),
         "avg_f1_macro": training.get("avg_f1_macro"),
@@ -528,6 +529,13 @@ def _summarize_training(training):
             "retirement": feature_governance.get("retirement", {}),
             "admission_summary": feature_governance.get("admission_summary", {}),
         },
+        "operational_monitoring": {
+            "healthy": bool(operational_monitoring.get("healthy", True)),
+            "reasons": list(operational_monitoring.get("reasons", [])),
+            "summary": operational_monitoring.get("summary", {}),
+            "artifacts": operational_monitoring.get("artifacts", {}),
+        },
+        "promotion_gates": training.get("promotion_gates", {}),
         "fold_stability": training.get("fold_stability"),
         "fold_count": len(training.get("fold_metrics", [])),
     }
@@ -1842,6 +1850,9 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "feature_admission": bool(
                 (validation_metrics.get("training") or {}).get("promotion_gates", {}).get("feature_admission", True)
             ),
+            "operational_health": bool(
+                (validation_metrics.get("training") or {}).get("promotion_gates", {}).get("operational_health", True)
+            ),
             "fold_stability": bool(fold_stability_gate["passed"] or not fold_stability_gate["applies"]),
             "param_fragility": None,
             "locked_holdout": None,
@@ -1864,6 +1875,8 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             eligibility_reasons.append("model_family_trial_count_above_limit")
         if not eligibility_checks["feature_admission"]:
             eligibility_reasons.append("feature_admission_failed")
+        if not eligibility_checks["operational_health"]:
+            eligibility_reasons.append("operational_monitoring_failed")
         if not eligibility_checks["fold_stability"]:
             eligibility_reasons.append("fold_stability_failed")
 
@@ -2753,6 +2766,10 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             status="challenger",
             meta_model=best_training.get("last_meta"),
         )
+        monitoring_report = _json_ready(best_training.get("operational_monitoring") or {})
+        monitoring_path = None
+        if monitoring_report:
+            monitoring_path = registry_store.attach_monitoring_report(version_id, monitoring_report, symbol=symbol)
         promotion_decision = evaluate_challenger_promotion(
             {
                 "promotion_ready": bool(summary["promotion_ready"]),
@@ -2764,6 +2781,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 ),
             },
             champion_record=champion_before,
+            monitoring_report=monitoring_report,
             policy=registry_config.get("promotion_policy"),
         )
         registry_store.record_promotion_decision(version_id, promotion_decision, symbol=symbol)
@@ -2776,6 +2794,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             "current_status": registry_entry.get("current_status") if registry_entry else "challenger",
             "promotion_decision": promotion_decision,
             "champion_before": champion_before.get("version_id") if champion_before else None,
+            "monitoring_report": str(monitoring_path) if monitoring_path is not None else None,
         }
 
     engine = getattr(getattr(study, "_storage", None), "engine", None)
