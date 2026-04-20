@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from core import ResearchPipeline, select_features, train_model, trend_scanning_labels
+from core import ResearchPipeline, build_reference_validation_bundle, select_features, train_model, trend_scanning_labels
 from core.models import compute_feature_family_diagnostics, summarize_feature_family_diagnostics
 
 
@@ -297,6 +297,64 @@ class DerivativesContextPipelineTest(unittest.TestCase):
         self.assertIn("realized_leverage_series", backtest)
         self.assertGreater(int(backtest["liquidation_event_count"]), 0)
         self.assertFalse(backtest["liquidation_events"].empty)
+
+    def test_reference_validation_bundle_feeds_reference_overlay_features(self):
+        index = pd.date_range("2026-02-01", periods=48, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        futures_context = _make_futures_context(index, raw_data["close"].to_numpy())
+        bybit_bundle = {
+            "mark_price": pd.DataFrame(
+                {
+                    "mark_open": raw_data["close"].shift(1).fillna(raw_data["close"].iloc[0]) * 1.0004,
+                    "mark_high": raw_data["close"] * 1.0012,
+                    "mark_low": raw_data["close"] * 0.9992,
+                    "mark_close": raw_data["close"] * 1.0006,
+                },
+                index=index,
+            ),
+            "index_price": pd.DataFrame(
+                {
+                    "index_open": raw_data["close"].shift(1).fillna(raw_data["close"].iloc[0]) * 1.0001,
+                    "index_high": raw_data["close"] * 1.0008,
+                    "index_low": raw_data["close"] * 0.9995,
+                    "index_close": raw_data["close"] * 1.0002,
+                },
+                index=index,
+            ),
+        }
+
+        reference_bundle = build_reference_validation_bundle(
+            raw_data,
+            market="um_futures",
+            symbol="BTCUSDT",
+            interval="1h",
+            futures_context=futures_context,
+            config={
+                "fetch_live": False,
+                "futures": {
+                    "frames": {"bybit": bybit_bundle},
+                },
+            },
+        )
+
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h", "market": "um_futures"},
+                "indicators": [],
+                "features": {"rolling_window": 10, "context_timeframes": ["4h"]},
+                "stationarity": {"enabled": False},
+            }
+        )
+        pipeline.state["raw_data"] = raw_data
+        pipeline.state["data"] = raw_data.copy()
+        pipeline.state["futures_context"] = futures_context
+        pipeline.state["reference_overlay_data"] = reference_bundle["overlay"]
+
+        features = pipeline.build_features()
+
+        self.assertIn("reference_price", reference_bundle["overlay"].columns)
+        self.assertIn("ref_price_gap", features.columns)
+        self.assertIn("composite_basis", features.columns)
 
     def test_feature_family_metadata_survives_alignment_and_selection(self):
         index = pd.date_range("2026-02-01", periods=240, freq="1h", tz="UTC")

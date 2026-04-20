@@ -164,7 +164,16 @@ from .stat_tests import (
     select_post_selection_candidates,
 )
 from .backtest import kelly_fraction, run_backtest
-from .reference_data import build_reference_overlay_feature_block
+from .reference_data import (
+    build_futures_reference_validation,
+    build_reference_overlay_feature_block,
+    build_reference_validation_bundle,
+    build_spot_reference_validation,
+    fetch_bybit_futures_reference,
+    fetch_coinbase_reference_bars,
+    fetch_kraken_reference_bars,
+    normalize_okx_reference_bundle,
+)
 from .registry import (
     LocalRegistryStore,
     RegistryVersionManifest,

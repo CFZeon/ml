@@ -87,7 +87,7 @@ from .slippage import (
     ProxyImpactModel,
     SquareRootImpactModel,
 )
-from .reference_data import build_reference_overlay_feature_block
+from .reference_data import build_reference_overlay_feature_block, build_reference_validation_bundle
 from .universe import (
     build_symbol_lifecycle_frame,
     evaluate_universe_eligibility,
@@ -2026,6 +2026,7 @@ class FetchDataStep(PipelineStep):
 
     def run(self, pipeline):
         config = dict(pipeline.section("data"))
+        reference_config = dict(pipeline.section("reference_data") or {})
         universe_config = dict(pipeline.section("universe") or {})
         futures_context_config = dict(config.pop("futures_context", {}) or {})
         cross_asset_context_config = dict(config.pop("cross_asset_context", {}) or {})
@@ -2164,6 +2165,24 @@ class FetchDataStep(PipelineStep):
                 market=cross_asset_context_config.get("market", market),
             )
             pipeline.state["cross_asset_context_symbols"] = list(context_symbols)
+
+        if reference_config.get("enabled", False):
+            reference_bundle = build_reference_validation_bundle(
+                market_data,
+                market=market,
+                symbol=primary_symbol,
+                interval=config.get("interval", "1h"),
+                start=config.get("start"),
+                end=config.get("end"),
+                cache_dir=reference_config.get("cache_dir", cache_dir),
+                futures_context=pipeline.state.get("futures_context"),
+                config=reference_config,
+            )
+            pipeline.state["reference_integrity_report"] = dict(reference_bundle.get("report") or {})
+            pipeline.state["reference_venue_frames"] = dict(reference_bundle.get("venue_frames") or {})
+            reference_overlay = reference_bundle.get("overlay")
+            if reference_overlay is not None and not pd.DataFrame(reference_overlay).empty:
+                pipeline.state["reference_overlay_data"] = pd.DataFrame(reference_overlay).copy()
 
         market_manifest = dict(getattr(market_data, "attrs", {}).get("dataset_manifest") or {})
         custom_manifests = [
@@ -3338,6 +3357,7 @@ class TrainModelsStep(PipelineStep):
             family_diagnostics=feature_family_diagnostics,
             config=pipeline.section("feature_governance"),
         )
+        reference_integrity_report = dict(pipeline.state.get("reference_integrity_report") or {})
         feature_admission_summary = summarize_feature_admission_reports(fold_feature_governance)
         regime_ablation_summary = summarize_regime_ablation_reports(
             [row.get("ablation") for row in fold_regime]
@@ -3436,6 +3456,7 @@ class TrainModelsStep(PipelineStep):
             "feature_block_diagnostics": feature_diagnostics,
             "feature_family_diagnostics": feature_family_diagnostics,
             "feature_portability_diagnostics": feature_portability_diagnostics,
+            "cross_venue_integrity": reference_integrity_report,
             "feature_governance": {
                 "mode": "fold_local",
                 "retirement": pipeline.state.get("feature_retirement", {}),
@@ -3448,6 +3469,7 @@ class TrainModelsStep(PipelineStep):
                 "feature_admission": bool(feature_admission_summary.get("promotion_pass", True)),
                 "regime_stability": bool(regime_ablation_summary.get("promotion_pass", True)),
                 "operational_health": bool(operational_monitoring.get("healthy", True)),
+                "cross_venue_integrity": bool(reference_integrity_report.get("promotion_pass", True)),
             },
             "regime": {
                 "mode": "fold_local",
@@ -3759,6 +3781,8 @@ class BacktestStep(PipelineStep):
                 scope="backtest_paths",
             )
             backtest["operational_monitoring"] = monitoring_report
+            if pipeline.state.get("reference_integrity_report") is not None:
+                backtest["cross_venue_integrity"] = dict(pipeline.state.get("reference_integrity_report") or {})
             pipeline.state["operational_monitoring"] = monitoring_report
             pipeline.state["backtest"] = backtest
             return backtest
@@ -3787,6 +3811,8 @@ class BacktestStep(PipelineStep):
             scope="backtest",
         )
         backtest["operational_monitoring"] = monitoring_report
+        if pipeline.state.get("reference_integrity_report") is not None:
+            backtest["cross_venue_integrity"] = dict(pipeline.state.get("reference_integrity_report") or {})
         pipeline.state["operational_monitoring"] = monitoring_report
         pipeline.state["backtest"] = backtest
         return backtest

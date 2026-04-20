@@ -516,6 +516,7 @@ def _summarize_training(training):
     bootstrap = training.get("bootstrap") or {}
     feature_governance = training.get("feature_governance") or {}
     operational_monitoring = training.get("operational_monitoring") or {}
+    cross_venue_integrity = training.get("cross_venue_integrity") or {}
     return {
         "avg_accuracy": training.get("avg_accuracy"),
         "avg_f1_macro": training.get("avg_f1_macro"),
@@ -545,6 +546,17 @@ def _summarize_training(training):
             "reasons": list(operational_monitoring.get("reasons", [])),
             "summary": operational_monitoring.get("summary", {}),
             "artifacts": operational_monitoring.get("artifacts", {}),
+        },
+        "cross_venue_integrity": {
+            "kind": cross_venue_integrity.get("kind"),
+            "promotion_pass": bool(cross_venue_integrity.get("promotion_pass", True)),
+            "gate_mode": cross_venue_integrity.get("gate_mode"),
+            "reasons": list(cross_venue_integrity.get("reasons", [])),
+            "warnings": list(cross_venue_integrity.get("warnings", [])),
+            "venues": cross_venue_integrity.get("venues", {}),
+            "self_consistency": cross_venue_integrity.get("self_consistency", {}),
+            "divergence": cross_venue_integrity.get("divergence", {}),
+            "overlay_columns": list(cross_venue_integrity.get("overlay_columns", [])),
         },
         "promotion_gates": training.get("promotion_gates", {}),
         "fold_stability": training.get("fold_stability"),
@@ -1868,12 +1880,14 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         promotion_gates = dict(training_summary.get("promotion_gates") or {})
         feature_admission_summary = dict((training_summary.get("feature_governance") or {}).get("admission_summary") or {})
         feature_portability_diagnostics = dict(training_summary.get("feature_portability_diagnostics") or {})
+        cross_venue_integrity = dict(training_summary.get("cross_venue_integrity") or {})
         regime_ablation_summary = dict((training_summary.get("regime") or {}).get("ablation_summary") or {})
         operational_monitoring = dict(training_summary.get("operational_monitoring") or {})
         feature_portability_pass = bool(promotion_gates.get("feature_portability", True))
         feature_admission_pass = bool(promotion_gates.get("feature_admission", True))
         regime_stability_pass = bool(promotion_gates.get("regime_stability", True))
         operational_health_pass = bool(promotion_gates.get("operational_health", True))
+        cross_venue_integrity_pass = bool(promotion_gates.get("cross_venue_integrity", True))
 
         eligibility_checks = {
             "minimum_dsr": bool(meets_minimum_dsr_threshold or not dsr_gate_applies),
@@ -1900,6 +1914,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "feature_admission": feature_admission_pass,
             "regime_stability": regime_stability_pass,
             "operational_health": operational_health_pass,
+            "cross_venue_integrity": cross_venue_integrity_pass,
             "fold_stability": bool(fold_stability_gate["passed"] or not fold_stability_gate["applies"]),
             "param_fragility": None,
             "locked_holdout": None,
@@ -2007,6 +2022,14 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 "threshold": True,
                 "reason": None if eligibility_checks["operational_health"] else _first_failure_reason(operational_monitoring, "operational_monitoring_failed"),
                 "details": operational_monitoring,
+            },
+            {
+                "name": "cross_venue_integrity",
+                "passed": eligibility_checks["cross_venue_integrity"],
+                "measured": cross_venue_integrity.get("promotion_pass"),
+                "threshold": True,
+                "reason": None if eligibility_checks["cross_venue_integrity"] else _first_failure_reason(cross_venue_integrity, "cross_venue_integrity_failed"),
+                "details": cross_venue_integrity,
             },
             {
                 "name": "fold_stability",
