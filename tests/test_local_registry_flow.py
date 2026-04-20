@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+import json
 
 import pandas as pd
 
@@ -66,6 +67,53 @@ class LocalRegistryFlowTest(unittest.TestCase):
             self.assertEqual(champion["version_id"], v1)
             archived_v2 = next(row for row in store.list_versions("BTCUSDT") if row["version_id"] == v2)
             self.assertEqual(archived_v2["current_status"], "archived")
+
+    def test_registry_persists_input_data_lineage(self):
+        model, feature_columns = _fit_logistic_model()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            version_id = store.register_version(
+                model,
+                symbol="BTCUSDT",
+                feature_columns=feature_columns,
+                metadata={
+                    "data_lineage": {
+                        "source_datasets": [
+                            {
+                                "name": "binance_spot_bars",
+                                "contract": {"contract_hash": "abc123"},
+                                "source_fingerprint": "fingerprint-1",
+                            }
+                        ]
+                    }
+                },
+                lineage={
+                    "data_lineage": {
+                        "source_datasets": [
+                            {
+                                "name": "binance_spot_bars",
+                                "contract": {"contract_hash": "abc123"},
+                                "source_fingerprint": "fingerprint-1",
+                            }
+                        ]
+                    }
+                },
+                training_summary={"avg_f1_macro": 0.75},
+                validation_summary={"raw_objective_value": 0.12},
+            )
+
+            version_dir = Path(temp_dir) / "BTCUSDT" / version_id
+            version_manifest = json.loads((version_dir / "version_manifest.json").read_text(encoding="utf-8"))
+            model_manifest = json.loads((version_dir / "model.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                version_manifest["lineage"]["data_lineage"]["source_datasets"][0]["contract"]["contract_hash"],
+                "abc123",
+            )
+            self.assertEqual(
+                model_manifest["metadata"]["data_lineage"]["source_datasets"][0]["source_fingerprint"],
+                "fingerprint-1",
+            )
 
 
 if __name__ == "__main__":

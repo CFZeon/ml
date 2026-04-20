@@ -183,6 +183,8 @@ class DataFetchIntegrityTest(unittest.TestCase):
 
         self.assertEqual(len(result), 4)
         self.assertEqual(pipeline.state["data_integrity_report"], report)
+        self.assertIn("data_lineage", pipeline.state)
+        self.assertTrue(pipeline.state["data_lineage"]["source_groups"]["market_data"])
 
 
 if __name__ == "__main__":

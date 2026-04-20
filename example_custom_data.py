@@ -70,6 +70,12 @@ def main():
                         "frame": custom_feed,
                         "timestamp_column": "timestamp",
                         "availability_column": "available_at",
+                        "value_columns": [
+                            "realized_vol_24h",
+                            "trend_12h",
+                            "volume_zscore_24h",
+                            "session_bias",
+                        ],
                         "prefix": "exo",
                         "max_feature_age": "6h",
                     }

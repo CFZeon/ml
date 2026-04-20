@@ -23,6 +23,13 @@ from .data import (
     join_custom_data,
     load_futures_leverage_brackets,
 )
+from .data_contracts import (
+    build_dataset_bundle_manifest,
+    validate_futures_context_bundle,
+    validate_market_context_frames,
+    validate_market_frame_contract,
+    validate_reference_overlay_frame_contract,
+)
 from .data_quality import check_data_quality
 from .feature_governance import (
     apply_feature_retirement,
@@ -113,6 +120,184 @@ def _default_stationarity_specs(pipeline):
     if features is not None and "close_fracdiff" in features.columns:
         specs.append({"name": "close_fracdiff", "source": "features", "column": "close_fracdiff"})
     return specs
+
+
+def _manifest_payload(manifest):
+    if hasattr(manifest, "to_dict"):
+        return manifest.to_dict()
+    return dict(manifest or {})
+
+
+def _extract_frame_manifest_mapping(frames):
+    manifests = {}
+    for key, frame in dict(frames or {}).items():
+        manifest = dict(getattr(frame, "attrs", {}).get("dataset_manifest") or {})
+        if manifest:
+            manifests[key] = manifest
+    return manifests
+
+
+def _ensure_data_lineage_state(pipeline):
+    lineage = dict(pipeline.state.get("data_lineage") or {})
+    lineage.setdefault("source_groups", {})
+    lineage.setdefault("source_datasets", [])
+    lineage.setdefault("active_datasets", {})
+    pipeline.state["data_lineage"] = lineage
+    return lineage
+
+
+def _sync_source_datasets(lineage):
+    source_datasets = []
+    for value in (lineage.get("source_groups") or {}).values():
+        if isinstance(value, list):
+            source_datasets.extend(_manifest_payload(item) for item in value if item)
+            continue
+        if isinstance(value, dict) and value.get("contract"):
+            source_datasets.append(_manifest_payload(value))
+            continue
+        if isinstance(value, dict):
+            source_datasets.extend(_manifest_payload(item) for item in value.values() if item)
+    lineage["source_datasets"] = source_datasets
+    return lineage
+
+
+def _set_lineage_group(pipeline, group_name, manifests):
+    if not manifests:
+        return _ensure_data_lineage_state(pipeline)
+
+    lineage = _ensure_data_lineage_state(pipeline)
+    if isinstance(manifests, list):
+        lineage["source_groups"][group_name] = [_manifest_payload(item) for item in manifests if item]
+    elif isinstance(manifests, dict) and manifests.get("contract"):
+        lineage["source_groups"][group_name] = _manifest_payload(manifests)
+    elif isinstance(manifests, dict):
+        lineage["source_groups"][group_name] = {
+            key: _manifest_payload(value)
+            for key, value in manifests.items()
+            if value
+        }
+    return _sync_source_datasets(lineage)
+
+
+def _refresh_active_dataset_manifests(pipeline, *, data_quality_report=None):
+    lineage = _ensure_data_lineage_state(pipeline)
+    source_groups = lineage.get("source_groups") or {}
+    source_datasets = list(lineage.get("source_datasets") or [])
+    market_manifest = source_groups.get("market_data")
+    raw_upstreams = [market_manifest] if isinstance(market_manifest, dict) and market_manifest.get("contract") else source_datasets
+
+    validation = {"status": "pass"}
+    if data_quality_report is not None:
+        validation = {
+            "status": data_quality_report.get("status", "pass"),
+            "blocking": bool(data_quality_report.get("blocking", False)),
+            "data_quality_report": data_quality_report,
+        }
+
+    raw_data = pipeline.state.get("raw_data")
+    if raw_data is not None:
+        lineage["active_datasets"]["raw_data"] = build_dataset_bundle_manifest(
+            raw_data,
+            name="raw_data",
+            upstream_manifests=raw_upstreams,
+            validation=validation,
+            source={
+                "bundle_role": "raw_data",
+                "integrity_status": (pipeline.state.get("data_integrity_report") or {}).get("status"),
+            },
+        )
+
+    data = pipeline.state.get("data")
+    if data is not None:
+        lineage["active_datasets"]["data"] = build_dataset_bundle_manifest(
+            data,
+            name="data",
+            upstream_manifests=source_datasets,
+            validation=validation,
+            source={"bundle_role": "data"},
+        )
+
+    pipeline.state["data_lineage"] = lineage
+    return lineage
+
+
+def _ensure_pipeline_data_contracts(pipeline, *, include_reference=False):
+    config = dict(pipeline.section("data") or {})
+    market = config.get("market", "spot")
+    interval = config.get("interval", "1h")
+    symbol = config.get("symbol", "unknown")
+
+    raw_data = pipeline.state.get("raw_data")
+    if raw_data is not None and not dict(getattr(raw_data, "attrs", {}).get("dataset_manifest") or {}):
+        validated_raw, market_manifest = validate_market_frame_contract(
+            raw_data,
+            market=market,
+            dataset_name=f"pipeline_{market}_{str(symbol).lower()}_{interval}_bars",
+            source={
+                "source_name": "pipeline_state",
+                "symbol": symbol,
+                "market": market,
+                "interval": interval,
+            },
+        )
+        pipeline.state["raw_data"] = validated_raw
+        _set_lineage_group(pipeline, "market_data", market_manifest)
+    elif raw_data is not None:
+        _set_lineage_group(
+            pipeline,
+            "market_data",
+            dict(getattr(raw_data, "attrs", {}).get("dataset_manifest") or {}),
+        )
+
+    custom_reports = list(pipeline.state.get("custom_data_report") or [])
+    custom_manifests = [dict(report.get("dataset_manifest") or {}) for report in custom_reports if report.get("dataset_manifest")]
+    if custom_manifests:
+        _set_lineage_group(pipeline, "custom_data", custom_manifests)
+
+    futures_context = pipeline.state.get("futures_context")
+    if futures_context:
+        futures_manifests = _extract_frame_manifest_mapping(futures_context)
+        if not futures_manifests:
+            validated_context, futures_manifests = validate_futures_context_bundle(
+                futures_context,
+                symbol=symbol,
+                interval=interval,
+                source_name="pipeline_state_futures_context",
+            )
+            pipeline.state["futures_context"] = validated_context
+        _set_lineage_group(pipeline, "futures_context", futures_manifests)
+
+    cross_asset_context = pipeline.state.get("cross_asset_context")
+    if cross_asset_context:
+        cross_asset_manifests = _extract_frame_manifest_mapping(cross_asset_context)
+        if not cross_asset_manifests:
+            validated_context, cross_asset_manifests = validate_market_context_frames(
+                cross_asset_context,
+                market=config.get("cross_asset_context", {}).get("market", market),
+                interval=interval,
+                group_name="cross_asset_context",
+            )
+            pipeline.state["cross_asset_context"] = validated_context
+        _set_lineage_group(pipeline, "cross_asset_context", cross_asset_manifests)
+
+    if include_reference:
+        reference_key = "reference_overlay_data" if pipeline.state.get("reference_overlay_data") is not None else "reference_data"
+        reference_frame = pipeline.state.get(reference_key)
+        if reference_frame is not None:
+            reference_manifest = dict(getattr(reference_frame, "attrs", {}).get("dataset_manifest") or {})
+            if not reference_manifest:
+                validated_reference, reference_manifest = validate_reference_overlay_frame_contract(
+                    reference_frame,
+                    dataset_name=reference_key,
+                    source={"source_name": "pipeline_state_reference_data", "symbol": symbol, "interval": interval},
+                )
+                pipeline.state[reference_key] = validated_reference
+            _set_lineage_group(pipeline, "reference_data", reference_manifest)
+
+    return _refresh_active_dataset_manifests(
+        pipeline,
+        data_quality_report=pipeline.state.get("data_quality_report"),
+    )
 
 
 def _positive_class_probability(model, X, positive_class=1):
@@ -1980,6 +2165,24 @@ class FetchDataStep(PipelineStep):
             )
             pipeline.state["cross_asset_context_symbols"] = list(context_symbols)
 
+        market_manifest = dict(getattr(market_data, "attrs", {}).get("dataset_manifest") or {})
+        custom_manifests = [
+            dict(report.get("dataset_manifest") or {})
+            for report in custom_data_report
+            if report.get("dataset_manifest")
+        ]
+        futures_context_manifests = _extract_frame_manifest_mapping(pipeline.state.get("futures_context"))
+        cross_asset_manifests = _extract_frame_manifest_mapping(pipeline.state.get("cross_asset_context"))
+        if market_manifest:
+            _set_lineage_group(pipeline, "market_data", market_manifest)
+        if custom_manifests:
+            _set_lineage_group(pipeline, "custom_data", custom_manifests)
+        if futures_context_manifests:
+            _set_lineage_group(pipeline, "futures_context", futures_context_manifests)
+        if cross_asset_manifests:
+            _set_lineage_group(pipeline, "cross_asset_context", cross_asset_manifests)
+        _ensure_pipeline_data_contracts(pipeline)
+
         return data
 
 
@@ -1987,6 +2190,7 @@ class DataQualityStep(PipelineStep):
     name = "check_data_quality"
 
     def run(self, pipeline):
+        _ensure_pipeline_data_contracts(pipeline)
         raw_data = pipeline.require("raw_data")
         data = pipeline.require("data")
         config = pipeline.section("data_quality")
@@ -1999,6 +2203,9 @@ class DataQualityStep(PipelineStep):
         pipeline.state["data"] = data.reindex(clean_index).copy()
         pipeline.state["data_quality_mask"] = result.quarantine_mask
         pipeline.state["data_quality_report"] = result.report
+        _refresh_active_dataset_manifests(pipeline, data_quality_report=result.report)
+        if result.report.get("blocking"):
+            raise ValueError("Data quality quarantine blocked the run")
         return clean_raw
 
 
@@ -2072,6 +2279,7 @@ class FeaturesStep(PipelineStep):
     name = "build_features"
 
     def run(self, pipeline):
+        _ensure_pipeline_data_contracts(pipeline, include_reference=True)
         data = pipeline.require("data")
         raw_data = pipeline.require("raw_data")
         indicator_run = pipeline.state.get("indicator_run")

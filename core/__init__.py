@@ -14,6 +14,15 @@ from .data import (
     load_futures_leverage_brackets,
     load_custom_dataset,
 )
+from .data_contracts import (
+    DatasetManifest,
+    build_dataset_bundle_manifest,
+    validate_custom_source_contract,
+    validate_futures_context_bundle,
+    validate_market_context_frames,
+    validate_market_frame_contract,
+    validate_reference_overlay_frame_contract,
+)
 from .data_quality import DataQualityResult, check_data_quality
 from .drift import ADWINDetector, DriftMonitor, evaluate_drift_guardrails
 from .context import (
@@ -117,6 +126,14 @@ from .monitoring import (
     evaluate_l2_snapshot_age,
     evaluate_raw_data_freshness,
     write_monitoring_artifacts,
+)
+from .promotion import (
+    build_promotion_gate_check_map,
+    create_promotion_eligibility_report,
+    finalize_promotion_eligibility_report,
+    resolve_canonical_promotion_score,
+    resolve_promotion_gate_mode,
+    upsert_promotion_gate,
 )
 from .slippage import (
     DepthCurveImpactModel,

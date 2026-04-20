@@ -107,6 +107,26 @@ class DataQualityQuarantineTest(unittest.TestCase):
         self.assertGreaterEqual(int(result.report["summary"]["action_counts"]["flag"]), 1)
         self.assertGreaterEqual(int(result.report["summary"]["action_counts"]["null"]), 1)
 
+    def test_quarantine_can_block_run_when_configured(self):
+        index = pd.date_range("2024-01-01", periods=3, freq="h", tz="UTC")
+        frame = pd.DataFrame(
+            {
+                "open": [100.0, 101.0, 102.0],
+                "high": [101.0, 100.0, 103.0],
+                "low": [99.0, 101.5, 101.0],
+                "close": [100.5, 100.8, 102.5],
+                "volume": [10.0, 0.0, 12.0],
+                "quote_volume": [1005.0, 0.0, 1230.0],
+                "trades": [100, 101, 102],
+            },
+            index=index,
+        )
+
+        result = check_data_quality(frame, config={"block_on_quarantine": True})
+
+        self.assertEqual(result.report["status"], "quarantine")
+        self.assertTrue(result.report["blocking"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,8 +8,12 @@ from core import (
     LocalRegistryStore,
     build_model,
     build_monitoring_report,
+    create_promotion_eligibility_report,
     evaluate_challenger_promotion,
+    finalize_promotion_eligibility_report,
+    resolve_canonical_promotion_score,
     run_backtest,
+    upsert_promotion_gate,
     write_monitoring_artifacts,
 )
 
@@ -20,6 +24,51 @@ def _fit_logistic_model():
     model = build_model("logistic", {"c": 1.0})
     model.fit(X, y)
     return model, list(X.columns)
+
+
+def _make_eligibility_report(score_value=0.12):
+    score = resolve_canonical_promotion_score(
+        locked_holdout_report={"raw_objective_value": score_value},
+        selection_value=score_value,
+    )
+    report = create_promotion_eligibility_report(score_basis=score["basis"], score_value=score["value"])
+    report = upsert_promotion_gate(
+        report,
+        group="selection",
+        name="feature_admission",
+        passed=True,
+    )
+    report = upsert_promotion_gate(
+        report,
+        group="selection",
+        name="feature_portability",
+        passed=True,
+    )
+    report = upsert_promotion_gate(
+        report,
+        group="selection",
+        name="regime_stability",
+        passed=True,
+    )
+    report = upsert_promotion_gate(
+        report,
+        group="selection",
+        name="operational_health",
+        passed=True,
+    )
+    report = upsert_promotion_gate(
+        report,
+        group="post_selection",
+        name="locked_holdout",
+        passed=True,
+    )
+    report = upsert_promotion_gate(
+        report,
+        group="post_selection",
+        name="locked_holdout_gap",
+        passed=True,
+    )
+    return finalize_promotion_eligibility_report(report)
 
 
 class OperationsMonitoringTest(unittest.TestCase):
@@ -115,7 +164,12 @@ class OperationsMonitoringTest(unittest.TestCase):
             )
             monitoring_path = store.attach_monitoring_report(version_id, unhealthy_report, symbol="BTCUSDT")
             decision = evaluate_challenger_promotion(
-                {"promotion_ready": True, "selection_value": 0.12, "sample_count": 500},
+                {
+                    "promotion_ready": True,
+                    "selection_value": 0.12,
+                    "sample_count": 500,
+                    "promotion_eligibility_report": _make_eligibility_report(0.12),
+                },
                 monitoring_report=unhealthy_report,
                 policy={"require_operational_health": True},
             )

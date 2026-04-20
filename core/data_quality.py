@@ -105,6 +105,7 @@ def _winsorize_rows(frame, mask, columns, window, z_threshold):
 def check_data_quality(frame, config=None):
     config = dict(config or {})
     actions = dict(config.get("actions", {}) or {})
+    block_on_quarantine = bool(config.get("block_on_quarantine", False))
     frame = pd.DataFrame(frame).copy()
     window = max(5, int(config.get("rolling_window", 24)))
     return_spike_threshold = float(config.get("return_spike_threshold", 8.0))
@@ -167,11 +168,17 @@ def check_data_quality(frame, config=None):
     if drop_mask.any():
         clean = clean.loc[~drop_mask].copy()
 
+    quarantined_rows = int(quarantine_mask.sum())
+    status = "pass" if quarantined_rows == 0 else "quarantine"
+    blocking = bool(block_on_quarantine and quarantined_rows > 0)
+
     report = {
+        "status": status,
+        "blocking": blocking,
         "summary": {
             "rows_input": int(len(frame)),
             "rows_output": int(len(clean)),
-            "quarantined_rows": int(quarantine_mask.sum()),
+            "quarantined_rows": quarantined_rows,
             "dropped_rows": int(drop_mask.sum()),
             "anomaly_counts": {name: details["count"] for name, details in anomaly_report.items()},
             "action_counts": action_counts,

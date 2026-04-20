@@ -27,6 +27,7 @@ class RegistryVersionManifest:
     training_summary: dict = field(default_factory=dict)
     validation_summary: dict = field(default_factory=dict)
     locked_holdout: dict = field(default_factory=dict)
+    promotion_eligibility_report: dict = field(default_factory=dict)
     promotion_ready: bool | None = None
 
     def to_dict(self):
@@ -45,6 +46,7 @@ def build_registry_manifest(
     training_summary=None,
     validation_summary=None,
     locked_holdout=None,
+    promotion_eligibility_report=None,
     promotion_ready=None,
 ):
     columns = list(feature_columns or [])
@@ -65,6 +67,7 @@ def build_registry_manifest(
         training_summary=dict(training_summary or {}),
         validation_summary=dict(validation_summary or {}),
         locked_holdout=dict(locked_holdout or {}),
+        promotion_eligibility_report=dict(promotion_eligibility_report or {}),
         promotion_ready=promotion_ready,
     )
 
@@ -75,6 +78,8 @@ def flatten_registry_record(manifest, *, current_status, version_dir, latest_dri
     training_summary = dict(payload.get("training_summary") or {})
     validation_summary = dict(payload.get("validation_summary") or {})
     locked_holdout = dict(payload.get("locked_holdout") or {})
+    promotion_eligibility_report = dict(payload.get("promotion_eligibility_report") or {})
+    promotion_score = dict(promotion_eligibility_report.get("score") or {})
     return {
         "version_id": payload.get("version_id"),
         "symbol": payload.get("symbol"),
@@ -87,6 +92,9 @@ def flatten_registry_record(manifest, *, current_status, version_dir, latest_dri
         "feature_schema_hash": feature_schema.get("schema_hash"),
         "feature_count": int(len(feature_schema.get("feature_order") or [])),
         "selection_value": validation_summary.get("raw_objective_value") or training_summary.get("avg_f1_macro"),
+        "promotion_score": promotion_score.get("value"),
+        "promotion_score_basis": promotion_score.get("basis"),
+        "eligibility_report_present": bool(promotion_eligibility_report),
         "promotion_ready": payload.get("promotion_ready"),
         "latest_drift_report": str(latest_drift_report) if latest_drift_report is not None else None,
         "latest_promotion_report": str(latest_promotion_report) if latest_promotion_report is not None else None,

@@ -243,6 +243,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
                     "frame": custom_frame,
                     "timestamp_column": "timestamp",
                     "availability_column": "available_at",
+                    "value_columns": ["sentiment"],
                     "prefix": "sent",
                     "max_feature_age": "45m",
                 }
@@ -280,6 +281,32 @@ class DataBacktestAdapterTest(unittest.TestCase):
                         "name": "sentiment_feed",
                         "frame": custom_frame,
                         "timestamp_column": "timestamp",
+                        "value_columns": ["sentiment"],
+                        "prefix": "sent",
+                    }
+                ],
+            )
+
+    def test_custom_join_requires_explicit_value_columns(self):
+        index = pd.date_range("2026-03-10", periods=2, freq="1h", tz="UTC")
+        base = pd.DataFrame({"close": [100.0, 101.0]}, index=index)
+        custom_frame = pd.DataFrame(
+            {
+                "timestamp": [index[0]],
+                "available_at": [index[0] + pd.Timedelta(minutes=30)],
+                "sentiment": [0.25],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "value_columns"):
+            join_custom_data(
+                base,
+                [
+                    {
+                        "name": "sentiment_feed",
+                        "frame": custom_frame,
+                        "timestamp_column": "timestamp",
+                        "availability_column": "available_at",
                         "prefix": "sent",
                     }
                 ],
@@ -306,6 +333,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
                     "frame": custom_frame,
                     "timestamp_column": "timestamp",
                     "assume_event_time_is_available_time": True,
+                    "value_columns": ["sentiment"],
                     "prefix": "assumed",
                 }
             ],
@@ -318,6 +346,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
                     "frame": custom_frame.assign(available_at=custom_frame["timestamp"]),
                     "timestamp_column": "timestamp",
                     "availability_column": "available_at",
+                    "value_columns": ["sentiment"],
                     "prefix": "explicit",
                 }
             ],

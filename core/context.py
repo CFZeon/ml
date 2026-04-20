@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+from .data_contracts import validate_futures_context_bundle, validate_market_context_frames
 from .data import fetch_binance_bars, _interval_timedelta, _parse_bound, _parse_interval
 from .features import FeatureBlock
 from .storage import read_parquet_frame, write_parquet_frame
@@ -349,7 +350,13 @@ def fetch_binance_futures_context(symbol="BTCUSDT", interval="1h", start="2024-0
                 namespace="basis",
             )
 
-    return context
+    validated_context, _ = validate_futures_context_bundle(
+        context,
+        symbol=symbol,
+        interval=interval,
+        source_name="binance_futures_context",
+    )
+    return validated_context
 
 
 def fetch_context_symbol_bars(symbols=None, interval="1h", start="2024-01-01", end="2024-03-01", cache_dir=".cache", market="spot"):
@@ -365,7 +372,13 @@ def fetch_context_symbol_bars(symbols=None, interval="1h", start="2024-01-01", e
             cache_dir=cache_dir,
             market=market,
         )
-    return frames
+    validated_frames, _ = validate_market_context_frames(
+        frames,
+        market=market,
+        interval=interval,
+        group_name="cross_asset_context",
+    )
+    return validated_frames
 
 
 def build_futures_context_feature_block(base_data, futures_context, rolling_window=20, min_recent_coverage=0.6):

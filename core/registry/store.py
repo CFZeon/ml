@@ -9,6 +9,13 @@ import pandas as pd
 
 from ..drift import evaluate_drift_guardrails
 from ..models import load_model, save_model
+from ..promotion import (
+    create_promotion_eligibility_report,
+    finalize_promotion_eligibility_report,
+    get_promotion_score,
+    resolve_promotion_gate_mode,
+    upsert_promotion_gate,
+)
 from ..storage import read_json, read_parquet_frame, write_json, write_parquet_frame
 from .manifest import build_feature_schema_hash, build_registry_manifest, flatten_registry_record
 
@@ -19,23 +26,126 @@ def evaluate_challenger_promotion(challenger_summary, champion_record=None, drif
     minimum_margin = float(policy.get("minimum_score_margin", 0.0))
     require_automl_ready = bool(policy.get("require_automl_promotion_ready", True))
     require_operational_health = bool(policy.get("require_operational_health", monitoring_report is not None))
+    require_canonical_report = bool(policy.get("require_canonical_report", True))
+    allow_legacy_versions = bool(policy.get("allow_legacy_versions", False))
+    score_preference = str(policy.get("score_preference", "locked_holdout_first"))
+    calibration_mode = bool(policy.get("calibration_mode", False))
 
     challenger = dict(challenger_summary or {})
     champion = dict(champion_record or {})
-    reasons = []
+
+    challenger_report = dict(challenger.get("promotion_eligibility_report") or {})
+    if challenger_report:
+        eligibility_report = finalize_promotion_eligibility_report(challenger_report)
+    else:
+        eligibility_report = create_promotion_eligibility_report(calibration_mode=calibration_mode)
+    if require_canonical_report and not challenger_report:
+        eligibility_report = upsert_promotion_gate(
+            eligibility_report,
+            group="registry",
+            name="canonical_report_present",
+            passed=False,
+            mode=resolve_promotion_gate_mode(policy, "canonical_report_present"),
+            measured=False,
+            threshold=True,
+            reason="challenger_missing_canonical_eligibility_report",
+            details={"legacy": True},
+        )
 
     sample_count = int(challenger.get("sample_count") or 0)
-    if sample_count < minimum_samples:
-        reasons.append("minimum_samples_not_met")
+    eligibility_report = upsert_promotion_gate(
+        eligibility_report,
+        group="registry",
+        name="minimum_samples",
+        passed=bool(sample_count >= minimum_samples),
+        mode=resolve_promotion_gate_mode(policy, "minimum_samples"),
+        measured=sample_count,
+        threshold=minimum_samples,
+        reason=None if sample_count >= minimum_samples else "minimum_samples_not_met",
+        details={"sample_count": sample_count},
+    )
 
-    if require_automl_ready and not bool(challenger.get("promotion_ready", False)):
-        reasons.append("automl_promotion_not_ready")
+    automl_ready = bool(eligibility_report.get("promotion_ready", challenger.get("promotion_ready", False)))
+    eligibility_report = upsert_promotion_gate(
+        eligibility_report,
+        group="registry",
+        name="automl_promotion_ready",
+        passed=bool(automl_ready or not require_automl_ready),
+        mode=resolve_promotion_gate_mode(policy, "automl_promotion_ready"),
+        measured=automl_ready,
+        threshold=True,
+        reason=None if (automl_ready or not require_automl_ready) else "automl_promotion_not_ready",
+        details={"require_automl_ready": require_automl_ready},
+    )
 
-    challenger_score = challenger.get("selection_value")
-    champion_score = champion.get("locked_holdout_score")
-    if champion_score is not None and challenger_score is not None:
-        if float(challenger_score) < float(champion_score) + minimum_margin:
-            reasons.append("challenger_not_better_than_champion")
+    challenger_score = get_promotion_score(eligibility_report)
+    champion_score = None
+    champion_manifest = None
+    if champion:
+        champion_manifest = read_json(Path(champion["version_dir"]) / "version_manifest.json") or {}
+        champion_report = dict(champion_manifest.get("promotion_eligibility_report") or {})
+        if champion_report:
+            champion_score = get_promotion_score(finalize_promotion_eligibility_report(champion_report))
+        elif allow_legacy_versions:
+            champion_score = {
+                "basis": "locked_holdout_raw_objective" if champion.get("locked_holdout_score") is not None else "selection_value",
+                "value": champion.get("locked_holdout_score") if champion.get("locked_holdout_score") is not None else champion.get("selection_value"),
+            }
+        else:
+            eligibility_report = upsert_promotion_gate(
+                eligibility_report,
+                group="registry",
+                name="champion_comparable",
+                passed=False,
+                mode=resolve_promotion_gate_mode(policy, "champion_comparable"),
+                measured=False,
+                threshold=True,
+                reason="legacy_champion_missing_canonical_eligibility_report",
+                details={"version_id": champion.get("version_id")},
+            )
+
+        challenger_score_value = challenger_score.get("value") if challenger_score else None
+        if challenger_score_value is None:
+            eligibility_report = upsert_promotion_gate(
+                eligibility_report,
+                group="registry",
+                name="promotion_score_present",
+                passed=False,
+                mode=resolve_promotion_gate_mode(policy, "promotion_score_present"),
+                measured=None,
+                threshold=score_preference,
+                reason="promotion_score_unavailable",
+                details={"score_preference": score_preference},
+            )
+        elif champion_score is not None and champion_score.get("value") is not None:
+            margin = float(challenger_score_value) - float(champion_score["value"])
+            eligibility_report = upsert_promotion_gate(
+                eligibility_report,
+                group="registry",
+                name="score_margin",
+                passed=bool(float(challenger_score_value) >= float(champion_score["value"]) + minimum_margin),
+                mode=resolve_promotion_gate_mode(policy, "score_margin"),
+                measured=margin,
+                threshold=minimum_margin,
+                reason=None if float(challenger_score_value) >= float(champion_score["value"]) + minimum_margin else "challenger_not_better_than_champion",
+                details={
+                    "challenger_score": challenger_score,
+                    "champion_score": champion_score,
+                    "score_preference": score_preference,
+                },
+            )
+        elif champion and champion_score is None:
+            eligibility_report = upsert_promotion_gate(
+                eligibility_report,
+                group="registry",
+                name="promotion_score_present",
+                passed=False,
+                mode=resolve_promotion_gate_mode(policy, "promotion_score_present"),
+                measured=None,
+                threshold=score_preference,
+                reason="promotion_score_unavailable",
+                details={"score_preference": score_preference},
+            )
 
     if drift_report is not None:
         drift_guardrails = evaluate_drift_guardrails(
@@ -46,25 +156,47 @@ def evaluate_challenger_promotion(challenger_summary, champion_record=None, drif
                 "min_drift_signals": policy.get("drift_min_signals", 2),
             },
         )
-        if not drift_guardrails.get("approved", False):
-            reasons.append("drift_guardrails_not_met")
     else:
         drift_guardrails = None
+    eligibility_report = upsert_promotion_gate(
+        eligibility_report,
+        group="registry",
+        name="drift_guardrails",
+        passed=bool(drift_guardrails is None or drift_guardrails.get("approved", False)),
+        mode=resolve_promotion_gate_mode(policy, "drift_guardrails"),
+        measured=(drift_guardrails or {}).get("signal_count"),
+        threshold=policy.get("drift_min_signals", 2),
+        reason=None if (drift_guardrails is None or drift_guardrails.get("approved", False)) else "drift_guardrails_not_met",
+        details=drift_guardrails or {},
+    )
 
     monitoring_health = None
     if monitoring_report is not None:
         monitoring_health = bool((monitoring_report or {}).get("healthy", False))
-        if require_operational_health and not monitoring_health:
-            reasons.append("operational_monitoring_not_healthy")
+    eligibility_report = upsert_promotion_gate(
+        eligibility_report,
+        group="registry",
+        name="registry_operational_health",
+        passed=bool((not require_operational_health) or monitoring_health),
+        mode=resolve_promotion_gate_mode(policy, "registry_operational_health"),
+        measured=monitoring_health,
+        threshold=True,
+        reason=None if ((not require_operational_health) or monitoring_health) else "operational_monitoring_not_healthy",
+        details=monitoring_report or {},
+    )
 
-    approved = not reasons
+    eligibility_report = finalize_promotion_eligibility_report(eligibility_report)
+    approved = bool(eligibility_report.get("approved", False))
     return {
         "approved": approved,
-        "reasons": reasons or ["approved"],
+        "reasons": list(eligibility_report.get("blocking_failures") or ["approved"]),
         "sample_count": sample_count,
-        "selection_value": challenger_score,
+        "selection_value": challenger.get("selection_value"),
+        "score_basis": (challenger_score or {}).get("basis"),
+        "score_value": (challenger_score or {}).get("value"),
         "drift_guardrails": drift_guardrails,
         "monitoring_health": monitoring_health,
+        "promotion_eligibility_report": eligibility_report,
     }
 
 
@@ -89,6 +221,9 @@ class LocalRegistryStore:
             "feature_schema_hash",
             "feature_count",
             "selection_value",
+            "promotion_score",
+            "promotion_score_basis",
+            "eligibility_report_present",
             "promotion_ready",
             "latest_drift_report",
             "latest_monitoring_report",
@@ -160,6 +295,7 @@ class LocalRegistryStore:
         training_summary=None,
         validation_summary=None,
         locked_holdout=None,
+        promotion_eligibility_report=None,
         lineage=None,
         status="challenger",
         meta_model=None,
@@ -203,7 +339,12 @@ class LocalRegistryStore:
             training_summary=training_summary,
             validation_summary=validation_summary,
             locked_holdout=locked_holdout,
-            promotion_ready=(dict(validation_summary or {}).get("promotion_ready") if validation_summary else None),
+            promotion_eligibility_report=promotion_eligibility_report,
+            promotion_ready=(
+                dict(promotion_eligibility_report or {}).get("promotion_ready")
+                if promotion_eligibility_report is not None
+                else (dict(validation_summary or {}).get("promotion_ready") if validation_summary else None)
+            ),
         )
         manifest_path = self._manifest_path(symbol, version_id)
         self._write_immutable_manifest(manifest_path, manifest.to_dict())

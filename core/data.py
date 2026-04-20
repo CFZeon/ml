@@ -17,7 +17,7 @@ import random
 import re
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+from .data_contracts import validate_custom_source_contract, validate_market_frame_contract
 from .storage import read_json, read_parquet_frame, write_json, write_parquet_frame
 
 _VISION_BASES = {
@@ -75,6 +76,8 @@ class CustomDataset:
     availability_is_assumed: bool = False
     default_allow_exact_matches: bool = True
     max_feature_age: pd.Timedelta | None = None
+    value_columns: tuple[str, ...] = ()
+    dataset_manifest: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -625,6 +628,26 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
     if df.empty:
         raise RuntimeError(f"No data fetched for {symbol} {interval} [{start}, {end})")
 
+    df, dataset_manifest = validate_market_frame_contract(
+        df,
+        market=market,
+        dataset_name=f"binance_{market}_{symbol.lower()}_{interval}_bars",
+        source={
+            "source_name": "binance_vision",
+            "symbol": symbol,
+            "market": market,
+            "interval": interval,
+            "start": start_dt,
+            "end": end_dt,
+            "gap_policy": gap_policy,
+            "integrity_status": integrity_report.get("status"),
+            "missing_rows": integrity_report.get("missing_rows"),
+            "retry_count": integrity_report.get("retry_count"),
+        },
+    )
+    df.attrs["integrity_report"] = integrity_report
+    df.attrs["dataset_manifest"] = dataset_manifest
+
     if return_report:
         return df, integrity_report
     return df
@@ -671,7 +694,7 @@ def _prefix_columns(columns, prefix):
 def load_custom_dataset(path=None, frame=None, name=None, file_format=None,
                         timestamp_column="timestamp", availability_column=None,
                         assume_event_time_is_available_time=False,
-                        value_columns=None, prefix=None, start=None, end=None,
+                        value_columns=None, value_dtypes=None, prefix=None, start=None, end=None,
                         max_feature_age=None):
     """Load a point-in-time safe custom dataset with explicit availability timestamps."""
     if frame is None:
@@ -696,11 +719,11 @@ def load_custom_dataset(path=None, frame=None, name=None, file_format=None,
 
     dataset_name = name or (Path(path).stem if path is not None else "custom_data")
     dataset_prefix = prefix or re.sub(r"[^a-z0-9]+", "_", dataset_name.lower()).strip("_")
+    selected_value_columns = list(value_columns or [])
+    if not selected_value_columns:
+        raise ValueError("Custom data contract requires explicit value_columns")
 
     prepared = raw.copy()
-    prepared[timestamp_column] = pd.to_datetime(prepared[timestamp_column], utc=True)
-    prepared[availability_column] = pd.to_datetime(prepared[availability_column], utc=True)
-    prepared = prepared.sort_values(availability_column)
 
     if start is not None:
         start_dt = _parse_bound(start)
@@ -709,10 +732,23 @@ def load_custom_dataset(path=None, frame=None, name=None, file_format=None,
         end_dt = _parse_bound(end)
         prepared = prepared[prepared[availability_column] < end_dt]
 
-    selected_value_columns = list(value_columns or [
-        column for column in prepared.columns
-        if column not in {timestamp_column, availability_column}
-    ])
+    prepared, dataset_manifest = validate_custom_source_contract(
+        prepared,
+        dataset_name=dataset_name,
+        timestamp_column=timestamp_column,
+        availability_column=availability_column,
+        value_columns=selected_value_columns,
+        value_dtypes=value_dtypes,
+        source={
+            "source_name": "custom_dataset",
+            "path": str(path) if path is not None else None,
+            "file_format": file_format,
+            "start": _parse_bound(start) if start is not None else None,
+            "end": _parse_bound(end) if end is not None else None,
+        },
+        availability_is_assumed=availability_is_assumed,
+    )
+    prepared = prepared.sort_values(availability_column)
     rename_map = _prefix_columns(selected_value_columns, dataset_prefix)
 
     selected = prepared[selected_value_columns].copy()
@@ -727,6 +763,8 @@ def load_custom_dataset(path=None, frame=None, name=None, file_format=None,
         availability_is_assumed=availability_is_assumed,
         default_allow_exact_matches=not availability_is_assumed,
         max_feature_age=_parse_optional_tolerance(max_feature_age),
+        value_columns=tuple(selected_value_columns),
+        dataset_manifest=dataset_manifest,
     )
 
 
@@ -745,6 +783,7 @@ _CUSTOM_DATASET_LOAD_KEYS = {
     "availability_column",
     "assume_event_time_is_available_time",
     "value_columns",
+    "value_dtypes",
     "prefix",
     "start",
     "end",
@@ -768,6 +807,8 @@ def _custom_join_report_defaults(dataset, joined_columns, allow_exact_matches):
         "fallback_assumption_rows": 0,
         "fallback_assumption_rate": 0.0,
         "allow_exact_matches": bool(allow_exact_matches),
+        "dataset_manifest": dict(dataset.dataset_manifest or {}),
+        "contract_hash": dict(dataset.dataset_manifest or {}).get("contract", {}).get("contract_hash"),
     }
 
 
@@ -842,6 +883,8 @@ def join_custom_dataset(base_frame, dataset, tolerance=None, allow_exact_matches
         "fallback_assumption_rows": fallback_rows,
         "fallback_assumption_rate": (fallback_rows / len(base)) if len(base) > 0 else 0.0,
         "allow_exact_matches": bool(allow_exact_matches),
+        "dataset_manifest": dict(dataset.dataset_manifest or {}),
+        "contract_hash": dict(dataset.dataset_manifest or {}).get("contract", {}).get("contract_hash"),
     }
     result = base.join(joined)
     return (result, report) if return_report else result

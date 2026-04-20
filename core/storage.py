@@ -10,6 +10,11 @@ import numpy as np
 import pandas as pd
 
 
+def payload_sha256(payload):
+    encoded = json.dumps(_json_encode(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _json_encode(value):
     if isinstance(value, dict):
         return {key: _json_encode(item) for key, item in value.items()}
@@ -82,8 +87,20 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+def frame_fingerprint(frame, *, include_index=True):
+    normalized = pd.DataFrame(frame).copy()
+    digest = hashlib.sha256()
+    digest.update("|".join(map(str, normalized.columns)).encode("utf-8"))
+    digest.update(normalized.dtypes.astype(str).to_json().encode("utf-8"))
+    hashed = pd.util.hash_pandas_object(normalized, index=include_index, categorize=True)
+    digest.update(hashed.to_numpy(dtype="uint64", copy=False).tobytes())
+    return digest.hexdigest()
+
+
 __all__ = [
     "file_sha256",
+    "frame_fingerprint",
+    "payload_sha256",
     "read_json",
     "read_parquet_frame",
     "write_json",

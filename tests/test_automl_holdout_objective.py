@@ -1572,6 +1572,107 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
         self.assertIn("fold_stability", summary["top_trials"][0])
         self.assertIsNotNone(summary["top_trials"][0]["param_fragility_score"])
 
+    def test_selection_policy_binds_feature_portability_and_regime_stability(self):
+        raw = _build_market_frame(120)
+        storage_path = _make_storage_path()
+
+        class _GovernanceGatePipeline(_ScenarioAutoMLPipeline):
+            def run_step(self, name):
+                result = super().run_step(name)
+                if name == "train_models":
+                    model_type = str(self.config.get("model", {}).get("type", "gbm"))
+                    training = self.state["training"]
+                    bad_variant = model_type == "gbm"
+                    training["feature_governance"] = {
+                        "admission_summary": {"promotion_pass": True, "reasons": []}
+                    }
+                    training["feature_portability_diagnostics"] = {
+                        "promotion_pass": not bad_variant,
+                        "reasons": (["venue_specific_importance_dominates"] if bad_variant else []),
+                    }
+                    training["operational_monitoring"] = {"healthy": True, "reasons": []}
+                    training["regime"] = {
+                        "mode": "fold_local",
+                        "folds": [],
+                        "ablation_summary": {
+                            "promotion_pass": not bad_variant,
+                            "reasons": (["contextual_regime_less_stable"] if bad_variant else []),
+                        },
+                    }
+                    training["promotion_gates"] = {
+                        "feature_portability": not bad_variant,
+                        "feature_admission": True,
+                        "regime_stability": not bad_variant,
+                        "operational_health": True,
+                    }
+                    self.state["training"] = training
+                    self.step_results[name] = training
+                    return training
+                return result
+
+        _GovernanceGatePipeline.reset()
+        _GovernanceGatePipeline.full_rows = len(raw)
+        _GovernanceGatePipeline.metrics_by_variant = {
+            "gbm": {
+                "search": {"sharpe_ratio": 1.4, "returns": [0.0014, 0.0011, 0.0015, 0.0012]},
+                "validation": {"sharpe_ratio": 1.3, "returns": [0.0013, 0.0010, 0.0014, 0.0011]},
+                "holdout": {"sharpe_ratio": 1.2, "returns": [0.0012, 0.0009, 0.0013, 0.0010]},
+            },
+            "rf": {
+                "search": {"sharpe_ratio": 1.1, "returns": [0.0011, 0.0008, 0.0012, 0.0009]},
+                "validation": {"sharpe_ratio": 1.0, "returns": [0.0010, 0.0007, 0.0011, 0.0008]},
+                "holdout": {"sharpe_ratio": 0.9, "returns": [0.0009, 0.0006, 0.0010, 0.0007]},
+            },
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 2,
+                    "objective": "sharpe_ratio",
+                    "seed": 41,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_fraction": 0.2,
+                    "locked_holdout_min_search_rows": 48,
+                    "enable_pruning": False,
+                    "storage": storage_path,
+                    "study_name": "automl_governance_gate_binding_test",
+                    "selection_policy": {
+                        "min_validation_trade_count": 1,
+                        "require_locked_holdout_pass": False,
+                    },
+                },
+                "model": {"type": "gbm"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        variants = [
+            {"model": {"type": "gbm"}},
+            {"model": {"type": "rf"}},
+        ]
+        with mock.patch("core.automl._sample_trial_overrides", side_effect=lambda trial, _: variants[trial.number]):
+            summary = run_automl_study(
+                base_pipeline,
+                pipeline_class=_GovernanceGatePipeline,
+                trial_step_classes=[],
+            )
+
+        self.assertEqual(summary["best_overrides"]["model"]["type"], "rf")
+        rejected_trial = next(trial for trial in summary["top_trials"] if trial["model_family"] == "gbm")
+        self.assertFalse(rejected_trial["selection_policy"]["eligible"])
+        self.assertIn("feature_portability_failed", rejected_trial["selection_policy"]["eligibility_reasons"])
+        self.assertIn("regime_stability_failed", rejected_trial["selection_policy"]["eligibility_reasons"])
+        gate_report = rejected_trial["selection_policy"]["promotion_eligibility_report"]
+        self.assertIn("feature_portability", gate_report["gate_status"])
+        self.assertIn("regime_stability", gate_report["gate_status"])
+        self.assertEqual(gate_report["gate_status"]["feature_portability"]["reason"], "feature_portability_failed")
+        self.assertEqual(gate_report["gate_status"]["regime_stability"]["reason"], "regime_stability_failed")
+        self.assertFalse(gate_report["eligible_before_post_checks"])
+
 
 if __name__ == "__main__":
     unittest.main()

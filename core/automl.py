@@ -10,6 +10,15 @@ from statistics import NormalDist
 import numpy as np
 import pandas as pd
 
+from .promotion import (
+    build_promotion_gate_check_map,
+    create_promotion_eligibility_report,
+    finalize_promotion_eligibility_report,
+    resolve_canonical_promotion_score,
+    resolve_promotion_gate_mode,
+    set_promotion_score,
+    upsert_promotion_gate,
+)
 from .registry import LocalRegistryStore, evaluate_challenger_promotion
 from .stat_tests import compute_post_selection_inference
 
@@ -240,6 +249,7 @@ def _build_state_bundle(base_pipeline):
         "indicator_run": base_pipeline.state.get("indicator_run"),
         "futures_context": _slice_temporal_value(base_pipeline.state.get("futures_context")),
         "cross_asset_context": _slice_temporal_value(base_pipeline.state.get("cross_asset_context")),
+        "data_lineage": copy.deepcopy(base_pipeline.state.get("data_lineage")),
         "symbol_filters": copy.deepcopy(base_pipeline.state.get("symbol_filters")),
         "symbol_lifecycle": _slice_temporal_value(base_pipeline.state.get("symbol_lifecycle")),
         "universe_policy": copy.deepcopy(base_pipeline.state.get("universe_policy")),
@@ -265,6 +275,7 @@ def _build_temporal_state_bundle(full_state_bundle, end_timestamp=None):
             full_state_bundle.get("cross_asset_context"),
             end_timestamp=end_timestamp,
         ),
+        "data_lineage": copy.deepcopy(full_state_bundle.get("data_lineage")),
         "symbol_filters": copy.deepcopy(full_state_bundle.get("symbol_filters")),
         "symbol_lifecycle": _slice_temporal_value(full_state_bundle.get("symbol_lifecycle"), end_timestamp=end_timestamp),
         "universe_policy": copy.deepcopy(full_state_bundle.get("universe_policy")),
@@ -973,6 +984,8 @@ def _resolve_selection_policy(automl_config=None):
     if not enabled:
         return {
             "enabled": False,
+            "calibration_mode": False,
+            "gate_modes": {},
             "max_generalization_gap": float("inf"),
             "max_param_fragility": float("inf"),
             "max_complexity_score": float("inf"),
@@ -986,6 +999,8 @@ def _resolve_selection_policy(automl_config=None):
         }
     return {
         "enabled": True,
+        "calibration_mode": bool(policy.get("calibration_mode", False)),
+        "gate_modes": copy.deepcopy(policy.get("gate_modes") or {}),
         "max_generalization_gap": float(policy.get("max_generalization_gap", 0.35)),
         "max_param_fragility": float(policy.get("max_param_fragility", 0.30)),
         "max_complexity_score": float(policy.get("max_complexity_score", 18.0)),
@@ -1010,6 +1025,29 @@ def _resolve_fold_stability_gate(training_summary, selection_policy):
         "reasons": list(stability.get("reasons", [])),
         "summary": stability,
     }
+
+
+def _first_failure_reason(payload, fallback):
+    reasons = list((payload or {}).get("reasons") or [])
+    if reasons:
+        return str(reasons[0])
+    return fallback
+
+
+def _update_selection_policy_report(policy_report, promotion_eligibility_report, *, include_post_selection=False):
+    report = finalize_promotion_eligibility_report(promotion_eligibility_report)
+    checks = dict(policy_report.get("eligibility_checks") or {})
+    checks.update(build_promotion_gate_check_map(report))
+    selection_group = dict((report.get("groups") or {}).get("selection") or {})
+
+    policy_report["promotion_eligibility_report"] = report
+    policy_report["eligibility_checks"] = checks
+    policy_report["eligible_before_post_checks"] = bool(report.get("eligible_before_post_checks", False))
+    policy_report["eligibility_reasons"] = list(selection_group.get("blocking_failures") or [])
+    if include_post_selection:
+        policy_report["promotion_ready"] = bool(report.get("promotion_ready", False))
+        policy_report["promotion_reasons"] = list(report.get("blocking_failures") or [])
+    return policy_report
 
 
 def _infer_model_family(overrides):
@@ -1826,6 +1864,17 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         objective_gate_passed = bool(
             (objective_diagnostics.get("classification_gates") or {}).get("passed", True)
         )
+        training_summary = validation_metrics.get("training") or {}
+        promotion_gates = dict(training_summary.get("promotion_gates") or {})
+        feature_admission_summary = dict((training_summary.get("feature_governance") or {}).get("admission_summary") or {})
+        feature_portability_diagnostics = dict(training_summary.get("feature_portability_diagnostics") or {})
+        regime_ablation_summary = dict((training_summary.get("regime") or {}).get("ablation_summary") or {})
+        operational_monitoring = dict(training_summary.get("operational_monitoring") or {})
+        feature_portability_pass = bool(promotion_gates.get("feature_portability", True))
+        feature_admission_pass = bool(promotion_gates.get("feature_admission", True))
+        regime_stability_pass = bool(promotion_gates.get("regime_stability", True))
+        operational_health_pass = bool(promotion_gates.get("operational_health", True))
+
         eligibility_checks = {
             "minimum_dsr": bool(meets_minimum_dsr_threshold or not dsr_gate_applies),
             "objective_constraints": objective_gate_passed,
@@ -1847,38 +1896,158 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 model_family_counts.get(model_family, 0)
                 <= selection_policy.get("max_trials_per_model_family", np.inf)
             ),
-            "feature_admission": bool(
-                (validation_metrics.get("training") or {}).get("promotion_gates", {}).get("feature_admission", True)
-            ),
-            "operational_health": bool(
-                (validation_metrics.get("training") or {}).get("promotion_gates", {}).get("operational_health", True)
-            ),
+            "feature_portability": feature_portability_pass,
+            "feature_admission": feature_admission_pass,
+            "regime_stability": regime_stability_pass,
+            "operational_health": operational_health_pass,
             "fold_stability": bool(fold_stability_gate["passed"] or not fold_stability_gate["applies"]),
             "param_fragility": None,
             "locked_holdout": None,
             "locked_holdout_gap": None,
         }
-        eligibility_reasons = []
-        if not eligibility_checks["minimum_dsr"]:
-            eligibility_reasons.append("deflated_sharpe_below_threshold")
-        if not eligibility_checks["objective_constraints"]:
-            eligibility_reasons.append("objective_constraints_failed")
-        if not eligibility_checks["validation_trade_count"]:
-            eligibility_reasons.append("validation_trade_count_below_minimum")
-        if not eligibility_checks["complexity"]:
-            eligibility_reasons.append("complexity_score_above_limit")
-        if not eligibility_checks["feature_count_ratio"]:
-            eligibility_reasons.append("feature_count_ratio_above_limit")
-        if not eligibility_checks["generalization_gap"]:
-            eligibility_reasons.append("search_validation_gap_above_limit")
-        if not eligibility_checks["model_family_trial_count"]:
-            eligibility_reasons.append("model_family_trial_count_above_limit")
-        if not eligibility_checks["feature_admission"]:
-            eligibility_reasons.append("feature_admission_failed")
-        if not eligibility_checks["operational_health"]:
-            eligibility_reasons.append("operational_monitoring_failed")
-        if not eligibility_checks["fold_stability"]:
-            eligibility_reasons.append("fold_stability_failed")
+
+        promotion_eligibility_report = create_promotion_eligibility_report(
+            calibration_mode=selection_policy.get("calibration_mode", False)
+        )
+        promotion_eligibility_report = set_promotion_score(
+            promotion_eligibility_report,
+            basis="selection_value",
+            value=selection_value,
+            metadata={
+                "raw_objective_value": float(record["raw_objective_value"]),
+                "selection_value": float(selection_value),
+            },
+        )
+
+        gate_specs = [
+            {
+                "name": "minimum_dsr",
+                "passed": eligibility_checks["minimum_dsr"],
+                "measured": dsr_value,
+                "threshold": minimum_dsr_threshold if dsr_gate_applies else None,
+                "reason": None if eligibility_checks["minimum_dsr"] else "deflated_sharpe_below_threshold",
+                "details": deflated_sharpe,
+            },
+            {
+                "name": "objective_constraints",
+                "passed": eligibility_checks["objective_constraints"],
+                "measured": objective_gate_passed,
+                "threshold": True,
+                "reason": None if eligibility_checks["objective_constraints"] else "objective_constraints_failed",
+                "details": objective_diagnostics,
+            },
+            {
+                "name": "validation_trade_count",
+                "passed": eligibility_checks["validation_trade_count"],
+                "measured": validation_trade_count,
+                "threshold": int(selection_policy.get("min_validation_trade_count", 0)),
+                "reason": None if eligibility_checks["validation_trade_count"] else "validation_trade_count_below_minimum",
+                "details": {"validation_trade_count": validation_trade_count},
+            },
+            {
+                "name": "complexity",
+                "passed": eligibility_checks["complexity"],
+                "measured": complexity["trial_complexity_score"],
+                "threshold": selection_policy.get("max_complexity_score", np.inf),
+                "reason": None if eligibility_checks["complexity"] else "complexity_score_above_limit",
+                "details": complexity,
+            },
+            {
+                "name": "feature_count_ratio",
+                "passed": eligibility_checks["feature_count_ratio"],
+                "measured": complexity.get("feature_count_ratio"),
+                "threshold": selection_policy.get("max_feature_count_ratio", np.inf),
+                "reason": None if eligibility_checks["feature_count_ratio"] else "feature_count_ratio_above_limit",
+                "details": complexity,
+            },
+            {
+                "name": "generalization_gap",
+                "passed": eligibility_checks["generalization_gap"],
+                "measured": (search_gap.get("normalized_degradation") or 0.0),
+                "threshold": selection_policy.get("max_generalization_gap", np.inf),
+                "reason": None if eligibility_checks["generalization_gap"] else "search_validation_gap_above_limit",
+                "details": search_gap,
+            },
+            {
+                "name": "model_family_trial_count",
+                "passed": eligibility_checks["model_family_trial_count"],
+                "measured": model_family_counts.get(model_family, 0),
+                "threshold": selection_policy.get("max_trials_per_model_family", np.inf),
+                "reason": None if eligibility_checks["model_family_trial_count"] else "model_family_trial_count_above_limit",
+                "details": {"model_family": model_family, "trial_count": model_family_counts.get(model_family, 0)},
+            },
+            {
+                "name": "feature_portability",
+                "passed": eligibility_checks["feature_portability"],
+                "measured": feature_portability_diagnostics.get("venue_specific_importance_share"),
+                "threshold": feature_portability_diagnostics.get("config"),
+                "reason": None if eligibility_checks["feature_portability"] else _first_failure_reason(feature_portability_diagnostics, "feature_portability_failed"),
+                "details": feature_portability_diagnostics,
+            },
+            {
+                "name": "feature_admission",
+                "passed": eligibility_checks["feature_admission"],
+                "measured": feature_admission_summary.get("promotion_pass"),
+                "threshold": True,
+                "reason": None if eligibility_checks["feature_admission"] else _first_failure_reason(feature_admission_summary, "feature_admission_failed"),
+                "details": feature_admission_summary,
+            },
+            {
+                "name": "regime_stability",
+                "passed": eligibility_checks["regime_stability"],
+                "measured": regime_ablation_summary.get("stability_improvement"),
+                "threshold": True,
+                "reason": None if eligibility_checks["regime_stability"] else _first_failure_reason(regime_ablation_summary, "regime_stability_failed"),
+                "details": regime_ablation_summary,
+            },
+            {
+                "name": "operational_health",
+                "passed": eligibility_checks["operational_health"],
+                "measured": operational_monitoring.get("healthy"),
+                "threshold": True,
+                "reason": None if eligibility_checks["operational_health"] else _first_failure_reason(operational_monitoring, "operational_monitoring_failed"),
+                "details": operational_monitoring,
+            },
+            {
+                "name": "fold_stability",
+                "passed": eligibility_checks["fold_stability"],
+                "measured": fold_stability_gate["summary"].get("persistence"),
+                "threshold": True,
+                "reason": None if eligibility_checks["fold_stability"] else "fold_stability_failed",
+                "details": fold_stability_gate["summary"],
+            },
+        ]
+        for gate in gate_specs:
+            promotion_eligibility_report = upsert_promotion_gate(
+                promotion_eligibility_report,
+                group="selection",
+                name=gate["name"],
+                passed=gate["passed"],
+                mode=resolve_promotion_gate_mode(selection_policy, gate["name"]),
+                measured=gate["measured"],
+                threshold=gate["threshold"],
+                reason=gate["reason"],
+                details=gate["details"],
+            )
+        promotion_eligibility_report = finalize_promotion_eligibility_report(promotion_eligibility_report)
+
+        selection_policy_report = {
+            "enabled": bool(selection_policy.get("enabled", True)),
+            "eligible_before_post_checks": False,
+            "eligible": None,
+            "promotion_ready": None,
+            "promotion_reasons": [],
+            "frozen": False,
+            "holdout_consulted_for_selection": False,
+            "eligibility_checks": eligibility_checks,
+            "eligibility_reasons": [],
+            "promotion_eligibility_report": promotion_eligibility_report,
+        }
+        selection_policy_report = _update_selection_policy_report(
+            selection_policy_report,
+            promotion_eligibility_report,
+            include_post_selection=False,
+        )
 
         trial_reports.append(
             {
@@ -1906,17 +2075,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 "param_fragility_score": None,
                 "param_fragility": None,
                 "locked_holdout": None,
-                "selection_policy": {
-                    "enabled": bool(selection_policy.get("enabled", True)),
-                    "eligible_before_post_checks": not eligibility_reasons,
-                    "eligible": None,
-                    "promotion_ready": None,
-                    "promotion_reasons": [],
-                    "frozen": False,
-                    "holdout_consulted_for_selection": False,
-                    "eligibility_checks": eligibility_checks,
-                    "eligibility_reasons": eligibility_reasons,
-                },
+                "selection_policy": selection_policy_report,
             }
         )
 
@@ -2593,11 +2752,24 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         )
         report["param_fragility"] = fragility
         report["param_fragility_score"] = fragility.get("param_fragility_score")
-        policy_report["eligibility_checks"]["param_fragility"] = bool(fragility.get("passed", True))
-        if not fragility.get("passed", True):
-            policy_report["eligibility_reasons"].append("parameter_fragility_above_limit")
-
-        policy_report["eligible"] = not policy_report["eligibility_reasons"]
+        promotion_eligibility_report = policy_report.get("promotion_eligibility_report") or create_promotion_eligibility_report()
+        promotion_eligibility_report = upsert_promotion_gate(
+            promotion_eligibility_report,
+            group="selection",
+            name="param_fragility",
+            passed=bool(fragility.get("passed", True)),
+            mode=resolve_promotion_gate_mode(selection_policy, "param_fragility"),
+            measured=fragility.get("param_fragility_score"),
+            threshold=selection_policy.get("max_param_fragility", np.inf),
+            reason=None if fragility.get("passed", True) else "parameter_fragility_above_limit",
+            details=fragility,
+        )
+        policy_report = _update_selection_policy_report(
+            policy_report,
+            promotion_eligibility_report,
+            include_post_selection=False,
+        )
+        policy_report["eligible"] = bool(policy_report.get("eligible_before_post_checks", False))
         if policy_report["eligible"]:
             best_trial_report = report
             break
@@ -2659,16 +2831,56 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     best_trial_report["selection_policy"]["eligibility_checks"]["locked_holdout_gap"] = post_selection_holdout[
         "locked_holdout_gap_pass"
     ]
-    best_trial_report["selection_policy"]["promotion_ready"] = post_selection_holdout["promotion_ready"]
-    best_trial_report["selection_policy"]["promotion_reasons"] = post_selection_holdout["promotion_reasons"]
+    promotion_eligibility_report = best_trial_report["selection_policy"].get("promotion_eligibility_report") or create_promotion_eligibility_report()
+    score = resolve_canonical_promotion_score(
+        locked_holdout_report=locked_holdout,
+        selection_value=best_trial_report.get("selection_value"),
+        preference="locked_holdout_first",
+    )
+    promotion_eligibility_report = set_promotion_score(
+        promotion_eligibility_report,
+        basis=score.get("basis"),
+        value=score.get("value"),
+        metadata={
+            "selection_value": best_trial_report.get("selection_value"),
+            "locked_holdout_score": (locked_holdout or {}).get("raw_objective_value"),
+        },
+    )
+    promotion_eligibility_report = upsert_promotion_gate(
+        promotion_eligibility_report,
+        group="post_selection",
+        name="locked_holdout",
+        passed=bool(post_selection_holdout["locked_holdout_pass"]),
+        mode=resolve_promotion_gate_mode(selection_policy, "locked_holdout"),
+        measured=(locked_holdout or {}).get("raw_objective_value"),
+        threshold=selection_policy.get("min_locked_holdout_score", 0.0),
+        reason=None if post_selection_holdout["locked_holdout_pass"] else "locked_holdout_failed",
+        details=locked_holdout,
+    )
+    promotion_eligibility_report = upsert_promotion_gate(
+        promotion_eligibility_report,
+        group="post_selection",
+        name="locked_holdout_gap",
+        passed=bool(post_selection_holdout["locked_holdout_gap_pass"]),
+        mode=resolve_promotion_gate_mode(selection_policy, "locked_holdout_gap"),
+        measured=(post_selection_holdout["generalization_gap"] or {}).get("normalized_degradation"),
+        threshold=selection_policy.get("max_generalization_gap", np.inf),
+        reason=None if post_selection_holdout["locked_holdout_gap_pass"] else "validation_holdout_gap_above_limit",
+        details=post_selection_holdout["generalization_gap"],
+    )
+    best_trial_report["selection_policy"] = _update_selection_policy_report(
+        best_trial_report["selection_policy"],
+        promotion_eligibility_report,
+        include_post_selection=True,
+    )
     best_trial_report["selection_policy"]["holdout_consulted_for_selection"] = False
     selection_report["diagnostics"]["holdout_access_count"] = int(locked_holdout_access_count)
     selection_report["diagnostics"]["holdout_evaluated_once"] = bool(locked_holdout.get("evaluated_once", False))
     selection_report["diagnostics"]["holdout_evaluated_after_freeze"] = bool(
         locked_holdout.get("evaluated_after_freeze", False)
     )
-    selection_report["diagnostics"]["promotion_ready"] = bool(post_selection_holdout["promotion_ready"])
-    selection_report["diagnostics"]["promotion_reasons"] = list(post_selection_holdout["promotion_reasons"])
+    selection_report["diagnostics"]["promotion_ready"] = bool(best_trial_report["selection_policy"]["promotion_ready"])
+    selection_report["diagnostics"]["promotion_reasons"] = list(best_trial_report["selection_policy"]["promotion_reasons"])
 
     top_trials = []
     for report in selection_report["trial_reports"][:5]:
@@ -2697,6 +2909,8 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             }
         )
 
+    data_lineage = _json_ready(base_pipeline.state.get("data_lineage") or {})
+
     summary = {
         "study_name": study.study_name,
         "storage": str(storage_path),
@@ -2724,13 +2938,16 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             "param_fragility_score": best_trial_report.get("param_fragility_score"),
             "param_fragility": best_trial_report.get("param_fragility"),
             "selection_policy": best_trial_report.get("selection_policy"),
+            "promotion_eligibility_report": best_trial_report.get("selection_policy", {}).get("promotion_eligibility_report"),
         },
         "selection_freeze": selection_snapshot,
         "validation_holdout": validation_holdout,
         "locked_holdout": locked_holdout,
-        "promotion_ready": bool(post_selection_holdout["promotion_ready"]),
-        "promotion_reasons": list(post_selection_holdout["promotion_reasons"]),
+        "promotion_ready": bool(best_trial_report["selection_policy"]["promotion_ready"]),
+        "promotion_reasons": list(best_trial_report["selection_policy"]["promotion_reasons"]),
+        "promotion_eligibility_report": best_trial_report.get("selection_policy", {}).get("promotion_eligibility_report"),
         "overfitting_diagnostics": selection_report["diagnostics"],
+        "data_lineage": data_lineage,
         "top_trials": top_trials,
         "trial_count": len(completed_trials),
     }
@@ -2755,13 +2972,18 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 "selection_freeze": selection_snapshot,
                 "best_params": summary["best_params"],
                 "best_overrides": summary["best_overrides"],
+                "data_lineage": data_lineage,
             },
             training_summary=_json_ready(_summarize_training(best_training)),
             validation_summary=_json_ready(best_trial_report.get("validation_metrics") or {}),
             locked_holdout=_json_ready(locked_holdout),
+            promotion_eligibility_report=_json_ready(
+                best_trial_report.get("selection_policy", {}).get("promotion_eligibility_report") or {}
+            ),
             lineage={
                 "candidate_hash": selection_snapshot.get("candidate_hash"),
                 "selection_timestamp": selection_snapshot.get("selection_timestamp"),
+                "data_lineage": data_lineage,
             },
             status="challenger",
             meta_model=best_training.get("last_meta"),
@@ -2773,6 +2995,9 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         promotion_decision = evaluate_challenger_promotion(
             {
                 "promotion_ready": bool(summary["promotion_ready"]),
+                "promotion_eligibility_report": _json_ready(
+                    best_trial_report.get("selection_policy", {}).get("promotion_eligibility_report") or {}
+                ),
                 "selection_value": summary["best_value"],
                 "sample_count": int(
                     (locked_holdout.get("backtest") or {}).get("total_trades")
