@@ -1,12 +1,14 @@
-"""Training, meta-labeling, validation splitters, regime detection, model store."""
+"""Training, meta-labeling, validation splitters, and model store."""
 
-import pickle
+import hashlib
+import json
 import warnings
 from itertools import combinations
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn import __version__ as sklearn_version
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, log_loss
@@ -16,7 +18,18 @@ from sklearn.preprocessing import StandardScaler
 from .execution import resolve_liquidity_inputs
 from .features import ENDOGENOUS_FEATURE_FAMILIES, resolve_feature_family
 from .labeling import sequential_bootstrap
+from .regime import detect_regime
 from .slippage import _estimate_reference_trade_slippage_rates
+from .storage import file_sha256, read_json, write_json
+
+try:  # pragma: no cover - exercised through save/load tests
+    from skops.io import dump as skops_dump
+    from skops.io import get_untrusted_types as skops_get_untrusted_types
+    from skops.io import load as skops_load
+except ImportError:  # pragma: no cover
+    skops_dump = None
+    skops_get_untrusted_types = None
+    skops_load = None
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1255,261 +1268,172 @@ def summarize_feature_family_diagnostics(fold_diagnostics):
         "endogenous_only_selected_all_folds": all(endogenous_flags),
     }
 
-
 # ───────────────────────────────────────────────────────────────────────────
-def _coalesce_regime_signal(features, include_terms, exclude_terms=None,
-                            fallback_column=None, reference_features=None):
-    exclude_terms = tuple(term.lower() for term in (exclude_terms or ()))
-    reference = features if reference_features is None else reference_features.reindex(columns=features.columns)
-    selected_columns = []
-    for column in features.columns:
-        lower = column.lower()
-        if any(term in lower for term in include_terms) and not any(term in lower for term in exclude_terms):
-            selected_columns.append(column)
+# Safe artifact store
+# ───────────────────────────────────────────────────────────────────────────
 
-    if not selected_columns and fallback_column is not None and fallback_column in features.columns:
-        selected_columns = [fallback_column]
-
-    if not selected_columns:
-        return pd.Series(0.0, index=features.index, dtype=float)
-
-    selected = features[selected_columns].apply(pd.to_numeric, errors="coerce")
-    reference_selected = reference[selected_columns].apply(pd.to_numeric, errors="coerce")
-    reference_mean = reference_selected.mean()
-    reference_std = reference_selected.std().replace(0, 1)
-    standardized = (selected - reference_mean) / reference_std
-    return standardized.mean(axis=1).fillna(0.0)
+_SAFE_MODEL_FORMAT_VERSION = 1
 
 
-def _bucket_regime_signal(series, lower_quantile=0.33, upper_quantile=0.67,
-                          invert=False, reference_series=None):
-    values = -pd.Series(series, copy=False) if invert else pd.Series(series, copy=False)
-    reference = values if reference_series is None else (-pd.Series(reference_series, copy=False) if invert else pd.Series(reference_series, copy=False))
-    clean = reference.dropna()
-    if clean.empty:
-        return pd.Series(0, index=values.index, dtype=int)
-
-    lower = float(clean.quantile(lower_quantile))
-    upper = float(clean.quantile(upper_quantile))
-    bucket = pd.Series(0, index=values.index, dtype=int)
-    bucket[values <= lower] = -1
-    bucket[values >= upper] = 1
-    return bucket
+def _artifact_paths(path):
+    target = Path(path)
+    if target.suffix in {".json", ".skops", ".pkl", ".pickle"}:
+        base = target.with_suffix("")
+    else:
+        base = target
+    manifest_path = base.with_suffix(".json")
+    model_path = base.with_suffix(".skops")
+    return manifest_path, model_path
 
 
-def _detect_explicit_regime(features, config=None, fit_features=None):
-    config = dict(config or {})
-    clean = features.dropna()
-    if clean.empty:
-        return pd.DataFrame(columns=["trend_regime", "volatility_regime", "liquidity_regime", "regime"])
-
-    reference = clean if fit_features is None else fit_features.reindex(columns=features.columns).dropna()
-    if reference.empty:
-        reference = clean
-
-    trend_score = _coalesce_regime_signal(
-        clean,
-        include_terms=("trend", "ret_", "return", "momentum"),
-        exclude_terms=("vol", "volume", "liquid"),
-        reference_features=reference,
-    )
-    volatility_score = _coalesce_regime_signal(
-        clean,
-        include_terms=("vol", "range", "atr", "dispersion"),
-        exclude_terms=("volume", "liquid"),
-        reference_features=reference,
-    )
-    liquidity_score = _coalesce_regime_signal(
-        clean,
-        include_terms=("liquid", "volume", "turnover", "trade"),
-        exclude_terms=("illiquid",),
-        reference_features=reference,
-    )
-    illiquidity_score = _coalesce_regime_signal(
-        clean,
-        include_terms=("illiquid", "amihud"),
-        reference_features=reference,
-    )
-    liquidity_score = liquidity_score - illiquidity_score
-
-    trend_reference = _coalesce_regime_signal(
-        reference,
-        include_terms=("trend", "ret_", "return", "momentum"),
-        exclude_terms=("vol", "volume", "liquid"),
-        reference_features=reference,
-    )
-    volatility_reference = _coalesce_regime_signal(
-        reference,
-        include_terms=("vol", "range", "atr", "dispersion"),
-        exclude_terms=("volume", "liquid"),
-        reference_features=reference,
-    )
-    liquidity_reference = _coalesce_regime_signal(
-        reference,
-        include_terms=("liquid", "volume", "turnover", "trade"),
-        exclude_terms=("illiquid",),
-        reference_features=reference,
-    )
-    illiquidity_reference = _coalesce_regime_signal(
-        reference,
-        include_terms=("illiquid", "amihud"),
-        reference_features=reference,
-    )
-    liquidity_reference = liquidity_reference - illiquidity_reference
-
-    lower_quantile = float(config.get("lower_quantile", 0.33))
-    upper_quantile = float(config.get("upper_quantile", 0.67))
-    liquidity_invert = bool(config.get("liquidity_invert", False))
-
-    trend_regime = _bucket_regime_signal(
-        trend_score,
-        lower_quantile=lower_quantile,
-        upper_quantile=upper_quantile,
-        reference_series=trend_reference,
-    )
-    volatility_regime = _bucket_regime_signal(
-        volatility_score,
-        lower_quantile=lower_quantile,
-        upper_quantile=upper_quantile,
-        reference_series=volatility_reference,
-    )
-    liquidity_regime = _bucket_regime_signal(
-        liquidity_score,
-        lower_quantile=lower_quantile,
-        upper_quantile=upper_quantile,
-        invert=liquidity_invert,
-        reference_series=liquidity_reference,
-    )
-
-    composite = (
-        (trend_regime + 1) * 9
-        + (volatility_regime + 1) * 3
-        + (liquidity_regime + 1)
-    ).astype(int)
-
-    return pd.DataFrame(
-        {
-            "trend_regime": trend_regime.astype(int),
-            "volatility_regime": volatility_regime.astype(int),
-            "liquidity_regime": liquidity_regime.astype(int),
-            "regime": composite,
-        },
-        index=clean.index,
-    )
+def _json_ready(value):
+    if isinstance(value, dict):
+        return {key: _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except TypeError:
+            pass
+    return value
 
 
-def _detect_hmm_regime(features, n_regimes=2, config=None, fit_features=None):
-    """Gaussian HMM-based regime detection with stable state ordering.
+def _coerce_feature_schema(metadata, feature_schema=None):
+    metadata = dict(metadata or {})
+    schema = dict(feature_schema or metadata.get("feature_schema") or {})
+    explicit_columns = schema.get("feature_order") or metadata.get("feature_order") or metadata.get("feature_columns")
+    if explicit_columns is None:
+        explicit_columns = metadata.get("last_selected_columns")
+    if explicit_columns is None:
+        explicit_columns = metadata.get("required_columns")
+    if explicit_columns is not None:
+        schema["feature_order"] = list(explicit_columns)
+        schema.setdefault("required_columns", list(explicit_columns))
 
-    States are sorted by ascending L1 norm of their mean vectors so that state 0
-    is the most neutral and the last state is the most deviant. This keeps regime
-    semantics stable across walk-forward folds.
+    required_columns = schema.get("required_columns")
+    if required_columns is not None:
+        schema["required_columns"] = list(required_columns)
 
-    Parameters
-    ----------
-    features : pd.DataFrame – numeric columns describing regime state
-    n_regimes : int         – number of hidden states
-    config : dict or None   – optional HMM settings:
-        covariance_type (default "diag"), n_iter (default 100),
-        tol (default 1e-3), random_state (default 42)
-    fit_features : pd.DataFrame or None – reference training slice used to fit
-        the scaler and HMM transition/emission parameters.
-    """
-    try:
-        from hmmlearn.hmm import GaussianHMM  # deferred – not a hard runtime dep
-    except ImportError as exc:  # pragma: no cover
+    schema_version = schema.get("schema_version") or metadata.get("schema_version") or metadata.get("feature_schema_version")
+    if schema_version is not None:
+        schema["schema_version"] = schema_version
+    return schema
+
+
+def _build_model_manifest(metadata, feature_schema, model_path, trusted_types, serializer):
+    clean_metadata = _json_ready(metadata or {})
+    manifest = {
+        "format_version": _SAFE_MODEL_FORMAT_VERSION,
+        "serializer": serializer,
+        "model_path": model_path.name,
+        "model_sha256": file_sha256(model_path) if model_path.exists() else None,
+        "feature_schema": _json_ready(feature_schema or {}),
+        "metadata": clean_metadata,
+        "trusted_types": list(trusted_types or []),
+        "sklearn_version": sklearn_version,
+    }
+    if serializer == "recipe_only":
+        manifest["retrain_recipe"] = clean_metadata.get("retrain_recipe") or clean_metadata.get("training_recipe")
+    return manifest
+
+
+def _verify_model_hash(model_path, manifest):
+    expected_hash = manifest.get("model_sha256")
+    if not expected_hash:
+        return
+    actual_hash = file_sha256(model_path)
+    if actual_hash != expected_hash:
+        raise ValueError(f"Model artifact hash verification failed for {model_path}")
+
+
+def _verify_feature_schema(feature_schema, expected_feature_columns=None):
+    if not expected_feature_columns:
+        return
+
+    expected = list(expected_feature_columns)
+    required = list((feature_schema or {}).get("required_columns") or [])
+    if required and expected != required:
+        raise ValueError(
+            "Feature schema mismatch: expected feature order "
+            f"{required} but received {expected}"
+        )
+
+    feature_order = list((feature_schema or {}).get("feature_order") or [])
+    if feature_order and expected != feature_order:
+        raise ValueError(
+            "Feature order mismatch: artifact requires "
+            f"{feature_order} but received {expected}"
+        )
+
+
+def save_model(model, path, metadata=None, feature_schema=None):
+    """Persist a sklearn-compatible model using skops plus a JSON manifest."""
+    manifest_path, model_path = _artifact_paths(path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    feature_schema = _coerce_feature_schema(metadata, feature_schema=feature_schema)
+
+    if skops_dump is None or skops_get_untrusted_types is None:
         raise ImportError(
-            "hmmlearn is required for method='hmm'. "
-            "Install it with: pip install hmmlearn>=0.3"
-        ) from exc
+            "Safe model persistence requires skops. Install it with `python -m pip install skops`."
+        )
 
-    config = dict(config or {})
-    clean = features.dropna()
-    if clean.empty:
-        return pd.Series(dtype=int, name="regime")
-
-    reference = clean if fit_features is None else fit_features.reindex(columns=features.columns).dropna()
-    if reference.empty:
-        reference = clean
-
-    n_states = max(1, min(int(n_regimes), len(reference)))
-    if n_states == 1:
-        return pd.Series(0, index=clean.index, name="regime", dtype=int)
-
-    covariance_type = config.get("covariance_type", "diag")
-    n_iter = int(config.get("n_iter", 100))
-    tol = float(config.get("tol", 1e-3))
-    random_state = int(config.get("random_state", 42))
-
-    scaler = StandardScaler()
-    scaler.fit(reference)
-    normed_reference = scaler.transform(reference)
-    normed = scaler.transform(clean)
-
-    hmm_model = GaussianHMM(
-        n_components=n_states,
-        covariance_type=covariance_type,
-        n_iter=n_iter,
-        tol=tol,
-        random_state=random_state,
-    )
+    serializer = "skops"
+    trusted_types = []
     try:
-        hmm_model.fit(normed_reference)
-        raw_labels = hmm_model.predict(normed)
-    except Exception:  # noqa: BLE001 – fall back gracefully on convergence failures
-        return pd.Series(0, index=clean.index, name="regime", dtype=int)
+        skops_dump(model, model_path)
+        trusted_types = list(skops_get_untrusted_types(file=str(model_path)))
+    except Exception as exc:
+        model_path.unlink(missing_ok=True)
+        retrain_recipe = dict(metadata or {}).get("retrain_recipe") or dict(metadata or {}).get("training_recipe")
+        if retrain_recipe is None:
+            raise RuntimeError(
+                "Model could not be safely serialized with skops and no retrain recipe was supplied"
+            ) from exc
+        serializer = "recipe_only"
 
-    # Stable ordering: sort states by ascending L1 norm of state means.
-    # State 0 = most neutral; last state = most extreme. This keeps regime
-    # semantics consistent across folds even though HMM init is random.
-    norms = np.linalg.norm(hmm_model.means_, ord=1, axis=1)
-    sort_order = np.argsort(norms)  # old_label -> rank position
-    remap = np.empty(n_states, dtype=int)
-    for new_label, old_label in enumerate(sort_order):
-        remap[old_label] = new_label
-
-    return pd.Series(remap[raw_labels], index=clean.index, name="regime", dtype=int)
-
-
-def detect_regime(features, n_regimes=2, method="hmm", config=None, fit_features=None):
-    """Detect market regimes from a feature frame.
-
-    Parameters
-    ----------
-    features : pd.DataFrame – numeric columns describing regime state
-    n_regimes : int         – number of regimes / hidden states
-    method : str            – "hmm" (default) or "explicit"
-    config : dict or None   – optional method-specific settings
-    fit_features : pd.DataFrame or None – reference slice used to fit scaler,
-        HMM parameters or quantiles before applying to ``features``.
-
-    Returns a pd.Series (hmm) or a pd.DataFrame (explicit).
-    """
-    method = (method or "hmm").lower()
-    if method == "explicit":
-        return _detect_explicit_regime(features, config=config, fit_features=fit_features)
-    if method == "hmm":
-        return _detect_hmm_regime(features, n_regimes=n_regimes, config=config, fit_features=fit_features)
-
-    raise ValueError(
-        f"Unknown regime detection method={method!r}. Choose from ['hmm', 'explicit']"
+    manifest = _build_model_manifest(
+        metadata=metadata,
+        feature_schema=feature_schema,
+        model_path=model_path,
+        trusted_types=trusted_types,
+        serializer=serializer,
     )
+    write_json(manifest_path, manifest)
+    return manifest_path
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Artifact store  (pickle-based – swap for MLflow/W&B later)
-# ───────────────────────────────────────────────────────────────────────────
+def load_model(path, expected_feature_columns=None):
+    """Return (model, metadata) from a manifest-verified safe artifact bundle."""
+    manifest_path, model_path = _artifact_paths(path)
+    manifest = read_json(manifest_path)
+    if manifest is None:
+        raise FileNotFoundError(f"Model manifest not found at {manifest_path}")
 
-def save_model(model, path, metadata=None):
-    """Persist model + metadata dict to *path*."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "wb") as f:
-        pickle.dump({"model": model, "metadata": metadata or {}}, f)
+    serializer = manifest.get("serializer", "skops")
+    feature_schema = dict(manifest.get("feature_schema") or {})
+    _verify_feature_schema(feature_schema, expected_feature_columns=expected_feature_columns)
 
+    metadata = dict(manifest.get("metadata") or {})
+    metadata.setdefault("feature_schema", feature_schema)
+    metadata.setdefault("artifact_manifest", manifest_path)
 
-def load_model(path):
-    """Return (model, metadata) from a previously saved artifact."""
-    with open(path, "rb") as f:
-        art = pickle.load(f)
-    return art["model"], art["metadata"]
+    if serializer == "recipe_only":
+        raise RuntimeError(
+            "This artifact stores only a retraining recipe because the model could not be safely serialized"
+        )
+
+    if skops_load is None:
+        raise ImportError(
+            "Safe model loading requires skops. Install it with `python -m pip install skops`."
+        )
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model artifact not found at {model_path}")
+
+    _verify_model_hash(model_path, manifest)
+    trusted_types = list(manifest.get("trusted_types") or [])
+    model = skops_load(str(model_path), trusted=trusted_types)
+    return model, metadata

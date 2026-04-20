@@ -37,6 +37,7 @@ class BuiltFeatureSet:
     frame: pd.DataFrame
     feature_blocks: dict[str, str]
     feature_families: dict[str, str] = field(default_factory=dict)
+    feature_lineage: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,6 +70,32 @@ def derive_feature_families(feature_blocks, columns=None):
         column: resolve_feature_family(blocks.get(column, "unknown"))
         for column in selected_columns
     }
+
+
+def derive_feature_lineage(feature_blocks, columns=None):
+    blocks = dict(feature_blocks or {})
+    selected_columns = list(columns) if columns is not None else list(blocks)
+    lineage = {}
+    for column in selected_columns:
+        block_name = blocks.get(column, "unknown")
+        source_column = column
+        transform_chain = ["raw"]
+
+        if "_lag" in column:
+            base_name, lag_suffix = column.rsplit("_lag", 1)
+            if lag_suffix.isdigit():
+                source_column = base_name
+                transform_chain.append(f"lag:{lag_suffix}")
+
+        if column.endswith("_fracdiff"):
+            transform_chain.append("frac_diff")
+
+        lineage[column] = {
+            "source_column": source_column,
+            "block": block_name,
+            "transform_chain": transform_chain,
+        }
+    return lineage
 
 
 def summarize_feature_families(feature_blocks, columns=None):
@@ -1085,7 +1112,13 @@ def build_feature_set(
         feature_blocks=feature_blocks,
     )
     feature_families = derive_feature_families(feature_blocks, columns=features.columns)
-    return BuiltFeatureSet(frame=features, feature_blocks=feature_blocks, feature_families=feature_families)
+    feature_lineage = derive_feature_lineage(feature_blocks, columns=features.columns)
+    return BuiltFeatureSet(
+        frame=features,
+        feature_blocks=feature_blocks,
+        feature_families=feature_families,
+        feature_lineage=feature_lineage,
+    )
 
 
 # ---------------------------------------------------------------------------

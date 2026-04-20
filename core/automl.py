@@ -10,6 +10,7 @@ from statistics import NormalDist
 import numpy as np
 import pandas as pd
 
+from .registry import LocalRegistryStore, evaluate_challenger_promotion
 from .stat_tests import compute_post_selection_inference
 
 try:
@@ -502,6 +503,7 @@ def _validate_trial_overrides(overrides):
 def _summarize_training(training):
     feature_selection = training.get("feature_selection") or {}
     bootstrap = training.get("bootstrap") or {}
+    feature_governance = training.get("feature_governance") or {}
     return {
         "avg_accuracy": training.get("avg_accuracy"),
         "avg_f1_macro": training.get("avg_f1_macro"),
@@ -521,6 +523,10 @@ def _summarize_training(training):
             "used_in_any_fold": bootstrap.get("used_in_any_fold"),
             "warning_count": bootstrap.get("warning_count"),
             "folds": bootstrap.get("folds", []),
+        },
+        "feature_governance": {
+            "retirement": feature_governance.get("retirement", {}),
+            "admission_summary": feature_governance.get("admission_summary", {}),
         },
         "fold_stability": training.get("fold_stability"),
         "fold_count": len(training.get("fold_metrics", [])),
@@ -1833,6 +1839,9 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 model_family_counts.get(model_family, 0)
                 <= selection_policy.get("max_trials_per_model_family", np.inf)
             ),
+            "feature_admission": bool(
+                (validation_metrics.get("training") or {}).get("promotion_gates", {}).get("feature_admission", True)
+            ),
             "fold_stability": bool(fold_stability_gate["passed"] or not fold_stability_gate["applies"]),
             "param_fragility": None,
             "locked_holdout": None,
@@ -1853,6 +1862,8 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             eligibility_reasons.append("search_validation_gap_above_limit")
         if not eligibility_checks["model_family_trial_count"]:
             eligibility_reasons.append("model_family_trial_count_above_limit")
+        if not eligibility_checks["feature_admission"]:
+            eligibility_reasons.append("feature_admission_failed")
         if not eligibility_checks["fold_stability"]:
             eligibility_reasons.append("fold_stability_failed")
 
@@ -2710,6 +2721,62 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "top_trials": top_trials,
         "trial_count": len(completed_trials),
     }
+
+    registry_config = dict(base_config.get("registry") or {})
+    if registry_config.get("enabled", False):
+        symbol = base_config.get("data", {}).get("symbol", "unknown")
+        registry_store = LocalRegistryStore(
+            root_dir=registry_config.get("root_dir", ".cache/registry"),
+            max_versions_per_symbol=registry_config.get("max_versions_per_symbol", 10),
+        )
+        champion_before = registry_store.get_champion(symbol)
+        best_training = best_trial_report.get("training") or {}
+        feature_columns = list(best_training.get("last_selected_columns") or [])
+        version_id = registry_store.register_version(
+            best_training.get("last_model"),
+            symbol=symbol,
+            feature_columns=feature_columns,
+            metadata={
+                "study_name": summary["study_name"],
+                "best_trial_number": summary["best_trial_number"],
+                "selection_freeze": selection_snapshot,
+                "best_params": summary["best_params"],
+                "best_overrides": summary["best_overrides"],
+            },
+            training_summary=_json_ready(_summarize_training(best_training)),
+            validation_summary=_json_ready(best_trial_report.get("validation_metrics") or {}),
+            locked_holdout=_json_ready(locked_holdout),
+            lineage={
+                "candidate_hash": selection_snapshot.get("candidate_hash"),
+                "selection_timestamp": selection_snapshot.get("selection_timestamp"),
+            },
+            status="challenger",
+            meta_model=best_training.get("last_meta"),
+        )
+        promotion_decision = evaluate_challenger_promotion(
+            {
+                "promotion_ready": bool(summary["promotion_ready"]),
+                "selection_value": summary["best_value"],
+                "sample_count": int(
+                    (locked_holdout.get("backtest") or {}).get("total_trades")
+                    or best_training.get("oos_trade_count")
+                    or 0
+                ),
+            },
+            champion_record=champion_before,
+            policy=registry_config.get("promotion_policy"),
+        )
+        registry_store.record_promotion_decision(version_id, promotion_decision, symbol=symbol)
+        if promotion_decision.get("approved", False):
+            registry_store.promote(version_id, "champion", symbol=symbol, decision=promotion_decision)
+        registry_entry = registry_store._find_row(version_id, symbol=symbol)
+        summary["registry"] = {
+            "version_id": version_id,
+            "symbol": symbol,
+            "current_status": registry_entry.get("current_status") if registry_entry else "challenger",
+            "promotion_decision": promotion_decision,
+            "champion_before": champion_before.get("version_id") if champion_before else None,
+        }
 
     engine = getattr(getattr(study, "_storage", None), "engine", None)
     if engine is not None:

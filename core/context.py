@@ -12,6 +12,7 @@ import requests
 
 from .data import fetch_binance_bars, _interval_timedelta, _parse_bound, _parse_interval
 from .features import FeatureBlock
+from .storage import read_parquet_frame, write_parquet_frame
 
 
 _FAPI_BASE = "https://fapi.binance.com"
@@ -25,23 +26,19 @@ def _cache_path(cache_dir, namespace, payload):
 
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     digest = hashlib.sha1(encoded).hexdigest()
-    return Path(cache_dir) / "context" / namespace / f"{digest}.pkl"
+    return Path(cache_dir) / "context" / namespace / f"{digest}.parquet"
 
 
 def _read_cache(path):
     if path is None or not path.exists():
         return None
-    return pd.read_pickle(path)
+    return read_parquet_frame(path)
 
 
 def _write_cache(path, frame):
     if path is None:
         return
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    frame.to_pickle(temp_path)
-    temp_path.replace(path)
+    write_parquet_frame(path, pd.DataFrame(frame))
 
 
 def _request_json(session, path, params):

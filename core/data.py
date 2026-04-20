@@ -25,6 +25,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+from .storage import read_json, read_parquet_frame, write_json, write_parquet_frame
+
 _VISION_BASES = {
     "spot": "https://data.binance.vision/data/spot",
     "um_futures": "https://data.binance.vision/data/futures/um",
@@ -201,36 +203,30 @@ def _cache_path(cache_dir, symbol, interval, period, market="spot"):
         / symbol
         / interval
         / period.kind
-        / f"{period.key}.pkl"
+        / f"{period.key}.parquet"
     )
 
 
 def _read_cache(path):
     if not path.exists():
         return None
-    return _normalize_output_schema(pd.read_pickle(path))
+    return _normalize_output_schema(read_parquet_frame(path))
 
 
 def _write_cache(path, frame):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    frame.to_pickle(temp_path)
-    temp_path.replace(path)
+    write_parquet_frame(path, pd.DataFrame(frame))
 
 
 def _read_object_cache(path):
-    if path is None or not path.exists():
+    if path is None:
         return None
-    return pd.read_pickle(path)
+    return read_json(path)
 
 
 def _write_object_cache(path, payload):
     if path is None:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    pd.to_pickle(payload, temp_path)
-    temp_path.replace(path)
+    write_json(path, payload)
 
 
 def _normalize_output_schema(frame):
@@ -872,19 +868,19 @@ def join_custom_data(base_frame, datasets):
 def _symbol_filters_cache_path(cache_dir, market, symbol):
     if cache_dir is None:
         return None
-    return Path(cache_dir) / _normalize_market(market) / "symbol_filters" / f"{symbol}.pkl"
+    return Path(cache_dir) / _normalize_market(market) / "symbol_filters" / f"{symbol}.json"
 
 
 def _exchange_info_cache_path(cache_dir, market):
     if cache_dir is None:
         return None
-    return Path(cache_dir) / _normalize_market(market) / "exchange_info" / "all.pkl"
+    return Path(cache_dir) / _normalize_market(market) / "exchange_info" / "all.json"
 
 
 def _futures_metadata_cache_path(cache_dir, market, symbol, namespace):
     if cache_dir is None:
         return None
-    return Path(cache_dir) / _normalize_market(market) / "futures_metadata" / namespace / f"{symbol}.pkl"
+    return Path(cache_dir) / _normalize_market(market) / "futures_metadata" / namespace / f"{symbol}.json"
 
 
 def _coerce_filter_float(value):

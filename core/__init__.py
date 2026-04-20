@@ -15,6 +15,7 @@ from .data import (
     load_custom_dataset,
 )
 from .data_quality import DataQualityResult, check_data_quality
+from .drift import ADWINDetector, DriftMonitor, evaluate_drift_guardrails
 from .context import (
     fetch_binance_futures_context,
     fetch_context_symbol_bars,
@@ -64,18 +65,31 @@ from .pipeline import (
     StationarityStep,
     TrainModelsStep,
 )
+from .regime import (
+    RegimeFeatureSet,
+    build_default_regime_feature_set,
+    build_regime_ablation_report,
+    compute_regime_path_stability,
+    detect_regime,
+    summarize_regime_ablation_reports,
+    summarize_regime_provenance,
+)
 from .features import (
     build_feature_set,
     build_features,
     check_stationarity,
+    derive_feature_lineage,
     fractional_diff,
     screen_features_for_stationarity,
     select_features,
 )
 from .feature_governance import (
+    apply_feature_retirement,
     derive_feature_metadata,
+    evaluate_feature_admission,
     evaluate_feature_portability,
     filter_feature_metadata,
+    summarize_feature_admission_reports,
     summarize_feature_portability,
 )
 from .labeling import (
@@ -104,7 +118,6 @@ from .models import (
     train_model,
     train_meta_model,
     evaluate_model,
-    detect_regime,
     save_model,
     load_model,
 )
@@ -117,6 +130,13 @@ from .stat_tests import (
 )
 from .backtest import kelly_fraction, run_backtest
 from .reference_data import build_reference_overlay_feature_block
+from .registry import (
+    LocalRegistryStore,
+    RegistryVersionManifest,
+    build_feature_schema_hash,
+    build_registry_manifest,
+    evaluate_challenger_promotion,
+)
 from .universe import (
     HistoricalUniverseSnapshot,
     apply_symbol_lifecycle_policy,

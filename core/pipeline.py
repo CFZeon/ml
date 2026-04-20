@@ -24,9 +24,12 @@ from .data import (
 )
 from .data_quality import check_data_quality
 from .feature_governance import (
+    apply_feature_retirement,
     derive_feature_metadata,
+    evaluate_feature_admission,
     evaluate_feature_portability,
     filter_feature_metadata,
+    summarize_feature_admission_reports,
 )
 from .features import (
     build_feature_set,
@@ -51,7 +54,6 @@ from .models import (
     build_meta_feature_frame,
     compute_feature_block_diagnostics,
     compute_feature_family_diagnostics,
-    detect_regime,
     evaluate_model,
     fit_binary_probability_calibrator,
     predict_probability_frame,
@@ -60,6 +62,13 @@ from .models import (
     train_meta_model,
     train_model,
     walk_forward_split,
+)
+from .regime import (
+    build_default_regime_feature_set,
+    build_regime_ablation_report,
+    detect_regime,
+    normalize_regime_feature_set,
+    summarize_regime_ablation_reports,
 )
 from .slippage import (
     DepthCurveImpactModel,
@@ -79,21 +88,21 @@ from .universe import (
 
 def _default_regime_features(pipeline):
     data = pipeline.require("data")
-    returns = data["close"].pct_change()
-    quote_volume = data["quote_volume"] if "quote_volume" in data.columns else (data["close"] * data["volume"])
-    illiquidity = returns.abs() / quote_volume.replace(0, np.nan)
-    return pd.DataFrame(
-        {
-            "trend_20": data["close"].pct_change(20),
-            "trend_60": data["close"].pct_change(60),
-            "vol_20": data["close"].pct_change().rolling(20).std(),
-            "vol_60": data["close"].pct_change().rolling(60).std(),
-            "range_20": ((data["high"] - data["low"]) / data["close"]).rolling(20).mean(),
-            "liquidity_20": np.log1p(quote_volume).rolling(20).mean(),
-            "illiquidity_20": illiquidity.rolling(20).mean(),
-            "trades_20": (data["trades"].rolling(20).mean() if "trades" in data.columns else np.nan),
-        }
-    ).dropna()
+    features_config = pipeline.section("features")
+    reference_data = (
+        pipeline.state.get("reference_overlay_data")
+        if pipeline.state.get("reference_overlay_data") is not None
+        else pipeline.state.get("reference_data")
+    )
+    return build_default_regime_feature_set(
+        data,
+        base_interval=pipeline.section("data").get("interval", "1h"),
+        rolling_window=features_config.get("rolling_window", 20),
+        futures_context=pipeline.state.get("futures_context"),
+        cross_asset_context=pipeline.state.get("cross_asset_context"),
+        reference_data=reference_data,
+        context_timeframes=features_config.get("context_timeframes"),
+    )
 
 
 def _default_stationarity_specs(pipeline):
@@ -927,9 +936,11 @@ def _build_regime_feature_source(pipeline):
 
     config = pipeline.section("regime")
     builder = config.get("builder") or _default_regime_features
-    regime_features = builder(pipeline)
-    pipeline.state["regime_features"] = regime_features
-    return regime_features
+    feature_set = normalize_regime_feature_set(builder(pipeline))
+    pipeline.state["regime_features"] = feature_set.frame
+    pipeline.state["regime_feature_sources"] = dict(feature_set.source_map)
+    pipeline.state["regime_provenance"] = dict(feature_set.provenance)
+    return feature_set.frame
 
 
 def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
@@ -948,6 +959,8 @@ def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
     if index is None or len(index) == 0:
         return pd.DataFrame(index=index if index is not None else pd.Index([])), {}
 
+    pipeline.state.pop("_last_regime_details", None)
+
     # --- Per-fold data scoping: include a lookback buffer so rolling stats
     #     at the fold start are not NaN due to insufficient history, while
     #     still preventing future-bar data from influencing quantile thresholds.
@@ -965,9 +978,14 @@ def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
 
     builder = config.get("builder") or _default_regime_features
     scoped_pipeline = _FoldScopedPipeline(pipeline, buffered_data)
-    regime_features = builder(scoped_pipeline)
+    feature_set = normalize_regime_feature_set(builder(scoped_pipeline))
+    regime_features = feature_set.frame
 
     if regime_features is None or (hasattr(regime_features, "empty") and regime_features.empty):
+        pipeline.state["_last_regime_details"] = {
+            "provenance": dict(feature_set.provenance),
+            "ablation": {},
+        }
         return pd.DataFrame(index=index), {}
 
     regime_window = regime_features.reindex(index)
@@ -979,6 +997,22 @@ def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
         config=config,
         fit_features=fit_features,
     )
+    ablation = build_regime_ablation_report(
+        {
+            "frame": regime_window,
+            "source_map": feature_set.source_map,
+            "provenance": feature_set.provenance,
+        },
+        n_regimes=config.get("n_regimes", 2),
+        method=config.get("method", "hmm"),
+        config=config,
+        fit_features=fit_features,
+        full_regimes=regimes,
+    )
+    pipeline.state["_last_regime_details"] = {
+        "provenance": dict(feature_set.provenance),
+        "ablation": ablation,
+    }
     frame = _coerce_regime_frame(regimes, column_name=config.get("column_name", "regime")).reindex(index)
     return frame, {column: "regime" for column in frame.columns}
 
@@ -2027,11 +2061,6 @@ class FeaturesStep(PipelineStep):
             }
 
         feature_families = derive_feature_families(feature_blocks, columns=features.columns)
-        feature_metadata = derive_feature_metadata(
-            feature_blocks=feature_blocks,
-            feature_families=feature_families,
-            columns=features.columns,
-        )
 
         screening_result = screen_features_for_stationarity(
             features,
@@ -2041,6 +2070,14 @@ class FeaturesStep(PipelineStep):
         screening_report = copy.deepcopy(screening_result.report)
         screening_report["mode"] = "global_preview_only"
         screening_report.setdefault("summary", {})["mode"] = "global_preview_only"
+        feature_metadata = derive_feature_metadata(
+            feature_blocks=feature_blocks,
+            feature_families=feature_families,
+            columns=features.columns,
+            screening_report=screening_report,
+            feature_lineage=getattr(feature_set, "feature_lineage", {}),
+            retired_features=(pipeline.section("feature_governance") or {}).get("retired_features"),
+        )
 
         pipeline.state["raw_features"] = features
         pipeline.state["feature_blocks_raw"] = feature_blocks
@@ -2082,25 +2119,40 @@ class RegimeStep(PipelineStep):
     def run(self, pipeline):
         config = pipeline.section("regime")
         builder = config.get("builder") or _default_regime_features
-        regime_features = builder(pipeline)
+        feature_set = normalize_regime_feature_set(builder(pipeline))
+        regime_features = feature_set.frame
         regimes = detect_regime(
             regime_features,
             n_regimes=config.get("n_regimes", 2),
             method=config.get("method", "hmm"),
             config=config,
         )
+        ablation = build_regime_ablation_report(
+            feature_set,
+            n_regimes=config.get("n_regimes", 2),
+            method=config.get("method", "hmm"),
+            config=config,
+            full_regimes=regimes,
+        )
 
         pipeline.state["regime_features"] = regime_features
+        pipeline.state["regime_feature_sources"] = dict(feature_set.source_map)
+        pipeline.state["regime_provenance"] = dict(feature_set.provenance)
         pipeline.state["regimes"] = regimes
+        pipeline.state["regime_ablation"] = ablation
         pipeline.state["regime_detection"] = {
             "mode": "global_preview_only",
             "method": config.get("method", "hmm"),
             "columns": list(regimes.columns) if isinstance(regimes, pd.DataFrame) else [config.get("column_name", "regime")],
+            "provenance": feature_set.provenance,
+            "ablation": ablation,
         }
         return {
             "regime_features": regime_features,
             "regimes": regimes,
             "mode": "global_preview_only",
+            "provenance": feature_set.provenance,
+            "ablation": ablation,
         }
 
 
@@ -2209,13 +2261,28 @@ class AlignDataStep(PipelineStep):
         y = y.loc[mask]
         labels_aligned = labels_aligned.loc[mask]
 
+        X, feature_blocks, feature_families, feature_metadata, retirement_report = apply_feature_retirement(
+            X,
+            feature_blocks=feature_blocks,
+            feature_families=feature_families,
+            feature_metadata=feature_metadata,
+            config=pipeline.section("feature_governance"),
+        )
+
         pipeline.state["feature_blocks"] = feature_blocks
         pipeline.state["feature_families"] = feature_families
         pipeline.state["feature_metadata"] = filter_feature_metadata(feature_metadata, X.columns)
         pipeline.state["feature_family_summary"] = summarize_feature_families(feature_blocks, columns=X.columns)
+        pipeline.state["feature_retirement"] = retirement_report
         if dropped_columns:
             report = dict(pipeline.state.get("feature_screening", {}))
             report.setdefault("alignment", {})["dropped_all_nan_columns"] = dropped_columns
+            if retirement_report.get("dropped_columns"):
+                report.setdefault("alignment", {})["retired_columns"] = retirement_report.get("dropped_columns")
+            pipeline.state["feature_screening"] = report
+        elif retirement_report.get("dropped_columns"):
+            report = dict(pipeline.state.get("feature_screening", {}))
+            report.setdefault("alignment", {})["retired_columns"] = retirement_report.get("dropped_columns")
             pipeline.state["feature_screening"] = report
 
         pipeline.state["X"] = X
@@ -2312,6 +2379,7 @@ class TrainModelsStep(PipelineStep):
         fold_backtests = []
         fold_block_diagnostics = []
         fold_family_diagnostics = []
+        fold_feature_governance = []
         fold_feature_selection = []
         fold_signal_policy = []
         fold_stationarity = []
@@ -2416,6 +2484,7 @@ class TrainModelsStep(PipelineStep):
                 fold_window.index,
                 fit_index=X_fit.index,
             )
+            regime_details = dict(pipeline.state.pop("_last_regime_details", {}) or {})
             if not regime_frame.empty:
                 fold_frame = fold_frame.join(regime_frame)
                 fold_feature_blocks.update(regime_feature_blocks)
@@ -2426,6 +2495,8 @@ class TrainModelsStep(PipelineStep):
                     "mode": "fold_local",
                     "columns": list(regime_frame.columns),
                     "available_rows": int(regime_frame.dropna(how="all").shape[0]),
+                    "provenance": regime_details.get("provenance", {}),
+                    "ablation": regime_details.get("ablation", {}),
                 }
             )
 
@@ -2483,6 +2554,39 @@ class TrainModelsStep(PipelineStep):
             X_fit_model = X_fit.loc[:, selected_columns]
             X_test_model = X_test.loc[:, selected_columns]
             X_val_model = X_val.loc[:, selected_columns] if X_val is not None else None
+
+            fold_feature_metadata = filter_feature_metadata(
+                pipeline.state.get("feature_metadata") or derive_feature_metadata(fold_feature_blocks, columns=selected_columns),
+                selected_columns,
+            )
+            feature_admission = evaluate_feature_admission(
+                X_fit_model,
+                y_fit,
+                feature_metadata=fold_feature_metadata,
+                regime_data=regime_frame.reindex(X_fit_model.index) if not regime_frame.empty else None,
+                config=pipeline.section("feature_governance"),
+                candidate_order=selected_columns,
+            )
+            admitted_columns = [column for column in feature_admission.get("admitted_columns", []) if column in X_fit_model.columns]
+            if admitted_columns:
+                selected_columns = admitted_columns
+                family_summary = summarize_feature_families(fold_feature_blocks, columns=selected_columns)
+                X_fit_model = X_fit.loc[:, selected_columns]
+                X_test_model = X_test.loc[:, selected_columns]
+                X_val_model = X_val.loc[:, selected_columns] if X_val is not None else None
+                fold_feature_metadata = filter_feature_metadata(feature_admission.get("feature_metadata", {}), selected_columns)
+
+            fold_feature_governance.append(
+                {
+                    "fold": fold,
+                    "split_id": split_id,
+                    "summary": feature_admission.get("summary", {}),
+                    "admitted_columns": list(feature_admission.get("admitted_columns", [])),
+                    "training_columns": list(selected_columns),
+                    "rejected_columns": list(feature_admission.get("rejected_columns", [])),
+                    "retired_columns": list(feature_admission.get("retired_columns", [])),
+                }
+            )
 
             fold_feature_selection.append(
                 {
@@ -2923,6 +3027,10 @@ class TrainModelsStep(PipelineStep):
             family_diagnostics=feature_family_diagnostics,
             config=pipeline.section("feature_governance"),
         )
+        feature_admission_summary = summarize_feature_admission_reports(fold_feature_governance)
+        regime_ablation_summary = summarize_regime_ablation_reports(
+            [row.get("ablation") for row in fold_regime]
+        )
         fold_stability = _build_fold_stability_summary(
             fold_metrics,
             fold_backtests,
@@ -3008,11 +3116,22 @@ class TrainModelsStep(PipelineStep):
             "feature_block_diagnostics": feature_diagnostics,
             "feature_family_diagnostics": feature_family_diagnostics,
             "feature_portability_diagnostics": feature_portability_diagnostics,
+            "feature_governance": {
+                "mode": "fold_local",
+                "retirement": pipeline.state.get("feature_retirement", {}),
+                "admission_summary": feature_admission_summary,
+                "folds": fold_feature_governance,
+            },
             "promotion_gates": {
                 "feature_portability": bool(feature_portability_diagnostics.get("promotion_pass", True)),
+                "feature_admission": bool(feature_admission_summary.get("promotion_pass", True)),
+                "regime_stability": bool(regime_ablation_summary.get("promotion_pass", True)),
             },
             "regime": {
                 "mode": "fold_local",
+                "preview_provenance": pipeline.state.get("regime_provenance"),
+                "preview_ablation": pipeline.state.get("regime_ablation"),
+                "ablation_summary": regime_ablation_summary,
                 "folds": fold_regime,
             },
             "stationarity": {
