@@ -260,8 +260,10 @@ def _build_state_bundle(base_pipeline):
     }
 
 
-def _build_temporal_state_bundle(full_state_bundle, end_timestamp=None):
+def _build_window_state_bundle(full_state_bundle, start_timestamp=None, end_timestamp=None):
     raw_data = pd.DataFrame(full_state_bundle["raw_data"], copy=True)
+    if start_timestamp is not None:
+        raw_data = raw_data.loc[raw_data.index >= start_timestamp].copy()
     if end_timestamp is not None:
         raw_data = raw_data.loc[raw_data.index <= end_timestamp].copy()
 
@@ -269,21 +271,46 @@ def _build_temporal_state_bundle(full_state_bundle, end_timestamp=None):
     return {
         "raw_data": raw_data,
         "data": full_state_bundle["data"].reindex(slice_index).copy(),
-        "indicator_run": full_state_bundle.get("indicator_run"),
-        "futures_context": _slice_temporal_value(full_state_bundle.get("futures_context"), end_timestamp=end_timestamp),
+        "indicator_run": _slice_temporal_value(
+            full_state_bundle.get("indicator_run"),
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        ),
+        "futures_context": _slice_temporal_value(
+            full_state_bundle.get("futures_context"),
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        ),
         "cross_asset_context": _slice_temporal_value(
             full_state_bundle.get("cross_asset_context"),
+            start_timestamp=start_timestamp,
             end_timestamp=end_timestamp,
         ),
         "data_lineage": copy.deepcopy(full_state_bundle.get("data_lineage")),
         "symbol_filters": copy.deepcopy(full_state_bundle.get("symbol_filters")),
-        "symbol_lifecycle": _slice_temporal_value(full_state_bundle.get("symbol_lifecycle"), end_timestamp=end_timestamp),
+        "symbol_lifecycle": _slice_temporal_value(
+            full_state_bundle.get("symbol_lifecycle"),
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        ),
         "universe_policy": copy.deepcopy(full_state_bundle.get("universe_policy")),
-        "universe_snapshot": _slice_temporal_value(full_state_bundle.get("universe_snapshot"), end_timestamp=end_timestamp),
+        "universe_snapshot": _slice_temporal_value(
+            full_state_bundle.get("universe_snapshot"),
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        ),
         "universe_snapshot_meta": copy.deepcopy(full_state_bundle.get("universe_snapshot_meta")),
         "eligible_symbols": copy.deepcopy(full_state_bundle.get("eligible_symbols")),
-        "universe_report": _slice_temporal_value(full_state_bundle.get("universe_report"), end_timestamp=end_timestamp),
+        "universe_report": _slice_temporal_value(
+            full_state_bundle.get("universe_report"),
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        ),
     }
+
+
+def _build_temporal_state_bundle(full_state_bundle, end_timestamp=None):
+    return _build_window_state_bundle(full_state_bundle, end_timestamp=end_timestamp)
 
 
 def _resolve_stage_gap_defaults(base_config, automl_config):
@@ -313,8 +340,11 @@ def _resolve_stage_gap_defaults(base_config, automl_config):
     if signal_delay is None:
         signal_delay = 2 if backtest_config.get("use_open_execution", True) else 1
     signal_delay = max(0, int(signal_delay))
+    execution_policy = dict(backtest_config.get("execution_policy") or {})
+    action_latency_bars = execution_policy.get("action_latency_bars", backtest_config.get("action_latency_bars", 0))
+    action_latency_bars = max(0, int(action_latency_bars or 0))
 
-    default_gap = max(label_gap, signal_delay, configured_embargo)
+    default_gap = max(label_gap, signal_delay + action_latency_bars, configured_embargo)
     search_validation_gap = automl_config.get("search_validation_gap_bars")
     validation_holdout_gap = automl_config.get("validation_holdout_gap_bars")
     return {
@@ -323,6 +353,7 @@ def _resolve_stage_gap_defaults(base_config, automl_config):
         "validation_holdout_gap_bars": max(0, int(default_gap if validation_holdout_gap is None else validation_holdout_gap)),
         "label_gap_bars": int(label_gap),
         "signal_delay_bars": int(signal_delay),
+        "action_latency_bars": int(action_latency_bars),
         "configured_embargo_bars": int(configured_embargo),
     }
 
@@ -517,6 +548,7 @@ def _summarize_training(training):
     feature_governance = training.get("feature_governance") or {}
     operational_monitoring = training.get("operational_monitoring") or {}
     cross_venue_integrity = training.get("cross_venue_integrity") or {}
+    signal_decay = training.get("signal_decay") or {}
     return {
         "avg_accuracy": training.get("avg_accuracy"),
         "avg_f1_macro": training.get("avg_f1_macro"),
@@ -558,6 +590,7 @@ def _summarize_training(training):
             "divergence": cross_venue_integrity.get("divergence", {}),
             "overlay_columns": list(cross_venue_integrity.get("overlay_columns", [])),
         },
+        "signal_decay": signal_decay,
         "promotion_gates": training.get("promotion_gates", {}),
         "fold_stability": training.get("fold_stability"),
         "fold_count": len(training.get("fold_metrics", [])),
@@ -576,12 +609,20 @@ def _summarize_backtest(backtest):
         "total_trades",
         "win_rate",
         "ending_equity",
+        "fill_ratio",
+        "cancelled_orders",
+        "unfilled_notional",
+        "average_action_delay_bars",
+        "average_fill_delay_bars",
+        "max_fill_delay_bars",
     ]
     summary = {key: backtest.get(key) for key in keys}
     equity_curve = backtest.get("equity_curve")
     summary["bar_count"] = int(len(equity_curve)) if isinstance(equity_curve, pd.Series) else None
     if backtest.get("statistical_significance") is not None:
         summary["statistical_significance"] = backtest.get("statistical_significance")
+    if backtest.get("signal_decay") is not None:
+        summary["signal_decay"] = backtest.get("signal_decay")
     return summary
 
 
@@ -852,6 +893,379 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
     report["raw_objective_value"] = float(report["objective_diagnostics"]["final_score"])
     sharpe_ci_lower = _extract_sharpe_ci_lower(report["backtest"])
     report["holdout_warning"] = bool(sharpe_ci_lower is not None and sharpe_ci_lower < 0.0)
+    return report
+
+
+def _resolve_replication_config(base_config, automl_config=None, base_pipeline=None):
+    config = copy.deepcopy((automl_config or {}).get("replication") or {})
+    include_symbol_cohorts = bool(config.get("include_symbol_cohorts", True))
+    include_window_cohorts = bool(config.get("include_window_cohorts", True))
+    include_regime_slices = bool(config.get("include_regime_slices", False))
+
+    primary_symbol = str((base_config.get("data") or {}).get("symbol", "unknown"))
+    timeframe = str((base_config.get("data") or {}).get("interval", "unknown"))
+
+    symbols = [str(symbol) for symbol in (config.get("symbols") or []) if symbol is not None]
+    if not symbols and base_pipeline is not None and include_symbol_cohorts:
+        cross_asset_context = base_pipeline.state.get("cross_asset_context") or {}
+        symbols = [str(symbol) for symbol in cross_asset_context.keys()]
+
+    eligible_symbols = {str(symbol) for symbol in ((base_pipeline.state.get("eligible_symbols") or []) if base_pipeline is not None else [])}
+    if eligible_symbols:
+        symbols = [symbol for symbol in symbols if symbol in eligible_symbols]
+    symbols = [symbol for symbol in symbols if symbol != primary_symbol]
+
+    max_symbol_cohorts = int(config.get("max_symbol_cohorts", len(symbols) if symbols else 0))
+    if max_symbol_cohorts >= 0:
+        symbols = symbols[:max_symbol_cohorts]
+
+    requested_defaults = int(include_symbol_cohorts) + int(include_window_cohorts)
+    return {
+        "enabled": bool(config.get("enabled", False)),
+        "metric": _normalize_objective_name(config.get("metric", "risk_adjusted_after_costs")),
+        "min_score": float(config.get("min_score", 0.0)),
+        "min_coverage": int(config.get("min_coverage", max(requested_defaults, 1) if requested_defaults else 1)),
+        "min_pass_rate": float(config.get("min_pass_rate", 0.6)),
+        "min_rows": int(config.get("min_rows", 64)),
+        "symbols": symbols,
+        "include_symbol_cohorts": include_symbol_cohorts,
+        "include_window_cohorts": include_window_cohorts,
+        "include_regime_slices": include_regime_slices,
+        "alternate_window_count": int(config.get("alternate_window_count", 1)),
+        "alternate_window_fraction": float(config.get("alternate_window_fraction", 0.5)),
+        "periods": copy.deepcopy(config.get("periods") or config.get("time_windows") or []),
+        "primary_symbol": primary_symbol,
+        "timeframe": timeframe,
+    }
+
+
+def _build_symbol_replication_state_bundle(full_state_bundle, symbol, start_timestamp=None, end_timestamp=None):
+    cross_asset_context = dict(full_state_bundle.get("cross_asset_context") or {})
+    symbol_frame = cross_asset_context.get(symbol)
+    if not isinstance(symbol_frame, pd.DataFrame) or symbol_frame.empty:
+        return None
+
+    raw_data = pd.DataFrame(symbol_frame, copy=True)
+    if start_timestamp is not None:
+        raw_data = raw_data.loc[raw_data.index >= start_timestamp].copy()
+    if end_timestamp is not None:
+        raw_data = raw_data.loc[raw_data.index <= end_timestamp].copy()
+    if raw_data.empty:
+        return None
+
+    return {
+        "raw_data": raw_data,
+        "data": raw_data.copy(),
+        "indicator_run": None,
+        "futures_context": None,
+        "cross_asset_context": {
+            key: _slice_temporal_value(value, start_timestamp=start_timestamp, end_timestamp=end_timestamp)
+            for key, value in cross_asset_context.items()
+            if str(key) != str(symbol)
+        },
+        "data_lineage": copy.deepcopy(full_state_bundle.get("data_lineage")),
+        "symbol_filters": {},
+        "symbol_lifecycle": _slice_temporal_value(
+            full_state_bundle.get("symbol_lifecycle"),
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        ),
+        "universe_policy": copy.deepcopy(full_state_bundle.get("universe_policy")),
+        "universe_snapshot": _slice_temporal_value(
+            full_state_bundle.get("universe_snapshot"),
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        ),
+        "universe_snapshot_meta": copy.deepcopy(full_state_bundle.get("universe_snapshot_meta")),
+        "eligible_symbols": copy.deepcopy(full_state_bundle.get("eligible_symbols")),
+        "universe_report": _slice_temporal_value(
+            full_state_bundle.get("universe_report"),
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        ),
+    }
+
+
+def _build_generated_replication_periods(raw_index, replication_config, holdout_plan):
+    explicit_periods = list(replication_config.get("periods") or [])
+    if explicit_periods:
+        periods = []
+        for position, period in enumerate(explicit_periods, start=1):
+            start_timestamp = period.get("start_timestamp", period.get("start"))
+            end_timestamp = period.get("end_timestamp", period.get("end"))
+            if start_timestamp is not None:
+                start_timestamp = pd.Timestamp(start_timestamp)
+            if end_timestamp is not None:
+                end_timestamp = pd.Timestamp(end_timestamp)
+            if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
+                continue
+            periods.append(
+                {
+                    "cohort_id": f"period:{position}",
+                    "kind": "period",
+                    "label": str(period.get("label") or f"period_{position}"),
+                    "start_timestamp": start_timestamp,
+                    "end_timestamp": end_timestamp,
+                }
+            )
+        return periods
+
+    candidate_index = pd.DatetimeIndex(raw_index)
+    search_end_timestamp = holdout_plan.get("search_end_timestamp") if holdout_plan else None
+    if search_end_timestamp is not None:
+        candidate_index = candidate_index[candidate_index <= pd.Timestamp(search_end_timestamp)]
+
+    min_rows = int(replication_config.get("min_rows", 0))
+    window_count = max(0, int(replication_config.get("alternate_window_count", 0)))
+    if window_count <= 0 or len(candidate_index) < max(2, min_rows):
+        return []
+
+    window_fraction = float(replication_config.get("alternate_window_fraction", 0.5))
+    window_fraction = min(max(window_fraction, 0.05), 1.0)
+    window_size = int(round(len(candidate_index) * window_fraction))
+    window_size = max(window_size, min_rows)
+    if window_size >= len(candidate_index):
+        return []
+
+    available_start = len(candidate_index) - window_size
+    if available_start <= 0:
+        return []
+
+    if window_count == 1:
+        start_positions = [0]
+    else:
+        step = max(1, available_start // max(window_count - 1, 1))
+        start_positions = sorted({min(available_start, step * position) for position in range(window_count)})
+
+    periods = []
+    for position, start_location in enumerate(start_positions, start=1):
+        end_location = start_location + window_size - 1
+        periods.append(
+            {
+                "cohort_id": f"period:{position}",
+                "kind": "period",
+                "label": f"period_{position}",
+                "start_timestamp": candidate_index[start_location],
+                "end_timestamp": candidate_index[end_location],
+            }
+        )
+    return periods
+
+
+def _build_replication_cohort_specs(base_config, full_state_bundle, holdout_plan, replication_config):
+    timeframe = str((base_config.get("data") or {}).get("interval", "unknown"))
+    cohort_specs = []
+
+    if replication_config.get("include_symbol_cohorts", True):
+        for symbol in replication_config.get("symbols") or []:
+            state_bundle = _build_symbol_replication_state_bundle(full_state_bundle, symbol)
+            cohort_specs.append(
+                {
+                    "cohort_id": f"symbol:{symbol}",
+                    "kind": "symbol",
+                    "label": symbol,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "state_bundle": state_bundle,
+                    "config_overrides": {"data": {"symbol": symbol}},
+                }
+            )
+
+    if replication_config.get("include_window_cohorts", True):
+        for period in _build_generated_replication_periods(
+            full_state_bundle["raw_data"].index,
+            replication_config,
+            holdout_plan,
+        ):
+            state_bundle = _build_window_state_bundle(
+                full_state_bundle,
+                start_timestamp=period.get("start_timestamp"),
+                end_timestamp=period.get("end_timestamp"),
+            )
+            cohort_specs.append(
+                {
+                    "cohort_id": period["cohort_id"],
+                    "kind": period["kind"],
+                    "label": period["label"],
+                    "symbol": replication_config.get("primary_symbol"),
+                    "timeframe": timeframe,
+                    "start_timestamp": period.get("start_timestamp"),
+                    "end_timestamp": period.get("end_timestamp"),
+                    "state_bundle": state_bundle,
+                    "config_overrides": {},
+                }
+            )
+
+    return cohort_specs
+
+
+def _evaluate_replication_cohorts(
+    base_config,
+    best_overrides,
+    pipeline_class,
+    trial_step_classes,
+    full_state_bundle,
+    holdout_plan,
+    base_pipeline=None,
+):
+    automl_config = base_config.get("automl", {}) or {}
+    replication_config = _resolve_replication_config(
+        base_config,
+        automl_config,
+        base_pipeline=base_pipeline,
+    )
+    report = {
+        "enabled": bool(replication_config.get("enabled", False)),
+        "kind": "replication",
+        "metric": replication_config.get("metric"),
+        "primary_symbol": replication_config.get("primary_symbol"),
+        "timeframe": replication_config.get("timeframe"),
+        "min_score": float(replication_config.get("min_score", 0.0)),
+        "min_coverage": int(replication_config.get("min_coverage", 0)),
+        "min_pass_rate": float(replication_config.get("min_pass_rate", 0.0)),
+        "min_rows": int(replication_config.get("min_rows", 0)),
+        "include_symbol_cohorts": bool(replication_config.get("include_symbol_cohorts", True)),
+        "include_window_cohorts": bool(replication_config.get("include_window_cohorts", True)),
+        "include_regime_slices": bool(replication_config.get("include_regime_slices", False)),
+        "requested_cohort_count": 0,
+        "completed_cohort_count": 0,
+        "coverage_ratio": None,
+        "pass_count": 0,
+        "pass_rate": None,
+        "median_score": None,
+        "tail_score": None,
+        "median_net_profit_pct": None,
+        "promotion_pass": True,
+        "gate_mode": "disabled",
+        "reasons": [],
+        "warnings": [],
+        "cohorts": [],
+        "summary_by_kind": {},
+    }
+    if not report["enabled"]:
+        return report
+
+    cohort_specs = _build_replication_cohort_specs(
+        base_config,
+        full_state_bundle,
+        holdout_plan,
+        replication_config,
+    )
+    report["requested_cohort_count"] = int(len(cohort_specs))
+    if not cohort_specs:
+        report["promotion_pass"] = bool(report["min_coverage"] <= 0)
+        report["warnings"].append("replication_cohorts_unavailable")
+        if report["min_coverage"] > 0:
+            report["reasons"].append("replication_coverage_below_minimum")
+        return report
+
+    objective_name = replication_config.get("metric")
+    min_score = float(replication_config.get("min_score", 0.0))
+    min_rows = int(replication_config.get("min_rows", 0))
+
+    for spec in cohort_specs:
+        state_bundle = spec.get("state_bundle")
+        cohort_row = {
+            "cohort_id": spec.get("cohort_id"),
+            "kind": spec.get("kind"),
+            "label": spec.get("label"),
+            "symbol": spec.get("symbol"),
+            "timeframe": spec.get("timeframe"),
+            "start_timestamp": _json_ready(spec.get("start_timestamp")),
+            "end_timestamp": _json_ready(spec.get("end_timestamp")),
+            "row_count": 0,
+            "completed": False,
+            "passed": False,
+            "score": None,
+            "net_profit_pct": None,
+            "total_trades": None,
+            "reason": None,
+        }
+
+        if state_bundle is None:
+            cohort_row["reason"] = "cohort_data_unavailable"
+            report["cohorts"].append(cohort_row)
+            continue
+
+        raw_data = state_bundle.get("raw_data")
+        row_count = int(len(raw_data)) if raw_data is not None else 0
+        cohort_row["row_count"] = row_count
+        if row_count < min_rows:
+            cohort_row["reason"] = "replication_min_rows_not_met"
+            report["cohorts"].append(cohort_row)
+            continue
+
+        overrides = copy.deepcopy(best_overrides or {})
+        _deep_merge(overrides, copy.deepcopy(spec.get("config_overrides") or {}))
+        try:
+            training, backtest = _execute_trial_candidate(
+                base_config,
+                overrides,
+                pipeline_class,
+                trial_step_classes,
+                state_bundle,
+            )
+            evaluation = _build_evaluation_record(
+                training,
+                backtest,
+                objective_name,
+                automl_config,
+            )
+        except RuntimeError as exc:
+            cohort_row["reason"] = str(exc)
+            report["cohorts"].append(cohort_row)
+            continue
+
+        score = _coerce_float(evaluation.get("raw_objective_value"))
+        backtest_summary = evaluation.get("backtest") or {}
+        cohort_row["completed"] = True
+        cohort_row["score"] = score
+        cohort_row["net_profit_pct"] = _coerce_float(backtest_summary.get("net_profit_pct"))
+        cohort_row["total_trades"] = int(backtest_summary.get("total_trades") or 0)
+        cohort_row["passed"] = bool(score is not None and score >= min_score)
+        report["cohorts"].append(cohort_row)
+
+    requested = int(len(report["cohorts"]))
+    completed = [cohort for cohort in report["cohorts"] if cohort.get("completed")]
+    completed_count = int(len(completed))
+    pass_count = int(sum(1 for cohort in completed if cohort.get("passed")))
+    scores = [float(cohort["score"]) for cohort in completed if cohort.get("score") is not None]
+    net_profit_values = [
+        float(cohort["net_profit_pct"])
+        for cohort in completed
+        if cohort.get("net_profit_pct") is not None
+    ]
+
+    report["completed_cohort_count"] = completed_count
+    report["coverage_ratio"] = (float(completed_count) / float(requested)) if requested > 0 else None
+    report["pass_count"] = pass_count
+    report["pass_rate"] = (float(pass_count) / float(completed_count)) if completed_count > 0 else None
+    report["median_score"] = float(np.median(scores)) if scores else None
+    report["tail_score"] = float(min(scores)) if scores else None
+    report["median_net_profit_pct"] = float(np.median(net_profit_values)) if net_profit_values else None
+
+    summary_by_kind = {}
+    for kind in sorted({str(cohort.get("kind")) for cohort in report["cohorts"]}):
+        kind_rows = [cohort for cohort in report["cohorts"] if str(cohort.get("kind")) == kind]
+        kind_completed = [cohort for cohort in kind_rows if cohort.get("completed")]
+        kind_passed = [cohort for cohort in kind_completed if cohort.get("passed")]
+        summary_by_kind[kind] = {
+            "requested": int(len(kind_rows)),
+            "completed": int(len(kind_completed)),
+            "passed": int(len(kind_passed)),
+            "pass_rate": (float(len(kind_passed)) / float(len(kind_completed))) if kind_completed else None,
+        }
+    report["summary_by_kind"] = summary_by_kind
+
+    coverage_pass = bool(completed_count >= report["min_coverage"])
+    pass_rate_pass = bool(report["pass_rate"] is not None and report["pass_rate"] >= report["min_pass_rate"])
+    report["promotion_pass"] = bool(coverage_pass and pass_rate_pass)
+    if not coverage_pass:
+        report["reasons"].append("replication_coverage_below_minimum")
+    if completed_count > 0 and not pass_rate_pass:
+        report["reasons"].append("replication_pass_rate_below_minimum")
+    if completed_count == 0:
+        report["reasons"].append("replication_coverage_below_minimum")
     return report
 
 
@@ -1881,6 +2295,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         feature_admission_summary = dict((training_summary.get("feature_governance") or {}).get("admission_summary") or {})
         feature_portability_diagnostics = dict(training_summary.get("feature_portability_diagnostics") or {})
         cross_venue_integrity = dict(training_summary.get("cross_venue_integrity") or {})
+        signal_decay = dict(training_summary.get("signal_decay") or {})
         regime_ablation_summary = dict((training_summary.get("regime") or {}).get("ablation_summary") or {})
         operational_monitoring = dict(training_summary.get("operational_monitoring") or {})
         feature_portability_pass = bool(promotion_gates.get("feature_portability", True))
@@ -1888,6 +2303,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         regime_stability_pass = bool(promotion_gates.get("regime_stability", True))
         operational_health_pass = bool(promotion_gates.get("operational_health", True))
         cross_venue_integrity_pass = bool(promotion_gates.get("cross_venue_integrity", True))
+        signal_decay_pass = bool(promotion_gates.get("signal_decay", signal_decay.get("promotion_pass", True)))
 
         eligibility_checks = {
             "minimum_dsr": bool(meets_minimum_dsr_threshold or not dsr_gate_applies),
@@ -1915,6 +2331,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "regime_stability": regime_stability_pass,
             "operational_health": operational_health_pass,
             "cross_venue_integrity": cross_venue_integrity_pass,
+            "signal_decay": signal_decay_pass,
             "fold_stability": bool(fold_stability_gate["passed"] or not fold_stability_gate["applies"]),
             "param_fragility": None,
             "locked_holdout": None,
@@ -2030,6 +2447,14 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 "threshold": True,
                 "reason": None if eligibility_checks["cross_venue_integrity"] else _first_failure_reason(cross_venue_integrity, "cross_venue_integrity_failed"),
                 "details": cross_venue_integrity,
+            },
+            {
+                "name": "signal_decay",
+                "passed": eligibility_checks["signal_decay"],
+                "measured": signal_decay.get("net_edge_at_effective_delay"),
+                "threshold": signal_decay.get("policy"),
+                "reason": None if eligibility_checks["signal_decay"] else _first_failure_reason(signal_decay, "signal_decay_failed"),
+                "details": signal_decay,
             },
             {
                 "name": "fold_stability",
@@ -2846,7 +3271,19 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         best_trial_report,
         locked_holdout,
     )
+    replication_report = _evaluate_replication_cohorts(
+        base_config=base_config,
+        best_overrides=best_overrides,
+        pipeline_class=pipeline_class,
+        trial_step_classes=trial_step_classes,
+        full_state_bundle=full_state_bundle,
+        holdout_plan=holdout_plan,
+        base_pipeline=base_pipeline,
+    )
+    replication_report["gate_mode"] = resolve_promotion_gate_mode(selection_policy, "replication")
+    replication_report = _json_ready(replication_report)
     best_trial_report["locked_holdout"] = locked_holdout
+    best_trial_report["replication"] = replication_report
     best_trial_report["generalization_gap"]["validation_to_locked_holdout"] = post_selection_holdout["generalization_gap"]
     best_trial_report["selection_policy"]["eligibility_checks"]["locked_holdout"] = post_selection_holdout[
         "locked_holdout_pass"
@@ -2891,6 +3328,22 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         reason=None if post_selection_holdout["locked_holdout_gap_pass"] else "validation_holdout_gap_above_limit",
         details=post_selection_holdout["generalization_gap"],
     )
+    if replication_report.get("enabled"):
+        promotion_eligibility_report = upsert_promotion_gate(
+            promotion_eligibility_report,
+            group="post_selection",
+            name="replication",
+            passed=bool(replication_report.get("promotion_pass", True)),
+            mode=replication_report.get("gate_mode"),
+            measured=replication_report.get("pass_rate"),
+            threshold={
+                "min_coverage": replication_report.get("min_coverage"),
+                "min_pass_rate": replication_report.get("min_pass_rate"),
+                "min_score": replication_report.get("min_score"),
+            },
+            reason=None if replication_report.get("promotion_pass", True) else _first_failure_reason(replication_report, "replication_failed"),
+            details=replication_report,
+        )
     best_trial_report["selection_policy"] = _update_selection_policy_report(
         best_trial_report["selection_policy"],
         promotion_eligibility_report,
@@ -2902,6 +3355,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     selection_report["diagnostics"]["holdout_evaluated_after_freeze"] = bool(
         locked_holdout.get("evaluated_after_freeze", False)
     )
+    selection_report["diagnostics"]["replication"] = replication_report
     selection_report["diagnostics"]["promotion_ready"] = bool(best_trial_report["selection_policy"]["promotion_ready"])
     selection_report["diagnostics"]["promotion_reasons"] = list(best_trial_report["selection_policy"]["promotion_reasons"])
 
@@ -2928,6 +3382,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 "param_fragility": report.get("param_fragility"),
                 "selection_policy": report.get("selection_policy"),
                 "locked_holdout": report.get("locked_holdout"),
+                "replication": report.get("replication"),
                 "overfitting": report["overfitting"],
             }
         )
@@ -2960,12 +3415,14 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             "generalization_gap": best_trial_report.get("generalization_gap"),
             "param_fragility_score": best_trial_report.get("param_fragility_score"),
             "param_fragility": best_trial_report.get("param_fragility"),
+            "replication": best_trial_report.get("replication"),
             "selection_policy": best_trial_report.get("selection_policy"),
             "promotion_eligibility_report": best_trial_report.get("selection_policy", {}).get("promotion_eligibility_report"),
         },
         "selection_freeze": selection_snapshot,
         "validation_holdout": validation_holdout,
         "locked_holdout": locked_holdout,
+        "replication": best_trial_report.get("replication"),
         "promotion_ready": bool(best_trial_report["selection_policy"]["promotion_ready"]),
         "promotion_reasons": list(best_trial_report["selection_policy"]["promotion_reasons"]),
         "promotion_eligibility_report": best_trial_report.get("selection_policy", {}).get("promotion_eligibility_report"),
@@ -3000,6 +3457,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             training_summary=_json_ready(_summarize_training(best_training)),
             validation_summary=_json_ready(best_trial_report.get("validation_metrics") or {}),
             locked_holdout=_json_ready(locked_holdout),
+            replication=_json_ready(best_trial_report.get("replication") or {}),
             promotion_eligibility_report=_json_ready(
                 best_trial_report.get("selection_policy", {}).get("promotion_eligibility_report") or {}
             ),

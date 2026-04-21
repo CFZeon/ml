@@ -96,6 +96,54 @@ def _safe_ratio(numerator, denominator, default=0.0):
     return numerator / denominator
 
 
+def _apply_action_latency(requested_position, action_latency_bars):
+    requested = pd.Series(requested_position, copy=False).astype(float)
+    request_timestamps = pd.Series(requested.index, index=requested.index, dtype=object)
+    latency = max(0, int(action_latency_bars))
+    if latency <= 0:
+        return requested, request_timestamps
+    return requested.shift(latency).fillna(0.0), request_timestamps.shift(latency)
+
+
+def _summarize_execution_delay_metrics(order_intents, order_ledger, index):
+    if order_intents is None or order_intents.empty:
+        return {
+            "average_action_delay_bars": 0.0,
+            "average_fill_delay_bars": 0.0,
+            "max_fill_delay_bars": 0,
+        }
+
+    index_lookup = {timestamp: loc for loc, timestamp in enumerate(pd.DatetimeIndex(index))}
+
+    def _delay_bars(later, earlier):
+        later_loc = index_lookup.get(pd.Timestamp(later)) if later is not None and pd.notna(later) else None
+        earlier_loc = index_lookup.get(pd.Timestamp(earlier)) if earlier is not None and pd.notna(earlier) else None
+        if later_loc is None or earlier_loc is None:
+            return None
+        return max(0, int(later_loc - earlier_loc))
+
+    action_delays = [
+        _delay_bars(row.get("timestamp"), row.get("request_timestamp"))
+        for _, row in order_intents.iterrows()
+    ]
+    action_delays = [delay for delay in action_delays if delay is not None]
+
+    fill_delays = []
+    if order_ledger is not None and not order_ledger.empty:
+        for _, row in order_ledger.iterrows():
+            if float(row.get("executed_notional", 0.0) or 0.0) <= 0.0:
+                continue
+            delay = _delay_bars(row.get("timestamp"), row.get("request_timestamp"))
+            if delay is not None:
+                fill_delays.append(delay)
+
+    return {
+        "average_action_delay_bars": float(np.mean(action_delays)) if action_delays else 0.0,
+        "average_fill_delay_bars": float(np.mean(fill_delays)) if fill_delays else 0.0,
+        "max_fill_delay_bars": int(max(fill_delays)) if fill_delays else 0,
+    }
+
+
 def _round_down_to_step(values, step):
     if step is None or step <= 0:
         return values
@@ -391,6 +439,12 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                               execution_policy=None, scenario_schedule=None,
                               scenario_policy=None):
     policy = resolve_execution_policy(execution_policy)
+    effective_order_type = "market" if policy.order_type in {"market", "aggressive"} else policy.order_type
+    if effective_order_type != "market":
+        raise ValueError(
+            "Passive or limit order types are not yet supported in the default bar execution engine; "
+            "Phase 5 is restricted to market/aggressive execution."
+        )
     if policy.adapter == "legacy":
         report = _build_legacy_execution_contract(
             close,
@@ -417,6 +471,10 @@ def _build_execution_contract(close, requested_position, equity, execution_price
     raw_execution = execution_prices if execution_prices is not None else close
     execution_series = pd.Series(raw_execution, index=valuation_series.index).reindex(valuation_series.index).astype(float)
     requested_position = pd.Series(requested_position, index=valuation_series.index).reindex(valuation_series.index).fillna(0.0).astype(float)
+    requested_position, request_timestamps = _apply_action_latency(
+        requested_position,
+        policy.action_latency_bars,
+    )
     if volume is None:
         volume_series = pd.Series(np.nan, index=valuation_series.index, dtype=float)
     else:
@@ -482,6 +540,8 @@ def _build_execution_contract(close, requested_position, equity, execution_price
             available_quantity = np.inf
 
         desired_position = float(requested_position.loc[timestamp])
+        request_timestamp = request_timestamps.loc[timestamp]
+        request_bar = bar_loc if pd.isna(request_timestamp) else max(0, valuation_series.index.get_loc(pd.Timestamp(request_timestamp)))
 
         if pending_order is not None:
             pending_age = bar_loc - int(pending_order["submit_bar"])
@@ -499,6 +559,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                         "requested_notional": remaining_notional,
                         "executed_notional": 0.0,
                         "execution_price": execution_price,
+                        "request_timestamp": pending_order.get("request_timestamp"),
                         "status": "cancelled",
                         "reason": "cancel_replace",
                         "adjustment_reasons": [],
@@ -511,7 +572,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
             fill_quantity = min(float(pending_order["remaining_quantity"]), available_quantity)
             validation = _validate_order_intent(
                 side=pending_order["side"],
-                order_type=policy.order_type,
+                order_type=effective_order_type,
                 price=execution_price,
                 quantity=fill_quantity,
                 current_quantity=current_quantity,
@@ -532,6 +593,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                         "requested_notional": float(fill_quantity * execution_price),
                         "executed_notional": 0.0,
                         "execution_price": execution_price,
+                        "request_timestamp": pending_order.get("request_timestamp"),
                         "status": "rejected",
                         "reason": validation["reason"],
                         "adjustment_reasons": validation.get("adjustment_reasons", []),
@@ -562,6 +624,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                         "requested_notional": float(fill_quantity * execution_price),
                         "executed_notional": executed_notional,
                         "execution_price": execution_price,
+                        "request_timestamp": pending_order.get("request_timestamp"),
                         "status": "partial_fill" if pending_order["remaining_quantity"] > tolerance else "accepted",
                         "reason": validation["reason"],
                         "adjustment_reasons": validation.get("adjustment_reasons", []),
@@ -583,6 +646,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                             "requested_notional": float(pending_order["remaining_quantity"] * execution_price),
                             "executed_notional": 0.0,
                             "execution_price": execution_price,
+                            "request_timestamp": pending_order.get("request_timestamp"),
                             "status": "cancelled",
                             "reason": "max_order_age",
                             "adjustment_reasons": [],
@@ -605,6 +669,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                         "requested_notional": float(pending_order["remaining_quantity"] * execution_price),
                         "executed_notional": 0.0,
                         "execution_price": execution_price,
+                        "request_timestamp": pending_order.get("request_timestamp"),
                         "status": "cancelled",
                         "reason": "max_order_age",
                         "adjustment_reasons": [],
@@ -621,8 +686,9 @@ def _build_execution_contract(close, requested_position, equity, execution_price
             if requested_order_quantity > tolerance:
                 intent = OrderIntent(
                     timestamp=timestamp,
+                    request_timestamp=None if pd.isna(request_timestamp) else pd.Timestamp(request_timestamp),
                     side=side,
-                    order_type=policy.order_type,
+                    order_type=effective_order_type,
                     time_in_force=policy.time_in_force,
                     requested_position=desired_position,
                     previous_position=float(current_position),
@@ -631,13 +697,14 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                     execution_price=float(execution_price),
                     participation_cap=float(policy.participation_cap),
                     min_fill_ratio=float(policy.min_fill_ratio),
+                    action_latency_bars=int(policy.action_latency_bars),
                     max_order_age_bars=int(policy.max_order_age_bars),
                     cancel_replace_bars=int(policy.cancel_replace_bars),
                 )
                 intent_rows.append(intent.to_dict())
                 validation = _validate_order_intent(
                     side=side,
-                    order_type=policy.order_type,
+                    order_type=effective_order_type,
                     price=execution_price,
                     quantity=requested_order_quantity,
                     current_quantity=current_quantity,
@@ -659,6 +726,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                             "requested_notional": float(requested_notional),
                             "executed_notional": 0.0,
                             "execution_price": execution_price,
+                            "request_timestamp": None if pd.isna(request_timestamp) else pd.Timestamp(request_timestamp),
                             "status": "rejected",
                             "reason": validation["reason"],
                             "adjustment_reasons": validation.get("adjustment_reasons", []),
@@ -681,6 +749,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                                 "requested_notional": float(validated_quantity * execution_price),
                                 "executed_notional": 0.0,
                                 "execution_price": execution_price,
+                                "request_timestamp": None if pd.isna(request_timestamp) else pd.Timestamp(request_timestamp),
                                 "status": "cancelled",
                                 "reason": "min_fill_ratio",
                                 "adjustment_reasons": validation.get("adjustment_reasons", []),
@@ -712,6 +781,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                                 "requested_notional": float(validated_quantity * execution_price),
                                 "executed_notional": float(executed_notional),
                                 "execution_price": execution_price,
+                                "request_timestamp": None if pd.isna(request_timestamp) else pd.Timestamp(request_timestamp),
                                 "status": "partial_fill" if remaining_quantity > tolerance else base_status,
                                 "reason": validation["reason"],
                                 "adjustment_reasons": validation.get("adjustment_reasons", []),
@@ -731,6 +801,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                                         "requested_notional": float(remaining_quantity * execution_price),
                                         "executed_notional": 0.0,
                                         "execution_price": execution_price,
+                                        "request_timestamp": None if pd.isna(request_timestamp) else pd.Timestamp(request_timestamp),
                                         "status": "cancelled",
                                         "reason": "ioc_unfilled",
                                         "adjustment_reasons": [],
@@ -741,6 +812,8 @@ def _build_execution_contract(close, requested_position, equity, execution_price
                                     "requested_position": desired_position,
                                     "side": side,
                                     "remaining_quantity": float(remaining_quantity),
+                                    "request_timestamp": None if pd.isna(request_timestamp) else pd.Timestamp(request_timestamp),
+                                    "request_bar": int(request_bar),
                                     "submit_bar": int(bar_loc),
                                 }
 
@@ -774,6 +847,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
     total_requested_notional = float(order_intents.get("requested_notional", pd.Series(dtype=float)).sum()) if not order_intents.empty else 0.0
     blocked_notional = float(order_ledger.loc[rejected_mask, "requested_notional"].sum()) if not order_ledger.empty else 0.0
     executed_notional = float(order_ledger.get("executed_notional", pd.Series(dtype=float)).sum()) if not order_ledger.empty else 0.0
+    delay_metrics = _summarize_execution_delay_metrics(order_intents, order_ledger, valuation_series.index)
     return {
         "valuation_series": valuation_series,
         "execution_series": execution_series,
@@ -792,6 +866,9 @@ def _build_execution_contract(close, requested_position, equity, execution_price
         "cancelled_orders": int((order_ledger.get("status") == "cancelled").sum()) if not order_ledger.empty else 0,
         "unfilled_notional": max(0.0, total_requested_notional - executed_notional),
         "fill_ratio": _round_metric(_safe_ratio(executed_notional, total_requested_notional), 6),
+        "average_action_delay_bars": _round_metric(delay_metrics["average_action_delay_bars"], 6),
+        "average_fill_delay_bars": _round_metric(delay_metrics["average_fill_delay_bars"], 6),
+        "max_fill_delay_bars": int(delay_metrics["max_fill_delay_bars"]),
         "blocked_notional_share": _round_metric(_safe_ratio(blocked_notional, total_requested_notional), 6),
         "order_rejection_reasons": (
             order_ledger.loc[order_ledger["status"] == "rejected", "reason"].value_counts().to_dict()
@@ -1107,6 +1184,9 @@ def _normalize_futures_account_config(futures_account=None, market="spot", lever
     margin_mode = str(configured.get("margin_mode", "isolated")).lower()
     if margin_mode not in {"isolated", "cross"}:
         raise ValueError("futures_account.margin_mode must be 'isolated' or 'cross'")
+    margin_safety_mode = str(configured.get("margin_safety_mode", "diagnostic")).lower()
+    if margin_safety_mode not in {"diagnostic", "blocking"}:
+        raise ValueError("futures_account.margin_safety_mode must be 'diagnostic' or 'blocking'")
 
     bracket_payload = configured.get("leverage_brackets") or {}
     if isinstance(bracket_payload, dict):
@@ -1127,6 +1207,7 @@ def _normalize_futures_account_config(futures_account=None, market="spot", lever
         "margin_mode": margin_mode,
         "configured_leverage": max(1.0, float(configured.get("leverage", leverage))),
         "warning_margin_ratio": max(0.0, float(configured.get("warning_margin_ratio", 0.8))),
+        "margin_safety_mode": margin_safety_mode,
         "maintenance_margin_ratio": max(0.0, float(configured.get("maintenance_margin_ratio", 0.0))),
         "maintenance_amount": max(0.0, float(configured.get("maintenance_amount", 0.0))),
         "liquidation_fee_rate": max(0.0, float(liquidation_fee_rate or 0.0)),
@@ -1214,6 +1295,83 @@ def _cap_futures_target_position(target_position, account_equity, futures_accoun
     }
 
 
+def _enforce_futures_margin_safety(target_position, account_equity, futures_account):
+    requested = float(target_position)
+    warning_ratio = max(0.0, float((futures_account or {}).get("warning_margin_ratio", 0.8) or 0.8))
+    margin_mode = str((futures_account or {}).get("margin_mode", "isolated")).lower()
+    mode = str((futures_account or {}).get("margin_safety_mode", "blocking")).lower()
+    requested_abs = abs(requested)
+    safe_abs = requested_abs
+    bracket = None
+    projected_margin_ratio = 0.0
+
+    if requested_abs <= 1e-12 or account_equity <= 0.0:
+        return requested, {
+            "mode": mode,
+            "requested_position": requested,
+            "safe_position": requested,
+            "adjusted": False,
+            "projected_margin_ratio": 0.0,
+            "warning_margin_ratio": warning_ratio,
+            "reason": None,
+            "bracket": None,
+        }
+
+    for _ in range(16):
+        projected_notional = safe_abs * max(float(account_equity), 0.0)
+        leverage_cap, bracket = _resolve_futures_leverage_cap(projected_notional, futures_account)
+        leverage_cap = max(1.0, float(leverage_cap))
+        projected_initial_margin = projected_notional / leverage_cap if projected_notional > 0.0 else 0.0
+        if margin_mode == "isolated":
+            projected_margin_balance = min(projected_initial_margin, max(float(account_equity), 0.0))
+        else:
+            projected_margin_balance = max(float(account_equity), 0.0)
+        projected_maintenance_margin = _compute_futures_maintenance_margin(
+            projected_notional,
+            futures_account,
+            bracket=bracket,
+        )
+        projected_margin_ratio = _safe_ratio(
+            projected_maintenance_margin,
+            max(projected_margin_balance, 1e-12),
+            default=float("inf"),
+        ) if projected_notional > 0.0 else 0.0
+        if projected_margin_ratio < warning_ratio - 1e-12:
+            break
+        safe_abs *= 0.85
+
+    safe_position = float(np.sign(requested) * safe_abs)
+    adjusted = safe_abs < requested_abs - 1e-12
+    reason = None
+    if adjusted and projected_margin_ratio >= warning_ratio - 1e-12:
+        reason = "margin_safety_blocked"
+    elif adjusted:
+        reason = "margin_safety_clipped"
+
+    if mode != "blocking":
+        return requested, {
+            "mode": mode,
+            "requested_position": requested,
+            "safe_position": safe_position,
+            "adjusted": adjusted,
+            "projected_margin_ratio": float(projected_margin_ratio),
+            "warning_margin_ratio": warning_ratio,
+            "reason": reason,
+            "bracket": bracket,
+        }
+
+    return safe_position, {
+        "mode": mode,
+        "requested_position": requested,
+        "safe_position": safe_position,
+        "adjusted": adjusted,
+        "projected_margin_ratio": float(projected_margin_ratio),
+        "warning_margin_ratio": warning_ratio,
+        "reason": reason,
+        "bracket": bracket,
+    }
+
+
 def _build_futures_trade_notional(position, equity_curve):
     position = pd.Series(position, copy=False).astype(float)
     prev_equity = pd.Series(equity_curve, index=position.index).shift(1).fillna(float(equity_curve.iloc[0]))
@@ -1264,6 +1422,7 @@ def _run_futures_account_backtest(close, position, equity, fee_rate, slippage_ra
 
     liquidation_rows = []
     leverage_adjustment_rows = []
+    margin_safety_rows = []
     warning_ratio = float(futures_account.get("warning_margin_ratio", 0.8))
     margin_mode = futures_account.get("margin_mode", "isolated")
 
@@ -1365,6 +1524,24 @@ def _run_futures_account_backtest(close, position, equity, fee_rate, slippage_ra
                 }
             )
 
+        safe_target, margin_safety_meta = _enforce_futures_margin_safety(
+            capped_target,
+            max(total_equity_before_trade, 0.0),
+            futures_account,
+        )
+        if margin_safety_meta.get("adjusted"):
+            margin_safety_rows.append(
+                {
+                    "timestamp": timestamp,
+                    "requested_position": margin_safety_meta.get("requested_position"),
+                    "safe_position": margin_safety_meta.get("safe_position"),
+                    "projected_margin_ratio": margin_safety_meta.get("projected_margin_ratio"),
+                    "warning_margin_ratio": margin_safety_meta.get("warning_margin_ratio"),
+                    "reason": margin_safety_meta.get("reason"),
+                }
+            )
+        capped_target = float(safe_target)
+
         turnover = abs(capped_target - previous_position)
         fee_cash = max(prev_equity, 0.0) * turnover * float(fee_rate)
         slippage_cash = max(prev_equity, 0.0) * turnover * float(slippage_rates.iloc[loc])
@@ -1422,6 +1599,9 @@ def _run_futures_account_backtest(close, position, equity, fee_rate, slippage_ra
         "avg_realized_leverage": _round_metric(float(realized_leverage_series.mean()) if len(realized_leverage_series) > 0 else 0.0, 6),
         "leverage_cap_adjustments": int(len(leverage_adjustment_rows)),
         "leverage_cap_adjustment_log": pd.DataFrame(leverage_adjustment_rows),
+        "margin_safety_mode": futures_account.get("margin_safety_mode"),
+        "margin_safety_adjustments": int(len(margin_safety_rows)),
+        "margin_safety_adjustment_log": pd.DataFrame(margin_safety_rows),
     }
 
     return _summarize_backtest(
@@ -1672,6 +1852,9 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
                 "blocked_notional_share": execution_report.get("blocked_notional_share", 0.0),
                 "fill_ratio": execution_report.get("fill_ratio", 0.0),
                 "unfilled_notional": execution_report.get("unfilled_notional", 0.0),
+                "average_action_delay_bars": execution_report.get("average_action_delay_bars", 0.0),
+                "average_fill_delay_bars": execution_report.get("average_fill_delay_bars", 0.0),
+                "max_fill_delay_bars": execution_report.get("max_fill_delay_bars", 0),
                 "order_rejection_reasons": execution_report.get("order_rejection_reasons", {}),
                 "execution_adapter": execution_report.get("execution_adapter"),
                 "execution_backend": execution_report.get("execution_backend"),

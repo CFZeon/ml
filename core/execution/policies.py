@@ -10,6 +10,7 @@ class ExecutionPolicy:
     time_in_force: str = "IOC"
     participation_cap: float = 1.0
     min_fill_ratio: float = 0.0
+    action_latency_bars: int = 0
     max_order_age_bars: int = 1
     cancel_replace_bars: int = 1
 
@@ -28,6 +29,7 @@ def resolve_execution_policy(config=None):
         time_in_force=str(config.get("time_in_force", "IOC")).upper(),
         participation_cap=max(0.0, float(config.get("participation_cap", 1.0))),
         min_fill_ratio=max(0.0, min(1.0, float(config.get("min_fill_ratio", 0.0)))),
+        action_latency_bars=max(0, int(config.get("action_latency_bars", 0))),
         max_order_age_bars=max(1, int(config.get("max_order_age_bars", 1))),
         cancel_replace_bars=max(1, int(config.get("cancel_replace_bars", 1))),
     )

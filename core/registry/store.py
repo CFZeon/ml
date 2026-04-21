@@ -225,6 +225,9 @@ class LocalRegistryStore:
             "promotion_score_basis",
             "eligibility_report_present",
             "promotion_ready",
+            "replication_present",
+            "replication_coverage",
+            "replication_pass_rate",
             "latest_drift_report",
             "latest_monitoring_report",
             "latest_promotion_report",
@@ -295,6 +298,7 @@ class LocalRegistryStore:
         training_summary=None,
         validation_summary=None,
         locked_holdout=None,
+        replication=None,
         promotion_eligibility_report=None,
         lineage=None,
         status="challenger",
@@ -339,6 +343,7 @@ class LocalRegistryStore:
             training_summary=training_summary,
             validation_summary=validation_summary,
             locked_holdout=locked_holdout,
+            replication=replication,
             promotion_eligibility_report=promotion_eligibility_report,
             promotion_ready=(
                 dict(promotion_eligibility_report or {}).get("promotion_ready")

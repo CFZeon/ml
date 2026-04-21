@@ -1770,6 +1770,180 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
         self.assertIn("cross_venue_integrity", gate_report["gate_status"])
         self.assertEqual(gate_report["gate_status"]["cross_venue_integrity"]["reason"], "spot_reference_divergence")
 
+    def test_selection_policy_binds_signal_decay_gate(self):
+        raw = _build_market_frame(120)
+        storage_path = _make_storage_path()
+
+        class _SignalDecayGatePipeline(_ScenarioAutoMLPipeline):
+            def run_step(self, name):
+                result = super().run_step(name)
+                if name == "train_models":
+                    model_type = str(self.config.get("model", {}).get("type", "gbm"))
+                    training = self.state["training"]
+                    bad_variant = model_type == "gbm"
+                    training["feature_governance"] = {
+                        "admission_summary": {"promotion_pass": True, "reasons": []}
+                    }
+                    training["feature_portability_diagnostics"] = {"promotion_pass": True, "reasons": []}
+                    training["operational_monitoring"] = {"healthy": True, "reasons": []}
+                    training["regime"] = {
+                        "mode": "fold_local",
+                        "folds": [],
+                        "ablation_summary": {"promotion_pass": True, "reasons": []},
+                    }
+                    training["cross_venue_integrity"] = {
+                        "promotion_pass": True,
+                        "gate_mode": "blocking",
+                        "reasons": [],
+                    }
+                    training["signal_decay"] = {
+                        "promotion_pass": not bad_variant,
+                        "gate_mode": "blocking",
+                        "reasons": (["edge_decays_before_effective_delay"] if bad_variant else []),
+                        "net_edge_at_effective_delay": (-0.004 if bad_variant else 0.012),
+                        "half_life_bars": (1 if bad_variant else 4),
+                        "policy": {"min_net_edge_at_effective_delay": 0.0},
+                    }
+                    training["promotion_gates"] = {
+                        "feature_portability": True,
+                        "feature_admission": True,
+                        "regime_stability": True,
+                        "operational_health": True,
+                        "cross_venue_integrity": True,
+                        "signal_decay": not bad_variant,
+                    }
+                    self.state["training"] = training
+                    self.step_results[name] = training
+                    return training
+                return result
+
+        _SignalDecayGatePipeline.reset()
+        _SignalDecayGatePipeline.full_rows = len(raw)
+        _SignalDecayGatePipeline.metrics_by_variant = {
+            "gbm": {
+                "search": {"sharpe_ratio": 1.3, "returns": [0.0014, 0.0011, 0.0015, 0.0012]},
+                "validation": {"sharpe_ratio": 1.2, "returns": [0.0013, 0.0010, 0.0014, 0.0011]},
+                "holdout": {"sharpe_ratio": 1.1, "returns": [0.0012, 0.0009, 0.0013, 0.0010]},
+            },
+            "rf": {
+                "search": {"sharpe_ratio": 1.0, "returns": [0.0010, 0.0008, 0.0011, 0.0009]},
+                "validation": {"sharpe_ratio": 0.9, "returns": [0.0009, 0.0007, 0.0010, 0.0008]},
+                "holdout": {"sharpe_ratio": 0.8, "returns": [0.0008, 0.0006, 0.0009, 0.0007]},
+            },
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 2,
+                    "objective": "sharpe_ratio",
+                    "seed": 17,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_fraction": 0.2,
+                    "locked_holdout_min_search_rows": 48,
+                    "enable_pruning": False,
+                    "storage": storage_path,
+                    "study_name": "automl_signal_decay_gate_binding_test",
+                    "selection_policy": {
+                        "min_validation_trade_count": 1,
+                        "require_locked_holdout_pass": False,
+                    },
+                },
+                "model": {"type": "gbm"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        variants = [
+            {"model": {"type": "gbm"}},
+            {"model": {"type": "rf"}},
+        ]
+        with mock.patch("core.automl._sample_trial_overrides", side_effect=lambda trial, _: variants[trial.number]):
+            summary = run_automl_study(
+                base_pipeline,
+                pipeline_class=_SignalDecayGatePipeline,
+                trial_step_classes=[],
+            )
+
+        self.assertEqual(summary["best_overrides"]["model"]["type"], "rf")
+        rejected_trial = next(trial for trial in summary["top_trials"] if trial["model_family"] == "gbm")
+        self.assertFalse(rejected_trial["selection_policy"]["eligible"])
+        self.assertIn("edge_decays_before_effective_delay", rejected_trial["selection_policy"]["eligibility_reasons"])
+        gate_report = rejected_trial["selection_policy"]["promotion_eligibility_report"]
+        self.assertIn("signal_decay", gate_report["gate_status"])
+        self.assertEqual(gate_report["gate_status"]["signal_decay"]["reason"], "edge_decays_before_effective_delay")
+
+    def test_promotion_report_binds_replication_gate(self):
+        raw = _build_market_frame(120)
+        storage_path = _make_storage_path()
+
+        _ScenarioAutoMLPipeline.reset()
+        _ScenarioAutoMLPipeline.full_rows = len(raw)
+        _ScenarioAutoMLPipeline.metrics_by_variant = {
+            "gbm": {
+                "search": {"sharpe_ratio": 1.2, "returns": [0.0012, 0.0010, 0.0013, 0.0011]},
+                "validation": {"sharpe_ratio": 1.1, "returns": [0.0011, 0.0009, 0.0012, 0.0010]},
+                "holdout": {"sharpe_ratio": 1.0, "returns": [0.0010, 0.0008, 0.0011, 0.0009]},
+            }
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 1,
+                    "objective": "sharpe_ratio",
+                    "seed": 17,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_fraction": 0.2,
+                    "locked_holdout_min_search_rows": 48,
+                    "enable_pruning": False,
+                    "storage": storage_path,
+                    "study_name": "automl_replication_gate_binding_test",
+                    "replication": {"enabled": True},
+                    "selection_policy": {
+                        "min_validation_trade_count": 1,
+                        "require_locked_holdout_pass": False,
+                    },
+                },
+                "model": {"type": "gbm"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        with mock.patch("core.automl._sample_trial_overrides", return_value={"model": {"type": "gbm"}}), mock.patch(
+            "core.automl._evaluate_replication_cohorts",
+            return_value={
+                "enabled": True,
+                "promotion_pass": False,
+                "pass_rate": 0.5,
+                "min_pass_rate": 0.75,
+                "min_coverage": 2,
+                "min_score": 0.0,
+                "completed_cohort_count": 2,
+                "requested_cohort_count": 2,
+                "reasons": ["replication_pass_rate_below_minimum"],
+                "warnings": [],
+                "cohorts": [],
+            },
+        ):
+            summary = run_automl_study(
+                base_pipeline,
+                pipeline_class=_ScenarioAutoMLPipeline,
+                trial_step_classes=[],
+            )
+
+        self.assertFalse(summary["promotion_ready"])
+        self.assertFalse(summary["replication"]["promotion_pass"])
+        gate_report = summary["promotion_eligibility_report"]
+        self.assertIn("replication", gate_report["gate_status"])
+        self.assertEqual(gate_report["gate_status"]["replication"]["reason"], "replication_pass_rate_below_minimum")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -115,6 +115,58 @@ class LocalRegistryFlowTest(unittest.TestCase):
                 "fingerprint-1",
             )
 
+    def test_registry_manifest_persists_signal_decay_summary(self):
+        model, feature_columns = _fit_logistic_model()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            version_id = store.register_version(
+                model,
+                symbol="BTCUSDT",
+                feature_columns=feature_columns,
+                training_summary={
+                    "avg_f1_macro": 0.75,
+                    "signal_decay": {
+                        "half_life_bars": 4,
+                        "net_edge_at_effective_delay": 0.011,
+                    },
+                },
+                validation_summary={"raw_objective_value": 0.12},
+            )
+
+            version_dir = Path(temp_dir) / "BTCUSDT" / version_id
+            version_manifest = json.loads((version_dir / "version_manifest.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(version_manifest["training_summary"]["signal_decay"]["half_life_bars"], 4)
+            self.assertAlmostEqual(
+                float(version_manifest["training_summary"]["signal_decay"]["net_edge_at_effective_delay"]),
+                0.011,
+            )
+
+    def test_registry_manifest_persists_replication_summary(self):
+        model, feature_columns = _fit_logistic_model()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            version_id = store.register_version(
+                model,
+                symbol="BTCUSDT",
+                feature_columns=feature_columns,
+                training_summary={"avg_f1_macro": 0.75},
+                validation_summary={"raw_objective_value": 0.12},
+                replication={
+                    "enabled": True,
+                    "completed_cohort_count": 3,
+                    "pass_rate": 2.0 / 3.0,
+                    "promotion_pass": True,
+                },
+            )
+
+            version_dir = Path(temp_dir) / "BTCUSDT" / version_id
+            version_manifest = json.loads((version_dir / "version_manifest.json").read_text(encoding="utf-8"))
+
+            self.assertTrue(version_manifest["replication"]["enabled"])
+            self.assertEqual(version_manifest["replication"]["completed_cohort_count"], 3)
+            self.assertAlmostEqual(float(version_manifest["replication"]["pass_rate"]), 2.0 / 3.0)
+
 
 if __name__ == "__main__":
     unittest.main()

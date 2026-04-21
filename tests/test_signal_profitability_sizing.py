@@ -397,6 +397,67 @@ class SignalProfitabilitySizingTest(unittest.TestCase):
             "validation_unavailable_static_fallback",
         )
 
+    def test_pipeline_persists_signal_decay_in_training_and_backtest(self):
+        index = pd.date_range("2026-03-13", periods=220, freq="1h", tz="UTC")
+        steps = np.linspace(0.0, 1.0, len(index))
+        close = 100.0 + 6.0 * steps + 2.0 * np.sin(np.linspace(0.0, 10.0 * np.pi, len(index)))
+        open_ = np.r_[close[0], close[:-1]]
+        high = np.maximum(open_, close) * 1.002
+        low = np.minimum(open_, close) * 0.998
+        volume = 1_200.0 + 30.0 * np.cos(np.linspace(0.0, 5.0 * np.pi, len(index)))
+        raw = pd.DataFrame(
+            {
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "quote_volume": close * volume,
+                "trades": 100,
+            },
+            index=index,
+        )
+
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "indicators": [],
+                "features": {"lags": [1, 3], "frac_diff_d": 0.4, "rolling_window": 20},
+                "labels": {"kind": "fixed_horizon", "horizon": 6, "threshold": 0.0001},
+                "model": {"type": "gbm", "cv_method": "walk_forward", "n_splits": 1, "gap": 0},
+                "feature_selection": {"enabled": True, "max_features": 12},
+                "signals": {
+                    "avg_win": 0.02,
+                    "avg_loss": 0.02,
+                    "decay": {
+                        "min_realized_trade_count": 1,
+                        "min_half_life_holding_ratio": 0.0,
+                    },
+                },
+                "backtest": {
+                    "equity": 10_000.0,
+                    "use_open_execution": False,
+                    "signal_delay_bars": 1,
+                    "fee_rate": 0.0,
+                    "slippage_rate": 0.0,
+                },
+            }
+        )
+        pipeline.state["raw_data"] = raw
+        pipeline.state["data"] = raw.copy()
+
+        pipeline.build_features()
+        pipeline.build_labels()
+        pipeline.align_data()
+        training = pipeline.train_models()
+        pipeline.generate_signals()
+        backtest = pipeline.run_backtest()
+
+        self.assertIn("signal_decay", training)
+        self.assertIn("net_edge_by_horizon", training["signal_decay"])
+        self.assertIn("signal_decay", backtest)
+        self.assertIn("signal_decay", backtest["operational_monitoring"]["components"])
+
 
 if __name__ == "__main__":
     unittest.main()

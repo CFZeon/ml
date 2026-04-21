@@ -25,6 +25,10 @@ _DEFAULT_POLICY = {
     "max_queue_backlog": np.inf,
     "require_inference_metrics": False,
     "fail_closed_on_schema_drift": True,
+    "min_signal_decay_net_edge_at_delay": -np.inf,
+    "min_signal_half_life_bars": -np.inf,
+    "max_signal_delay_edge_deterioration": np.inf,
+    "max_signal_half_life_deterioration": np.inf,
 }
 
 
@@ -365,6 +369,71 @@ def evaluate_inference_health(latencies_ms=None, queue_backlog=None, policy=None
     }
 
 
+def evaluate_signal_decay_health(signal_decay_report=None, baseline_report=None, policy=None):
+    policy = {**_DEFAULT_POLICY, **dict(policy or {})}
+    report = dict(signal_decay_report or {})
+    if not report:
+        return {
+            "healthy": True,
+            "observed": False,
+            "reason": None,
+        }
+
+    current_net_edge = report.get("net_edge_at_effective_delay")
+    current_half_life = report.get("half_life_bars")
+    baseline = dict(baseline_report or {})
+    baseline_net_edge = baseline.get("net_edge_at_effective_delay")
+    baseline_half_life = baseline.get("half_life_bars")
+
+    edge_deterioration = None
+    if (
+        current_net_edge is not None
+        and baseline_net_edge is not None
+        and np.isfinite(float(current_net_edge))
+        and np.isfinite(float(baseline_net_edge))
+    ):
+        edge_deterioration = float(baseline_net_edge) - float(current_net_edge)
+
+    half_life_deterioration = None
+    if (
+        current_half_life is not None
+        and baseline_half_life is not None
+        and np.isfinite(float(current_half_life))
+        and np.isfinite(float(baseline_half_life))
+    ):
+        half_life_deterioration = float(baseline_half_life) - float(current_half_life)
+
+    reasons = []
+    if report.get("gate_mode") == "blocking" and not bool(report.get("promotion_pass", True)):
+        reasons.append((report.get("reasons") or ["signal_decay_gate_failed"])[0])
+    if current_net_edge is not None and np.isfinite(float(current_net_edge)):
+        if float(current_net_edge) < float(policy.get("min_signal_decay_net_edge_at_delay", -np.inf)):
+            reasons.append("signal_decay_net_edge_at_delay")
+    if current_half_life is not None and np.isfinite(float(current_half_life)):
+        if float(current_half_life) < float(policy.get("min_signal_half_life_bars", -np.inf)):
+            reasons.append("signal_half_life_below_minimum")
+    if edge_deterioration is not None and edge_deterioration > float(policy.get("max_signal_delay_edge_deterioration", np.inf)):
+        reasons.append("signal_delay_edge_deterioration")
+    if half_life_deterioration is not None and half_life_deterioration > float(policy.get("max_signal_half_life_deterioration", np.inf)):
+        reasons.append("signal_half_life_deterioration")
+
+    return {
+        "healthy": not reasons,
+        "observed": True,
+        "trade_count": int(report.get("trade_count", 0)),
+        "gate_mode": report.get("gate_mode"),
+        "promotion_pass": bool(report.get("promotion_pass", True)),
+        "half_life_bars": report.get("half_life_bars"),
+        "net_edge_at_effective_delay": current_net_edge,
+        "edge_retention_at_effective_delay": report.get("edge_retention_at_effective_delay"),
+        "baseline_net_edge_at_effective_delay": baseline_net_edge,
+        "baseline_half_life_bars": baseline_half_life,
+        "edge_deterioration": edge_deterioration,
+        "half_life_deterioration": half_life_deterioration,
+        "reason": reasons[0] if reasons else None,
+    }
+
+
 def build_monitoring_report(
     *,
     data_index=None,
@@ -378,6 +447,8 @@ def build_monitoring_report(
     actual_feature_columns=None,
     backtest_reports=None,
     baseline_backtest_report=None,
+    signal_decay_report=None,
+    baseline_signal_decay_report=None,
     inference_latencies_ms=None,
     queue_backlog=None,
     policy=None,
@@ -405,6 +476,11 @@ def build_monitoring_report(
             baseline_report=baseline_backtest_report,
             policy=resolved_policy,
         ),
+        "signal_decay": evaluate_signal_decay_health(
+            signal_decay_report,
+            baseline_report=baseline_signal_decay_report,
+            policy=resolved_policy,
+        ),
         "inference": evaluate_inference_health(
             inference_latencies_ms,
             queue_backlog=queue_backlog,
@@ -420,6 +496,8 @@ def build_monitoring_report(
         "avg_slippage_gap": components["execution_quality"].get("avg_slippage_gap"),
         "feature_schema_hash": components["feature_schema"].get("actual_schema_hash"),
         "max_inference_p95_ms": components["inference"].get("p95_latency_ms"),
+        "signal_half_life_bars": components["signal_decay"].get("half_life_bars"),
+        "net_edge_at_effective_delay": components["signal_decay"].get("net_edge_at_effective_delay"),
     }
     return {
         "healthy": not unhealthy_components,
@@ -500,5 +578,6 @@ __all__ = [
     "evaluate_inference_health",
     "evaluate_l2_snapshot_age",
     "evaluate_raw_data_freshness",
+    "evaluate_signal_decay_health",
     "write_monitoring_artifacts",
 ]

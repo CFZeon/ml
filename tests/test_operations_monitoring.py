@@ -178,6 +178,29 @@ class OperationsMonitoringTest(unittest.TestCase):
             self.assertFalse(decision["approved"])
             self.assertIn("operational_monitoring_not_healthy", decision["reasons"])
 
+    def test_signal_decay_deterioration_is_reported(self):
+        report = build_monitoring_report(
+            signal_decay_report={
+                "promotion_pass": True,
+                "gate_mode": "blocking",
+                "trade_count": 40,
+                "half_life_bars": 3,
+                "net_edge_at_effective_delay": 0.004,
+                "edge_retention_at_effective_delay": 0.25,
+            },
+            baseline_signal_decay_report={
+                "half_life_bars": 6,
+                "net_edge_at_effective_delay": 0.020,
+            },
+            policy={
+                "max_signal_delay_edge_deterioration": 0.01,
+            },
+        )
+
+        self.assertFalse(report["healthy"])
+        self.assertIn("signal_decay", report["reasons"])
+        self.assertEqual(report["components"]["signal_decay"]["reason"], "signal_delay_edge_deterioration")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,7 @@ class RegistryVersionManifest:
     training_summary: dict = field(default_factory=dict)
     validation_summary: dict = field(default_factory=dict)
     locked_holdout: dict = field(default_factory=dict)
+    replication: dict = field(default_factory=dict)
     promotion_eligibility_report: dict = field(default_factory=dict)
     promotion_ready: bool | None = None
 
@@ -46,6 +47,7 @@ def build_registry_manifest(
     training_summary=None,
     validation_summary=None,
     locked_holdout=None,
+    replication=None,
     promotion_eligibility_report=None,
     promotion_ready=None,
 ):
@@ -67,6 +69,7 @@ def build_registry_manifest(
         training_summary=dict(training_summary or {}),
         validation_summary=dict(validation_summary or {}),
         locked_holdout=dict(locked_holdout or {}),
+        replication=dict(replication or {}),
         promotion_eligibility_report=dict(promotion_eligibility_report or {}),
         promotion_ready=promotion_ready,
     )
@@ -78,6 +81,7 @@ def flatten_registry_record(manifest, *, current_status, version_dir, latest_dri
     training_summary = dict(payload.get("training_summary") or {})
     validation_summary = dict(payload.get("validation_summary") or {})
     locked_holdout = dict(payload.get("locked_holdout") or {})
+    replication = dict(payload.get("replication") or {})
     promotion_eligibility_report = dict(payload.get("promotion_eligibility_report") or {})
     promotion_score = dict(promotion_eligibility_report.get("score") or {})
     return {
@@ -96,6 +100,9 @@ def flatten_registry_record(manifest, *, current_status, version_dir, latest_dri
         "promotion_score_basis": promotion_score.get("basis"),
         "eligibility_report_present": bool(promotion_eligibility_report),
         "promotion_ready": payload.get("promotion_ready"),
+        "replication_present": bool(replication),
+        "replication_coverage": replication.get("completed_cohort_count"),
+        "replication_pass_rate": replication.get("pass_rate"),
         "latest_drift_report": str(latest_drift_report) if latest_drift_report is not None else None,
         "latest_promotion_report": str(latest_promotion_report) if latest_promotion_report is not None else None,
         "locked_holdout_score": locked_holdout.get("raw_objective_value"),

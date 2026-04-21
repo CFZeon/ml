@@ -125,6 +125,7 @@ from .monitoring import (
     evaluate_inference_health,
     evaluate_l2_snapshot_age,
     evaluate_raw_data_freshness,
+    evaluate_signal_decay_health,
     write_monitoring_artifacts,
 )
 from .promotion import (
@@ -155,6 +156,11 @@ from .models import (
     evaluate_model,
     save_model,
     load_model,
+)
+from .signal_decay import (
+    build_signal_decay_report,
+    resolve_effective_delay_bars,
+    resolve_signal_decay_policy,
 )
 from .stat_tests import (
     align_post_selection_return_matrix,

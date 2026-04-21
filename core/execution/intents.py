@@ -8,6 +8,7 @@ import pandas as pd
 @dataclass
 class OrderIntent:
     timestamp: pd.Timestamp
+    request_timestamp: pd.Timestamp | None
     side: str | None
     order_type: str
     time_in_force: str
@@ -18,6 +19,7 @@ class OrderIntent:
     execution_price: float
     participation_cap: float
     min_fill_ratio: float
+    action_latency_bars: int
     max_order_age_bars: int
     cancel_replace_bars: int
 

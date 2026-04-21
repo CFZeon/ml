@@ -88,6 +88,7 @@ from .slippage import (
     SquareRootImpactModel,
 )
 from .reference_data import build_reference_overlay_feature_block, build_reference_validation_bundle
+from .signal_decay import build_signal_decay_report
 from .universe import (
     build_symbol_lifecycle_frame,
     evaluate_universe_eligibility,
@@ -586,6 +587,7 @@ def _resolve_backtest_execution_policy(pipeline):
         "time_in_force": backtest_config.get("time_in_force", "IOC"),
         "participation_cap": backtest_config.get("participation_cap", 1.0),
         "min_fill_ratio": backtest_config.get("min_fill_ratio", 0.0),
+        "action_latency_bars": backtest_config.get("action_latency_bars", 0),
         "max_order_age_bars": backtest_config.get("max_order_age_bars", 1),
         "cancel_replace_bars": backtest_config.get("cancel_replace_bars", 1),
     }
@@ -718,6 +720,7 @@ def _build_pipeline_operational_monitoring(
     backtest_reports=None,
     expected_feature_columns=None,
     actual_feature_columns=None,
+    signal_decay_report=None,
     inference_latencies_ms=None,
     queue_backlog=None,
     scope="training",
@@ -743,6 +746,8 @@ def _build_pipeline_operational_monitoring(
         actual_feature_columns=actual_feature_columns,
         backtest_reports=backtest_reports,
         baseline_backtest_report=monitoring_config.get("baseline_backtest_report"),
+        signal_decay_report=signal_decay_report,
+        baseline_signal_decay_report=monitoring_config.get("baseline_signal_decay_report"),
         inference_latencies_ms=inference_latencies_ms,
         queue_backlog=queue_backlog,
         policy=monitoring_config,
@@ -1294,6 +1299,98 @@ def _build_execution_trade_outcomes(pipeline, predictions, holding_bars, cutoff_
         orderbook_depth=runtime_kwargs.get("orderbook_depth"),
         liquidity_lag_bars=runtime_kwargs.get("liquidity_lag_bars", 1),
     )
+
+
+def _resolve_signal_decay_regime_frame(regimes, index):
+    if regimes is None:
+        return pd.DataFrame(index=index)
+    if isinstance(regimes, pd.Series):
+        return regimes.reindex(index).to_frame(name=regimes.name or "regime")
+    if isinstance(regimes, pd.DataFrame):
+        return regimes.reindex(index)
+    return pd.DataFrame(index=index)
+
+
+def _build_signal_decay_segment(
+    pipeline,
+    *,
+    signal_index,
+    predictions,
+    direction_edge,
+    event_signals,
+    regime_frame=None,
+):
+    if signal_index is None or len(signal_index) == 0:
+        return None
+
+    valuation_prices = _resolve_backtest_valuation_close(pipeline, signal_index)
+    if valuation_prices is None or len(valuation_prices) == 0:
+        return None
+
+    execution_prices = _resolve_backtest_execution_prices(pipeline, signal_index)
+    runtime_kwargs = _resolve_backtest_runtime_kwargs(pipeline, signal_index)
+    backtest_config = pipeline.section("backtest") or {}
+    return {
+        "predictions": pd.Series(predictions, copy=False).reindex(signal_index),
+        "direction_edge": None if direction_edge is None else pd.Series(direction_edge, copy=False).reindex(signal_index),
+        "event_signals": pd.Series(event_signals, copy=False).reindex(signal_index),
+        "valuation_prices": valuation_prices,
+        "execution_prices": execution_prices,
+        "runtime_kwargs": runtime_kwargs,
+        "fee_rate": float(backtest_config.get("fee_rate", 0.0)),
+        "slippage_rate": float(backtest_config.get("slippage_rate", 0.0)),
+        "equity": float(backtest_config.get("equity", 10_000.0)),
+        "liquidity_lag_bars": runtime_kwargs.get("liquidity_lag_bars", 1),
+        "regimes": _resolve_signal_decay_regime_frame(regime_frame, signal_index),
+        "cutoff_timestamp": signal_index[-1],
+    }
+
+
+def _build_signal_decay_report_for_segments(pipeline, segments, holding_bars):
+    normalized_segments = [segment for segment in list(segments or []) if segment is not None]
+    return build_signal_decay_report(
+        normalized_segments,
+        holding_bars=holding_bars,
+        signal_delay_bars=_resolve_signal_delay_bars(pipeline.section("backtest")),
+        execution_policy=_resolve_backtest_execution_policy(pipeline),
+        config=(pipeline.section("signals") or {}).get("decay"),
+    )
+
+
+def _build_signal_decay_report_from_signal_state(pipeline, signal_state):
+    segments = []
+    if signal_state.get("paths"):
+        for path in signal_state.get("paths", []):
+            event_signals = path.get("event_signals")
+            if event_signals is None:
+                continue
+            segment = _build_signal_decay_segment(
+                pipeline,
+                signal_index=event_signals.index,
+                predictions=path.get("predictions"),
+                direction_edge=path.get("direction_edge"),
+                event_signals=event_signals,
+            )
+            if segment is not None:
+                segments.append(segment)
+        holding_bars = int(signal_state.get("paths", [{}])[0].get("holding_bars", 1))
+    else:
+        event_signals = signal_state.get("event_signals")
+        if event_signals is None:
+            return {}
+        segment = _build_signal_decay_segment(
+            pipeline,
+            signal_index=event_signals.index,
+            predictions=signal_state.get("predictions"),
+            direction_edge=signal_state.get("direction_edge"),
+            event_signals=event_signals,
+            regime_frame=pipeline.state.get("regimes"),
+        )
+        if segment is not None:
+            segments.append(segment)
+        holding_bars = int(signal_state.get("holding_bars", 1))
+
+    return _build_signal_decay_report_for_segments(pipeline, segments, holding_bars)
 
 
 def _count_realized_trades(trade_outcomes):
@@ -2710,6 +2807,7 @@ class TrainModelsStep(PipelineStep):
         oos_signals = []
         oos_trade_outcomes = []
         oos_paths = []
+        signal_decay_segments = []
 
         for split in _iter_validation_splits(pipeline, X):
             fold = split["fold"]
@@ -3190,8 +3288,9 @@ class TrainModelsStep(PipelineStep):
 
             fold_backtest = None
             fold_close = _resolve_backtest_valuation_close(pipeline, X_test_model.index)
+            fold_execution_prices = _resolve_backtest_execution_prices(pipeline, X_test_model.index)
+            fold_runtime_kwargs = _resolve_backtest_runtime_kwargs(pipeline, X_test_model.index) or {}
             if fold_close is not None and len(fold_close) > 0:
-                fold_execution_prices = _resolve_backtest_execution_prices(pipeline, X_test_model.index)
                 fold_backtest = run_backtest(
                     close=fold_close.loc[signal_state["continuous_signals"].index],
                     signals=signal_state["continuous_signals"],
@@ -3204,7 +3303,7 @@ class TrainModelsStep(PipelineStep):
                         if fold_execution_prices is not None
                         else None
                     ),
-                    **(_resolve_backtest_runtime_kwargs(pipeline, X_test_model.index) or {}),
+                    **fold_runtime_kwargs,
                 )
 
             fold_metrics.append(metrics)
@@ -3257,6 +3356,16 @@ class TrainModelsStep(PipelineStep):
                 test_primary_preds,
                 holding_bars=holding_bars,
                 cutoff_timestamp=X_test_model.index[-1],
+            )
+            signal_decay_segments.append(
+                _build_signal_decay_segment(
+                    pipeline,
+                    signal_index=X_test_model.index,
+                    predictions=test_primary_preds,
+                    direction_edge=signal_state["direction_edge"],
+                    event_signals=signal_state["event_signals"],
+                    regime_frame=regime_frame.reindex(X_test_model.index) if not regime_frame.empty else None,
+                )
             )
             oos_paths.append(
                 {
@@ -3362,11 +3471,13 @@ class TrainModelsStep(PipelineStep):
         regime_ablation_summary = summarize_regime_ablation_reports(
             [row.get("ablation") for row in fold_regime]
         )
+        signal_decay = _build_signal_decay_report_for_segments(pipeline, signal_decay_segments, holding_bars)
         operational_monitoring = _build_pipeline_operational_monitoring(
             pipeline,
             backtest_reports=fold_backtest_reports,
             expected_feature_columns=last_selected_columns,
             actual_feature_columns=last_selected_columns,
+            signal_decay_report=signal_decay,
             inference_latencies_ms=inference_latencies_ms,
             queue_backlog=[0] * len(inference_latencies_ms),
             scope="training",
@@ -3457,6 +3568,7 @@ class TrainModelsStep(PipelineStep):
             "feature_family_diagnostics": feature_family_diagnostics,
             "feature_portability_diagnostics": feature_portability_diagnostics,
             "cross_venue_integrity": reference_integrity_report,
+            "signal_decay": signal_decay,
             "feature_governance": {
                 "mode": "fold_local",
                 "retirement": pipeline.state.get("feature_retirement", {}),
@@ -3470,6 +3582,7 @@ class TrainModelsStep(PipelineStep):
                 "regime_stability": bool(regime_ablation_summary.get("promotion_pass", True)),
                 "operational_health": bool(operational_monitoring.get("healthy", True)),
                 "cross_venue_integrity": bool(reference_integrity_report.get("promotion_pass", True)),
+                "signal_decay": bool(signal_decay.get("promotion_pass", True)),
             },
             "regime": {
                 "mode": "fold_local",
@@ -3778,9 +3891,11 @@ class BacktestStep(PipelineStep):
                 backtest_reports=[row.get("backtest") for row in path_backtests],
                 expected_feature_columns=training.get("last_selected_columns") or feature_columns,
                 actual_feature_columns=training.get("last_selected_columns") or feature_columns,
+                signal_decay_report=(training.get("signal_decay") or {}),
                 scope="backtest_paths",
             )
             backtest["operational_monitoring"] = monitoring_report
+            backtest["signal_decay"] = dict(training.get("signal_decay") or {})
             if pipeline.state.get("reference_integrity_report") is not None:
                 backtest["cross_venue_integrity"] = dict(pipeline.state.get("reference_integrity_report") or {})
             pipeline.state["operational_monitoring"] = monitoring_report
@@ -3803,14 +3918,19 @@ class BacktestStep(PipelineStep):
         training = pipeline.state.get("training") or {}
         feature_frame = pipeline.state.get("X")
         feature_columns = list(feature_frame.columns) if isinstance(feature_frame, pd.DataFrame) else []
+        signal_decay_report = dict(training.get("signal_decay") or {})
+        if not signal_decay_report:
+            signal_decay_report = _build_signal_decay_report_from_signal_state(pipeline, signal_state)
         monitoring_report = _build_pipeline_operational_monitoring(
             pipeline,
             backtest_reports=[backtest],
             expected_feature_columns=training.get("last_selected_columns") or feature_columns,
             actual_feature_columns=training.get("last_selected_columns") or feature_columns,
+            signal_decay_report=signal_decay_report,
             scope="backtest",
         )
         backtest["operational_monitoring"] = monitoring_report
+        backtest["signal_decay"] = signal_decay_report
         if pipeline.state.get("reference_integrity_report") is not None:
             backtest["cross_venue_integrity"] = dict(pipeline.state.get("reference_integrity_report") or {})
         pipeline.state["operational_monitoring"] = monitoring_report
