@@ -38,6 +38,55 @@ def print_section(sep, step, title):
     print(f"\n{sep}\nStep {step} · {title}\n{sep}")
 
 
+def build_example_universe_config(
+    primary_symbol,
+    *,
+    context_symbols=None,
+    market="spot",
+    snapshot_timestamp=None,
+    min_history_days=30,
+    min_liquidity=1_000_000.0,
+    requested_symbol_policy="error",
+):
+    """Build a self-contained historical-universe config for runnable examples.
+
+    Examples that request cross-asset context now need an explicit universe snapshot.
+    Keeping the snapshot inline avoids hidden cache dependencies while still exercising
+    the same eligibility path as the production pipeline.
+    """
+
+    resolved_snapshot = pd.Timestamp(snapshot_timestamp or "2024-01-01", tz="UTC")
+    symbols = [str(primary_symbol), *[str(symbol) for symbol in (context_symbols or [])]]
+    ordered_symbols = list(dict.fromkeys(symbols))
+    base_liquidity = max(float(min_liquidity) * 10.0, 10_000_000.0)
+
+    snapshot_symbols = []
+    for index, symbol in enumerate(ordered_symbols):
+        snapshot_symbols.append(
+            {
+                "symbol": symbol,
+                "market": market,
+                "status": "TRADING",
+                "listing_start": "2020-01-01T00:00:00Z",
+                "avg_daily_quote_volume": float(base_liquidity - (index * float(min_liquidity))),
+            }
+        )
+
+    return {
+        "market": market,
+        "snapshots": [
+            {
+                "snapshot_timestamp": resolved_snapshot.isoformat().replace("+00:00", "Z"),
+                "market": market,
+                "symbols": snapshot_symbols,
+            }
+        ],
+        "requested_symbol_policy": requested_symbol_policy,
+        "min_history_days": int(min_history_days),
+        "min_liquidity": float(min_liquidity),
+    }
+
+
 def print_stationarity_summary(stationarity):
     for feature_name in ["close", "close_fracdiff"]:
         stats = stationarity.get(feature_name)

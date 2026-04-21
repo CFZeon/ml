@@ -880,6 +880,97 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
         self.assertEqual(summary["objective"], "accuracy_first")
         self.assertEqual(summary["best_overrides"]["model"]["type"], "rf")
 
+    def test_disabled_selection_policy_skips_fragility_and_accepts_best_trial(self):
+        raw = _build_market_frame(100)
+        storage_path = _make_storage_path()
+
+        _ScenarioAutoMLPipeline.reset()
+        _ScenarioAutoMLPipeline.full_rows = len(raw)
+        _ScenarioAutoMLPipeline.metrics_by_variant = {
+            "rf": {
+                "search": {
+                    "directional_accuracy": 0.52,
+                    "log_loss": 0.32,
+                    "calibration_error": 0.11,
+                    "sharpe_ratio": 0.2,
+                    "returns": [0.0010, -0.0002, 0.0009, -0.0001],
+                },
+                "validation": {
+                    "directional_accuracy": 0.52,
+                    "log_loss": 0.32,
+                    "calibration_error": 0.11,
+                    "sharpe_ratio": 0.2,
+                    "returns": [0.0010, -0.0002, 0.0009, -0.0001],
+                },
+                "holdout": {
+                    "directional_accuracy": 0.52,
+                    "log_loss": 0.32,
+                    "calibration_error": 0.11,
+                    "sharpe_ratio": 0.2,
+                    "returns": [0.0010, -0.0002, 0.0009, -0.0001],
+                },
+            },
+            "gbm": {
+                "search": {
+                    "directional_accuracy": 0.61,
+                    "log_loss": 0.24,
+                    "calibration_error": 0.08,
+                    "sharpe_ratio": 0.6,
+                    "returns": [0.0015, 0.0005, 0.0014, 0.0004],
+                },
+                "validation": {
+                    "directional_accuracy": 0.61,
+                    "log_loss": 0.24,
+                    "calibration_error": 0.08,
+                    "sharpe_ratio": 0.6,
+                    "returns": [0.0015, 0.0005, 0.0014, 0.0004],
+                },
+                "holdout": {
+                    "directional_accuracy": 0.61,
+                    "log_loss": 0.24,
+                    "calibration_error": 0.08,
+                    "sharpe_ratio": 0.6,
+                    "returns": [0.0015, 0.0005, 0.0014, 0.0004],
+                },
+            },
+        }
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 2,
+                    "seed": 13,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_enabled": False,
+                    "enable_pruning": False,
+                    "minimum_dsr_threshold": None,
+                    "objective": "sharpe_ratio",
+                    "storage": storage_path,
+                    "study_name": "automl_selection_policy_disabled_test",
+                    "selection_policy": {"enabled": False},
+                },
+                "model": {"type": "rf"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        variants = [{"model": {"type": "rf"}}, {"model": {"type": "gbm"}}]
+        with mock.patch("core.automl._sample_trial_overrides", side_effect=lambda trial, _: variants[trial.number]):
+            with mock.patch("core.automl._evaluate_candidate_fragility") as fragility_mock:
+                summary = run_automl_study(
+                    base_pipeline,
+                    pipeline_class=_ScenarioAutoMLPipeline,
+                    trial_step_classes=[],
+                )
+
+        self.assertEqual(summary["best_overrides"]["model"]["type"], "gbm")
+        self.assertFalse(summary["best_selection_policy"]["selection_policy"]["enabled"])
+        self.assertTrue(summary["best_selection_policy"]["selection_policy"]["eligible"])
+        fragility_mock.assert_not_called()
+
     def test_two_stage_holdout_validation_used_for_ranking(self):
         raw = _build_market_frame(100)
         storage_path = _make_storage_path()

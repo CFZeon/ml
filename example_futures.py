@@ -1,4 +1,4 @@
-"""USDT-M futures example using real Binance data and the VectorBT-first adapter.
+"""USDT-M futures example using real Binance data and the liquidation-aware pandas adapter.
 
 Usage
 -----
@@ -7,6 +7,7 @@ Usage
 
 from core import ATR, MACD, RSI, ResearchPipeline
 from example_utils import (
+    build_example_universe_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -22,17 +23,29 @@ from example_utils import (
 
 def main():
     sep = "=" * 60
+    symbol = "BTCUSDT"
+    interval = "1h"
+    start = "2024-01-01"
+    end = "2024-04-01"
+    context_symbols = ["ETHUSDT", "SOLUSDT"]
+
     pipeline = ResearchPipeline(
         {
             "data": {
-                "symbol": "BTCUSDT",
-                "interval": "1h",
-                "start": "2024-01-01",
-                "end": "2024-04-01",
+                "symbol": symbol,
+                "interval": interval,
+                "start": start,
+                "end": end,
                 "market": "um_futures",
                 "futures_context": {"enabled": True, "include_recent_stats": True},
-                "cross_asset_context": {"symbols": ["ETHUSDT", "SOLUSDT"], "market": "um_futures"},
+                "cross_asset_context": {"symbols": context_symbols, "market": "um_futures"},
             },
+            "universe": build_example_universe_config(
+                symbol,
+                context_symbols=context_symbols,
+                market="um_futures",
+                snapshot_timestamp=start,
+            ),
             "indicators": [RSI(14), MACD(), ATR(14)],
             "features": {
                 "lags": [1, 3, 6],

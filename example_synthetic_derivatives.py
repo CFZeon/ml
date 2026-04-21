@@ -154,13 +154,17 @@ def main():
                 "meta_n_splits": 2,
             },
             "signals": {
+                "policy_mode": "frozen_manual",
+                "avg_win": 0.04,
+                "avg_loss": 0.01,
                 "threshold": 0.0,
                 "edge_threshold": 0.0,
                 "shrinkage_alpha": 0.5,
-                "fraction": 1.0,
+                "fraction": 0.75,
                 "min_trades_for_kelly": 30,
                 "max_kelly_fraction": 0.5,
-                "meta_threshold": 0.5,
+                "meta_threshold": 0.0,
+                "profitability_threshold": 0.0,
                 "expected_edge_threshold": 0.0,
                 "sizing_mode": "expected_utility",
             },
@@ -231,6 +235,8 @@ def main():
     print_section(sep, 9, "Backtesting")
     backtest = pipeline.run_backtest()
     print_backtest_summary(backtest)
+    if float(backtest.get("total_trades") or 0.0) == 0.0:
+        print("  note         : the profitability filter abstained on every CPCV path, so this example validates the derivatives feature stack without opening positions.")
 
     print(f"\n{sep}\nSynthetic derivatives example complete.\n{sep}")
 

@@ -45,6 +45,7 @@ def main():
                 "interval": "1h",
                 "start": "2024-01-01",
                 "end": "2024-06-01",
+                "futures_context": {"enabled": False},
             },
             "indicators": [
                 {"kind": "rsi", "params": {"period": 14}},
@@ -76,15 +77,19 @@ def main():
                 "meta_n_splits": 2,
             },
             "signals": {
-                "avg_win": 0.02,
-                "avg_loss": 0.02,
+                "policy_mode": "frozen_manual",
+                "avg_win": 0.04,
+                "avg_loss": 0.01,
                 "shrinkage_alpha": 0.5,
-                "fraction": 0.5,
+                "fraction": 0.75,
                 "min_trades_for_kelly": 30,
                 "max_kelly_fraction": 0.5,
-                "threshold": 0.01,
-                "edge_threshold": 0.05,
-                "meta_threshold": 0.55,
+                "threshold": 0.0,
+                "edge_threshold": 0.0,
+                "meta_threshold": 0.0,
+                "profitability_threshold": 0.0,
+                "expected_edge_threshold": 0.0,
+                "sizing_mode": "expected_utility",
                 "tuning_min_trades": 5,
             },
             "backtest": {
@@ -155,6 +160,8 @@ def main():
     print_section(sep, 10, "Backtesting")
     backtest = pipeline.run_backtest()
     print_backtest_summary(backtest)
+    if float(backtest.get("total_trades") or 0.0) == 0.0:
+        print("  note         : the profitability filter abstained on every CPCV path, so this example finishes as a feature-and-validation smoke test.")
 
     print(f"\n{sep}\nPipeline complete.\n{sep}")
 

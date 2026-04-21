@@ -2351,151 +2351,167 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             },
         )
 
-        gate_specs = [
-            {
-                "name": "minimum_dsr",
-                "passed": eligibility_checks["minimum_dsr"],
-                "measured": dsr_value,
-                "threshold": minimum_dsr_threshold if dsr_gate_applies else None,
-                "reason": None if eligibility_checks["minimum_dsr"] else "deflated_sharpe_below_threshold",
-                "details": deflated_sharpe,
-            },
-            {
-                "name": "objective_constraints",
-                "passed": eligibility_checks["objective_constraints"],
-                "measured": objective_gate_passed,
-                "threshold": True,
-                "reason": None if eligibility_checks["objective_constraints"] else "objective_constraints_failed",
-                "details": objective_diagnostics,
-            },
-            {
-                "name": "validation_trade_count",
-                "passed": eligibility_checks["validation_trade_count"],
-                "measured": validation_trade_count,
-                "threshold": int(selection_policy.get("min_validation_trade_count", 0)),
-                "reason": None if eligibility_checks["validation_trade_count"] else "validation_trade_count_below_minimum",
-                "details": {"validation_trade_count": validation_trade_count},
-            },
-            {
-                "name": "complexity",
-                "passed": eligibility_checks["complexity"],
-                "measured": complexity["trial_complexity_score"],
-                "threshold": selection_policy.get("max_complexity_score", np.inf),
-                "reason": None if eligibility_checks["complexity"] else "complexity_score_above_limit",
-                "details": complexity,
-            },
-            {
-                "name": "feature_count_ratio",
-                "passed": eligibility_checks["feature_count_ratio"],
-                "measured": complexity.get("feature_count_ratio"),
-                "threshold": selection_policy.get("max_feature_count_ratio", np.inf),
-                "reason": None if eligibility_checks["feature_count_ratio"] else "feature_count_ratio_above_limit",
-                "details": complexity,
-            },
-            {
-                "name": "generalization_gap",
-                "passed": eligibility_checks["generalization_gap"],
-                "measured": (search_gap.get("normalized_degradation") or 0.0),
-                "threshold": selection_policy.get("max_generalization_gap", np.inf),
-                "reason": None if eligibility_checks["generalization_gap"] else "search_validation_gap_above_limit",
-                "details": search_gap,
-            },
-            {
-                "name": "model_family_trial_count",
-                "passed": eligibility_checks["model_family_trial_count"],
-                "measured": model_family_counts.get(model_family, 0),
-                "threshold": selection_policy.get("max_trials_per_model_family", np.inf),
-                "reason": None if eligibility_checks["model_family_trial_count"] else "model_family_trial_count_above_limit",
-                "details": {"model_family": model_family, "trial_count": model_family_counts.get(model_family, 0)},
-            },
-            {
-                "name": "feature_portability",
-                "passed": eligibility_checks["feature_portability"],
-                "measured": feature_portability_diagnostics.get("venue_specific_importance_share"),
-                "threshold": feature_portability_diagnostics.get("config"),
-                "reason": None if eligibility_checks["feature_portability"] else _first_failure_reason(feature_portability_diagnostics, "feature_portability_failed"),
-                "details": feature_portability_diagnostics,
-            },
-            {
-                "name": "feature_admission",
-                "passed": eligibility_checks["feature_admission"],
-                "measured": feature_admission_summary.get("promotion_pass"),
-                "threshold": True,
-                "reason": None if eligibility_checks["feature_admission"] else _first_failure_reason(feature_admission_summary, "feature_admission_failed"),
-                "details": feature_admission_summary,
-            },
-            {
-                "name": "regime_stability",
-                "passed": eligibility_checks["regime_stability"],
-                "measured": regime_ablation_summary.get("stability_improvement"),
-                "threshold": True,
-                "reason": None if eligibility_checks["regime_stability"] else _first_failure_reason(regime_ablation_summary, "regime_stability_failed"),
-                "details": regime_ablation_summary,
-            },
-            {
-                "name": "operational_health",
-                "passed": eligibility_checks["operational_health"],
-                "measured": operational_monitoring.get("healthy"),
-                "threshold": True,
-                "reason": None if eligibility_checks["operational_health"] else _first_failure_reason(operational_monitoring, "operational_monitoring_failed"),
-                "details": operational_monitoring,
-            },
-            {
-                "name": "cross_venue_integrity",
-                "passed": eligibility_checks["cross_venue_integrity"],
-                "measured": cross_venue_integrity.get("promotion_pass"),
-                "threshold": True,
-                "reason": None if eligibility_checks["cross_venue_integrity"] else _first_failure_reason(cross_venue_integrity, "cross_venue_integrity_failed"),
-                "details": cross_venue_integrity,
-            },
-            {
-                "name": "signal_decay",
-                "passed": eligibility_checks["signal_decay"],
-                "measured": signal_decay.get("net_edge_at_effective_delay"),
-                "threshold": signal_decay.get("policy"),
-                "reason": None if eligibility_checks["signal_decay"] else _first_failure_reason(signal_decay, "signal_decay_failed"),
-                "details": signal_decay,
-            },
-            {
-                "name": "fold_stability",
-                "passed": eligibility_checks["fold_stability"],
-                "measured": fold_stability_gate["summary"].get("persistence"),
-                "threshold": True,
-                "reason": None if eligibility_checks["fold_stability"] else "fold_stability_failed",
-                "details": fold_stability_gate["summary"],
-            },
-        ]
-        for gate in gate_specs:
-            promotion_eligibility_report = upsert_promotion_gate(
-                promotion_eligibility_report,
-                group="selection",
-                name=gate["name"],
-                passed=gate["passed"],
-                mode=resolve_promotion_gate_mode(selection_policy, gate["name"]),
-                measured=gate["measured"],
-                threshold=gate["threshold"],
-                reason=gate["reason"],
-                details=gate["details"],
-            )
-        promotion_eligibility_report = finalize_promotion_eligibility_report(promotion_eligibility_report)
+        selection_policy_enabled = bool(selection_policy.get("enabled", True))
+        if selection_policy_enabled:
+            gate_specs = [
+                {
+                    "name": "minimum_dsr",
+                    "passed": eligibility_checks["minimum_dsr"],
+                    "measured": dsr_value,
+                    "threshold": minimum_dsr_threshold if dsr_gate_applies else None,
+                    "reason": None if eligibility_checks["minimum_dsr"] else "deflated_sharpe_below_threshold",
+                    "details": deflated_sharpe,
+                },
+                {
+                    "name": "objective_constraints",
+                    "passed": eligibility_checks["objective_constraints"],
+                    "measured": objective_gate_passed,
+                    "threshold": True,
+                    "reason": None if eligibility_checks["objective_constraints"] else "objective_constraints_failed",
+                    "details": objective_diagnostics,
+                },
+                {
+                    "name": "validation_trade_count",
+                    "passed": eligibility_checks["validation_trade_count"],
+                    "measured": validation_trade_count,
+                    "threshold": int(selection_policy.get("min_validation_trade_count", 0)),
+                    "reason": None if eligibility_checks["validation_trade_count"] else "validation_trade_count_below_minimum",
+                    "details": {"validation_trade_count": validation_trade_count},
+                },
+                {
+                    "name": "complexity",
+                    "passed": eligibility_checks["complexity"],
+                    "measured": complexity["trial_complexity_score"],
+                    "threshold": selection_policy.get("max_complexity_score", np.inf),
+                    "reason": None if eligibility_checks["complexity"] else "complexity_score_above_limit",
+                    "details": complexity,
+                },
+                {
+                    "name": "feature_count_ratio",
+                    "passed": eligibility_checks["feature_count_ratio"],
+                    "measured": complexity.get("feature_count_ratio"),
+                    "threshold": selection_policy.get("max_feature_count_ratio", np.inf),
+                    "reason": None if eligibility_checks["feature_count_ratio"] else "feature_count_ratio_above_limit",
+                    "details": complexity,
+                },
+                {
+                    "name": "generalization_gap",
+                    "passed": eligibility_checks["generalization_gap"],
+                    "measured": (search_gap.get("normalized_degradation") or 0.0),
+                    "threshold": selection_policy.get("max_generalization_gap", np.inf),
+                    "reason": None if eligibility_checks["generalization_gap"] else "search_validation_gap_above_limit",
+                    "details": search_gap,
+                },
+                {
+                    "name": "model_family_trial_count",
+                    "passed": eligibility_checks["model_family_trial_count"],
+                    "measured": model_family_counts.get(model_family, 0),
+                    "threshold": selection_policy.get("max_trials_per_model_family", np.inf),
+                    "reason": None if eligibility_checks["model_family_trial_count"] else "model_family_trial_count_above_limit",
+                    "details": {"model_family": model_family, "trial_count": model_family_counts.get(model_family, 0)},
+                },
+                {
+                    "name": "feature_portability",
+                    "passed": eligibility_checks["feature_portability"],
+                    "measured": feature_portability_diagnostics.get("venue_specific_importance_share"),
+                    "threshold": feature_portability_diagnostics.get("config"),
+                    "reason": None if eligibility_checks["feature_portability"] else _first_failure_reason(feature_portability_diagnostics, "feature_portability_failed"),
+                    "details": feature_portability_diagnostics,
+                },
+                {
+                    "name": "feature_admission",
+                    "passed": eligibility_checks["feature_admission"],
+                    "measured": feature_admission_summary.get("promotion_pass"),
+                    "threshold": True,
+                    "reason": None if eligibility_checks["feature_admission"] else _first_failure_reason(feature_admission_summary, "feature_admission_failed"),
+                    "details": feature_admission_summary,
+                },
+                {
+                    "name": "regime_stability",
+                    "passed": eligibility_checks["regime_stability"],
+                    "measured": regime_ablation_summary.get("stability_improvement"),
+                    "threshold": True,
+                    "reason": None if eligibility_checks["regime_stability"] else _first_failure_reason(regime_ablation_summary, "regime_stability_failed"),
+                    "details": regime_ablation_summary,
+                },
+                {
+                    "name": "operational_health",
+                    "passed": eligibility_checks["operational_health"],
+                    "measured": operational_monitoring.get("healthy"),
+                    "threshold": True,
+                    "reason": None if eligibility_checks["operational_health"] else _first_failure_reason(operational_monitoring, "operational_monitoring_failed"),
+                    "details": operational_monitoring,
+                },
+                {
+                    "name": "cross_venue_integrity",
+                    "passed": eligibility_checks["cross_venue_integrity"],
+                    "measured": cross_venue_integrity.get("promotion_pass"),
+                    "threshold": True,
+                    "reason": None if eligibility_checks["cross_venue_integrity"] else _first_failure_reason(cross_venue_integrity, "cross_venue_integrity_failed"),
+                    "details": cross_venue_integrity,
+                },
+                {
+                    "name": "signal_decay",
+                    "passed": eligibility_checks["signal_decay"],
+                    "measured": signal_decay.get("net_edge_at_effective_delay"),
+                    "threshold": signal_decay.get("policy"),
+                    "reason": None if eligibility_checks["signal_decay"] else _first_failure_reason(signal_decay, "signal_decay_failed"),
+                    "details": signal_decay,
+                },
+                {
+                    "name": "fold_stability",
+                    "passed": eligibility_checks["fold_stability"],
+                    "measured": fold_stability_gate["summary"].get("persistence"),
+                    "threshold": True,
+                    "reason": None if eligibility_checks["fold_stability"] else "fold_stability_failed",
+                    "details": fold_stability_gate["summary"],
+                },
+            ]
+            for gate in gate_specs:
+                promotion_eligibility_report = upsert_promotion_gate(
+                    promotion_eligibility_report,
+                    group="selection",
+                    name=gate["name"],
+                    passed=gate["passed"],
+                    mode=resolve_promotion_gate_mode(selection_policy, gate["name"]),
+                    measured=gate["measured"],
+                    threshold=gate["threshold"],
+                    reason=gate["reason"],
+                    details=gate["details"],
+                )
+            promotion_eligibility_report = finalize_promotion_eligibility_report(promotion_eligibility_report)
 
-        selection_policy_report = {
-            "enabled": bool(selection_policy.get("enabled", True)),
-            "eligible_before_post_checks": False,
-            "eligible": None,
-            "promotion_ready": None,
-            "promotion_reasons": [],
-            "frozen": False,
-            "holdout_consulted_for_selection": False,
-            "eligibility_checks": eligibility_checks,
-            "eligibility_reasons": [],
-            "promotion_eligibility_report": promotion_eligibility_report,
-        }
-        selection_policy_report = _update_selection_policy_report(
-            selection_policy_report,
-            promotion_eligibility_report,
-            include_post_selection=False,
-        )
+            selection_policy_report = {
+                "enabled": True,
+                "eligible_before_post_checks": False,
+                "eligible": None,
+                "promotion_ready": None,
+                "promotion_reasons": [],
+                "frozen": False,
+                "holdout_consulted_for_selection": False,
+                "eligibility_checks": eligibility_checks,
+                "eligibility_reasons": [],
+                "promotion_eligibility_report": promotion_eligibility_report,
+            }
+            selection_policy_report = _update_selection_policy_report(
+                selection_policy_report,
+                promotion_eligibility_report,
+                include_post_selection=False,
+            )
+        else:
+            promotion_eligibility_report = finalize_promotion_eligibility_report(promotion_eligibility_report)
+            selection_policy_report = {
+                "enabled": False,
+                "eligible_before_post_checks": True,
+                "eligible": True,
+                "promotion_ready": True,
+                "promotion_reasons": [],
+                "frozen": False,
+                "holdout_consulted_for_selection": False,
+                "eligibility_checks": eligibility_checks,
+                "eligibility_reasons": [],
+                "promotion_eligibility_report": promotion_eligibility_report,
+            }
 
         trial_reports.append(
             {
@@ -3184,6 +3200,11 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         if not policy_report["eligible_before_post_checks"]:
             policy_report["eligible"] = False
             continue
+
+        if not selection_policy.get("enabled", True):
+            policy_report["eligible"] = True
+            best_trial_report = report
+            break
 
         fragility = _evaluate_candidate_fragility(
             base_config=base_config,

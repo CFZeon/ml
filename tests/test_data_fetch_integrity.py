@@ -1,4 +1,5 @@
 import io
+import tempfile
 import unittest
 import zipfile
 from unittest import mock
@@ -7,7 +8,8 @@ import pandas as pd
 import requests
 
 from core import ResearchPipeline
-from core.data import _COLUMNS, _download_archive, fetch_binance_vision
+from core.data import _COLUMNS, _download_archive, _symbol_filters_cache_path, fetch_binance_symbol_filters, fetch_binance_vision
+from core.storage import read_json, write_parquet_frame
 
 
 def _archive_bytes(rows):
@@ -185,6 +187,39 @@ class DataFetchIntegrityTest(unittest.TestCase):
         self.assertEqual(pipeline.state["data_integrity_report"], report)
         self.assertIn("data_lineage", pipeline.state)
         self.assertTrue(pipeline.state["data_lineage"]["source_groups"]["market_data"])
+
+    def test_symbol_filters_loader_rewrites_legacy_cache_as_json(self):
+        legacy_frame = pd.DataFrame(
+            [
+                {
+                    "symbol": "BTCUSDT",
+                    "tick_size": 0.1,
+                    "step_size": 0.001,
+                    "min_notional": 10.0,
+                }
+            ]
+        )
+        payload = {
+            "symbol": "BTCUSDT",
+            "filters": [
+                {"filterType": "PRICE_FILTER", "minPrice": "10", "maxPrice": "1000000", "tickSize": "0.01"},
+                {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "50", "stepSize": "0.001"},
+                {"filterType": "MIN_NOTIONAL", "minNotional": "10", "applyToMarket": True, "avgPriceMins": 5},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = _symbol_filters_cache_path(temp_dir, "spot", "BTCUSDT")
+            write_parquet_frame(cache_path, legacy_frame)
+
+            with mock.patch("core.data._fetch_exchange_info_symbol_payload", return_value=payload):
+                filters = fetch_binance_symbol_filters("BTCUSDT", market="spot", cache_dir=temp_dir)
+
+            self.assertIsInstance(filters, dict)
+            self.assertAlmostEqual(float(filters["tick_size"]), 0.01, places=6)
+            cached = read_json(cache_path)
+            self.assertIsInstance(cached, dict)
+            self.assertEqual(cached["symbol"], "BTCUSDT")
 
 
 if __name__ == "__main__":

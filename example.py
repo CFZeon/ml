@@ -7,6 +7,7 @@ Usage
 
 from core import RSI, ATR, BollingerBands, MACD, ResearchPipeline
 from example_utils import (
+    build_example_universe_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -22,16 +23,28 @@ from example_utils import (
 
 def main():
     SEP = "=" * 60
+    symbol = "BTCUSDT"
+    interval = "1h"
+    start = "2024-01-01"
+    end = "2024-06-01"
+    context_symbols = ["ETHUSDT", "SOLUSDT", "BNBUSDT"]
+
     pipeline = ResearchPipeline(
         {
             "data": {
-                "symbol": "BTCUSDT",
-                "interval": "1h",
-                "start": "2024-01-01",
-                "end": "2024-06-01",
+                "symbol": symbol,
+                "interval": interval,
+                "start": start,
+                "end": end,
                 "futures_context": {"enabled": True, "include_recent_stats": True},
-                "cross_asset_context": {"symbols": ["ETHUSDT", "SOLUSDT", "BNBUSDT"]},
+                "cross_asset_context": {"symbols": context_symbols},
             },
+            "universe": build_example_universe_config(
+                symbol,
+                context_symbols=context_symbols,
+                market="spot",
+                snapshot_timestamp=start,
+            ),
             "indicators": [RSI(14), MACD(), BollingerBands(20), ATR(14)],
             "features": {
                 "lags": [1, 3, 6],

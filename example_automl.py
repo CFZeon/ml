@@ -5,8 +5,11 @@ Usage
     python example_automl.py
 """
 
+from pathlib import Path
+
 from core import ATR, BollingerBands, MACD, RSI, ResearchPipeline
 from example_utils import (
+    build_example_universe_config,
     print_alignment_summary,
     print_automl_summary,
     print_backtest_summary,
@@ -23,16 +26,33 @@ from example_utils import (
 
 def main():
     sep = "=" * 60
+    symbol = "BTCUSDT"
+    interval = "1h"
+    start = "2024-01-01"
+    end = "2024-05-01"
+    context_symbols = ["ETHUSDT"]
+
+    automl_storage = Path(".cache") / "automl" / "example_automl_v3.db"
+    automl_storage.parent.mkdir(parents=True, exist_ok=True)
+    if automl_storage.exists():
+        automl_storage.unlink()
+
     pipeline = ResearchPipeline(
         {
             "data": {
-                "symbol": "BTCUSDT",
-                "interval": "1h",
-                "start": "2024-01-01",
-                "end": "2026-01-01",
-                "futures_context": {"enabled": True, "include_recent_stats": True},
-                "cross_asset_context": {"symbols": ["ETHUSDT", "SOLUSDT", "BNBUSDT"]},
+                "symbol": symbol,
+                "interval": interval,
+                "start": start,
+                "end": end,
+                "futures_context": {"enabled": False},
+                "cross_asset_context": {"symbols": context_symbols},
             },
+            "universe": build_example_universe_config(
+                symbol,
+                context_symbols=context_symbols,
+                market="spot",
+                snapshot_timestamp=start,
+            ),
             "indicators": [RSI(14), MACD(), BollingerBands(20), ATR(14)],
             "features": {
                 "lags": [1, 3, 6],
@@ -83,12 +103,54 @@ def main():
             },
             "automl": {
                 "enabled": True,
-                "n_trials": 8,
+                "n_trials": 2,
                 "seed": 42,
                 "validation_fraction": 0.2,
-                "minimum_dsr_threshold": 0.3,
-                "enable_pruning": True,
-                "study_name": "BTCUSDT_1h_trading_first_oos_demo_v4",
+                "minimum_dsr_threshold": None,
+                "locked_holdout_enabled": False,
+                "enable_pruning": False,
+                "objective": "sharpe_ratio",
+                "study_name": "BTCUSDT_1h_example_automl_v3",
+                "storage": str(automl_storage),
+                "selection_policy": {
+                    "enabled": False,
+                },
+                "overfitting_control": {
+                    "enabled": False,
+                    "deflated_sharpe": {"enabled": False},
+                    "pbo": {"enabled": False},
+                    "post_selection": {"enabled": False},
+                },
+                "search_space": {
+                    "features": {
+                        "lags": {"type": "categorical", "choices": ["1,3,6", "1,4,12"]},
+                        "frac_diff_d": {"type": "categorical", "choices": [0.4, 0.6]},
+                        "rolling_window": {"type": "categorical", "choices": [20, 28]},
+                        "squeeze_quantile": {"type": "categorical", "choices": [0.15, 0.2]},
+                    },
+                    "feature_selection": {
+                        "enabled": {"type": "categorical", "choices": [True]},
+                        "max_features": {"type": "categorical", "choices": [48, 64]},
+                        "min_mi_threshold": {"type": "categorical", "choices": [0.0, 0.0005]},
+                    },
+                    "labels": {
+                        "pt_mult": {"type": "categorical", "choices": [1.5, 2.0]},
+                        "sl_mult": {"type": "categorical", "choices": [1.5, 2.0]},
+                        "max_holding": {"type": "categorical", "choices": [12, 24]},
+                        "min_return": {"type": "categorical", "choices": [0.0005, 0.001]},
+                        "volatility_window": {"type": "categorical", "choices": [24]},
+                        "barrier_tie_break": {"type": "categorical", "choices": ["sl"]},
+                    },
+                    "regime": {
+                        "n_regimes": {"type": "categorical", "choices": [2]},
+                    },
+                    "model": {
+                        "type": {"type": "categorical", "choices": ["gbm"]},
+                        "gap": {"type": "categorical", "choices": [24]},
+                        "validation_fraction": {"type": "categorical", "choices": [0.2]},
+                        "meta_n_splits": {"type": "categorical", "choices": [2]},
+                    },
+                },
             },
         }
     )

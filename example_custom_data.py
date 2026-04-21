@@ -10,6 +10,7 @@ import pandas as pd
 
 from core import ATR, BollingerBands, RSI, ResearchPipeline, fetch_binance_bars
 from example_utils import (
+    build_example_universe_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -47,6 +48,7 @@ def main():
     interval = "1h"
     start = "2024-01-01"
     end = "2024-05-01"
+    context_symbols = ["ETHUSDT", "BNBUSDT"]
 
     print_section(sep, 1, "Building delayed custom data feed")
     base_bars, custom_feed = build_custom_feed(symbol=symbol, interval=interval, start=start, end=end)
@@ -63,7 +65,7 @@ def main():
                 "end": end,
                 "market": "spot",
                 "futures_context": {"enabled": False},
-                "cross_asset_context": {"symbols": ["ETHUSDT", "BNBUSDT"]},
+                "cross_asset_context": {"symbols": context_symbols},
                 "custom_data": [
                     {
                         "name": "delayed_market_microstructure",
@@ -81,6 +83,12 @@ def main():
                     }
                 ],
             },
+            "universe": build_example_universe_config(
+                symbol,
+                context_symbols=context_symbols,
+                market="spot",
+                snapshot_timestamp=start,
+            ),
             "indicators": [RSI(14), BollingerBands(20), ATR(14)],
             "features": {
                 "lags": [1, 3, 6],

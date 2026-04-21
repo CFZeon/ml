@@ -1211,12 +1211,17 @@ def fetch_binance_symbol_filters(symbol, market="spot", cache_dir=".cache"):
     """Fetch Binance symbol execution filters for spot or futures markets."""
     normalized_market = _normalize_market(market)
     cache_path = _symbol_filters_cache_path(cache_dir, normalized_market, symbol)
-    cached = _read_cache(cache_path) if cache_path is not None else None
+    cached = None
+    if cache_path is not None:
+        try:
+            cached = _read_object_cache(cache_path)
+        except Exception:
+            cached = None
     if cached is not None:
-        return cached
+        return dict(cached)
 
     payload = _fetch_exchange_info_symbol_payload(symbol, market=normalized_market, cache_dir=cache_dir)
     filters = _parse_symbol_filters(payload)
     if cache_path is not None:
-        _write_cache(cache_path, filters)
+        _write_object_cache(cache_path, filters)
     return filters
