@@ -67,8 +67,25 @@ The repo now includes:
 - `core/stat_tests.py`: White Reality Check, Hansen SPA, and aligned candidate return-matrix helpers
 - `core/pipeline.py`: stepwise research pipeline orchestration
 - `core/lookahead.py`: baseline-plus-prefix replay audit for lookahead bias provocation
-- `example.py`, `example_fvg.py`, `example_custom_data.py`, `example_futures.py`, `example_automl.py`: runnable end-to-end examples
+- `example_active_spot.py`, `example_active_futures.py`: runnable active-trading demos
+- `example.py`, `example_custom_data.py`, `example_futures.py`, `example_fvg.py`, `example_synthetic_derivatives.py`, `example_automl.py`: runnable end-to-end examples and smoke/integration demos
 - `tests/`: regression coverage for validation, joins, execution semantics, AutoML governance, and futures behavior
+
+## Example Guide
+
+If you want examples that reliably place trades under the current pipeline contracts, start with the active demos:
+
+- `example_active_spot.py`: spot workflow using cross-asset context, CPCV training, and a more permissive signal policy so the demo produces executed spot trades instead of mostly abstaining
+- `example_active_futures.py`: USDT-M futures workflow using mark-price valuation, isolated-margin account rules, and an active long/short signal policy on the pandas execution adapter
+
+The rest of the examples serve different purposes:
+
+- `example.py`: baseline end-to-end spot research workflow with conservative settings
+- `example_custom_data.py`: point-in-time-safe custom-data join example
+- `example_futures.py`: conservative futures example using real Binance data and the liquidation-aware adapter
+- `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain
+- `example_synthetic_derivatives.py`: offline synthetic derivatives/integration example; may also abstain depending on the generated regime path
+- `example_automl.py`: constrained AutoML study demo
 
 ## Installation
 
@@ -77,6 +94,18 @@ python -m pip install -r requirements.txt
 ```
 
 ## Quick Start
+
+Run the active spot example:
+
+```bash
+python example_active_spot.py
+```
+
+Run the active futures example:
+
+```bash
+python example_active_futures.py
+```
 
 Run the baseline research example:
 
@@ -88,6 +117,12 @@ Run the futures example with mark-price valuation and the liquidation-aware marg
 
 ```bash
 python example_futures.py
+```
+
+Run the custom-data example:
+
+```bash
+python example_custom_data.py
 ```
 
 Run the test suite:
