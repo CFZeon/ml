@@ -13,19 +13,27 @@ from .rsi import RSI
 from .macd import MACD
 from .bollinger_bands import BollingerBands
 from .atr import ATR
+from .adx import ADX
+from .stochastic import StochasticOscillator
+from .on_balance_volume import OnBalanceVolume
+from .donchian_channels import DonchianChannels
 from .fair_value_gap import FairValueGap
 
 
 __all__ = [
     "INDICATOR_REGISTRY",
+    "ADX",
     "ATR",
     "BollingerBands",
+    "DonchianChannels",
     "FairValueGap",
     "Indicator",
     "IndicatorResult",
     "IndicatorRunResult",
     "MACD",
+    "OnBalanceVolume",
     "RSI",
+    "StochasticOscillator",
     "attach_indicators",
     "build_indicator",
     "build_indicators",

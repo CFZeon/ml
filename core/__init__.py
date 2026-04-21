@@ -41,6 +41,7 @@ from .execution import (
     resolve_liquidity_inputs,
 )
 from .indicators import (
+    ADX,
     Indicator,
     IndicatorResult,
     IndicatorRunResult,
@@ -48,8 +49,11 @@ from .indicators import (
     MACD,
     BollingerBands,
     ATR,
+    DonchianChannels,
     FairValueGap,
     INDICATOR_REGISTRY,
+    OnBalanceVolume,
+    StochasticOscillator,
     build_indicator,
     build_indicators,
     run_indicators,

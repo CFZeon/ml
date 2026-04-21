@@ -11,7 +11,21 @@ BASE_COLUMNS = {"open", "high", "low", "close", "volume", "quote_volume", "trade
 DEFAULT_STATIONARITY_TRANSFORM_ORDER = ("log_diff", "pct_change", "diff", "zscore", "frac_diff")
 ENDOGENOUS_FEATURE_FAMILIES = frozenset({"endogenous_price", "indicator"})
 CONTEXT_FEATURE_FAMILIES = frozenset({"futures_context", "cross_asset", "custom_exogenous", "reference_overlay", "cross_venue_composite"})
-_INDICATOR_BLOCKS = frozenset({"rsi", "macd", "bollinger", "atr", "fvg", "generic_indicator", "indicator_interactions"})
+_INDICATOR_BLOCKS = frozenset(
+    {
+        "rsi",
+        "macd",
+        "bollinger",
+        "atr",
+        "adx",
+        "stochastic",
+        "obv",
+        "donchian",
+        "fvg",
+        "generic_indicator",
+        "indicator_interactions",
+    }
+)
 _BLOCK_TO_FAMILY = {
     "price_volume": "endogenous_price",
     "multi_timeframe": "endogenous_price",
@@ -438,6 +452,134 @@ def _extract_atr_features(result, df, rolling_window=20, **_):
     return _as_feature_block(frame, laggable, block_name=result.kind)
 
 
+def _extract_adx_features(result, df, rolling_window=20, **_):
+    adx = df[result.name].astype(float)
+    plus_di = df[f"{result.name}_plus_di"].astype(float)
+    minus_di = df[f"{result.name}_minus_di"].astype(float)
+    di_sum = (plus_di + minus_di).replace(0.0, np.nan)
+    strength = adx / 100.0
+    di_spread = (plus_di - minus_di) / 100.0
+
+    frame = pd.DataFrame(
+        {
+            f"{result.name}_strength": strength,
+            f"{result.name}_strength_slope": strength.diff(),
+            f"{result.name}_strength_zscore": _rolling_zscore(strength, rolling_window),
+            f"{result.name}_trend_regime": (adx >= 25.0).astype(float),
+            f"{result.name}_di_spread": di_spread,
+            f"{result.name}_di_imbalance": _safe_divide(plus_di - minus_di, di_sum),
+            f"{result.name}_plus_dominant": (plus_di > minus_di).astype(float),
+            f"{result.name}_minus_dominant": (minus_di > plus_di).astype(float),
+            f"{result.name}_di_cross_up": _cross_up(plus_di - minus_di, 0.0),
+            f"{result.name}_di_cross_down": _cross_down(plus_di - minus_di, 0.0),
+        },
+        index=df.index,
+    )
+    laggable = [
+        f"{result.name}_strength",
+        f"{result.name}_strength_slope",
+        f"{result.name}_strength_zscore",
+        f"{result.name}_di_spread",
+        f"{result.name}_di_imbalance",
+    ]
+    return _as_feature_block(frame, laggable, block_name=result.kind)
+
+
+def _extract_stochastic_features(result, df, rolling_window=20, **_):
+    k = df[f"{result.name}_k"].astype(float)
+    d = df[f"{result.name}_d"].astype(float)
+    spread = (k - d) / 100.0
+
+    frame = pd.DataFrame(
+        {
+            f"{result.name}_k_centered": (k - 50.0) / 50.0,
+            f"{result.name}_d_centered": (d - 50.0) / 50.0,
+            f"{result.name}_spread": spread,
+            f"{result.name}_k_slope": k.diff() / 100.0,
+            f"{result.name}_d_slope": d.diff() / 100.0,
+            f"{result.name}_spread_zscore": _rolling_zscore(spread, rolling_window),
+            f"{result.name}_overbought": (k >= 80.0).astype(float),
+            f"{result.name}_oversold": (k <= 20.0).astype(float),
+            f"{result.name}_bull_cross": _cross_up(k - d, 0.0),
+            f"{result.name}_bear_cross": _cross_down(k - d, 0.0),
+        },
+        index=df.index,
+    )
+    laggable = [
+        f"{result.name}_k_centered",
+        f"{result.name}_d_centered",
+        f"{result.name}_spread",
+        f"{result.name}_k_slope",
+        f"{result.name}_d_slope",
+        f"{result.name}_spread_zscore",
+    ]
+    return _as_feature_block(frame, laggable, block_name=result.kind)
+
+
+def _extract_obv_features(result, df, rolling_window=20, **_):
+    obv = df[result.name].astype(float)
+    close = df["close"].astype(float)
+    volume = df["volume"].astype(float)
+    rolling_volume = volume.rolling(rolling_window).sum().replace(0.0, np.nan)
+    obv_delta = obv.diff()
+    pressure = _safe_divide(obv_delta.rolling(rolling_window).sum(), rolling_volume)
+    flow = _safe_divide(obv_delta, volume.rolling(rolling_window).mean().replace(0.0, np.nan))
+    price_pressure = close.pct_change(rolling_window)
+
+    frame = pd.DataFrame(
+        {
+            f"{result.name}_flow": flow,
+            f"{result.name}_flow_zscore": _rolling_zscore(flow, rolling_window),
+            f"{result.name}_pressure": pressure,
+            f"{result.name}_pressure_change": pressure.diff(),
+            f"{result.name}_price_divergence": pressure - price_pressure,
+            f"{result.name}_accumulation": (pressure > 0.1).astype(float),
+            f"{result.name}_distribution": (pressure < -0.1).astype(float),
+        },
+        index=df.index,
+    )
+    laggable = [
+        f"{result.name}_flow",
+        f"{result.name}_flow_zscore",
+        f"{result.name}_pressure",
+        f"{result.name}_pressure_change",
+        f"{result.name}_price_divergence",
+    ]
+    return _as_feature_block(frame, laggable, block_name=result.kind)
+
+
+def _extract_donchian_features(result, df, rolling_window=20, **_):
+    upper = df[f"{result.name}_upper"].astype(float)
+    lower = df[f"{result.name}_lower"].astype(float)
+    mid = df[f"{result.name}_mid"].astype(float)
+    close = df["close"].astype(float)
+    width = upper - lower
+    width_safe = width.replace(0.0, np.nan)
+
+    frame = pd.DataFrame(
+        {
+            f"{result.name}_position": _safe_divide(close - lower, width_safe) - 0.5,
+            f"{result.name}_width": _safe_divide(width, mid.replace(0.0, np.nan)),
+            f"{result.name}_width_zscore": _rolling_zscore(_safe_divide(width, mid.replace(0.0, np.nan)), rolling_window),
+            f"{result.name}_mid_gap": _safe_divide(close - mid, mid.replace(0.0, np.nan)),
+            f"{result.name}_breakout_up": (close > upper.shift(1)).astype(float),
+            f"{result.name}_breakout_down": (close < lower.shift(1)).astype(float),
+            f"{result.name}_dist_upper": _safe_divide(upper - close, width_safe),
+            f"{result.name}_dist_lower": _safe_divide(close - lower, width_safe),
+        },
+        index=df.index,
+    )
+    laggable = [
+        f"{result.name}_position",
+        f"{result.name}_width",
+        f"{result.name}_width_zscore",
+        f"{result.name}_mid_gap",
+        f"{result.name}_dist_upper",
+        f"{result.name}_dist_lower",
+    ]
+    return _as_feature_block(frame, laggable, block_name=result.kind)
+
+
 def _extract_fvg_features(result, df, **_):
     prefix = result.name
     bull_size_pct = df[f"{prefix}_bull_size_pct"].astype(float).fillna(0.0)
@@ -540,6 +682,10 @@ INDICATOR_FEATURE_EXTRACTORS = {
     "macd": _extract_macd_features,
     "bollinger": _extract_bollinger_features,
     "atr": _extract_atr_features,
+    "adx": _extract_adx_features,
+    "stochastic": _extract_stochastic_features,
+    "obv": _extract_obv_features,
+    "donchian": _extract_donchian_features,
     "fvg": _extract_fvg_features,
 }
 
@@ -562,6 +708,10 @@ def _indicator_interaction_features(df, indicator_run, rolling_window=20):
     macd_result = results_by_kind.get("macd", [None])[0]
     bollinger_result = results_by_kind.get("bollinger", [None])[0]
     atr_result = results_by_kind.get("atr", [None])[0]
+    adx_result = results_by_kind.get("adx", [None])[0]
+    stochastic_result = results_by_kind.get("stochastic", [None])[0]
+    obv_result = results_by_kind.get("obv", [None])[0]
+    donchian_result = results_by_kind.get("donchian", [None])[0]
     fvg_result = results_by_kind.get("fvg", [None])[0]
 
     rsi = None
@@ -570,6 +720,13 @@ def _indicator_interaction_features(df, indicator_run, rolling_window=20):
     pctb = None
     bandwidth = None
     atr_pct = None
+    adx_strength = None
+    di_spread = None
+    stochastic_centered = None
+    stochastic_spread = None
+    obv_pressure = None
+    donchian_position = None
+    donchian_breakout_bias = None
 
     if rsi_result is not None:
         rsi = df[rsi_result.name].astype(float)
@@ -581,6 +738,29 @@ def _indicator_interaction_features(df, indicator_run, rolling_window=20):
         bandwidth = df[f"{bollinger_result.name}_bw"].astype(float)
     if atr_result is not None:
         atr_pct = _safe_divide(df[atr_result.name].astype(float), close)
+    if adx_result is not None:
+        adx_strength = df[adx_result.name].astype(float) / 100.0
+        di_spread = (
+            df[f"{adx_result.name}_plus_di"].astype(float)
+            - df[f"{adx_result.name}_minus_di"].astype(float)
+        ) / 100.0
+    if stochastic_result is not None:
+        stoch_k = df[f"{stochastic_result.name}_k"].astype(float)
+        stoch_d = df[f"{stochastic_result.name}_d"].astype(float)
+        stochastic_centered = (stoch_k - 50.0) / 50.0
+        stochastic_spread = (stoch_k - stoch_d) / 100.0
+    if obv_result is not None:
+        volume = df["volume"].astype(float)
+        obv_pressure = _safe_divide(
+            df[obv_result.name].astype(float).diff().rolling(rolling_window).sum(),
+            volume.rolling(rolling_window).sum().replace(0.0, np.nan),
+        )
+    if donchian_result is not None:
+        upper = df[f"{donchian_result.name}_upper"].astype(float)
+        lower = df[f"{donchian_result.name}_lower"].astype(float)
+        width = (upper - lower).replace(0.0, np.nan)
+        donchian_position = _safe_divide(close - lower, width) - 0.5
+        donchian_breakout_bias = (close > upper.shift(1)).astype(float) - (close < lower.shift(1)).astype(float)
 
     if rsi is not None and line_pct is not None and hist_pct is not None:
         trend_up = (line_pct > 0) & (hist_pct > 0)
@@ -611,6 +791,37 @@ def _indicator_interaction_features(df, indicator_run, rolling_window=20):
         frame["trend_strength_to_atr"] = _safe_divide(line_pct.abs(), atr_pct_safe)
         frame["hist_impulse_to_atr"] = _safe_divide(hist_pct, atr_pct_safe)
         laggable.extend(["trend_strength_to_atr", "hist_impulse_to_atr"])
+
+    if adx_strength is not None and di_spread is not None:
+        frame["adx_directional_bias"] = adx_strength * np.sign(di_spread.fillna(0.0))
+        frame["adx_di_conviction"] = adx_strength * di_spread.fillna(0.0)
+        laggable.extend(["adx_directional_bias", "adx_di_conviction"])
+
+    if adx_strength is not None and stochastic_centered is not None:
+        frame["trend_pullback_alignment"] = adx_strength * stochastic_centered.fillna(0.0)
+        if di_spread is not None:
+            frame["directional_pullback_score"] = di_spread.fillna(0.0) * stochastic_centered.fillna(0.0)
+            laggable.append("directional_pullback_score")
+        laggable.append("trend_pullback_alignment")
+
+    if donchian_position is not None and adx_strength is not None:
+        frame["breakout_trend_pressure"] = donchian_position.fillna(0.0) * adx_strength.fillna(0.0)
+        laggable.append("breakout_trend_pressure")
+        if donchian_breakout_bias is not None and di_spread is not None:
+            frame["directional_breakout_confirmation"] = donchian_breakout_bias * np.sign(di_spread.fillna(0.0)) * adx_strength.fillna(0.0)
+            laggable.append("directional_breakout_confirmation")
+
+    if obv_pressure is not None:
+        if hist_pct is not None:
+            frame["volume_momentum_confirmation"] = obv_pressure.fillna(0.0) * hist_pct.fillna(0.0)
+            laggable.append("volume_momentum_confirmation")
+        if donchian_breakout_bias is not None:
+            frame["breakout_volume_confirmation"] = donchian_breakout_bias * obv_pressure.fillna(0.0)
+            laggable.append("breakout_volume_confirmation")
+
+    if stochastic_spread is not None and line_pct is not None:
+        frame["stochastic_trend_synch"] = stochastic_spread.fillna(0.0) * line_pct.fillna(0.0)
+        laggable.append("stochastic_trend_synch")
 
     if fvg_result is not None:
         prefix = fvg_result.name

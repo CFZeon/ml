@@ -17,7 +17,7 @@ The current codebase is built around these constraints:
 The repo now includes:
 
 - Binance spot and futures data loaders with cacheing, retry/backoff, and integrity reporting
-- modular indicators in `core/indicators/`
+- modular indicators in `core/indicators/` including RSI, MACD, Bollinger Bands, ATR, Fair Value Gap, ADX, stochastic oscillator, on-balance volume, and Donchian channels
 - feature engineering with fractional differentiation and ADF-based stationarity screening
 - triple-barrier, fixed-horizon, and trend-scanning labels
 - uniqueness weighting and sequential bootstrap support
@@ -68,6 +68,7 @@ The repo now includes:
 - `core/pipeline.py`: stepwise research pipeline orchestration
 - `core/lookahead.py`: baseline-plus-prefix replay audit for lookahead bias provocation
 - `example_active_spot.py`, `example_active_futures.py`: runnable active-trading demos
+- `example_trend_volume_spot.py`, `example_trend_breakout_futures.py`: runnable expanded-indicator demos
 - `example.py`, `example_custom_data.py`, `example_futures.py`, `example_fvg.py`, `example_synthetic_derivatives.py`, `example_automl.py`: runnable end-to-end examples and smoke/integration demos
 - `tests/`: regression coverage for validation, joins, execution semantics, AutoML governance, and futures behavior
 
@@ -83,6 +84,8 @@ The rest of the examples serve different purposes:
 - `example.py`: baseline end-to-end spot research workflow with conservative settings
 - `example_custom_data.py`: point-in-time-safe custom-data join example
 - `example_futures.py`: conservative futures example using real Binance data and the liquidation-aware adapter
+- `example_trend_volume_spot.py`: spot example that blends RSI/MACD/Bollinger/ATR with ADX, stochastic, OBV, and Donchian features
+- `example_trend_breakout_futures.py`: futures example focused on ADX plus Donchian trend-breakout context layered onto the existing futures pipeline
 - `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain
 - `example_synthetic_derivatives.py`: offline synthetic derivatives/integration example; may also abstain depending on the generated regime path
 - `example_automl.py`: constrained AutoML study demo
@@ -123,6 +126,18 @@ Run the custom-data example:
 
 ```bash
 python example_custom_data.py
+```
+
+Run the expanded-indicator spot example:
+
+```bash
+python example_trend_volume_spot.py
+```
+
+Run the expanded-indicator futures example:
+
+```bash
+python example_trend_breakout_futures.py
 ```
 
 Run the test suite:
