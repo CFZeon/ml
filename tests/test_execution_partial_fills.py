@@ -20,6 +20,7 @@ class ExecutionPartialFillTest(unittest.TestCase):
             volume=volume,
             execution_policy={
                 "adapter": "nautilus",
+                "force_simulation": True,
                 "time_in_force": "IOC",
                 "participation_cap": 1.0,
                 "action_latency_bars": 1,
@@ -47,6 +48,7 @@ class ExecutionPartialFillTest(unittest.TestCase):
             volume=volume,
             execution_policy={
                 "adapter": "nautilus",
+                "force_simulation": True,
                 "time_in_force": "IOC",
                 "participation_cap": 1.0,
             },
@@ -73,6 +75,7 @@ class ExecutionPartialFillTest(unittest.TestCase):
             volume=volume,
             execution_policy={
                 "adapter": "nautilus",
+                "force_simulation": True,
                 "time_in_force": "GTC",
                 "participation_cap": 1.0,
                 "max_order_age_bars": 2,
@@ -98,6 +101,7 @@ class ExecutionPartialFillTest(unittest.TestCase):
                 volume=pd.Series([1_000.0] * len(index), index=index),
                 execution_policy={
                     "adapter": "nautilus",
+                    "force_simulation": True,
                     "order_type": "limit",
                     "time_in_force": "GTC",
                 },
@@ -118,6 +122,7 @@ class ExecutionPartialFillTest(unittest.TestCase):
             volume=pd.Series([1_000.0] * len(index), index=index),
             execution_policy={
                 "adapter": "nautilus",
+                "force_simulation": True,
                 "time_in_force": "IOC",
                 "participation_cap": 1.0,
             },

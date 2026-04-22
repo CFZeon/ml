@@ -115,7 +115,7 @@ class OperationsMonitoringTest(unittest.TestCase):
             signal_delay_bars=0,
             engine="pandas",
             volume=pd.Series([10_000.0] * len(index), index=index),
-            execution_policy={"adapter": "nautilus", "time_in_force": "IOC", "participation_cap": 1.0},
+            execution_policy={"adapter": "nautilus", "force_simulation": True, "time_in_force": "IOC", "participation_cap": 1.0},
         )
         stressed = run_backtest(
             close=close,
@@ -127,7 +127,7 @@ class OperationsMonitoringTest(unittest.TestCase):
             signal_delay_bars=0,
             engine="pandas",
             volume=pd.Series([1.0] * len(index), index=index),
-            execution_policy={"adapter": "nautilus", "time_in_force": "IOC", "participation_cap": 0.5},
+            execution_policy={"adapter": "nautilus", "force_simulation": True, "time_in_force": "IOC", "participation_cap": 0.5},
         )
 
         report = build_monitoring_report(

@@ -44,6 +44,7 @@ class FeatureBlock:
     frame: pd.DataFrame
     laggable_columns: list[str]
     block_name: str
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass

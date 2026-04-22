@@ -7,6 +7,7 @@ from core import (
     LocalRegistryStore,
     build_model,
     create_promotion_eligibility_report,
+    evaluate_execution_realism_gate,
     evaluate_challenger_promotion,
     finalize_promotion_eligibility_report,
     resolve_canonical_promotion_score,
@@ -36,6 +37,41 @@ def _make_report(score_value):
 
 
 class PromotionGateBindingTest(unittest.TestCase):
+    def test_execution_realism_gate_blocks_surrogate_promotion(self):
+        report = _make_report(0.15)
+        execution_realism = evaluate_execution_realism_gate(
+            {
+                "execution_mode": "conservative_bar_surrogate",
+                "promotion_execution_ready": False,
+                "execution_adapter": "bar_surrogate",
+                "execution_backend": "bar_surrogate",
+                "execution_limitations": ["bar_surrogate_only"],
+            }
+        )
+        report = upsert_promotion_gate(
+            report,
+            group="post_selection",
+            name="execution_realism",
+            passed=bool(execution_realism["passed"]),
+            mode="blocking",
+            measured=execution_realism["execution_mode"],
+            threshold=execution_realism["required_execution_mode"],
+            reason=execution_realism["reason"],
+            details=execution_realism,
+        )
+        report = finalize_promotion_eligibility_report(report)
+
+        decision = evaluate_challenger_promotion(
+            {
+                "promotion_eligibility_report": report,
+                "selection_value": 0.15,
+                "sample_count": 500,
+            }
+        )
+
+        self.assertFalse(decision["approved"])
+        self.assertIn("execution_realism_failed", decision["promotion_eligibility_report"]["blocking_failures"])
+
     def test_calibration_mode_downgrades_blocking_gate_to_advisory(self):
         report = create_promotion_eligibility_report(calibration_mode=True)
         report = upsert_promotion_gate(

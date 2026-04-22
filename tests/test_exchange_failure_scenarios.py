@@ -23,7 +23,7 @@ class ExchangeFailureScenariosTest(unittest.TestCase):
             signal_delay_bars=0,
             engine="pandas",
             volume=volume,
-            execution_policy={"adapter": "nautilus", "time_in_force": "IOC", "participation_cap": 1.0},
+            execution_policy={"adapter": "nautilus", "force_simulation": True, "time_in_force": "IOC", "participation_cap": 1.0},
         )
         stressed = run_backtest(
             close=close,
@@ -35,7 +35,7 @@ class ExchangeFailureScenariosTest(unittest.TestCase):
             signal_delay_bars=0,
             engine="pandas",
             volume=volume,
-            execution_policy={"adapter": "nautilus", "time_in_force": "IOC", "participation_cap": 1.0},
+            execution_policy={"adapter": "nautilus", "force_simulation": True, "time_in_force": "IOC", "participation_cap": 1.0},
             scenario_schedule=[
                 {"event_type": "downtime", "timestamp": index[1]},
                 {"event_type": "downtime", "timestamp": index[3]},
@@ -133,7 +133,7 @@ class ExchangeFailureScenariosTest(unittest.TestCase):
                 "signal_delay_bars": 0,
                 "engine": "pandas",
                 "volume": pd.Series(1_000.0, index=index),
-                "execution_policy": {"adapter": "nautilus", "time_in_force": "IOC", "participation_cap": 1.0},
+                "execution_policy": {"adapter": "nautilus", "force_simulation": True, "time_in_force": "IOC", "participation_cap": 1.0},
             },
             {
                 "downtime": {

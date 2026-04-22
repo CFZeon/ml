@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from core import ResearchPipeline, build_reference_validation_bundle, select_features, train_model, trend_scanning_labels
+from core.context import build_futures_context_feature_block
 from core.models import compute_feature_family_diagnostics, summarize_feature_family_diagnostics
 
 
@@ -199,6 +200,67 @@ class DerivativesContextPipelineTest(unittest.TestCase):
         self.assertNotIn("close_fracdiff", aligned["X"].columns)
         self.assertNotIn("close_fracdiff_lag1", aligned["X"].columns)
         self.assertNotIn("close_fracdiff_lag3", aligned["X"].columns)
+
+    def test_futures_context_ttl_blanks_stale_state_but_keeps_rows(self):
+        index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        futures_context = _make_futures_context(index, raw_data["close"].to_numpy())
+        futures_context["mark_price"] = futures_context["mark_price"].iloc[[0]].copy()
+
+        block = build_futures_context_feature_block(
+            raw_data,
+            futures_context,
+            rolling_window=4,
+            ttl_config={"mark_price": "2h", "premium_index": "2h", "funding": "12h", "recent": "4h", "max_stale_rate": 0.1},
+        )
+
+        self.assertIn("fut_context_stale_any", block.frame.columns)
+        self.assertEqual(float(block.frame.loc[index[3], "fut_context_stale_any"]), 1.0)
+        self.assertAlmostEqual(float(block.frame.loc[index[3], "fut_mark_spread_pct"]), 0.0, places=6)
+        self.assertGreater(block.metadata["ttl_report"]["stale_hit_count"], 0)
+        self.assertFalse(block.metadata["ttl_report"]["promotion_pass"])
+
+    def test_pipeline_surfaces_context_ttl_breach_in_operational_monitoring(self):
+        index = pd.date_range("2026-02-01", periods=240, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        futures_context = _make_futures_context(index, raw_data["close"].to_numpy())
+        futures_context["mark_price"] = futures_context["mark_price"].iloc[[0]].copy()
+        cross_asset_context = {
+            "ETHUSDT": _make_ohlcv(index, drift=9.0, amplitude=2.0, volume_base=1_300.0),
+            "SOLUSDT": _make_ohlcv(index, drift=15.0, amplitude=4.0, volume_base=1_100.0),
+            "BNBUSDT": _make_ohlcv(index, drift=6.0, amplitude=1.5, volume_base=900.0),
+        }
+
+        pipeline = self._make_context_pipeline(
+            labels={
+                "kind": "trend_scanning",
+                "min_horizon": 6,
+                "max_horizon": 24,
+                "step": 3,
+                "min_t_value": 0.75,
+                "min_return": 0.0001,
+            }
+        )
+        pipeline.config["features"]["futures_context_ttl"] = {
+            "mark_price": "2h",
+            "premium_index": "2h",
+            "funding": "12h",
+            "recent": "4h",
+            "max_stale_rate": 0.05,
+        }
+        pipeline.state["raw_data"] = raw_data
+        pipeline.state["data"] = raw_data.copy()
+        pipeline.state["futures_context"] = futures_context
+        pipeline.state["cross_asset_context"] = cross_asset_context
+        pipeline.build_features()
+        pipeline.detect_regimes()
+        pipeline.build_labels()
+        pipeline.align_data()
+        training = pipeline.train_models()
+
+        self.assertIn("context_ttl", training["operational_monitoring"])
+        self.assertFalse(training["operational_monitoring"]["healthy"])
+        self.assertIn("context_ttl_breached", training["operational_monitoring"]["reasons"])
 
     def test_mark_valuation_strict_policy_rejects_missing_leading_prices(self):
         index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")

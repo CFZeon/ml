@@ -4,7 +4,13 @@ import numpy as np
 import pandas as pd
 
 from core import ResearchPipeline, build_execution_outcome_frame, build_trade_outcome_frame
-from core.pipeline import SignalPolicyBuilder, _build_signal_state, _compute_theory_thresholds, _estimate_trade_outcome_stats
+from core.pipeline import (
+    SignalPolicyBuilder,
+    _build_signal_state,
+    _compute_theory_thresholds,
+    _estimate_trade_outcome_stats,
+    _select_causal_prior_trade_outcomes,
+)
 
 
 class SignalProfitabilitySizingTest(unittest.TestCase):
@@ -103,6 +109,48 @@ class SignalProfitabilitySizingTest(unittest.TestCase):
 
         self.assertFalse(state["used_flat_kelly_fallback"])
         self.assertAlmostEqual(float(state["position_size"].iloc[0]), 0.2, places=6)
+
+    def test_walk_forward_prior_trade_outcomes_require_strictly_earlier_timestamps(self):
+        earlier = pd.DataFrame(
+            {"net_trade_return": [0.03], "trade_taken": [1]},
+            index=pd.date_range("2026-03-01", periods=1, freq="1h", tz="UTC"),
+        )
+        later = pd.DataFrame(
+            {"net_trade_return": [0.07], "trade_taken": [1]},
+            index=pd.date_range("2026-03-10", periods=1, freq="1h", tz="UTC"),
+        )
+
+        filtered, policy = _select_causal_prior_trade_outcomes(
+            [later, earlier],
+            validation_method="walk_forward",
+            calibration_cutoff_timestamp=pd.Timestamp("2026-03-05", tz="UTC"),
+        )
+
+        self.assertListEqual(filtered.index.tolist(), earlier.index.tolist())
+        self.assertEqual(policy["policy_name"], "strictly_earlier_oos_only")
+        self.assertTrue(policy["allow_cross_fold_borrowing"])
+        self.assertEqual(int(policy["causal_trade_rows"]), 1)
+
+    def test_cpcv_prior_trade_outcomes_do_not_borrow_other_paths(self):
+        earlier = pd.DataFrame(
+            {"net_trade_return": [0.03], "trade_taken": [1]},
+            index=pd.date_range("2026-03-01", periods=1, freq="1h", tz="UTC"),
+        )
+        later = pd.DataFrame(
+            {"net_trade_return": [0.07], "trade_taken": [1]},
+            index=pd.date_range("2026-03-10", periods=1, freq="1h", tz="UTC"),
+        )
+
+        filtered, policy = _select_causal_prior_trade_outcomes(
+            [earlier, later],
+            validation_method="cpcv",
+            calibration_cutoff_timestamp=pd.Timestamp("2026-03-12", tz="UTC"),
+        )
+
+        self.assertTrue(filtered.empty)
+        self.assertEqual(policy["policy_name"], "validation_only_or_defaults")
+        self.assertFalse(policy["allow_cross_fold_borrowing"])
+        self.assertEqual(int(policy["causal_trade_rows"]), 0)
 
     def test_trade_outcome_frame_uses_profitability_not_raw_correctness(self):
         index = pd.date_range("2026-03-01", periods=4, freq="1h", tz="UTC")
@@ -396,6 +444,10 @@ class SignalProfitabilitySizingTest(unittest.TestCase):
             training["signal_policy"]["last_policy_quality"]["source"],
             "validation_unavailable_static_fallback",
         )
+        self.assertEqual(training["signal_policy"]["calibration_policy"]["policy_name"], "strictly_earlier_oos_only")
+        self.assertIn("causal_calibration_rows", training["signal_policy"]["last_policy_quality"])
+        self.assertIn("causal_cutoff_timestamp", training["signal_policy"]["last_policy_quality"])
+        self.assertIn("cross_fold_borrowing_allowed", training["signal_policy"]["last_policy_quality"])
 
     def test_pipeline_persists_signal_decay_in_training_and_backtest(self):
         index = pd.date_range("2026-03-13", periods=220, freq="1h", tz="UTC")

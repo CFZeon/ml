@@ -418,6 +418,33 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
 
         self.assertGreater(accurate_score, profitable_score)
 
+    def test_objective_uses_executable_validation_metrics_when_present(self):
+        training = {
+            "avg_accuracy": 0.12,
+            "avg_directional_accuracy": 0.12,
+            "avg_log_loss": 0.9,
+            "avg_brier_score": 0.5,
+            "avg_calibration_error": 0.4,
+            "executable_validation": {
+                "enabled": True,
+                "training": {
+                    "avg_accuracy": 0.78,
+                    "avg_directional_accuracy": 0.78,
+                    "avg_log_loss": 0.18,
+                    "avg_brier_score": 0.09,
+                    "avg_calibration_error": 0.03,
+                },
+            },
+        }
+
+        score = compute_objective_value(
+            "directional_accuracy",
+            training,
+            {"net_profit_pct": 0.0, "sharpe_ratio": 0.0, "max_drawdown": 0.0, "total_trades": 10},
+        )
+
+        self.assertAlmostEqual(score, 0.78)
+
     def test_risk_adjusted_after_costs_uses_backtest_and_gates_classification_quality(self):
         strong_backtest = {
             "net_profit_pct": 0.12,

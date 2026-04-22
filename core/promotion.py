@@ -47,6 +47,28 @@ def create_promotion_eligibility_report(*, calibration_mode=False, score_basis=N
     return report
 
 
+def evaluate_execution_realism_gate(backtest_summary=None, policy=None):
+    backtest_summary = dict(backtest_summary or {})
+    policy = dict(policy or {})
+    required_execution_mode = str(policy.get("required_execution_mode", "event_driven")).lower()
+    execution_mode = str(backtest_summary.get("execution_mode") or "unknown").lower()
+    promotion_execution_ready = bool(backtest_summary.get("promotion_execution_ready", False))
+    execution_limitations = list(backtest_summary.get("execution_limitations") or [])
+    passed = bool(promotion_execution_ready and execution_mode == required_execution_mode)
+    return {
+        "passed": passed,
+        "reason": None if passed else "execution_realism_failed",
+        "execution_mode": execution_mode,
+        "required_execution_mode": required_execution_mode,
+        "promotion_execution_ready": promotion_execution_ready,
+        "execution_adapter": backtest_summary.get("execution_adapter"),
+        "execution_backend": backtest_summary.get("execution_backend"),
+        "execution_limitations": execution_limitations,
+        "research_only": not passed,
+        "new_symbol_policy": str(policy.get("new_symbol_policy", "conservative_assumptions_only")),
+    }
+
+
 def set_promotion_score(report, *, basis, value, metadata=None):
     payload = copy.deepcopy(report or create_promotion_eligibility_report())
     payload["score"] = {
@@ -206,6 +228,7 @@ def get_promotion_score(report):
 __all__ = [
     "build_promotion_gate_check_map",
     "create_promotion_eligibility_report",
+    "evaluate_execution_realism_gate",
     "finalize_promotion_eligibility_report",
     "get_promotion_score",
     "resolve_canonical_promotion_score",

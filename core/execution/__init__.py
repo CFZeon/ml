@@ -9,11 +9,12 @@ from .costs import (
 )
 from .intents import OrderIntent
 from .liquidity import LiquidityInputResolver, resolve_liquidity_inputs
-from .nautilus_adapter import NAUTILUS_AVAILABLE, NautilusExecutionAdapter
+from .nautilus_adapter import ExecutionAdapterUnavailableError, NAUTILUS_AVAILABLE, NautilusExecutionAdapter
 from .policies import ExecutionPolicy, resolve_execution_policy
 
 __all__ = [
 	"DepthCurveImpactModel",
+	"ExecutionAdapterUnavailableError",
 	"ExecutionPolicy",
 	"FillAwareCostModel",
 	"FlatSlippageModel",

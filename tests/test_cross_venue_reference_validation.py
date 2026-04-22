@@ -46,6 +46,7 @@ class CrossVenueReferenceValidationTest(unittest.TestCase):
         self.assertTrue(result["report"]["promotion_pass"])
         self.assertEqual(result["report"]["gate_mode"], "advisory")
         self.assertIn("partial_reference_coverage", result["report"]["reasons"])
+        self.assertEqual(result["report"]["composite_policy"], "liquidity_weighted")
         self.assertIn("reference_price", result["overlay"].columns)
 
     def test_full_spot_cohort_blocks_on_severe_divergence(self):
@@ -64,6 +65,7 @@ class CrossVenueReferenceValidationTest(unittest.TestCase):
                     "venues": ["coinbase", "kraken"],
                     "frames": {"coinbase": coinbase, "kraken": kraken},
                     "partial_coverage_mode": "advisory",
+                    "divergence_mode": "blocking",
                     "min_coverage_ratio": 1.0,
                     "max_price_divergence_bps": 250.0,
                 },
@@ -74,6 +76,56 @@ class CrossVenueReferenceValidationTest(unittest.TestCase):
         self.assertEqual(result["report"]["gate_mode"], "blocking")
         self.assertIn("spot_reference_divergence", result["report"]["reasons"])
         self.assertTrue(result["report"]["full_cohort_available"])
+
+    def test_liquidity_weighted_overlay_tracks_heavier_venue(self):
+        index = pd.date_range("2026-05-01", periods=3, freq="1h", tz="UTC")
+        base = _make_market_frame(index, [100.0, 100.0, 100.0])
+        coinbase = _make_market_frame(index, [100.0, 100.0, 100.0])
+        kraken = _make_market_frame(index, [120.0, 120.0, 120.0])
+        coinbase["volume"] = 10_000.0
+        kraken["volume"] = 100.0
+
+        result = build_spot_reference_validation(
+            base,
+            symbol="BTCUSDT",
+            interval="1h",
+            config={
+                "fetch_live": False,
+                "spot": {
+                    "venues": ["coinbase", "kraken"],
+                    "frames": {"coinbase": coinbase, "kraken": kraken},
+                    "composite_policy": "liquidity_weighted",
+                },
+            },
+        )
+
+        self.assertLess(float(result["overlay"]["reference_price"].iloc[0]), 101.0)
+
+    def test_full_spot_cohort_can_warn_on_divergence_without_blocking(self):
+        index = pd.date_range("2026-05-01", periods=6, freq="1h", tz="UTC")
+        base = _make_market_frame(index, [100.0, 100.5, 101.0, 101.5, 102.0, 102.5])
+        coinbase = _make_market_frame(index, [118.0, 118.5, 119.0, 119.5, 120.0, 120.5])
+        kraken = _make_market_frame(index, [117.5, 118.2, 118.8, 119.2, 119.8, 120.1])
+
+        result = build_spot_reference_validation(
+            base,
+            symbol="BTCUSDT",
+            interval="1h",
+            config={
+                "fetch_live": False,
+                "spot": {
+                    "venues": ["coinbase", "kraken"],
+                    "frames": {"coinbase": coinbase, "kraken": kraken},
+                    "divergence_mode": "advisory",
+                    "min_coverage_ratio": 1.0,
+                    "max_price_divergence_bps": 250.0,
+                },
+            },
+        )
+
+        self.assertTrue(result["report"]["promotion_pass"])
+        self.assertEqual(result["report"]["gate_mode"], "advisory")
+        self.assertIn("spot_reference_divergence", result["report"]["warnings"])
 
 
 if __name__ == "__main__":

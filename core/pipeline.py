@@ -450,6 +450,109 @@ def _iter_validation_splits(pipeline, X):
         }
 
 
+def _resolve_executable_validation_training_config(pipeline, model_config):
+    executable_validation = copy.deepcopy(model_config.get("executable_validation") or {})
+    enabled = executable_validation.get("enabled")
+    if enabled is None:
+        enabled = _resolve_validation_method(model_config) == "cpcv"
+    if not enabled or bool(model_config.get("_skip_executable_validation", False)):
+        return {"enabled": False}
+
+    method = _resolve_validation_method({"cv_method": executable_validation.get("method", "walk_forward")})
+    if method != "walk_forward":
+        raise ValueError("model.executable_validation.method must resolve to 'walk_forward'")
+
+    replay_model_config = copy.deepcopy(model_config)
+    configured_splits = executable_validation.get("n_splits", model_config.get("n_splits"))
+    if configured_splits is None:
+        configured_splits = max(1, _resolve_cpcv_block_count(model_config) - 1)
+
+    replay_model_config["cv_method"] = method
+    replay_model_config["n_splits"] = max(1, int(configured_splits))
+    replay_model_config["train_size"] = executable_validation.get("train_size", model_config.get("train_size"))
+    replay_model_config["test_size"] = executable_validation.get("test_size", model_config.get("test_size"))
+    replay_model_config["gap"] = max(
+        0,
+        int(
+            executable_validation.get(
+                "gap",
+                model_config.get("gap", _resolve_cpcv_embargo_bars(pipeline, model_config)),
+            )
+        ),
+    )
+    replay_model_config["expanding"] = bool(
+        executable_validation.get("expanding", model_config.get("expanding", False))
+    )
+    replay_model_config["_skip_executable_validation"] = True
+    replay_model_config["executable_validation"] = {**executable_validation, "enabled": False}
+    return {
+        "enabled": True,
+        "source": "rolling_walk_forward_replay",
+        "model_config": replay_model_config,
+    }
+
+
+def _build_executable_validation_training(pipeline):
+    model_config = pipeline.section("model")
+    executable_validation_config = _resolve_executable_validation_training_config(pipeline, model_config)
+    if not executable_validation_config.get("enabled", False):
+        return None
+
+    clone_config = copy.deepcopy(pipeline.config)
+    clone_config["model"] = executable_validation_config["model_config"]
+    monitoring_config = dict(clone_config.get("monitoring") or {})
+    monitoring_config["write_reports"] = False
+    clone_config["monitoring"] = monitoring_config
+
+    clone = ResearchPipeline(clone_config, steps=[TrainModelsStep])
+    clone.state = {
+        key: value
+        for key, value in pipeline.state.items()
+        if key not in {"training", "signals", "backtest", "operational_monitoring"}
+    }
+    replay_training = clone.run_step("train_models")
+    return {
+        "enabled": True,
+        "source": executable_validation_config["source"],
+        "reporting_role": "primary",
+        "selection_role": "primary",
+        "training": replay_training,
+    }
+
+
+def _resolve_fold_calibration_policy(validation_method):
+    if validation_method == "cpcv":
+        return {
+            "policy_name": "validation_only_or_defaults",
+            "allow_cross_fold_borrowing": False,
+        }
+    return {
+        "policy_name": "strictly_earlier_oos_only",
+        "allow_cross_fold_borrowing": True,
+    }
+
+
+def _select_causal_prior_trade_outcomes(oos_trade_outcomes, validation_method, calibration_cutoff_timestamp):
+    policy = _resolve_fold_calibration_policy(validation_method)
+    pooled_outcomes = pd.concat(oos_trade_outcomes).sort_index() if oos_trade_outcomes else pd.DataFrame()
+    pooled_row_count = int(len(pooled_outcomes))
+
+    if pooled_outcomes.empty or calibration_cutoff_timestamp is None:
+        causal_outcomes = pooled_outcomes.iloc[0:0]
+    elif policy["allow_cross_fold_borrowing"]:
+        causal_outcomes = pooled_outcomes.loc[pooled_outcomes.index < calibration_cutoff_timestamp]
+    else:
+        causal_outcomes = pooled_outcomes.iloc[0:0]
+
+    return causal_outcomes, {
+        **policy,
+        "causal_cutoff_timestamp": calibration_cutoff_timestamp,
+        "candidate_trade_rows": pooled_row_count,
+        "causal_trade_rows": int(len(causal_outcomes)),
+        "dropped_trade_rows": int(pooled_row_count - len(causal_outcomes)),
+    }
+
+
 def _apply_holding_period(event_weights, holding_bars):
     weights = pd.Series(event_weights, copy=False).astype(float)
     if holding_bars <= 1 or weights.empty:
@@ -582,7 +685,7 @@ def _resolve_backtest_execution_policy(pipeline):
         return configured
 
     return {
-        "adapter": backtest_config.get("execution_adapter", "nautilus"),
+        "adapter": backtest_config.get("execution_adapter", "bar_surrogate"),
         "order_type": backtest_config.get("order_type", "market"),
         "time_in_force": backtest_config.get("time_in_force", "IOC"),
         "participation_cap": backtest_config.get("participation_cap", 1.0),
@@ -590,6 +693,7 @@ def _resolve_backtest_execution_policy(pipeline):
         "action_latency_bars": backtest_config.get("action_latency_bars", 0),
         "max_order_age_bars": backtest_config.get("max_order_age_bars", 1),
         "cancel_replace_bars": backtest_config.get("cancel_replace_bars", 1),
+        "force_simulation": backtest_config.get("force_simulation", False),
     }
 
 
@@ -770,10 +874,126 @@ def _timed_inference_call(latency_store, func, *args, **kwargs):
     return result
 
 
+def _resolve_signal_profitability_threshold(training_payload, config):
+    avg_loss = float(training_payload.get("last_avg_loss", config.get("avg_loss", 0.02)))
+    avg_win = float(training_payload.get("last_avg_win", config.get("avg_win", 0.02)))
+    break_even_prob = avg_loss / max(avg_win + avg_loss, 1e-12)
+    profitability_threshold = training_payload.get("last_signal_params", {}).get("profitability_threshold")
+    if profitability_threshold is None:
+        if config.get("sizing_mode", "expected_utility") == "kelly":
+            profitability_threshold = training_payload.get("last_signal_params", {}).get(
+                "meta_threshold",
+                config.get("meta_threshold", 0.55),
+            )
+        else:
+            profitability_threshold = break_even_prob
+    return float(break_even_prob), float(profitability_threshold)
+
+
+def _build_cpcv_path_results(training, pipeline, config, validation_method):
+    break_even_prob, profitability_threshold = _resolve_signal_profitability_threshold(training, config)
+    holding_bars = _resolve_signal_holding_bars(pipeline, config)
+    path_results = []
+    for path in training.get("oos_paths", []):
+        path_results.append(
+            {
+                "fold": path.get("fold"),
+                "split_id": path.get("split_id"),
+                "validation_method": path.get("validation_method", validation_method),
+                "train_blocks": path.get("train_blocks"),
+                "test_blocks": path.get("test_blocks"),
+                "predictions": path["predictions"],
+                "primary_probabilities": path["primary_probabilities"],
+                "meta_prob": path["meta_prob"],
+                "profitability_prob": path.get("profitability_prob", path["meta_prob"]),
+                "direction_edge": path["direction_edge"],
+                "confidence": path["confidence"],
+                "expected_trade_edge": path.get("expected_trade_edge"),
+                "expected_trade_utility": path.get("expected_trade_edge"),
+                "break_even_profit_prob": break_even_prob,
+                "profitability_threshold": profitability_threshold,
+                "position_size": path.get("position_size", path["kelly_size"]),
+                "kelly_size": path["kelly_size"],
+                "event_signals": path["event_signals"],
+                "holding_bars": holding_bars,
+                "continuous_signals": path["continuous_signals"],
+                "signals": path["signals"],
+                "avg_win_used": path.get("avg_win_used"),
+                "avg_loss_used": path.get("avg_loss_used"),
+                "kelly_trade_count": path.get("kelly_trade_count"),
+                "used_flat_kelly_fallback": path.get("used_flat_kelly_fallback", False),
+                "tuned_params": path.get("signal_params", {}),
+                "signal_policy": path.get("signal_policy"),
+            }
+        )
+    return path_results
+
+
+def _build_signal_result_from_training_payload(training_payload, pipeline, config, fallback_scope, signal_source):
+    break_even_prob, profitability_threshold = _resolve_signal_profitability_threshold(training_payload, config)
+    return {
+        "predictions": training_payload["oos_predictions"],
+        "primary_probabilities": training_payload["oos_probabilities"],
+        "meta_prob": training_payload["oos_meta_prob"],
+        "profitability_prob": training_payload.get("oos_profitability_prob", training_payload["oos_meta_prob"]),
+        "direction_edge": training_payload["oos_direction_edge"],
+        "confidence": training_payload["oos_confidence"],
+        "expected_trade_edge": training_payload.get("oos_expected_trade_edge"),
+        "expected_trade_utility": training_payload.get("oos_expected_trade_edge"),
+        "break_even_profit_prob": break_even_prob,
+        "profitability_threshold": profitability_threshold,
+        "position_size": training_payload.get("oos_position_size", training_payload["oos_kelly_size"]),
+        "kelly_size": training_payload["oos_kelly_size"],
+        "event_signals": training_payload["oos_event_signals"],
+        "holding_bars": _resolve_signal_holding_bars(pipeline, config),
+        "continuous_signals": training_payload["oos_continuous_signals"],
+        "signals": training_payload["oos_signals"],
+        "avg_win_used": training_payload.get("last_avg_win", config.get("avg_win", 0.02)),
+        "avg_loss_used": training_payload.get("last_avg_loss", config.get("avg_loss", 0.02)),
+        "kelly_trade_count": int(training_payload.get("oos_trade_count", 0)),
+        "used_flat_kelly_fallback": False,
+        "signal_tuning": training_payload.get("signal_tuning", []),
+        "signal_policy": training_payload.get("signal_policy"),
+        "tuned_params": training_payload.get("last_signal_params", {}),
+        "signal_source": signal_source,
+        "fallback_scope": fallback_scope,
+        "validation_method": training_payload.get("validation", {}).get("method", "walk_forward"),
+    }
+
+
+def _run_path_backtests(pipeline, config, path_entries):
+    path_backtests = []
+    for path in path_entries:
+        positions = path["continuous_signals"] if config.get("use_continuous_positions", True) else path["signals"]
+        valuation_close = _resolve_backtest_valuation_close(pipeline, positions.index)
+        execution_prices = _resolve_backtest_execution_prices(pipeline, positions.index)
+        path_backtest = run_backtest(
+            close=valuation_close,
+            signals=positions,
+            equity=config.get("equity", 10_000.0),
+            fee_rate=config.get("fee_rate", 0.001),
+            slippage_rate=config.get("slippage_rate", 0.0),
+            signal_delay_bars=_resolve_signal_delay_bars(config),
+            execution_prices=execution_prices,
+            **_resolve_backtest_runtime_kwargs(pipeline, positions.index),
+        )
+        path_backtests.append(
+            {
+                "fold": path.get("fold"),
+                "split_id": path.get("split_id"),
+                "validation_method": path.get("validation_method"),
+                "train_blocks": path.get("train_blocks"),
+                "test_blocks": path.get("test_blocks"),
+                "backtest": path_backtest,
+            }
+        )
+    return path_backtests
+
+
 def _summarize_path_backtests(path_backtests):
     summary = {
         "validation_method": "cpcv",
-        "aggregate_mode": "mean",
+        "aggregate_mode": "diagnostic_distribution",
         "path_count": int(len(path_backtests)),
     }
     if not path_backtests:
@@ -791,76 +1011,21 @@ def _summarize_path_backtests(path_backtests):
 
     enabled_significance_payloads = [payload for payload in significance_payloads if payload.get("enabled")]
     if enabled_significance_payloads:
-        aggregated_significance = {
-            "enabled": True,
-            "aggregate_mode": "mean",
+        summary["statistical_significance"] = {
+            "enabled": False,
+            "aggregate_mode": "path_diagnostics_only",
             "path_count": int(len(enabled_significance_payloads)),
             "method": enabled_significance_payloads[0].get("method"),
-            "bootstrap_samples": enabled_significance_payloads[0].get("bootstrap_samples"),
-            "confidence_level": enabled_significance_payloads[0].get("confidence_level"),
-            "mean_block_length": enabled_significance_payloads[0].get("mean_block_length"),
-            "random_state": enabled_significance_payloads[0].get("random_state"),
-            "benchmark_sharpe_ratio": None,
+            "reason": (
+                "CPCV path significance is diagnostic only; tradable confidence bounds and p-values "
+                "are reported on the executable walk-forward replay."
+            ),
             "metrics": {},
         }
-
-        benchmark_values = [
-            float(payload["benchmark_sharpe_ratio"])
-            for payload in enabled_significance_payloads
-            if payload.get("benchmark_sharpe_ratio") is not None
-        ]
-        if benchmark_values:
-            aggregated_significance["benchmark_sharpe_ratio"] = float(np.mean(benchmark_values))
-
-        metric_names = sorted(
-            {
-                metric_name
-                for payload in enabled_significance_payloads
-                for metric_name in (payload.get("metrics") or {}).keys()
-            }
-        )
-        for metric_name in metric_names:
-            metric_payload = {}
-
-            point_estimates = []
-            ci_lowers = []
-            ci_uppers = []
-            p_zero_values = []
-            p_benchmark_values = []
-            for payload in enabled_significance_payloads:
-                metric = (payload.get("metrics") or {}).get(metric_name) or {}
-                if metric.get("point_estimate") is not None:
-                    point_estimates.append(float(metric["point_estimate"]))
-                confidence_interval = metric.get("confidence_interval") or {}
-                if confidence_interval.get("lower") is not None:
-                    ci_lowers.append(float(confidence_interval["lower"]))
-                if confidence_interval.get("upper") is not None:
-                    ci_uppers.append(float(confidence_interval["upper"]))
-                if metric.get("p_value_gt_zero") is not None:
-                    p_zero_values.append(float(metric["p_value_gt_zero"]))
-                if metric.get("p_value_gt_benchmark") is not None:
-                    p_benchmark_values.append(float(metric["p_value_gt_benchmark"]))
-
-            if point_estimates:
-                metric_payload["point_estimate"] = float(np.mean(point_estimates))
-            if ci_lowers and ci_uppers:
-                metric_payload["confidence_interval"] = {
-                    "lower": float(np.mean(ci_lowers)),
-                    "upper": float(np.mean(ci_uppers)),
-                    "confidence_level": aggregated_significance["confidence_level"],
-                }
-            if p_zero_values:
-                metric_payload["p_value_gt_zero"] = float(np.mean(p_zero_values))
-            if p_benchmark_values:
-                metric_payload["p_value_gt_benchmark"] = float(np.mean(p_benchmark_values))
-            if metric_payload:
-                aggregated_significance["metrics"][metric_name] = metric_payload
-
-        summary["statistical_significance"] = aggregated_significance
     elif significance_payloads:
         summary["statistical_significance"] = {
             "enabled": False,
-            "aggregate_mode": "mean",
+            "aggregate_mode": "path_diagnostics_only",
             "path_count": int(len(significance_payloads)),
             "reason": significance_payloads[0].get("reason"),
             "method": significance_payloads[0].get("method"),
@@ -895,6 +1060,7 @@ def _summarize_path_backtests(path_backtests):
         "win_rate",
         "trade_win_rate",
     ]
+    metrics = {}
     for key in numeric_keys:
         values = []
         for path in path_backtests:
@@ -908,29 +1074,15 @@ def _summarize_path_backtests(path_backtests):
             if np.isfinite(numeric):
                 values.append(numeric)
         if values:
-            summary[key] = float(np.mean(values))
-
-    metric_ranges = {}
-    for key in ["net_profit_pct", "sharpe_ratio", "max_drawdown", "total_trades"]:
-        values = []
-        for path in path_backtests:
-            value = path.get("backtest", {}).get(key)
-            if value is None:
-                continue
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                continue
-            if np.isfinite(numeric):
-                values.append(numeric)
-        if values:
-            metric_ranges[key] = {
+            metrics[key] = {
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
                 "min": float(np.min(values)),
                 "median": float(np.median(values)),
                 "max": float(np.max(values)),
             }
-    if metric_ranges:
-        summary["metric_ranges"] = metric_ranges
+    if metrics:
+        summary["metrics"] = metrics
 
     return summary
 
@@ -2416,8 +2568,14 @@ class FeaturesStep(PipelineStep):
             raw_data,
             pipeline.state.get("futures_context"),
             rolling_window=config.get("rolling_window", 20),
+            ttl_config=config.get("futures_context_ttl"),
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, futures_context_block)
+        ttl_report = dict((futures_context_block.metadata or {}).get("ttl_report") or {})
+        if ttl_report:
+            context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
+            context_ttl_report["futures_context"] = ttl_report
+            pipeline.state["context_ttl_report"] = context_ttl_report
 
         cross_asset_context_block = build_cross_asset_context_feature_block(
             raw_data,
@@ -3054,7 +3212,16 @@ class TrainModelsStep(PipelineStep):
 
             primary_calibrator = None
             meta_calibrator = None
-            prior_oos_trade_outcomes = pd.concat(oos_trade_outcomes).sort_index() if oos_trade_outcomes else pd.DataFrame()
+            calibration_cutoff_timestamp = (
+                X_val_model.index[0]
+                if X_val_model is not None and not X_val_model.empty
+                else (X_test_model.index[0] if not X_test_model.empty else None)
+            )
+            prior_oos_trade_outcomes, calibration_policy = _select_causal_prior_trade_outcomes(
+                oos_trade_outcomes,
+                validation_method=validation_method,
+                calibration_cutoff_timestamp=calibration_cutoff_timestamp,
+            )
             prior_oos_trade_count = _count_realized_trades(prior_oos_trade_outcomes)
             # Extract regime / volatility context columns for meta-model enrichment.
             # Cap at 8 columns to avoid the context overshadowing the primary signal.
@@ -3090,6 +3257,8 @@ class TrainModelsStep(PipelineStep):
             fold_avg_loss = default_avg_loss
             sizing_trade_outcomes = None
             sizing_stats_source = "defaults"
+            active_kelly_trade_count = int(prior_oos_trade_count)
+            causal_calibration_rows = int(calibration_policy.get("causal_trade_rows", 0))
             signal_policy_context = {
                 "source": (
                     "validation_unavailable_static_fallback"
@@ -3097,7 +3266,12 @@ class TrainModelsStep(PipelineStep):
                     else "static_cost_math"
                 ),
                 "calibration_rows": 0,
-                "kelly_trade_count": int(prior_oos_trade_count),
+                "kelly_trade_count": int(active_kelly_trade_count),
+                "causal_calibration_rows": int(causal_calibration_rows),
+                "causal_cutoff_timestamp": calibration_policy.get("causal_cutoff_timestamp"),
+                "causal_prior_rows": int(calibration_policy.get("causal_trade_rows", 0)),
+                "calibration_policy": calibration_policy.get("policy_name"),
+                "cross_fold_borrowing_allowed": bool(calibration_policy.get("allow_cross_fold_borrowing", False)),
             }
             signal_policy_report = signal_policy_builder.build(
                 avg_win=fold_avg_win,
@@ -3159,6 +3333,9 @@ class TrainModelsStep(PipelineStep):
                 )
 
                 sizing_trade_outcomes = val_trade_outcomes
+                validation_trade_count = _count_realized_trades(val_trade_outcomes)
+                active_kelly_trade_count = int(prior_oos_trade_count + validation_trade_count)
+                causal_calibration_rows = int(calibration_policy.get("causal_trade_rows", 0) + len(val_trade_outcomes))
                 fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats(
                     sizing_trade_outcomes,
                     default_avg_win,
@@ -3171,7 +3348,12 @@ class TrainModelsStep(PipelineStep):
                 signal_policy_context = {
                     "source": "validation_trade_outcomes",
                     "calibration_rows": int(len(X_val_model)),
-                    "kelly_trade_count": int(prior_oos_trade_count),
+                    "kelly_trade_count": int(active_kelly_trade_count),
+                    "causal_calibration_rows": int(causal_calibration_rows),
+                    "causal_cutoff_timestamp": calibration_policy.get("causal_cutoff_timestamp"),
+                    "causal_prior_rows": int(calibration_policy.get("causal_trade_rows", 0)),
+                    "calibration_policy": calibration_policy.get("policy_name"),
+                    "cross_fold_borrowing_allowed": bool(calibration_policy.get("allow_cross_fold_borrowing", False)),
                 }
                 signal_policy_report = signal_policy_builder.build(
                     avg_win=fold_avg_win,
@@ -3190,7 +3372,7 @@ class TrainModelsStep(PipelineStep):
                     fold_avg_win,
                     fold_avg_loss,
                     holding_bars,
-                    kelly_trade_count=prior_oos_trade_count,
+                    kelly_trade_count=active_kelly_trade_count,
                 )
                 val_close_for_bt = _resolve_backtest_valuation_close(pipeline, X_val_model.index)
                 if val_close_for_bt is not None and len(val_close_for_bt) > 0:
@@ -3212,6 +3394,8 @@ class TrainModelsStep(PipelineStep):
                     )
             elif not prior_oos_trade_outcomes.empty:
                 sizing_trade_outcomes = prior_oos_trade_outcomes
+                active_kelly_trade_count = int(prior_oos_trade_count)
+                causal_calibration_rows = int(calibration_policy.get("causal_trade_rows", 0))
                 fold_avg_win, fold_avg_loss = _estimate_trade_outcome_stats(
                     sizing_trade_outcomes,
                     default_avg_win,
@@ -3221,7 +3405,12 @@ class TrainModelsStep(PipelineStep):
                 signal_policy_context = {
                     "source": "prior_oos_trade_outcomes",
                     "calibration_rows": int(len(sizing_trade_outcomes)),
-                    "kelly_trade_count": int(prior_oos_trade_count),
+                    "kelly_trade_count": int(active_kelly_trade_count),
+                    "causal_calibration_rows": int(causal_calibration_rows),
+                    "causal_cutoff_timestamp": calibration_policy.get("causal_cutoff_timestamp"),
+                    "causal_prior_rows": int(calibration_policy.get("causal_trade_rows", 0)),
+                    "calibration_policy": calibration_policy.get("policy_name"),
+                    "cross_fold_borrowing_allowed": bool(calibration_policy.get("allow_cross_fold_borrowing", False)),
                 }
                 signal_policy_report = signal_policy_builder.build(
                     avg_win=fold_avg_win,
@@ -3283,7 +3472,7 @@ class TrainModelsStep(PipelineStep):
                 fold_avg_win,
                 fold_avg_loss,
                 holding_bars,
-                kelly_trade_count=prior_oos_trade_count,
+                kelly_trade_count=active_kelly_trade_count,
             )
 
             fold_backtest = None
@@ -3393,6 +3582,10 @@ class TrainModelsStep(PipelineStep):
                     "signal_params": {**fold_signal_config},
                     "signal_policy": dict(signal_policy_report["policy_quality"]),
                     "sizing_stats_source": sizing_stats_source,
+                    "causal_calibration_rows": int(signal_policy_context.get("causal_calibration_rows", 0)),
+                    "causal_cutoff_timestamp": signal_policy_context.get("causal_cutoff_timestamp"),
+                    "calibration_policy": signal_policy_context.get("calibration_policy"),
+                    "cross_fold_borrowing_allowed": signal_policy_context.get("cross_fold_borrowing_allowed"),
                 }
             )
             last_model = model
@@ -3406,7 +3599,7 @@ class TrainModelsStep(PipelineStep):
             last_signal_policy = dict(signal_policy_report["policy_quality"])
             last_avg_win = fold_avg_win
             last_avg_loss = fold_avg_loss
-            last_kelly_trade_count = prior_oos_trade_count
+            last_kelly_trade_count = active_kelly_trade_count
             oos_predictions.append(test_primary_preds)
             oos_probabilities.append(test_primary_probs)
             oos_meta_prob.append(meta_prob_test)
@@ -3472,6 +3665,7 @@ class TrainModelsStep(PipelineStep):
             [row.get("ablation") for row in fold_regime]
         )
         signal_decay = _build_signal_decay_report_for_segments(pipeline, signal_decay_segments, holding_bars)
+        context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
         operational_monitoring = _build_pipeline_operational_monitoring(
             pipeline,
             backtest_reports=fold_backtest_reports,
@@ -3482,6 +3676,14 @@ class TrainModelsStep(PipelineStep):
             queue_backlog=[0] * len(inference_latencies_ms),
             scope="training",
         )
+        if context_ttl_report:
+            operational_monitoring["context_ttl"] = context_ttl_report
+            if not all(bool(report.get("promotion_pass", True)) for report in context_ttl_report.values()):
+                operational_monitoring["healthy"] = False
+                reasons = list(operational_monitoring.get("reasons", []))
+                if "context_ttl_breached" not in reasons:
+                    reasons.append("context_ttl_breached")
+                operational_monitoring["reasons"] = reasons
         fold_stability = _build_fold_stability_summary(
             fold_metrics,
             fold_backtests,
@@ -3545,6 +3747,7 @@ class TrainModelsStep(PipelineStep):
             "last_signal_params": last_signal_params,
             "signal_policy": {
                 "mode": _resolve_signal_policy_mode(signal_config),
+                "calibration_policy": _resolve_fold_calibration_policy(validation_method),
                 "folds": fold_signal_policy,
                 "last_policy_quality": last_signal_policy,
                 "last_policy_params": last_signal_params,
@@ -3576,6 +3779,7 @@ class TrainModelsStep(PipelineStep):
                 "folds": fold_feature_governance,
             },
             "operational_monitoring": operational_monitoring,
+            "context_ttl_report": context_ttl_report,
             "promotion_gates": {
                 "feature_portability": bool(feature_portability_diagnostics.get("promotion_pass", True)),
                 "feature_admission": bool(feature_admission_summary.get("promotion_pass", True)),
@@ -3617,6 +3821,16 @@ class TrainModelsStep(PipelineStep):
             "oos_avg_loss": oos_avg_loss,
             "oos_trade_count": int(oos_trade_count),
         }
+        if validation_method == "cpcv":
+            training["diagnostic_validation"] = {
+                "method": validation_method,
+                "aggregate_mode": "path_diagnostics_only",
+                "path_count": int(len(oos_paths)),
+                "reporting_role": "diagnostic",
+            }
+            executable_validation = _build_executable_validation_training(pipeline)
+            if executable_validation is not None:
+                training["executable_validation"] = executable_validation
         pipeline.state["training"] = training
         pipeline.state["operational_monitoring"] = operational_monitoring
         return training
@@ -3630,58 +3844,30 @@ class SignalsStep(PipelineStep):
         config = pipeline.section("signals")
         fallback_scope = training.get("fallback_inference")
         validation_method = training.get("validation", {}).get("method", "walk_forward")
+        executable_validation = training.get("executable_validation") or {}
+        executable_training = executable_validation.get("training") if executable_validation.get("enabled") else None
 
         if validation_method == "cpcv" and training.get("oos_paths"):
-            break_even_prob = float(
-                training.get("last_avg_loss", config.get("avg_loss", 0.02))
-            ) / max(
-                float(training.get("last_avg_win", config.get("avg_win", 0.02)))
-                + float(training.get("last_avg_loss", config.get("avg_loss", 0.02))),
-                1e-12,
-            )
-            profitability_threshold = training.get("last_signal_params", {}).get("profitability_threshold")
-            if profitability_threshold is None:
-                if config.get("sizing_mode", "expected_utility") == "kelly":
-                    profitability_threshold = training.get("last_signal_params", {}).get(
-                        "meta_threshold",
-                        config.get("meta_threshold", 0.55),
-                    )
-                else:
-                    profitability_threshold = break_even_prob
+            path_results = _build_cpcv_path_results(training, pipeline, config, validation_method)
 
-            path_results = []
-            for path in training.get("oos_paths", []):
-                path_results.append(
-                    {
-                        "fold": path.get("fold"),
-                        "split_id": path.get("split_id"),
-                        "validation_method": path.get("validation_method", validation_method),
-                        "train_blocks": path.get("train_blocks"),
-                        "test_blocks": path.get("test_blocks"),
-                        "predictions": path["predictions"],
-                        "primary_probabilities": path["primary_probabilities"],
-                        "meta_prob": path["meta_prob"],
-                        "profitability_prob": path.get("profitability_prob", path["meta_prob"]),
-                        "direction_edge": path["direction_edge"],
-                        "confidence": path["confidence"],
-                        "expected_trade_edge": path.get("expected_trade_edge"),
-                        "expected_trade_utility": path.get("expected_trade_edge"),
-                        "break_even_profit_prob": break_even_prob,
-                        "profitability_threshold": float(profitability_threshold),
-                        "position_size": path.get("position_size", path["kelly_size"]),
-                        "kelly_size": path["kelly_size"],
-                        "event_signals": path["event_signals"],
-                        "holding_bars": _resolve_signal_holding_bars(pipeline, config),
-                        "continuous_signals": path["continuous_signals"],
-                        "signals": path["signals"],
-                        "avg_win_used": path.get("avg_win_used"),
-                        "avg_loss_used": path.get("avg_loss_used"),
-                        "kelly_trade_count": path.get("kelly_trade_count"),
-                        "used_flat_kelly_fallback": path.get("used_flat_kelly_fallback", False),
-                        "tuned_params": path.get("signal_params", {}),
-                        "signal_policy": path.get("signal_policy"),
-                    }
+            if executable_training is not None and executable_training.get("oos_continuous_signals") is not None:
+                result = _build_signal_result_from_training_payload(
+                    executable_training,
+                    pipeline,
+                    config,
+                    executable_training.get("fallback_inference"),
+                    signal_source="cpcv_walk_forward_replay",
                 )
+                result["validation_method"] = validation_method
+                result["primary_validation_method"] = executable_training.get("validation", {}).get("method", "walk_forward")
+                result["diagnostic_validation"] = {
+                    "method": validation_method,
+                    "aggregate_mode": "path_diagnostics_only",
+                    "path_count": int(len(path_results)),
+                    "paths": path_results,
+                }
+                pipeline.state["signals"] = result
+                return result
 
             result = {
                 "validation_method": validation_method,
@@ -3690,7 +3876,7 @@ class SignalsStep(PipelineStep):
                 "signal_tuning": training.get("signal_tuning", []),
                 "signal_policy": training.get("signal_policy"),
                 "tuned_params": training.get("last_signal_params", {}),
-                "signal_source": "cpcv_oos_paths",
+                "signal_source": "cpcv_oos_paths_legacy",
                 "fallback_scope": fallback_scope,
                 "avg_win_used": training.get("last_avg_win", config.get("avg_win", 0.02)),
                 "avg_loss_used": training.get("last_avg_loss", config.get("avg_loss", 0.02)),
@@ -3701,50 +3887,13 @@ class SignalsStep(PipelineStep):
             return result
 
         if training.get("oos_continuous_signals") is not None:
-            break_even_prob = float(
-                training.get("last_avg_loss", config.get("avg_loss", 0.02))
-            ) / max(
-                float(training.get("last_avg_win", config.get("avg_win", 0.02)))
-                + float(training.get("last_avg_loss", config.get("avg_loss", 0.02))),
-                1e-12,
+            result = _build_signal_result_from_training_payload(
+                training,
+                pipeline,
+                config,
+                fallback_scope,
+                signal_source="walk_forward_oos",
             )
-            profitability_threshold = training.get("last_signal_params", {}).get("profitability_threshold")
-            if profitability_threshold is None:
-                if config.get("sizing_mode", "expected_utility") == "kelly":
-                    profitability_threshold = training.get("last_signal_params", {}).get(
-                        "meta_threshold",
-                        config.get("meta_threshold", 0.55),
-                    )
-                else:
-                    profitability_threshold = break_even_prob
-
-            result = {
-                "predictions": training["oos_predictions"],
-                "primary_probabilities": training["oos_probabilities"],
-                "meta_prob": training["oos_meta_prob"],
-                "profitability_prob": training.get("oos_profitability_prob", training["oos_meta_prob"]),
-                "direction_edge": training["oos_direction_edge"],
-                "confidence": training["oos_confidence"],
-                "expected_trade_edge": training.get("oos_expected_trade_edge"),
-                "expected_trade_utility": training.get("oos_expected_trade_edge"),
-                "break_even_profit_prob": break_even_prob,
-                "profitability_threshold": float(profitability_threshold),
-                "position_size": training.get("oos_position_size", training["oos_kelly_size"]),
-                "kelly_size": training["oos_kelly_size"],
-                "event_signals": training["oos_event_signals"],
-                "holding_bars": _resolve_signal_holding_bars(pipeline, config),
-                "continuous_signals": training["oos_continuous_signals"],
-                "signals": training["oos_signals"],
-                "avg_win_used": training.get("last_avg_win", config.get("avg_win", 0.02)),
-                "avg_loss_used": training.get("last_avg_loss", config.get("avg_loss", 0.02)),
-                "kelly_trade_count": int(training.get("oos_trade_count", 0)),
-                "used_flat_kelly_fallback": False,
-                "signal_tuning": training.get("signal_tuning", []),
-                "signal_policy": training.get("signal_policy"),
-                "tuned_params": training.get("last_signal_params", {}),
-                "signal_source": "walk_forward_oos",
-                "fallback_scope": fallback_scope,
-            }
             pipeline.state["signals"] = result
             return result
 
@@ -3853,32 +4002,8 @@ class BacktestStep(PipelineStep):
         signal_state = pipeline.require("signals")
         config = pipeline.section("backtest")
 
-        if signal_state.get("paths"):
-            path_backtests = []
-            for path in signal_state.get("paths", []):
-                positions = path["continuous_signals"] if config.get("use_continuous_positions", True) else path["signals"]
-                valuation_close = _resolve_backtest_valuation_close(pipeline, positions.index)
-                execution_prices = _resolve_backtest_execution_prices(pipeline, positions.index)
-                path_backtest = run_backtest(
-                    close=valuation_close,
-                    signals=positions,
-                    equity=config.get("equity", 10_000.0),
-                    fee_rate=config.get("fee_rate", 0.001),
-                    slippage_rate=config.get("slippage_rate", 0.0),
-                    signal_delay_bars=_resolve_signal_delay_bars(config),
-                    execution_prices=execution_prices,
-                    **_resolve_backtest_runtime_kwargs(pipeline, positions.index),
-                )
-                path_backtests.append(
-                    {
-                        "fold": path.get("fold"),
-                        "split_id": path.get("split_id"),
-                        "validation_method": path.get("validation_method"),
-                        "train_blocks": path.get("train_blocks"),
-                        "test_blocks": path.get("test_blocks"),
-                        "backtest": path_backtest,
-                    }
-                )
+        if signal_state.get("paths") and signal_state.get("continuous_signals") is None:
+            path_backtests = _run_path_backtests(pipeline, config, signal_state.get("paths", []))
 
             backtest = _summarize_path_backtests(path_backtests)
             backtest["paths"] = path_backtests
@@ -3915,6 +4040,10 @@ class BacktestStep(PipelineStep):
             execution_prices=execution_prices,
             **_resolve_backtest_runtime_kwargs(pipeline, positions.index),
         )
+        backtest["validation_method"] = signal_state.get("primary_validation_method", signal_state.get("validation_method", "walk_forward"))
+        if signal_state.get("primary_validation_method") is not None and signal_state.get("validation_method") is not None:
+            if signal_state.get("primary_validation_method") != signal_state.get("validation_method"):
+                backtest["diagnostic_validation_method"] = signal_state.get("validation_method")
         training = pipeline.state.get("training") or {}
         feature_frame = pipeline.state.get("X")
         feature_columns = list(feature_frame.columns) if isinstance(feature_frame, pd.DataFrame) else []
@@ -3933,6 +4062,17 @@ class BacktestStep(PipelineStep):
         backtest["signal_decay"] = signal_decay_report
         if pipeline.state.get("reference_integrity_report") is not None:
             backtest["cross_venue_integrity"] = dict(pipeline.state.get("reference_integrity_report") or {})
+        diagnostic_paths = (signal_state.get("diagnostic_validation") or {}).get("paths") or []
+        if diagnostic_paths:
+            path_backtests = _run_path_backtests(pipeline, config, diagnostic_paths)
+            backtest["diagnostic_validation"] = {
+                "method": (signal_state.get("diagnostic_validation") or {}).get("method", "cpcv"),
+                "path_count": int(len(path_backtests)),
+                "summary": _summarize_path_backtests(path_backtests),
+            }
+            backtest["debug"] = {
+                "cpcv_path_backtests": path_backtests,
+            }
         pipeline.state["operational_monitoring"] = monitoring_report
         pipeline.state["backtest"] = backtest
         return backtest

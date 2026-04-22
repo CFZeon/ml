@@ -13,6 +13,7 @@ import pandas as pd
 from .promotion import (
     build_promotion_gate_check_map,
     create_promotion_eligibility_report,
+    evaluate_execution_realism_gate,
     finalize_promotion_eligibility_report,
     resolve_canonical_promotion_score,
     resolve_promotion_gate_mode,
@@ -542,7 +543,16 @@ def _validate_trial_overrides(overrides):
     )
 
 
+def _resolve_primary_training_payload(training):
+    executable_validation = training.get("executable_validation") or {}
+    replay_training = executable_validation.get("training") if executable_validation.get("enabled") else None
+    if isinstance(replay_training, dict):
+        return replay_training, "executable_validation"
+    return training, "validation"
+
+
 def _summarize_training(training):
+    primary_training, primary_source = _resolve_primary_training_payload(training)
     feature_selection = training.get("feature_selection") or {}
     bootstrap = training.get("bootstrap") or {}
     feature_governance = training.get("feature_governance") or {}
@@ -550,14 +560,15 @@ def _summarize_training(training):
     cross_venue_integrity = training.get("cross_venue_integrity") or {}
     signal_decay = training.get("signal_decay") or {}
     return {
-        "avg_accuracy": training.get("avg_accuracy"),
-        "avg_f1_macro": training.get("avg_f1_macro"),
-        "avg_directional_accuracy": training.get("avg_directional_accuracy"),
-        "avg_directional_f1_macro": training.get("avg_directional_f1_macro"),
-        "avg_log_loss": training.get("avg_log_loss"),
-        "avg_brier_score": training.get("avg_brier_score"),
-        "avg_calibration_error": training.get("avg_calibration_error"),
-        "headline_metrics": training.get("headline_metrics", {}),
+        "avg_accuracy": primary_training.get("avg_accuracy"),
+        "avg_f1_macro": primary_training.get("avg_f1_macro"),
+        "avg_directional_accuracy": primary_training.get("avg_directional_accuracy"),
+        "avg_directional_f1_macro": primary_training.get("avg_directional_f1_macro"),
+        "avg_log_loss": primary_training.get("avg_log_loss"),
+        "avg_brier_score": primary_training.get("avg_brier_score"),
+        "avg_calibration_error": primary_training.get("avg_calibration_error"),
+        "headline_metrics": primary_training.get("headline_metrics", {}),
+        "selection_metrics_source": primary_source,
         "feature_selection": {
             "enabled": bool(feature_selection.get("enabled", False)),
             "avg_input_features": feature_selection.get("avg_input_features"),
@@ -592,8 +603,14 @@ def _summarize_training(training):
         },
         "signal_decay": signal_decay,
         "promotion_gates": training.get("promotion_gates", {}),
-        "fold_stability": training.get("fold_stability"),
-        "fold_count": len(training.get("fold_metrics", [])),
+        "fold_stability": primary_training.get("fold_stability", training.get("fold_stability")),
+        "fold_count": len(primary_training.get("fold_metrics", [])),
+        "diagnostic_validation": training.get("diagnostic_validation", {}),
+        "executable_validation": {
+            "enabled": bool((training.get("executable_validation") or {}).get("enabled", False)),
+            "source": (training.get("executable_validation") or {}).get("source"),
+            "method": (((training.get("executable_validation") or {}).get("training") or {}).get("validation") or {}).get("method"),
+        },
     }
 
 
@@ -627,9 +644,14 @@ def _summarize_backtest(backtest):
 
 
 def _resolve_metric(training, key, fallback=None):
-    value = training.get(key)
+    primary_training, _ = _resolve_primary_training_payload(training)
+    value = primary_training.get(key)
+    if value is None and primary_training is not training:
+        value = training.get(key)
     if value is None and fallback is not None:
-        value = training.get(fallback)
+        value = primary_training.get(fallback)
+        if value is None and primary_training is not training:
+            value = training.get(fallback)
     if value is None or not np.isfinite(value):
         return None
     return float(value)
@@ -3365,6 +3387,25 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             reason=None if replication_report.get("promotion_pass", True) else _first_failure_reason(replication_report, "replication_failed"),
             details=replication_report,
         )
+    execution_realism = evaluate_execution_realism_gate(
+        (locked_holdout or {}).get("backtest")
+        or validation_holdout.get("backtest")
+        or best_trial_report.get("backtest")
+        or {},
+        policy=selection_policy,
+    )
+    best_trial_report["selection_policy"]["eligibility_checks"]["execution_realism"] = bool(execution_realism["passed"])
+    promotion_eligibility_report = upsert_promotion_gate(
+        promotion_eligibility_report,
+        group="post_selection",
+        name="execution_realism",
+        passed=bool(execution_realism["passed"]),
+        mode=resolve_promotion_gate_mode(selection_policy, "execution_realism"),
+        measured=execution_realism.get("execution_mode"),
+        threshold=execution_realism.get("required_execution_mode"),
+        reason=execution_realism.get("reason"),
+        details=execution_realism,
+    )
     best_trial_report["selection_policy"] = _update_selection_policy_report(
         best_trial_report["selection_policy"],
         promotion_eligibility_report,
@@ -3376,6 +3417,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     selection_report["diagnostics"]["holdout_evaluated_after_freeze"] = bool(
         locked_holdout.get("evaluated_after_freeze", False)
     )
+    selection_report["diagnostics"]["execution_realism"] = execution_realism
     selection_report["diagnostics"]["replication"] = replication_report
     selection_report["diagnostics"]["promotion_ready"] = bool(best_trial_report["selection_policy"]["promotion_ready"])
     selection_report["diagnostics"]["promotion_reasons"] = list(best_trial_report["selection_policy"]["promotion_reasons"])

@@ -33,6 +33,7 @@ from .context import (
     build_multi_timeframe_context_feature_block,
 )
 from .execution import (
+    ExecutionAdapterUnavailableError,
     ExecutionPolicy,
     LiquidityInputResolver,
     NautilusExecutionAdapter,
@@ -135,6 +136,7 @@ from .monitoring import (
 from .promotion import (
     build_promotion_gate_check_map,
     create_promotion_eligibility_report,
+    evaluate_execution_realism_gate,
     finalize_promotion_eligibility_report,
     resolve_canonical_promotion_score,
     resolve_promotion_gate_mode,

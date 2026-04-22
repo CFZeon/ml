@@ -531,7 +531,7 @@ def _series_metric_summary(series, *, threshold):
     }
 
 
-def _build_spot_overlay(base_data, venue_frames):
+def _build_spot_overlay(base_data, venue_frames, *, composite_policy="liquidity_weighted", minimum_quorum=1):
     base_frame = pd.DataFrame(base_data).copy()
     close_matrix = pd.DataFrame(index=base_frame.index)
     volume_matrix = pd.DataFrame(index=base_frame.index)
@@ -542,7 +542,18 @@ def _build_spot_overlay(base_data, venue_frames):
 
     overlay = pd.DataFrame(index=base_frame.index)
     if not close_matrix.empty:
-        reference_close = close_matrix.median(axis=1, skipna=True)
+        composite_policy = str(composite_policy or "liquidity_weighted").lower()
+        if composite_policy == "liquidity_weighted":
+            weight_matrix = volume_matrix.where(volume_matrix > 0.0)
+            weighted_close = close_matrix.mul(weight_matrix)
+            weight_sums = weight_matrix.sum(axis=1, skipna=True)
+            reference_close = weighted_close.sum(axis=1, skipna=True).div(weight_sums.replace(0.0, np.nan))
+            reference_close = reference_close.where(weight_sums > 0.0, close_matrix.median(axis=1, skipna=True))
+        elif composite_policy == "strict_quorum":
+            venue_count = close_matrix.notna().sum(axis=1)
+            reference_close = close_matrix.median(axis=1, skipna=True).where(venue_count >= int(max(1, minimum_quorum)))
+        else:
+            reference_close = close_matrix.median(axis=1, skipna=True)
         overlay["reference_price"] = reference_close
         overlay["reference_close"] = reference_close
         overlay["composite_price"] = reference_close
@@ -571,7 +582,10 @@ def build_spot_reference_validation(
     config = dict(config or {})
     section = _resolve_reference_section(config, "spot")
     venues = list(dict.fromkeys(section.get("venues") or config.get("spot_venues") or ["coinbase", "kraken"]))
-    partial_mode = str(section.get("partial_coverage_mode", config.get("partial_coverage_mode", "advisory"))).lower()
+    partial_mode = str(section.get("partial_coverage_mode", config.get("partial_coverage_mode", "allow"))).lower()
+    divergence_mode = str(section.get("divergence_mode", config.get("divergence_mode", "advisory"))).lower()
+    composite_policy = str(section.get("composite_policy", config.get("composite_policy", "liquidity_weighted"))).lower()
+    minimum_quorum = int(section.get("minimum_quorum", config.get("minimum_quorum", 1)))
     min_coverage_ratio = float(section.get("min_coverage_ratio", config.get("min_coverage_ratio", 0.95)))
     max_price_divergence_bps = float(section.get("max_price_divergence_bps", config.get("max_price_divergence_bps", 75.0)))
     provided_frames = dict(section.get("frames") or config.get("spot_frames") or {})
@@ -606,7 +620,12 @@ def build_spot_reference_validation(
             "error": error,
         }
 
-    overlay = _build_spot_overlay(base_frame, venue_frames)
+    overlay = _build_spot_overlay(
+        base_frame,
+        venue_frames,
+        composite_policy=composite_policy,
+        minimum_quorum=minimum_quorum,
+    )
     reference_close = overlay.get("reference_price", pd.Series(index=base_frame.index, dtype=float))
     divergence_bps = (reference_close.sub(base_frame["close"].astype(float)).abs() / base_frame["close"].replace(0.0, np.nan).abs()) * 1e4
     divergence_summary = _series_metric_summary(divergence_bps, threshold=max_price_divergence_bps)
@@ -623,15 +642,38 @@ def build_spot_reference_validation(
     if severe_divergence:
         reasons.append("spot_reference_divergence")
 
+    promotion_pass = True
+    if severe_divergence and divergence_mode == "blocking":
+        promotion_pass = False
+
+    warnings.extend(
+        reason
+        for reason in reasons
+        if (reason == "partial_reference_coverage" and partial_mode in {"allow", "advisory"})
+        or (reason == "spot_reference_divergence" and divergence_mode == "advisory")
+    )
+
+    if severe_divergence and divergence_mode == "blocking":
+        gate_mode = "blocking"
+    elif partial_coverage and partial_mode == "blocking":
+        gate_mode = "blocking"
+    elif reasons:
+        gate_mode = "advisory"
+    else:
+        gate_mode = "advisory"
+
     report = {
         "kind": "spot_reference_validation",
         "requested_venues": venues,
         "partial_coverage_mode": partial_mode,
+        "divergence_mode": divergence_mode,
+        "composite_policy": composite_policy,
+        "minimum_quorum": int(max(1, minimum_quorum)),
         "min_coverage_ratio": min_coverage_ratio,
         "full_cohort_available": full_cohort_available,
         "available_venue_count": int(sum(1 for details in venue_details.values() if details.get("available"))),
-        "promotion_pass": not severe_divergence,
-        "gate_mode": "advisory" if partial_coverage and partial_mode == "advisory" else "blocking",
+        "promotion_pass": promotion_pass,
+        "gate_mode": gate_mode,
         "reasons": reasons,
         "warnings": warnings,
         "venues": venue_details,

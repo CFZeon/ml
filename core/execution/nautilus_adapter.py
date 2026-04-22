@@ -10,6 +10,10 @@ except Exception:  # pragma: no cover
     NAUTILUS_AVAILABLE = False
 
 
+class ExecutionAdapterUnavailableError(RuntimeError):
+    """Raised when a requested execution adapter is unavailable and no simulation override was provided."""
+
+
 class NautilusExecutionAdapter:
     """Execution adapter boundary for future NautilusTrader-backed simulation.
 
@@ -33,4 +37,4 @@ class NautilusExecutionAdapter:
         }
 
 
-__all__ = ["NAUTILUS_AVAILABLE", "NautilusExecutionAdapter"]
+__all__ = ["ExecutionAdapterUnavailableError", "NAUTILUS_AVAILABLE", "NautilusExecutionAdapter"]

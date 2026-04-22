@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from .execution import (
+    ExecutionAdapterUnavailableError,
     NautilusExecutionAdapter,
     OrderIntent,
     resolve_execution_policy,
@@ -459,12 +460,22 @@ def _build_execution_contract(close, requested_position, equity, execution_price
         report["order_intents"] = report["order_ledger"].copy()
         report["execution_adapter"] = "legacy"
         report["execution_backend"] = "legacy"
+        report["execution_mode"] = "legacy_bar_surrogate"
+        report["promotion_execution_ready"] = False
+        report["execution_limitations"] = [
+            "legacy_full_fill_contract",
+            "no_partial_fill_model",
+            "no_event_driven_matching",
+        ]
         report["execution_policy"] = policy.to_dict()
         report["partial_fill_orders"] = 0
         report["cancelled_orders"] = 0
         report["unfilled_notional"] = max(0.0, requested_total - executed_total)
         report["fill_ratio"] = _round_metric(_safe_ratio(executed_total, requested_total), 6)
         return report
+
+    if policy.adapter not in {"bar_surrogate", "nautilus"}:
+        raise ValueError("execution_policy.adapter must be one of ['legacy', 'bar_surrogate', 'nautilus']")
 
     symbol_filters = dict(symbol_filters or {})
     valuation_series = pd.Series(close, copy=False).astype(float)
@@ -502,6 +513,11 @@ def _build_execution_contract(close, requested_position, equity, execution_price
         if policy.adapter == "nautilus"
         else None
     )
+    if adapter_boundary is not None and not adapter_boundary.available and not policy.force_simulation:
+        raise ExecutionAdapterUnavailableError(
+            "execution_policy.adapter='nautilus' was requested, but NautilusTrader is unavailable. "
+            "Set execution_policy.force_simulation=true to use the bar surrogate explicitly."
+        )
     tolerance = 1e-12
 
     for bar_loc, timestamp in enumerate(valuation_series.index):
@@ -848,6 +864,19 @@ def _build_execution_contract(close, requested_position, equity, execution_price
     blocked_notional = float(order_ledger.loc[rejected_mask, "requested_notional"].sum()) if not order_ledger.empty else 0.0
     executed_notional = float(order_ledger.get("executed_notional", pd.Series(dtype=float)).sum()) if not order_ledger.empty else 0.0
     delay_metrics = _summarize_execution_delay_metrics(order_intents, order_ledger, valuation_series.index)
+    if adapter_boundary is not None and adapter_boundary.available:
+        execution_mode = "event_driven"
+        promotion_execution_ready = True
+        execution_limitations = []
+    else:
+        execution_mode = "conservative_bar_surrogate"
+        promotion_execution_ready = False
+        execution_limitations = [
+            "bar_surrogate_only",
+            "no_queue_position_model",
+            "no_event_driven_ack_latency",
+            "no_order_book_matching_engine",
+        ]
     return {
         "valuation_series": valuation_series,
         "execution_series": execution_series,
@@ -857,6 +886,9 @@ def _build_execution_contract(close, requested_position, equity, execution_price
         "order_ledger": order_ledger,
         "execution_adapter": policy.adapter,
         "execution_backend": adapter_boundary.backend if adapter_boundary is not None else policy.adapter,
+        "execution_mode": execution_mode,
+        "promotion_execution_ready": promotion_execution_ready,
+        "execution_limitations": execution_limitations,
         "execution_adapter_scenarios": adapter_boundary.describe_scenarios() if adapter_boundary is not None else {},
         "execution_policy": policy.to_dict(),
         "blocked_orders": int((order_ledger.get("status") == "rejected").sum()) if not order_ledger.empty else 0,
@@ -1858,6 +1890,9 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
                 "order_rejection_reasons": execution_report.get("order_rejection_reasons", {}),
                 "execution_adapter": execution_report.get("execution_adapter"),
                 "execution_backend": execution_report.get("execution_backend"),
+                "execution_mode": execution_report.get("execution_mode"),
+                "promotion_execution_ready": bool(execution_report.get("promotion_execution_ready", False)),
+                "execution_limitations": list(execution_report.get("execution_limitations") or []),
                 "execution_policy": execution_report.get("execution_policy", {}),
                 "execution_cost_report": execution_report.get("execution_cost_report", {}),
                 "order_intents": execution_report.get("order_intents", pd.DataFrame()),

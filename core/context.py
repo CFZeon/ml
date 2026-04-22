@@ -97,6 +97,46 @@ def _asof_reindex(base_index, frame):
     return joined.set_index("timestamp").reindex(base_index)
 
 
+def _coerce_ttl(value):
+    if value in {None, False, "", "none", "disabled"}:
+        return None
+    if isinstance(value, pd.Timedelta):
+        return value
+    return pd.Timedelta(value)
+
+
+def _asof_reindex_with_ttl(base_index, frame, max_age=None):
+    aligned_index = pd.DatetimeIndex(base_index)
+    if frame is None or frame.empty:
+        return pd.DataFrame(index=aligned_index), {
+            "source_timestamp": pd.Series(pd.NaT, index=aligned_index),
+            "feature_age": pd.Series(pd.NaT, index=aligned_index),
+            "stale_mask": pd.Series(False, index=aligned_index, dtype=bool),
+        }
+
+    context = frame.sort_index().reset_index().rename(columns={frame.index.name or "index": "source_timestamp"})
+    anchor = pd.DataFrame({"timestamp": aligned_index})
+    joined = pd.merge_asof(anchor, context, left_on="timestamp", right_on="source_timestamp", direction="backward")
+    joined = joined.set_index("timestamp").reindex(aligned_index)
+
+    source_timestamp = pd.to_datetime(joined.pop("source_timestamp"), utc=True) if "source_timestamp" in joined.columns else pd.Series(pd.NaT, index=aligned_index)
+    feature_age = pd.Series(pd.NaT, index=aligned_index)
+    stale_mask = pd.Series(False, index=aligned_index, dtype=bool)
+    ttl = _coerce_ttl(max_age)
+    if ttl is not None:
+        feature_age = pd.Series(aligned_index, index=aligned_index) - source_timestamp
+        stale_mask = source_timestamp.notna() & (feature_age > ttl)
+        if stale_mask.any():
+            for column in joined.columns:
+                joined.loc[stale_mask, column] = np.nan
+
+    return joined, {
+        "source_timestamp": source_timestamp,
+        "feature_age": feature_age,
+        "stale_mask": stale_mask,
+    }
+
+
 def _coverage_ratio(frame):
     if frame is None or frame.empty:
         return 0.0
@@ -381,7 +421,7 @@ def fetch_context_symbol_bars(symbols=None, interval="1h", start="2024-01-01", e
     return validated_frames
 
 
-def build_futures_context_feature_block(base_data, futures_context, rolling_window=20, min_recent_coverage=0.6):
+def build_futures_context_feature_block(base_data, futures_context, rolling_window=20, min_recent_coverage=0.6, ttl_config=None):
     """Build normalized derivatives-context features aligned to the base spot index."""
     if not futures_context:
         return _empty_feature_block(base_data.index, block_name="futures_context")
@@ -389,21 +429,43 @@ def build_futures_context_feature_block(base_data, futures_context, rolling_wind
     close = base_data["close"].astype(float)
     base_return = close.pct_change()
     feature_frame = pd.DataFrame(index=base_data.index)
+    stale_any = pd.Series(False, index=base_data.index, dtype=bool)
+    ttl_config = dict(ttl_config or {})
+    ttl_policy = {
+        "mark_price": ttl_config.get("mark_price", "2h"),
+        "premium_index": ttl_config.get("premium_index", "2h"),
+        "funding": ttl_config.get("funding", "12h"),
+        "recent": ttl_config.get("recent", "4h"),
+        "max_stale_rate": float(ttl_config.get("max_stale_rate", 0.2)),
+    }
+    ttl_sources = {}
+
+    def _align_with_ttl(source_name, frame, ttl_key):
+        aligned, diagnostics = _asof_reindex_with_ttl(base_data.index, frame, max_age=ttl_policy.get(ttl_key))
+        stale_mask = diagnostics["stale_mask"].fillna(False).astype(bool)
+        stale_any.loc[stale_mask.index] = stale_any.loc[stale_mask.index] | stale_mask
+        ttl_value = _coerce_ttl(ttl_policy.get(ttl_key))
+        ttl_sources[source_name] = {
+            "max_age": str(ttl_value) if ttl_value is not None else None,
+            "stale_hit_count": int(stale_mask.sum()),
+            "stale_hit_rate": float(stale_mask.mean()) if len(stale_mask) > 0 else 0.0,
+        }
+        return aligned
 
     mark_frame = futures_context.get("mark_price")
     if mark_frame is not None and not mark_frame.empty:
-        aligned_mark = _asof_reindex(base_data.index, mark_frame).ffill()
+        aligned_mark = _align_with_ttl("mark_price", mark_frame, "mark_price")
         mark_close = aligned_mark["mark_close"].astype(float)
         mark_range = _safe_divide(aligned_mark["mark_high"] - aligned_mark["mark_low"], mark_close)
         spread = _safe_divide(mark_close - close, close)
         feature_frame["fut_mark_spread_pct"] = spread
         feature_frame["fut_mark_spread_z"] = _rolling_zscore(spread, rolling_window)
         feature_frame["fut_mark_range_pct"] = mark_range
-        feature_frame["fut_mark_return_diff"] = mark_close.pct_change() - base_return
+        feature_frame["fut_mark_return_diff"] = mark_close.pct_change(fill_method=None) - base_return
 
     premium_frame = futures_context.get("premium_index")
     if premium_frame is not None and not premium_frame.empty:
-        aligned_premium = _asof_reindex(base_data.index, premium_frame).ffill()
+        aligned_premium = _align_with_ttl("premium_index", premium_frame, "premium_index")
         premium_close = aligned_premium["premium_close"].astype(float)
         feature_frame["fut_premium_close"] = premium_close
         feature_frame["fut_premium_change"] = premium_close.diff()
@@ -412,7 +474,7 @@ def build_futures_context_feature_block(base_data, futures_context, rolling_wind
 
     funding_frame = futures_context.get("funding")
     if funding_frame is not None and not funding_frame.empty:
-        aligned_funding = _asof_reindex(base_data.index, funding_frame).ffill()
+        aligned_funding = _align_with_ttl("funding", funding_frame, "funding")
         funding_rate = aligned_funding["funding_rate"].astype(float).fillna(0.0)
         funding_window = max(4, min(rolling_window, 24))
         feature_frame["fut_funding_rate"] = funding_rate
@@ -431,15 +493,15 @@ def build_futures_context_feature_block(base_data, futures_context, rolling_wind
         recent_frame = futures_context.get(key)
         if recent_frame is None or recent_frame.empty:
             continue
-        aligned_recent = _asof_reindex(base_data.index, recent_frame)
+        aligned_recent = _align_with_ttl(key, recent_frame, "recent")
         if _coverage_ratio(aligned_recent[list(set(rename_map) & set(aligned_recent.columns))]) < min_recent_coverage:
             continue
         for source_column, target_column in rename_map.items():
             if source_column not in aligned_recent.columns:
                 continue
-            series = aligned_recent[source_column].astype(float).ffill()
+            series = aligned_recent[source_column].astype(float)
             feature_frame[target_column] = series
-            feature_frame[f"{target_column}_change"] = series.pct_change().replace([np.inf, -np.inf], np.nan)
+            feature_frame[f"{target_column}_change"] = series.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
             feature_frame[f"{target_column}_z"] = _rolling_zscore(series, rolling_window)
 
     if "fut_taker_buy_vol" in feature_frame.columns and "fut_taker_sell_vol" in feature_frame.columns:
@@ -463,9 +525,30 @@ def build_futures_context_feature_block(base_data, futures_context, rolling_wind
             feature_frame["fut_basis_index_price"],
         )
 
+    feature_frame["fut_context_stale_any"] = stale_any.astype(float)
     feature_frame = feature_frame.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     laggable_columns = list(feature_frame.columns)
-    return FeatureBlock(frame=feature_frame, laggable_columns=laggable_columns, block_name="futures_context")
+    ttl_report = {
+        "enabled": True,
+        "scope": "futures_context",
+        "policy": {
+            "mark_price": str(_coerce_ttl(ttl_policy["mark_price"])) if _coerce_ttl(ttl_policy["mark_price"]) is not None else None,
+            "premium_index": str(_coerce_ttl(ttl_policy["premium_index"])) if _coerce_ttl(ttl_policy["premium_index"]) is not None else None,
+            "funding": str(_coerce_ttl(ttl_policy["funding"])) if _coerce_ttl(ttl_policy["funding"]) is not None else None,
+            "recent": str(_coerce_ttl(ttl_policy["recent"])) if _coerce_ttl(ttl_policy["recent"]) is not None else None,
+            "max_stale_rate": float(ttl_policy["max_stale_rate"]),
+        },
+        "sources": ttl_sources,
+        "stale_hit_count": int(stale_any.sum()),
+        "stale_hit_rate": float(stale_any.mean()) if len(stale_any) > 0 else 0.0,
+        "promotion_pass": bool(float(stale_any.mean()) <= float(ttl_policy["max_stale_rate"])) if len(stale_any) > 0 else True,
+    }
+    return FeatureBlock(
+        frame=feature_frame,
+        laggable_columns=laggable_columns,
+        block_name="futures_context",
+        metadata={"ttl_report": ttl_report},
+    )
 
 
 def build_cross_asset_context_feature_block(base_data, context_symbol_data, rolling_window=20):
