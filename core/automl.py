@@ -2770,6 +2770,13 @@ def _resolve_metric_value_with_significance(backtest, metric_name, use_lower_bou
     return point_estimate if point_estimate is not None else 0.0, "point_estimate", lower_bound
 
 
+def _should_use_objective_lower_bound(objective_name, automl_config=None):
+    configured = (automl_config or {}).get("objective_use_confidence_lower_bound")
+    if configured is not None:
+        return bool(configured)
+    return _normalize_objective_name(objective_name) in _BACKTEST_OBJECTIVES
+
+
 def _resolve_benchmark_reference(backtest, objective_name, automl_config):
     objective_name = _normalize_objective_name(objective_name)
     significance = (backtest or {}).get("statistical_significance") or {}
@@ -2819,6 +2826,7 @@ def _build_objective_diagnostics(objective_name, training, backtest, automl_conf
         "primary_metric_lower_bound": None,
         "benchmark_reference": None,
     }
+    use_lower_bound = _should_use_objective_lower_bound(objective_name, automl_config)
 
     if objective_name == "directional_accuracy":
         raw_score = float(directional_accuracy)
@@ -2833,21 +2841,68 @@ def _build_objective_diagnostics(objective_name, training, backtest, automl_conf
         raw_score = float(-(calibration_error if calibration_error is not None else 1e6))
         diagnostics["components"] = {"calibration_error": calibration_error}
     elif objective_name == "net_profit_pct":
-        raw_score = float(net_profit_pct)
-        diagnostics["components"] = {"net_profit_pct": float(net_profit_pct)}
+        primary_metric, primary_source, primary_lower = _resolve_metric_value_with_significance(
+            backtest,
+            "net_profit_pct",
+            use_lower_bound=use_lower_bound,
+        )
+        raw_score = float(primary_metric)
+        diagnostics.update(
+            {
+                "primary_metric": "net_profit_pct",
+                "primary_metric_source": primary_source,
+                "primary_metric_lower_bound": primary_lower,
+                "components": {"net_profit_pct": float(primary_metric)},
+            }
+        )
     elif objective_name == "sharpe_ratio":
-        raw_score = float(_coerce_float((backtest or {}).get("sharpe_ratio")) or 0.0)
-        diagnostics["components"] = {"sharpe_ratio": float(raw_score)}
+        primary_metric, primary_source, primary_lower = _resolve_metric_value_with_significance(
+            backtest,
+            "sharpe_ratio",
+            use_lower_bound=use_lower_bound,
+        )
+        raw_score = float(primary_metric)
+        diagnostics.update(
+            {
+                "primary_metric": "sharpe_ratio",
+                "primary_metric_source": primary_source,
+                "primary_metric_lower_bound": primary_lower,
+                "components": {"sharpe_ratio": float(raw_score)},
+            }
+        )
     elif objective_name == "profit_factor":
-        profit_factor = (backtest or {}).get("profit_factor", 0.0)
-        if not np.isfinite(profit_factor):
+        primary_metric, primary_source, primary_lower = _resolve_metric_value_with_significance(
+            backtest,
+            "profit_factor",
+            use_lower_bound=use_lower_bound,
+        )
+        if not np.isfinite(primary_metric):
             raw_score = float(automl_config.get("profit_factor_cap", 5.0))
         else:
-            raw_score = float(profit_factor)
-        diagnostics["components"] = {"profit_factor": float(raw_score)}
+            raw_score = float(primary_metric)
+        diagnostics.update(
+            {
+                "primary_metric": "profit_factor",
+                "primary_metric_source": primary_source,
+                "primary_metric_lower_bound": primary_lower,
+                "components": {"profit_factor": float(raw_score)},
+            }
+        )
     elif objective_name == "calmar_ratio":
-        raw_score = float(_coerce_float((backtest or {}).get("calmar_ratio")) or 0.0)
-        diagnostics["components"] = {"calmar_ratio": float(raw_score)}
+        primary_metric, primary_source, primary_lower = _resolve_metric_value_with_significance(
+            backtest,
+            "calmar_ratio",
+            use_lower_bound=use_lower_bound,
+        )
+        raw_score = float(primary_metric)
+        diagnostics.update(
+            {
+                "primary_metric": "calmar_ratio",
+                "primary_metric_source": primary_source,
+                "primary_metric_lower_bound": primary_lower,
+                "components": {"calmar_ratio": float(raw_score)},
+            }
+        )
     elif objective_name in {"risk_adjusted_after_costs", "benchmark_excess_sharpe", "net_profit_pct_vs_benchmark"}:
         metric_name = "sharpe_ratio"
         if objective_name == "net_profit_pct_vs_benchmark":
@@ -2855,7 +2910,7 @@ def _build_objective_diagnostics(objective_name, training, backtest, automl_conf
         primary_metric, primary_source, primary_lower = _resolve_metric_value_with_significance(
             backtest,
             metric_name,
-            use_lower_bound=bool(automl_config.get("objective_use_confidence_lower_bound", False)),
+            use_lower_bound=use_lower_bound,
         )
         benchmark_reference = _resolve_benchmark_reference(backtest, objective_name, automl_config)
         benchmark_reference = benchmark_reference if benchmark_reference is not None else 0.0

@@ -25,6 +25,7 @@ from .data_contracts import (
 )
 from .data_quality import DataQualityResult, check_data_quality
 from .drift import ADWINDetector, DriftMonitor, evaluate_drift_guardrails
+from .orchestration import run_drift_retraining_cycle
 from .context import (
     fetch_binance_futures_context,
     fetch_context_symbol_bars,

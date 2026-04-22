@@ -105,6 +105,8 @@ def evaluate_challenger_promotion(challenger_summary, champion_record=None, drif
             )
 
         challenger_score_value = challenger_score.get("value") if challenger_score else None
+        challenger_score_basis = challenger_score.get("basis") if challenger_score else None
+        champion_score_basis = champion_score.get("basis") if champion_score else None
         if challenger_score_value is None:
             eligibility_report = upsert_promotion_gate(
                 eligibility_report,
@@ -117,7 +119,36 @@ def evaluate_challenger_promotion(challenger_summary, champion_record=None, drif
                 reason="promotion_score_unavailable",
                 details={"score_preference": score_preference},
             )
+        elif champion_score is not None and champion_score.get("value") is not None and challenger_score_basis != champion_score_basis:
+            eligibility_report = upsert_promotion_gate(
+                eligibility_report,
+                group="registry",
+                name="score_basis_aligned",
+                passed=False,
+                mode=resolve_promotion_gate_mode(policy, "score_basis_aligned"),
+                measured={"challenger": challenger_score_basis, "champion": champion_score_basis},
+                threshold="same_score_basis",
+                reason="promotion_score_basis_mismatch",
+                details={
+                    "challenger_score": challenger_score,
+                    "champion_score": champion_score,
+                },
+            )
         elif champion_score is not None and champion_score.get("value") is not None:
+            eligibility_report = upsert_promotion_gate(
+                eligibility_report,
+                group="registry",
+                name="score_basis_aligned",
+                passed=True,
+                mode=resolve_promotion_gate_mode(policy, "score_basis_aligned"),
+                measured={"challenger": challenger_score_basis, "champion": champion_score_basis},
+                threshold="same_score_basis",
+                reason=None,
+                details={
+                    "challenger_score": challenger_score,
+                    "champion_score": champion_score,
+                },
+            )
             margin = float(challenger_score_value) - float(champion_score["value"])
             eligibility_report = upsert_promotion_gate(
                 eligibility_report,

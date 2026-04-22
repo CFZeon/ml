@@ -167,6 +167,27 @@ class LocalRegistryFlowTest(unittest.TestCase):
             self.assertEqual(version_manifest["replication"]["completed_cohort_count"], 3)
             self.assertAlmostEqual(float(version_manifest["replication"]["pass_rate"]), 2.0 / 3.0)
 
+    def test_registry_index_persists_promotion_score_basis(self):
+        model, feature_columns = _fit_logistic_model()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            version_id = store.register_version(
+                model,
+                symbol="BTCUSDT",
+                feature_columns=feature_columns,
+                training_summary={"avg_f1_macro": 0.75},
+                validation_summary={"raw_objective_value": 0.12},
+                promotion_eligibility_report={
+                    "score": {"basis": "selection_value", "value": 0.12},
+                    "promotion_ready": True,
+                },
+            )
+
+            row = next(record for record in store.list_versions("BTCUSDT") if record["version_id"] == version_id)
+
+            self.assertEqual(row["promotion_score_basis"], "selection_value")
+            self.assertAlmostEqual(float(row["promotion_score"]), 0.12)
+
 
 if __name__ == "__main__":
     unittest.main()
