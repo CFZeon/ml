@@ -7,7 +7,7 @@ Usage
 
 from core import ATR, MACD, RSI, ResearchPipeline
 from example_utils import (
-    build_example_universe_config,
+    build_futures_research_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -28,102 +28,17 @@ def main():
     start = "2024-01-01"
     end = "2024-04-01"
     context_symbols = ["ETHUSDT", "SOLUSDT"]
+    indicators = [RSI(14), MACD(), ATR(14)]
 
     pipeline = ResearchPipeline(
-        {
-            "data": {
-                "symbol": symbol,
-                "interval": interval,
-                "start": start,
-                "end": end,
-                "market": "um_futures",
-                "futures_context": {"enabled": True, "include_recent_stats": True},
-                "cross_asset_context": {"symbols": context_symbols, "market": "um_futures"},
-            },
-            "universe": build_example_universe_config(
-                symbol,
-                context_symbols=context_symbols,
-                market="um_futures",
-                snapshot_timestamp=start,
-            ),
-            "indicators": [RSI(14), MACD(), ATR(14)],
-            "features": {
-                "lags": [1, 3, 6],
-                "frac_diff_d": 0.4,
-                "rolling_window": 24,
-                "context_timeframes": ["4h"],
-            },
-            "feature_selection": {"enabled": True, "max_features": 64, "min_mi_threshold": 0.0},
-            "regime": {"method": "hmm"},  # HMM with stable norm-sorted state ordering
-            "labels": {
-                "kind": "triple_barrier",
-                "pt_sl": (1.5, 1.5),
-                "max_holding": 12,
-                "min_return": 0.0005,
-                "volatility_window": 24,
-                "barrier_tie_break": "sl",
-            },
-            "model": {
-                "type": "logistic",
-                "cv_method": "cpcv",
-                "n_blocks": 4,
-                "test_blocks": 2,
-                "validation_fraction": 0.2,
-                "meta_n_splits": 2,
-            },
-            "signals": {
-                "threshold": 0.0,
-                "edge_threshold": 0.0,
-                "shrinkage_alpha": 0.5,
-                "fraction": 0.75,
-                "min_trades_for_kelly": 30,
-                "max_kelly_fraction": 0.5,
-                "meta_threshold": 0.5,
-                "profitability_threshold": 0.5,
-                "expected_edge_threshold": 0.0,
-                "sizing_mode": "expected_utility",
-                "tuning_min_trades": 5,
-            },
-            "backtest": {
-                "equity": 10_000,
-                "fee_rate": 0.0004,
-                "slippage_rate": 0.0002,
-                "slippage_model": "sqrt_impact",
-                "engine": "pandas",
-                "valuation_price": "mark",
-                "apply_funding": True,
-                "allow_short": True,
-                "leverage": 1.5,
-                "use_open_execution": True,
-                "signal_delay_bars": 1,
-                "futures_account": {
-                    "enabled": True,
-                    "margin_mode": "isolated",
-                    "warning_margin_ratio": 0.8,
-                    "leverage_brackets_data": {
-                        "symbol": "BTCUSDT",
-                        "brackets": [
-                            {
-                                "bracket": 1,
-                                "initial_leverage": 20.0,
-                                "notional_floor": 0.0,
-                                "notional_cap": 50_000.0,
-                                "maint_margin_ratio": 0.02,
-                                "cum": 0.0,
-                            },
-                            {
-                                "bracket": 2,
-                                "initial_leverage": 10.0,
-                                "notional_floor": 50_000.0,
-                                "notional_cap": 250_000.0,
-                                "maint_margin_ratio": 0.04,
-                                "cum": 0.0,
-                            },
-                        ],
-                    },
-                },
-            },
-        }
+        build_futures_research_config(
+            symbol=symbol,
+            interval=interval,
+            start=start,
+            end=end,
+            indicators=indicators,
+            context_symbols=context_symbols,
+        )
     )
 
     print_section(sep, 1, "Fetching BTCUSDT futures data")

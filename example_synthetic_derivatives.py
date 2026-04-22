@@ -20,6 +20,7 @@ from example_utils import (
     print_stationarity_summary,
     print_training_summary,
     print_weight_summary,
+    seed_offline_pipeline_state,
 )
 
 
@@ -184,11 +185,13 @@ def main():
         }
     )
 
-    pipeline.state["raw_data"] = raw_data
-    pipeline.state["data"] = raw_data.copy()
-    pipeline.state["futures_context"] = make_futures_context(index, raw_data["close"].to_numpy())
-    pipeline.state["cross_asset_context"] = {"ETHUSDT": eth_data, "SOLUSDT": sol_data}
-    pipeline.state["symbol_filters"] = {"tick_size": 0.1, "step_size": 0.001, "min_notional": 10.0}
+    seed_offline_pipeline_state(
+        pipeline,
+        raw_data,
+        futures_context=make_futures_context(index, raw_data["close"].to_numpy()),
+        cross_asset_context={"ETHUSDT": eth_data, "SOLUSDT": sol_data},
+        symbol_filters={"tick_size": 0.1, "step_size": 0.001, "min_notional": 10.0},
+    )
 
     print_section(sep, 1, "Loading offline synthetic market state")
     print(f"  bars         : {len(raw_data)}")

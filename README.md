@@ -74,6 +74,8 @@ The repo now includes:
 
 ## Example Guide
 
+If your goal is to build your own scenario instead of just running the shipped demos, read `HOW_TO_USE.md` first and then copy `example_test_case_template.py`.
+
 If you want examples that reliably place trades under the current pipeline contracts, start with the active demos:
 
 - `example_active_spot.py`: spot workflow using cross-asset context, CPCV training, and a more permissive signal policy so the demo produces executed spot trades instead of mostly abstaining
@@ -102,6 +104,18 @@ Run the active spot example:
 
 ```bash
 python example_active_spot.py
+```
+
+Open the guided onboarding doc:
+
+```bash
+python -c "from pathlib import Path; print(Path('HOW_TO_USE.md').resolve())"
+```
+
+Run the copy-and-edit template:
+
+```bash
+python example_test_case_template.py
 ```
 
 Run the active futures example:

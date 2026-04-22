@@ -7,7 +7,8 @@ Usage
 
 from core import ATR, MACD, RSI, ResearchPipeline
 from example_utils import (
-    build_example_universe_config,
+    build_futures_research_config,
+    clone_config_with_overrides,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -28,33 +29,24 @@ def main():
     start = "2024-01-01"
     end = "2024-04-01"
     context_symbols = ["ETHUSDT"]
+    indicators = [RSI(14), MACD(), ATR(14)]
 
-    pipeline = ResearchPipeline(
+    config = build_futures_research_config(
+        symbol=symbol,
+        interval=interval,
+        start=start,
+        end=end,
+        indicators=indicators,
+        context_symbols=context_symbols,
+    )
+    config = clone_config_with_overrides(
+        config,
         {
-            "data": {
-                "symbol": symbol,
-                "interval": interval,
-                "start": start,
-                "end": end,
-                "market": "um_futures",
-                "futures_context": {"enabled": True, "include_recent_stats": True},
-                "cross_asset_context": {"symbols": context_symbols, "market": "um_futures"},
-            },
-            "universe": build_example_universe_config(
-                symbol,
-                context_symbols=context_symbols,
-                market="um_futures",
-                snapshot_timestamp=start,
-            ),
-            "indicators": [RSI(14), MACD(), ATR(14)],
             "features": {
                 "lags": [1, 2, 3],
-                "frac_diff_d": 0.4,
                 "rolling_window": 12,
-                "context_timeframes": ["4h"],
             },
-            "feature_selection": {"enabled": True, "max_features": 40, "min_mi_threshold": 0.0},
-            "regime": {"method": "hmm"},
+            "feature_selection": {"max_features": 40},
             "labels": {
                 "kind": "fixed_horizon",
                 "horizon": 3,
@@ -62,47 +54,25 @@ def main():
                 "cost_rate": 0.0,
             },
             "model": {
-                "type": "logistic",
                 "cv_method": "walk_forward",
                 "n_splits": 4,
                 "train_size": 360,
                 "test_size": 96,
                 "gap": 3,
-                "meta_n_splits": 2,
             },
             "signals": {
                 "policy_mode": "theory_only",
                 "avg_win": 0.012,
                 "avg_loss": 0.008,
-                "threshold": 0.0,
-                "edge_threshold": 0.0,
-                "fraction": 0.75,
                 "min_trades_for_kelly": 10,
-                "max_kelly_fraction": 0.5,
                 "meta_threshold": 0.0,
                 "profitability_threshold": 0.0,
-                "expected_edge_threshold": 0.0,
-                "sizing_mode": "expected_utility",
                 "tuning_min_trades": 1,
             },
             "backtest": {
-                "equity": 10_000,
-                "fee_rate": 0.0004,
-                "slippage_rate": 0.0002,
-                "slippage_model": "sqrt_impact",
-                "engine": "pandas",
-                "valuation_price": "mark",
-                "apply_funding": True,
-                "allow_short": True,
                 "leverage": 2.0,
-                "use_open_execution": True,
-                "signal_delay_bars": 1,
                 "futures_account": {
-                    "enabled": True,
-                    "margin_mode": "isolated",
-                    "warning_margin_ratio": 0.8,
                     "leverage_brackets_data": {
-                        "symbol": "BTCUSDT",
                         "brackets": [
                             {
                                 "bracket": 1,
@@ -116,8 +86,10 @@ def main():
                     },
                 },
             },
-        }
+        },
     )
+
+    pipeline = ResearchPipeline(config)
 
     print_section(sep, 1, "Fetching active futures dataset")
     data = pipeline.fetch_data()

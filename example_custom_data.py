@@ -10,7 +10,9 @@ import pandas as pd
 
 from core import ATR, BollingerBands, RSI, ResearchPipeline, fetch_binance_bars
 from example_utils import (
-    build_example_universe_config,
+    build_custom_data_entry,
+    build_spot_research_config,
+    clone_config_with_overrides,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -56,88 +58,62 @@ def main():
     print(f"  custom rows   : {len(custom_feed)}")
     print(f"  feed columns  : {[column for column in custom_feed.columns if column not in {'timestamp', 'available_at'}]}")
 
-    pipeline = ResearchPipeline(
+    custom_entry = build_custom_data_entry(
+        "delayed_market_microstructure",
+        custom_feed,
+        timestamp_column="timestamp",
+        availability_column="available_at",
+        value_columns=[
+            "realized_vol_24h",
+            "trend_12h",
+            "volume_zscore_24h",
+            "session_bias",
+        ],
+        prefix="exo",
+        max_feature_age="6h",
+    )
+
+    config = build_spot_research_config(
+        symbol=symbol,
+        interval=interval,
+        start=start,
+        end=end,
+        indicators=[RSI(14), BollingerBands(20), ATR(14)],
+        context_symbols=context_symbols,
+        custom_data=[custom_entry],
+    )
+    config = clone_config_with_overrides(
+        config,
         {
             "data": {
-                "symbol": symbol,
-                "interval": interval,
-                "start": start,
-                "end": end,
-                "market": "spot",
                 "futures_context": {"enabled": False},
-                "cross_asset_context": {"symbols": context_symbols},
-                "custom_data": [
-                    {
-                        "name": "delayed_market_microstructure",
-                        "frame": custom_feed,
-                        "timestamp_column": "timestamp",
-                        "availability_column": "available_at",
-                        "value_columns": [
-                            "realized_vol_24h",
-                            "trend_12h",
-                            "volume_zscore_24h",
-                            "session_bias",
-                        ],
-                        "prefix": "exo",
-                        "max_feature_age": "6h",
-                    }
-                ],
             },
-            "universe": build_example_universe_config(
-                symbol,
-                context_symbols=context_symbols,
-                market="spot",
-                snapshot_timestamp=start,
-            ),
-            "indicators": [RSI(14), BollingerBands(20), ATR(14)],
             "features": {
-                "lags": [1, 3, 6],
-                "frac_diff_d": 0.4,
                 "rolling_window": 24,
                 "context_timeframes": ["4h"],
             },
-            "feature_selection": {"enabled": True, "max_features": 72, "min_mi_threshold": 0.0},
-            "regime": {"method": "hmm"},  # HMM with stable norm-sorted state ordering
+            "feature_selection": {"max_features": 72, "min_mi_threshold": 0.0},
             "labels": {
-                "kind": "triple_barrier",
-                "pt_sl": (2.0, 2.0),
                 "max_holding": 12,
                 "min_return": 0.0005,
-                "volatility_window": 24,
-                "barrier_tie_break": "sl",
-            },
-            "model": {
-                "type": "gbm",
-                "cv_method": "cpcv",
-                "n_blocks": 4,
-                "test_blocks": 2,
-                "validation_fraction": 0.2,
-                "meta_n_splits": 2,
             },
             "signals": {
                 "threshold": 0.0,
                 "edge_threshold": 0.0,
-                "shrinkage_alpha": 0.5,
                 "fraction": 0.75,
-                "min_trades_for_kelly": 30,
-                "max_kelly_fraction": 0.5,
                 "meta_threshold": 0.5,
                 "profitability_threshold": 0.5,
                 "expected_edge_threshold": 0.0,
                 "sizing_mode": "expected_utility",
-                "tuning_min_trades": 5,
             },
             "backtest": {
-                "equity": 10_000,
-                "fee_rate": 0.001,
                 "slippage_rate": 0.0003,
-                "slippage_model": "sqrt_impact",
-                "engine": "vectorbt",
-                "use_open_execution": True,
                 "signal_delay_bars": 1,
             },
-        }
+        },
     )
+
+    pipeline = ResearchPipeline(config)
 
     print_section(sep, 2, "Fetching market data and joining custom feed")
     data = pipeline.fetch_data()

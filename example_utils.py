@@ -1,8 +1,282 @@
 """Shared helpers for the repository example scripts."""
 
+import copy
 from math import isfinite
 
 import pandas as pd
+
+
+def _copy_value(value):
+    if isinstance(value, (pd.DataFrame, pd.Series)):
+        return value.copy()
+    return copy.deepcopy(value)
+
+
+def _deep_update_dict(base, overrides):
+    for key, value in dict(overrides or {}).items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update_dict(base[key], value)
+        else:
+            base[key] = _copy_value(value)
+    return base
+
+
+def clone_config_with_overrides(base_config, config_overrides=None):
+    """Clone a nested example config and apply dict overrides recursively."""
+
+    cloned = _copy_value(base_config)
+    if config_overrides:
+        _deep_update_dict(cloned, config_overrides)
+    return cloned
+
+
+def build_custom_data_entry(
+    name,
+    frame,
+    *,
+    value_columns,
+    timestamp_column="timestamp",
+    availability_column="available_at",
+    prefix=None,
+    max_feature_age=None,
+    extra_fields=None,
+):
+    """Build a point-in-time-safe custom-data config entry for examples."""
+
+    entry = {
+        "name": str(name),
+        "frame": _copy_value(frame),
+        "timestamp_column": str(timestamp_column),
+        "availability_column": str(availability_column),
+        "value_columns": list(value_columns),
+    }
+    if prefix is not None:
+        entry["prefix"] = str(prefix)
+    if max_feature_age is not None:
+        entry["max_feature_age"] = max_feature_age
+    return clone_config_with_overrides(entry, extra_fields)
+
+
+def build_spot_research_config(
+    symbol,
+    interval,
+    start,
+    end,
+    *,
+    indicators,
+    context_symbols=None,
+    custom_data=None,
+    config_overrides=None,
+):
+    """Build the baseline spot-research example config.
+
+    Copy this into a new script when you want a real-data spot case and then
+    change only the nested sections you actually need.
+    """
+
+    context_symbols = list(context_symbols or [])
+    config = {
+        "data": {
+            "symbol": str(symbol),
+            "interval": str(interval),
+            "start": start,
+            "end": end,
+            "market": "spot",
+            "futures_context": {"enabled": True, "include_recent_stats": True},
+            "cross_asset_context": {"symbols": context_symbols},
+        },
+        "universe": build_example_universe_config(
+            symbol,
+            context_symbols=context_symbols,
+            market="spot",
+            snapshot_timestamp=start,
+        ),
+        "indicators": _copy_value(list(indicators)),
+        "features": {
+            "lags": [1, 3, 6],
+            "frac_diff_d": 0.4,
+            "rolling_window": 20,
+            "squeeze_quantile": 0.2,
+            "context_timeframes": ["4h", "1d"],
+        },
+        "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
+        "regime": {"method": "hmm"},
+        "labels": {
+            "kind": "triple_barrier",
+            "pt_sl": (2.0, 2.0),
+            "max_holding": 24,
+            "min_return": 0.001,
+            "volatility_window": 24,
+            "barrier_tie_break": "sl",
+        },
+        "model": {
+            "type": "gbm",
+            "cv_method": "cpcv",
+            "n_blocks": 4,
+            "test_blocks": 2,
+            "validation_fraction": 0.2,
+            "meta_n_splits": 2,
+        },
+        "signals": {
+            "avg_win": 0.02,
+            "avg_loss": 0.02,
+            "shrinkage_alpha": 0.5,
+            "fraction": 0.5,
+            "min_trades_for_kelly": 30,
+            "max_kelly_fraction": 0.5,
+            "threshold": 0.01,
+            "edge_threshold": 0.05,
+            "meta_threshold": 0.55,
+            "tuning_min_trades": 5,
+        },
+        "backtest": {
+            "equity": 10_000,
+            "fee_rate": 0.001,
+            "slippage_rate": 0.0002,
+            "slippage_model": "sqrt_impact",
+            "engine": "vectorbt",
+            "use_open_execution": True,
+            "signal_delay_bars": 2,
+        },
+    }
+    if custom_data:
+        config["data"]["custom_data"] = _copy_value(list(custom_data))
+    return clone_config_with_overrides(config, config_overrides)
+
+
+def build_futures_research_config(
+    symbol,
+    interval,
+    start,
+    end,
+    *,
+    indicators,
+    context_symbols=None,
+    config_overrides=None,
+):
+    """Build the baseline futures-research example config."""
+
+    context_symbols = list(context_symbols or [])
+    config = {
+        "data": {
+            "symbol": str(symbol),
+            "interval": str(interval),
+            "start": start,
+            "end": end,
+            "market": "um_futures",
+            "futures_context": {"enabled": True, "include_recent_stats": True},
+            "cross_asset_context": {"symbols": context_symbols, "market": "um_futures"},
+        },
+        "universe": build_example_universe_config(
+            symbol,
+            context_symbols=context_symbols,
+            market="um_futures",
+            snapshot_timestamp=start,
+        ),
+        "indicators": _copy_value(list(indicators)),
+        "features": {
+            "lags": [1, 3, 6],
+            "frac_diff_d": 0.4,
+            "rolling_window": 24,
+            "context_timeframes": ["4h"],
+        },
+        "feature_selection": {"enabled": True, "max_features": 64, "min_mi_threshold": 0.0},
+        "regime": {"method": "hmm"},
+        "labels": {
+            "kind": "triple_barrier",
+            "pt_sl": (1.5, 1.5),
+            "max_holding": 12,
+            "min_return": 0.0005,
+            "volatility_window": 24,
+            "barrier_tie_break": "sl",
+        },
+        "model": {
+            "type": "logistic",
+            "cv_method": "cpcv",
+            "n_blocks": 4,
+            "test_blocks": 2,
+            "validation_fraction": 0.2,
+            "meta_n_splits": 2,
+        },
+        "signals": {
+            "threshold": 0.0,
+            "edge_threshold": 0.0,
+            "shrinkage_alpha": 0.5,
+            "fraction": 0.75,
+            "min_trades_for_kelly": 30,
+            "max_kelly_fraction": 0.5,
+            "meta_threshold": 0.5,
+            "profitability_threshold": 0.5,
+            "expected_edge_threshold": 0.0,
+            "sizing_mode": "expected_utility",
+            "tuning_min_trades": 5,
+        },
+        "backtest": {
+            "equity": 10_000,
+            "fee_rate": 0.0004,
+            "slippage_rate": 0.0002,
+            "slippage_model": "sqrt_impact",
+            "engine": "pandas",
+            "valuation_price": "mark",
+            "apply_funding": True,
+            "allow_short": True,
+            "leverage": 1.5,
+            "use_open_execution": True,
+            "signal_delay_bars": 1,
+            "futures_account": {
+                "enabled": True,
+                "margin_mode": "isolated",
+                "warning_margin_ratio": 0.8,
+                "leverage_brackets_data": {
+                    "symbol": str(symbol),
+                    "brackets": [
+                        {
+                            "bracket": 1,
+                            "initial_leverage": 20.0,
+                            "notional_floor": 0.0,
+                            "notional_cap": 50_000.0,
+                            "maint_margin_ratio": 0.02,
+                            "cum": 0.0,
+                        },
+                        {
+                            "bracket": 2,
+                            "initial_leverage": 10.0,
+                            "notional_floor": 50_000.0,
+                            "notional_cap": 250_000.0,
+                            "maint_margin_ratio": 0.04,
+                            "cum": 0.0,
+                        },
+                    ],
+                },
+            },
+        },
+    }
+    return clone_config_with_overrides(config, config_overrides)
+
+
+def seed_offline_pipeline_state(
+    pipeline,
+    raw_data,
+    *,
+    data=None,
+    futures_context=None,
+    cross_asset_context=None,
+    symbol_filters=None,
+    extra_state=None,
+):
+    """Seed a pipeline with offline state for synthetic or deterministic tests."""
+
+    pipeline.state["raw_data"] = _copy_value(raw_data)
+    pipeline.state["data"] = _copy_value(data) if data is not None else _copy_value(raw_data)
+    if futures_context is not None:
+        pipeline.state["futures_context"] = _copy_value(futures_context)
+    if cross_asset_context is not None:
+        pipeline.state["cross_asset_context"] = _copy_value(cross_asset_context)
+    if symbol_filters is not None:
+        pipeline.state["symbol_filters"] = _copy_value(symbol_filters)
+    for key, value in dict(extra_state or {}).items():
+        pipeline.state[key] = _copy_value(value)
+    return pipeline
 
 
 def _format_metric(value, digits=4, percent=False, money=False):

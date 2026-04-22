@@ -7,7 +7,7 @@ Usage
 
 from core import RSI, ATR, BollingerBands, MACD, ResearchPipeline
 from example_utils import (
-    build_example_universe_config,
+    build_spot_research_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -28,71 +28,17 @@ def main():
     start = "2024-01-01"
     end = "2024-06-01"
     context_symbols = ["ETHUSDT", "SOLUSDT", "BNBUSDT"]
+    indicators = [RSI(14), MACD(), BollingerBands(20), ATR(14)]
 
     pipeline = ResearchPipeline(
-        {
-            "data": {
-                "symbol": symbol,
-                "interval": interval,
-                "start": start,
-                "end": end,
-                "futures_context": {"enabled": True, "include_recent_stats": True},
-                "cross_asset_context": {"symbols": context_symbols},
-            },
-            "universe": build_example_universe_config(
-                symbol,
-                context_symbols=context_symbols,
-                market="spot",
-                snapshot_timestamp=start,
-            ),
-            "indicators": [RSI(14), MACD(), BollingerBands(20), ATR(14)],
-            "features": {
-                "lags": [1, 3, 6],
-                "frac_diff_d": 0.4,
-                "rolling_window": 20,
-                "squeeze_quantile": 0.2,
-                "context_timeframes": ["4h", "1d"],
-            },
-            "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
-            "regime": {"method": "hmm"},  # HMM with stable norm-sorted state ordering
-            "labels": {
-                "kind": "triple_barrier",
-                "pt_sl": (2.0, 2.0),
-                "max_holding": 24,
-                "min_return": 0.001,
-                "volatility_window": 24,
-                "barrier_tie_break": "sl",
-            },
-            "model": {
-                "type": "gbm",
-                "cv_method": "cpcv",
-                "n_blocks": 4,
-                "test_blocks": 2,
-                "validation_fraction": 0.2,
-                "meta_n_splits": 2,
-            },
-            "signals": {
-                "avg_win": 0.02,
-                "avg_loss": 0.02,
-                "shrinkage_alpha": 0.5,
-                "fraction": 0.5,
-                "min_trades_for_kelly": 30,
-                "max_kelly_fraction": 0.5,
-                "threshold": 0.01,
-                "edge_threshold": 0.05,
-                "meta_threshold": 0.55,
-                "tuning_min_trades": 5,
-            },
-            "backtest": {
-                "equity": 10_000,
-                "fee_rate": 0.001,
-                "slippage_rate": 0.0002,
-                "slippage_model": "sqrt_impact",
-                "engine": "vectorbt",
-                "use_open_execution": True,
-                "signal_delay_bars": 2,
-            },
-        }
+        build_spot_research_config(
+            symbol=symbol,
+            interval=interval,
+            start=start,
+            end=end,
+            indicators=indicators,
+            context_symbols=context_symbols,
+        )
     )
 
     print_section(SEP, 1, "Fetching BTCUSDT spot data")
