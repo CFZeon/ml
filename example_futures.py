@@ -1,5 +1,8 @@
 """USDT-M futures example using real Binance data and the liquidation-aware pandas adapter.
 
+Recent Binance futures aggregate stats are shifted to publication-safe timestamps
+by default so the context block does not treat summarized periods as instantly known.
+
 Usage
 -----
     python example_futures.py

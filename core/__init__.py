@@ -138,6 +138,7 @@ from .promotion import (
     build_promotion_gate_check_map,
     create_promotion_eligibility_report,
     evaluate_execution_realism_gate,
+    evaluate_stress_realism_gate,
     finalize_promotion_eligibility_report,
     resolve_canonical_promotion_score,
     resolve_promotion_gate_mode,

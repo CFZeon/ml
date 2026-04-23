@@ -72,6 +72,7 @@ from .models import (
     walk_forward_split,
 )
 from .monitoring import build_monitoring_report, write_monitoring_artifacts
+from .orchestration import run_drift_retraining_cycle as orchestrate_drift_retraining_cycle
 from .regime import (
     build_default_regime_feature_set,
     build_regime_ablation_report,
@@ -697,17 +698,134 @@ def _resolve_backtest_execution_policy(pipeline):
     }
 
 
+def _resolve_backtest_funding_missing_policy(backtest_config):
+    configured = backtest_config.get("funding_missing_policy")
+    policy = {
+        "mode": "zero_fill",
+        "expected_interval": "8h",
+        "max_gap_multiplier": 1.5,
+    }
+    if isinstance(configured, str):
+        policy["mode"] = configured
+    elif isinstance(configured, dict):
+        policy.update(configured)
+    policy["mode"] = str(policy.get("mode", "zero_fill")).strip().lower()
+    policy["expected_interval"] = pd.Timedelta(policy.get("expected_interval", "8h"))
+    policy["max_gap_multiplier"] = float(policy.get("max_gap_multiplier", 1.5))
+    return policy
+
+
+def _store_backtest_funding_report(pipeline, report):
+    if not report:
+        return
+    context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
+    context_ttl_report["backtest_funding"] = report
+    pipeline.state["context_ttl_report"] = context_ttl_report
+
+
+def _align_backtest_funding_rates(funding_rates, index, policy):
+    if funding_rates is None:
+        return None, {
+            "enabled": True,
+            "scope": "backtest_funding",
+            "policy": {
+                "mode": policy["mode"],
+                "expected_interval": str(policy["expected_interval"]),
+                "max_gap_multiplier": float(policy["max_gap_multiplier"]),
+            },
+            "coverage_reason": "funding_unavailable",
+            "promotion_pass": policy["mode"] not in {"strict", "preserve", "preserve_missing"},
+        }
+
+    aligned_index = pd.DatetimeIndex(index)
+    observed = pd.Series(funding_rates, copy=False).dropna().sort_index().astype(float)
+    aligned = observed.reindex(aligned_index).fillna(0.0).astype(float)
+    expected_interval = policy["expected_interval"]
+    max_allowed_gap = expected_interval * float(policy["max_gap_multiplier"])
+
+    if observed.empty:
+        report = {
+            "enabled": True,
+            "scope": "backtest_funding",
+            "policy": {
+                "mode": policy["mode"],
+                "expected_interval": str(expected_interval),
+                "max_gap_multiplier": float(policy["max_gap_multiplier"]),
+            },
+            "coverage_reason": "no_observed_funding_events",
+            "promotion_pass": policy["mode"] not in {"strict", "preserve", "preserve_missing"},
+        }
+        return aligned, report
+
+    observed_index = pd.DatetimeIndex(observed.index)
+    diffs = pd.Series(observed_index[1:] - observed_index[:-1]) if len(observed_index) > 1 else pd.Series(dtype="timedelta64[ns]")
+    max_observed_gap = diffs.max() if not diffs.empty else pd.Timedelta(0)
+    internal_gap_count = int((diffs > max_allowed_gap).sum()) if not diffs.empty else 0
+    leading_gap = observed_index[0] - aligned_index[0] if len(aligned_index) > 0 else pd.Timedelta(0)
+    trailing_gap = aligned_index[-1] - observed_index[-1] if len(aligned_index) > 0 else pd.Timedelta(0)
+    off_index_event_count = int(len(observed_index.difference(aligned_index)))
+
+    breach_reasons = []
+    if leading_gap > max_allowed_gap:
+        breach_reasons.append("leading_coverage_gap")
+    if trailing_gap > max_allowed_gap:
+        breach_reasons.append("trailing_coverage_gap")
+    if internal_gap_count > 0:
+        breach_reasons.append("internal_event_gap")
+    if off_index_event_count > 0:
+        breach_reasons.append("off_index_funding_timestamps")
+
+    report = {
+        "enabled": True,
+        "scope": "backtest_funding",
+        "policy": {
+            "mode": policy["mode"],
+            "expected_interval": str(expected_interval),
+            "max_gap_multiplier": float(policy["max_gap_multiplier"]),
+        },
+        "observed_event_count": int(len(observed_index)),
+        "leading_gap": str(leading_gap),
+        "trailing_gap": str(trailing_gap),
+        "max_observed_gap": str(max_observed_gap),
+        "internal_gap_count": internal_gap_count,
+        "off_index_event_count": off_index_event_count,
+        "coverage_reason": None if not breach_reasons else ",".join(breach_reasons),
+        "promotion_pass": len(breach_reasons) == 0,
+    }
+    return aligned, report
+
+
 def _resolve_backtest_funding_rates(pipeline, index):
     backtest_config = pipeline.section("backtest")
     market = _resolve_backtest_market(pipeline)
     if not backtest_config.get("apply_funding", market != "spot"):
         return None
 
+    funding_policy = _resolve_backtest_funding_missing_policy(backtest_config)
+    strict_funding_policy = funding_policy["mode"] in {"strict", "preserve", "preserve_missing"}
     futures_context = pipeline.state.get("futures_context") or {}
     funding_frame = futures_context.get("funding")
     if funding_frame is None or funding_frame.empty or "funding_rate" not in funding_frame.columns:
+        report = {
+            "enabled": True,
+            "scope": "backtest_funding",
+            "policy": {
+                "mode": funding_policy["mode"],
+                "expected_interval": str(funding_policy["expected_interval"]),
+                "max_gap_multiplier": float(funding_policy["max_gap_multiplier"]),
+            },
+            "coverage_reason": "funding_frame_missing",
+            "promotion_pass": not strict_funding_policy,
+        }
+        _store_backtest_funding_report(pipeline, report)
+        if strict_funding_policy:
+            raise RuntimeError("Funding coverage gate failed: funding_frame_missing")
         return None
-    return funding_frame["funding_rate"].reindex(index).fillna(0.0)
+    aligned_funding, report = _align_backtest_funding_rates(funding_frame["funding_rate"], index, funding_policy)
+    _store_backtest_funding_report(pipeline, report)
+    if strict_funding_policy and report is not None and not bool(report.get("promotion_pass", True)):
+        raise RuntimeError(f"Funding coverage gate failed: {report.get('coverage_reason', 'unknown')}" )
+    return aligned_funding
 
 
 def _resolve_backtest_futures_account(pipeline):
@@ -799,6 +917,11 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "futures_leverage_brackets": pipeline.state.get("futures_leverage_brackets"),
         "symbol_lifecycle": pipeline.state.get("symbol_lifecycle"),
         "symbol_lifecycle_policy": pipeline.state.get("universe_policy"),
+        "scenario_schedule": backtest_config.get("scenario_schedule"),
+        "scenario_policy": backtest_config.get("scenario_policy"),
+        "scenario_matrix": backtest_config.get("scenario_matrix"),
+        "evaluation_mode": backtest_config.get("evaluation_mode", "research_only"),
+        "required_stress_scenarios": backtest_config.get("required_stress_scenarios"),
     }
 
 
@@ -2387,6 +2510,7 @@ class FetchDataStep(PipelineStep):
                 end=config.get("end", "2024-03-01"),
                 cache_dir=futures_context_config.get("cache_dir", cache_dir),
                 include_recent_stats=futures_context_config.get("include_recent_stats", True),
+                recent_stats_availability_lag=futures_context_config.get("recent_stats_availability_lag", "period_close"),
             )
 
         lifecycle_events = universe_config.get("lifecycle_events")
@@ -2569,6 +2693,7 @@ class FeaturesStep(PipelineStep):
             pipeline.state.get("futures_context"),
             rolling_window=config.get("rolling_window", 20),
             ttl_config=config.get("futures_context_ttl"),
+            missing_policy=config.get("context_missing_policy"),
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, futures_context_block)
         ttl_report = dict((futures_context_block.metadata or {}).get("ttl_report") or {})
@@ -2581,8 +2706,15 @@ class FeaturesStep(PipelineStep):
             raw_data,
             pipeline.state.get("cross_asset_context"),
             rolling_window=config.get("rolling_window", 20),
+            ttl_config=config.get("cross_asset_context_ttl"),
+            missing_policy=config.get("context_missing_policy"),
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, cross_asset_context_block)
+        ttl_report = dict((cross_asset_context_block.metadata or {}).get("ttl_report") or {})
+        if ttl_report:
+            context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
+            context_ttl_report["cross_asset_context"] = ttl_report
+            pipeline.state["context_ttl_report"] = context_ttl_report
 
         multi_timeframe_block = build_multi_timeframe_context_feature_block(
             raw_data,
@@ -2966,6 +3098,21 @@ class TrainModelsStep(PipelineStep):
         oos_trade_outcomes = []
         oos_paths = []
         signal_decay_segments = []
+
+        context_missing_policy = pipeline.section("features").get("context_missing_policy")
+        if isinstance(context_missing_policy, dict):
+            context_missing_mode = str(context_missing_policy.get("mode", "zero_fill")).strip().lower()
+        else:
+            context_missing_mode = str(context_missing_policy or "zero_fill").strip().lower()
+        if context_missing_mode in {"preserve", "preserve_missing", "strict"}:
+            context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
+            breached_scopes = [
+                scope for scope, report in context_ttl_report.items()
+                if not bool((report or {}).get("promotion_pass", True))
+            ]
+            if breached_scopes:
+                joined_scopes = ", ".join(sorted(breached_scopes))
+                raise RuntimeError(f"Context integrity gate failed: {joined_scopes}")
 
         for split in _iter_validation_splits(pipeline, X):
             fold = split["fold"]
@@ -4161,6 +4308,70 @@ class ResearchPipeline:
 
     def run_backtest(self):
         return self.run_step("run_backtest")
+
+    def run_drift_retraining_cycle(
+        self,
+        *,
+        store,
+        reference_features,
+        symbol=None,
+        current_features=None,
+        reference_predictions=None,
+        current_predictions=None,
+        current_performance=None,
+        bars_since_last_retrain=None,
+        scheduled_window_open=False,
+        train_challenger=None,
+        drift_config=None,
+        promotion_policy=None,
+        current_monitoring_report=None,
+        rollback_policy=None,
+    ):
+        resolved_symbol = symbol or self.section("data").get("symbol")
+        if not resolved_symbol:
+            raise ValueError("run_drift_retraining_cycle requires a symbol or data.symbol")
+
+        resolved_current_features = current_features
+        if resolved_current_features is None:
+            resolved_current_features = self.state.get("X")
+        if resolved_current_features is None:
+            resolved_current_features = self.state.get("features")
+        if resolved_current_features is None:
+            raise ValueError("run_drift_retraining_cycle requires current_features or populated pipeline state")
+
+        training = dict(self.state.get("training") or {})
+        if current_predictions is None:
+            current_predictions = training.get("oos_probabilities")
+        if current_performance is None:
+            backtest = dict(self.state.get("backtest") or {})
+            equity_curve = backtest.get("equity_curve")
+            if isinstance(equity_curve, pd.Series) and not equity_curve.empty:
+                current_performance = equity_curve.pct_change().dropna()
+        if current_monitoring_report is None:
+            current_monitoring_report = (
+                self.state.get("operational_monitoring")
+                or (self.state.get("backtest") or {}).get("operational_monitoring")
+                or training.get("operational_monitoring")
+            )
+
+        result = orchestrate_drift_retraining_cycle(
+            store=store,
+            symbol=resolved_symbol,
+            reference_features=reference_features,
+            current_features=resolved_current_features,
+            reference_predictions=reference_predictions,
+            current_predictions=current_predictions,
+            current_performance=current_performance,
+            bars_since_last_retrain=bars_since_last_retrain,
+            scheduled_window_open=scheduled_window_open,
+            train_challenger=train_challenger,
+            drift_config=drift_config,
+            promotion_policy=promotion_policy,
+            current_monitoring_report=current_monitoring_report,
+            rollback_policy=rollback_policy,
+        )
+        self.state["drift_cycle"] = result
+        return result
 
     def run(self):
         for step in self.steps:

@@ -87,6 +87,36 @@ def build_scenario_schedule(index, events=None):
     return schedule
 
 
+def summarize_scenario_schedule(index, scenario_schedule=None):
+    schedule = _coerce_scenario_frame(index, scenario_schedule)
+    event_columns = {
+        "venue_down": "downtime",
+        "stale_mark": "stale_mark",
+        "trading_halt": "halt",
+        "forced_deleveraging": "forced_deleveraging",
+        "leverage_cap": "leverage_cap",
+    }
+    configured_event_types = []
+    configured_event_count = 0
+    for column, event_name in event_columns.items():
+        series = schedule.get(column)
+        if series is None:
+            continue
+        if column == "leverage_cap":
+            active = pd.Series(series, index=schedule.index).notna()
+        else:
+            active = pd.Series(series, index=schedule.index).fillna(False).astype(bool)
+        if active.any():
+            configured_event_types.append(event_name)
+            configured_event_count += int(active.sum())
+
+    return {
+        "configured": bool(configured_event_types),
+        "configured_event_types": configured_event_types,
+        "configured_event_count": int(configured_event_count),
+    }
+
+
 def apply_scenario_price_policy(valuation_series, execution_series, scenario_schedule, policy=None):
     policy = dict(policy or {})
     schedule = _coerce_scenario_frame(valuation_series.index, scenario_schedule)
@@ -97,6 +127,7 @@ def apply_scenario_price_policy(valuation_series, execution_series, scenario_sch
         "stale_mark_rejections": 0,
         "warnings": [],
     }
+    report.update(summarize_scenario_schedule(valuation.index, schedule))
 
     stale_mask = schedule.get("stale_mark", pd.Series(False, index=valuation.index)).astype(bool)
     if stale_mask.any():
@@ -134,6 +165,7 @@ def apply_execution_scenarios(execution_report, scenario_schedule, policy=None):
         "forced_deleveraging_rows": 0,
     }
     schedule = _coerce_scenario_frame(execution_report["position"].index, scenario_schedule)
+    report.update(summarize_scenario_schedule(execution_report["position"].index, schedule))
     if schedule.empty:
         execution_report["scenario_report"] = report
         return execution_report

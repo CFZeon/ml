@@ -1,11 +1,13 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 import pandas as pd
 
 from core import ResearchPipeline, build_reference_validation_bundle, select_features, train_model, trend_scanning_labels
-from core.context import build_futures_context_feature_block
+from core.context import _fetch_period_endpoint, build_futures_context_feature_block
 from core.models import compute_feature_family_diagnostics, summarize_feature_family_diagnostics
+from core.pipeline import _resolve_backtest_funding_rates
 
 
 def _make_ohlcv(index, drift=12.0, amplitude=3.0, volume_base=1_000.0):
@@ -133,6 +135,31 @@ class DerivativesContextPipelineTest(unittest.TestCase):
             }
         )
 
+    def test_recent_futures_stats_are_shifted_to_publication_time(self):
+        start_dt = pd.Timestamp("2026-04-01 00:00:00", tz="UTC")
+        end_dt = pd.Timestamp("2026-04-01 03:00:00", tz="UTC")
+        rows = [
+            {"timestamp": int((start_dt - pd.Timedelta(hours=1)).timestamp() * 1000), "sumOpenInterest": "10", "sumOpenInterestValue": "100"},
+            {"timestamp": int(start_dt.timestamp() * 1000), "sumOpenInterest": "11", "sumOpenInterestValue": "110"},
+            {"timestamp": int((start_dt + pd.Timedelta(hours=1)).timestamp() * 1000), "sumOpenInterest": "12", "sumOpenInterestValue": "120"},
+        ]
+
+        with mock.patch("core.context._recent_window", return_value=(start_dt, end_dt)), mock.patch("core.context._request_json", side_effect=[rows, []]):
+            frame = _fetch_period_endpoint(
+                "/futures/data/openInterestHist",
+                params={"symbol": "BTCUSDT", "period": "1h"},
+                start_dt=start_dt,
+                end_dt=end_dt,
+                session=mock.Mock(),
+                cache_dir=None,
+                namespace="open_interest",
+                availability_lag="period_close",
+            )
+
+        self.assertEqual(list(frame.index), list(pd.date_range(start_dt, periods=3, freq="1h", tz="UTC")))
+        self.assertEqual(frame.attrs["availability_policy"]["mode"], "period_close")
+        self.assertEqual(frame.attrs["availability_policy"]["index"], "publication_time")
+
     def test_trend_scanning_labels_capture_non_zero_events(self):
         index = pd.date_range("2026-01-01", periods=180, freq="1h", tz="UTC")
         prices = pd.Series(100.0 + np.linspace(0.0, 10.0, len(index)) + 2.0 * np.sin(np.linspace(0.0, 6.0 * np.pi, len(index))), index=index)
@@ -220,6 +247,67 @@ class DerivativesContextPipelineTest(unittest.TestCase):
         self.assertGreater(block.metadata["ttl_report"]["stale_hit_count"], 0)
         self.assertFalse(block.metadata["ttl_report"]["promotion_pass"])
 
+    def test_futures_context_strict_missing_policy_preserves_unknown_state(self):
+        index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        futures_context = _make_futures_context(index, raw_data["close"].to_numpy())
+        futures_context["mark_price"] = futures_context["mark_price"].iloc[[0]].copy()
+
+        block = build_futures_context_feature_block(
+            raw_data,
+            futures_context,
+            rolling_window=4,
+            ttl_config={
+                "mark_price": "2h",
+                "premium_index": "2h",
+                "funding": "12h",
+                "recent": "4h",
+                "max_stale_rate": 0.1,
+                "max_unknown_rate": 0.0,
+            },
+            missing_policy={"mode": "preserve_missing", "add_indicator": True},
+        )
+
+        self.assertTrue(pd.isna(block.frame.loc[index[3], "fut_mark_spread_pct"]))
+        self.assertEqual(float(block.frame.loc[index[3], "fut_context_unknown_any"]), 1.0)
+        self.assertGreater(block.metadata["ttl_report"]["unknown_hit_count"], 0)
+        self.assertFalse(block.metadata["ttl_report"]["promotion_pass"])
+
+    def test_pipeline_rejects_cross_asset_context_breach_under_strict_missing_policy(self):
+        index = pd.date_range("2026-02-01", periods=240, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        futures_context = _make_futures_context(index, raw_data["close"].to_numpy())
+        cross_asset_context = {
+            "ETHUSDT": _make_ohlcv(index[:24], drift=9.0, amplitude=2.0, volume_base=1_300.0),
+            "SOLUSDT": _make_ohlcv(index, drift=15.0, amplitude=4.0, volume_base=1_100.0),
+            "BNBUSDT": _make_ohlcv(index, drift=6.0, amplitude=1.5, volume_base=900.0),
+        }
+
+        pipeline = self._make_context_pipeline(
+            labels={
+                "kind": "trend_scanning",
+                "min_horizon": 6,
+                "max_horizon": 24,
+                "step": 3,
+                "min_t_value": 0.75,
+                "min_return": 0.0001,
+            }
+        )
+        pipeline.config["features"]["cross_asset_context_ttl"] = {"max_age": "2h", "max_unknown_rate": 0.0}
+        pipeline.config["features"]["context_missing_policy"] = {"mode": "preserve_missing", "add_indicator": True}
+        pipeline.state["raw_data"] = raw_data
+        pipeline.state["data"] = raw_data.copy()
+        pipeline.state["futures_context"] = futures_context
+        pipeline.state["cross_asset_context"] = cross_asset_context
+        features = pipeline.build_features()
+        self.assertIn("cross_asset_context_unknown_any", features.columns)
+        self.assertFalse(pipeline.state["context_ttl_report"]["cross_asset_context"]["promotion_pass"])
+        pipeline.detect_regimes()
+        pipeline.build_labels()
+        pipeline.align_data()
+        with self.assertRaisesRegex(RuntimeError, "Context integrity gate failed: cross_asset_context"):
+            pipeline.train_models()
+
     def test_pipeline_surfaces_context_ttl_breach_in_operational_monitoring(self):
         index = pd.date_range("2026-02-01", periods=240, freq="1h", tz="UTC")
         raw_data = _make_ohlcv(index)
@@ -261,6 +349,30 @@ class DerivativesContextPipelineTest(unittest.TestCase):
         self.assertIn("context_ttl", training["operational_monitoring"])
         self.assertFalse(training["operational_monitoring"]["healthy"])
         self.assertIn("context_ttl_breached", training["operational_monitoring"]["reasons"])
+
+    def test_strict_backtest_funding_policy_rejects_missing_expected_events(self):
+        index = pd.date_range("2026-02-01", periods=48, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        futures_context = _make_futures_context(index, raw_data["close"].to_numpy())
+        funding_index = futures_context["funding"].index[1]
+        futures_context["funding"] = futures_context["funding"].drop(index=funding_index)
+
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h", "market": "um_futures"},
+                "backtest": {
+                    "apply_funding": True,
+                    "funding_missing_policy": {"mode": "strict", "expected_interval": "8h", "max_gap_multiplier": 1.25},
+                },
+            }
+        )
+        pipeline.state["futures_context"] = futures_context
+
+        with self.assertRaisesRegex(RuntimeError, "Funding coverage gate failed: internal_event_gap"):
+            _resolve_backtest_funding_rates(pipeline, index)
+
+        self.assertIn("backtest_funding", pipeline.state["context_ttl_report"])
+        self.assertFalse(pipeline.state["context_ttl_report"]["backtest_funding"]["promotion_pass"])
 
     def test_mark_valuation_strict_policy_rejects_missing_leading_prices(self):
         index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")

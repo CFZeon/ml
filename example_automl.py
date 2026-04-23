@@ -1,8 +1,12 @@
-"""Run a constrained Optuna-backed AutoML search on the research pipeline.
+"""Run a constrained Optuna-backed AutoML smoke demo on the research pipeline.
 
 Usage
 -----
     python example_automl.py
+
+This example is intentionally optimized for short demo/runtime feedback, not for
+promotion-safe model selection. For the hardened research path, use
+example_trade_ready_automl.py instead.
 """
 
 from pathlib import Path
@@ -32,6 +36,9 @@ def main():
     start = "2024-01-01"
     end = "2024-05-01"
     context_symbols = ["ETHUSDT"]
+
+    print("This is the demo AutoML workflow. It intentionally disables holdout and overfitting gates for speed.")
+    print("Use example_trade_ready_automl.py when you want the hardened research profile.")
 
     automl_storage = Path(".cache") / "automl" / "example_automl_v3.db"
     automl_storage.parent.mkdir(parents=True, exist_ok=True)

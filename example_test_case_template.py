@@ -24,6 +24,8 @@ from example_utils import (
 
 def build_case_config():
     # Edit this block first when creating a new scenario.
+    # Shared builders now fail closed on conflicting duplicate bars.
+    # Recent Binance futures stats are also aligned to publication time by default.
     base_config = build_spot_research_config(
         symbol="BTCUSDT",
         interval="1h",

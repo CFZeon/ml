@@ -8,7 +8,14 @@ import pandas as pd
 import requests
 
 from core import ResearchPipeline
-from core.data import _COLUMNS, _download_archive, _symbol_filters_cache_path, fetch_binance_symbol_filters, fetch_binance_vision
+from core.data import (
+    _COLUMNS,
+    _download_archive,
+    _prepare_frame,
+    _symbol_filters_cache_path,
+    fetch_binance_symbol_filters,
+    fetch_binance_vision,
+)
 from core.storage import read_json, write_parquet_frame
 
 
@@ -32,6 +39,82 @@ class _FakeResponse:
 
 
 class DataFetchIntegrityTest(unittest.TestCase):
+    def test_prepare_frame_deduplicates_exact_timestamp_repeats_and_reports_them(self):
+        raw = pd.DataFrame(
+            [
+                [1704067200000, "100", "101", "99", "100.5", "10", 1704070799999, "1000", "12", "4", "400", "0"],
+                [1704067200000, "100", "101", "99", "100.5", "10", 1704070799999, "1000", "12", "4", "400", "0"],
+            ],
+            columns=_COLUMNS,
+        )
+
+        prepared = _prepare_frame(raw)
+
+        self.assertEqual(len(prepared), 1)
+        duplicate_report = prepared.attrs["duplicate_report"]
+        self.assertEqual(duplicate_report["status"], "exact_duplicates_deduplicated")
+        self.assertEqual(int(duplicate_report["exact_duplicate_timestamps"]), 1)
+        self.assertEqual(int(duplicate_report["conflicting_duplicate_timestamps"]), 0)
+
+    def test_fetch_binance_vision_raises_on_conflicting_duplicate_bars_by_default(self):
+        index = pd.to_datetime([
+            "2024-01-01 00:00:00+00:00",
+            "2024-01-01 00:00:00+00:00",
+            "2024-01-01 01:00:00+00:00",
+        ])
+        frame = pd.DataFrame(
+            {
+                "open": [100.0, 101.0, 102.0],
+                "high": [101.0, 102.0, 103.0],
+                "low": [99.0, 100.0, 101.0],
+                "close": [100.5, 101.5, 102.5],
+                "volume": [10.0, 12.0, 11.0],
+                "quote_volume": [1005.0, 1218.0, 1127.5],
+                "trades": [12, 14, 13],
+                "taker_buy_base_vol": [4.0, 4.5, 4.2],
+                "taker_buy_quote_vol": [400.0, 450.0, 420.0],
+            },
+            index=index,
+        )
+        frame.attrs["duplicate_report"] = {
+            "status": "conflicts_detected",
+            "exact_duplicate_timestamps": 0,
+            "exact_duplicate_rows": 0,
+            "conflicting_duplicate_timestamps": 1,
+            "conflicting_duplicate_rows": 1,
+            "exact_timestamps": [],
+            "conflicting_timestamps": [pd.Timestamp("2024-01-01 00:00:00", tz="UTC")],
+        }
+        load_report = {
+            "period_kind": "monthly",
+            "period_key": "2024-01",
+            "window_start": pd.Timestamp("2024-01-01 00:00:00", tz="UTC"),
+            "window_end": pd.Timestamp("2024-01-01 02:00:00", tz="UTC"),
+            "expected_rows": 2,
+            "observed_rows": 2,
+            "missing_rows": 0,
+            "missing_segments": [],
+            "status": "complete",
+            "used_cache": False,
+            "refreshed": True,
+            "retry_count": 0,
+            "downloads": [],
+            "dropped_window": False,
+            "duplicate_report": dict(frame.attrs["duplicate_report"]),
+        }
+        session_factory = mock.MagicMock()
+        session_factory.return_value.__enter__.return_value = mock.Mock()
+
+        with mock.patch("core.data.requests.Session", session_factory), mock.patch("core.data._load_period", return_value=(frame, load_report)):
+            with self.assertRaisesRegex(RuntimeError, "Conflicting duplicate bars detected"):
+                fetch_binance_vision(
+                    symbol="BTCUSDT",
+                    interval="1h",
+                    start="2024-01-01",
+                    end="2024-01-01 02:00:00",
+                    cache_dir=None,
+                )
+
     def test_download_archive_retries_on_timeout_before_success(self):
         session = mock.Mock()
         session.get.side_effect = [

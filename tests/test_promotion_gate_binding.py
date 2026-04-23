@@ -8,6 +8,7 @@ from core import (
     build_model,
     create_promotion_eligibility_report,
     evaluate_execution_realism_gate,
+    evaluate_stress_realism_gate,
     evaluate_challenger_promotion,
     finalize_promotion_eligibility_report,
     resolve_canonical_promotion_score,
@@ -71,6 +72,54 @@ class PromotionGateBindingTest(unittest.TestCase):
 
         self.assertFalse(decision["approved"])
         self.assertIn("execution_realism_failed", decision["promotion_eligibility_report"]["blocking_failures"])
+
+    def test_stress_realism_gate_blocks_research_only_evaluation(self):
+        report = _make_report(0.15)
+        stress_realism = evaluate_stress_realism_gate(
+            {
+                "evaluation_mode": "research_only",
+                "stress_matrix": {"configured": False, "scenario_names": []},
+                "required_stress_scenarios": ["downtime", "stale_mark", "halt"],
+            }
+        )
+        report = upsert_promotion_gate(
+            report,
+            group="post_selection",
+            name="stress_realism",
+            passed=bool(stress_realism["passed"]),
+            mode="blocking",
+            measured=stress_realism["configured_scenarios"],
+            threshold=stress_realism["required_scenarios"],
+            reason=stress_realism["reason"],
+            details=stress_realism,
+        )
+        report = finalize_promotion_eligibility_report(report)
+
+        decision = evaluate_challenger_promotion(
+            {
+                "promotion_eligibility_report": report,
+                "selection_value": 0.15,
+                "sample_count": 500,
+            }
+        )
+
+        self.assertFalse(decision["approved"])
+        self.assertIn("research_only_evaluation", decision["promotion_eligibility_report"]["blocking_failures"])
+
+    def test_stress_realism_gate_accepts_trade_ready_scenarios(self):
+        stress_realism = evaluate_stress_realism_gate(
+            {
+                "evaluation_mode": "trade_ready",
+                "stress_matrix": {
+                    "configured": True,
+                    "scenario_names": ["downtime", "stale_mark", "halt"],
+                },
+                "required_stress_scenarios": ["downtime", "stale_mark", "halt"],
+            }
+        )
+
+        self.assertTrue(stress_realism["passed"])
+        self.assertFalse(stress_realism["research_only"])
 
     def test_calibration_mode_downgrades_blocking_gate_to_advisory(self):
         report = create_promotion_eligibility_report(calibration_mode=True)

@@ -143,6 +143,53 @@ def _coverage_ratio(frame):
     return float(frame.notna().all(axis=1).mean())
 
 
+def _resolve_context_missing_policy(policy=None):
+    resolved = {
+        "mode": "zero_fill",
+        "add_indicator": False,
+        "max_unknown_rate": 1.0,
+    }
+    if isinstance(policy, str):
+        resolved["mode"] = policy
+        policy_mapping = {}
+    elif isinstance(policy, dict):
+        resolved.update(policy)
+        policy_mapping = policy
+    else:
+        policy_mapping = {}
+
+    mode = str(resolved.get("mode", "zero_fill")).strip().lower()
+    if mode in {"preserve", "preserve_missing", "strict"}:
+        resolved["mode"] = "preserve_missing"
+        if "add_indicator" not in policy_mapping:
+            resolved["add_indicator"] = True
+        if "max_unknown_rate" not in policy_mapping:
+            resolved["max_unknown_rate"] = 0.0
+    else:
+        resolved["mode"] = "zero_fill"
+    resolved["add_indicator"] = bool(resolved.get("add_indicator", False))
+    resolved["max_unknown_rate"] = float(resolved.get("max_unknown_rate", 1.0))
+    return resolved
+
+
+def _resolve_context_ttl_config(config=None):
+    if config is None:
+        return {}
+    if isinstance(config, dict):
+        return dict(config)
+    return {"max_age": config}
+
+
+def _finalize_context_feature_frame(feature_frame, missing_policy=None, unknown_mask=None, unknown_column=None):
+    resolved_policy = _resolve_context_missing_policy(missing_policy)
+    finalized = feature_frame.replace([np.inf, -np.inf], np.nan)
+    if resolved_policy["add_indicator"] and unknown_mask is not None and unknown_column:
+        finalized[unknown_column] = unknown_mask.astype(float)
+    if resolved_policy["mode"] == "zero_fill":
+        finalized = finalized.fillna(0.0)
+    return finalized, resolved_policy
+
+
 def _slug_symbol(symbol):
     return symbol.lower()
 
@@ -260,28 +307,52 @@ def _recent_window(start_dt, end_dt, max_days=30):
     return max(start_dt, floor), end_dt
 
 
-def _fetch_period_endpoint(path, params, start_dt, end_dt, session, cache_dir, namespace):
+def _resolve_recent_stats_availability_lag(period, availability_lag=None):
+    period_delta = _interval_timedelta(period)
+    if period_delta is None:
+        raise ValueError(f"Expected fixed-width period for recent endpoint, got {period!r}")
+
+    configured = availability_lag
+    if configured in {None, "period", "period_close", "period_end", "default"}:
+        return period_delta, "period_close"
+    if configured in {False, 0, "0", "zero", "none", "disabled"}:
+        return pd.Timedelta(0), "none"
+    return pd.Timedelta(configured), str(configured)
+
+
+def _fetch_period_endpoint(path, params, start_dt, end_dt, session, cache_dir, namespace,
+                           availability_lag=None):
     recent_window = _recent_window(start_dt, end_dt)
     if recent_window is None:
         return pd.DataFrame()
 
     recent_start, recent_end = recent_window
+    period = params["period"]
+    availability_delta, availability_mode = _resolve_recent_stats_availability_lag(period, availability_lag)
+    fetch_start = recent_start - availability_delta
     cache_file = _cache_path(
         cache_dir,
         namespace=namespace,
-        payload={**params, "path": path, "start": recent_start, "end": recent_end},
+        payload={
+            **params,
+            "path": path,
+            "start": recent_start,
+            "end": recent_end,
+            "fetch_start": fetch_start,
+            "availability_lag": str(availability_delta),
+            "availability_mode": availability_mode,
+        },
     )
     cached = _read_cache(cache_file)
     if cached is not None:
         return cached
 
-    period = params["period"]
     period_delta = _interval_timedelta(period)
     if period_delta is None:
         raise ValueError(f"Expected fixed-width period for recent endpoint, got {period!r}")
 
     rows = []
-    current_ms = int(recent_start.timestamp() * 1000)
+    current_ms = int(fetch_start.timestamp() * 1000)
     end_ms = int(recent_end.timestamp() * 1000)
     step_ms = int(period_delta.total_seconds() * 1000)
 
@@ -303,19 +374,25 @@ def _fetch_period_endpoint(path, params, start_dt, end_dt, session, cache_dir, n
 
     frame = pd.DataFrame(rows)
     if not frame.empty:
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"].astype("int64"), unit="ms", utc=True)
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"].astype("int64"), unit="ms", utc=True) + availability_delta
         frame = frame.set_index("timestamp").sort_index()
         for column in frame.columns:
             if column in {"symbol", "pair", "contractType"}:
                 continue
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
         frame = frame[(frame.index >= recent_start) & (frame.index < recent_end)]
+        frame.attrs["availability_policy"] = {
+            "mode": availability_mode,
+            "lag": str(availability_delta),
+            "index": "publication_time",
+        }
 
     _write_cache(cache_file, frame)
     return frame
 
 
-def fetch_binance_futures_context(symbol="BTCUSDT", interval="1h", start="2024-01-01", end="2024-03-01", cache_dir=".cache", include_recent_stats=True):
+def fetch_binance_futures_context(symbol="BTCUSDT", interval="1h", start="2024-01-01", end="2024-03-01", cache_dir=".cache", include_recent_stats=True,
+                                 recent_stats_availability_lag="period_close"):
     """Fetch lightweight Binance futures context data for a spot-model feature set."""
     start_dt = _parse_bound(start)
     end_dt = _parse_bound(end)
@@ -361,6 +438,7 @@ def fetch_binance_futures_context(symbol="BTCUSDT", interval="1h", start="2024-0
                 session=session,
                 cache_dir=cache_dir,
                 namespace="open_interest",
+                availability_lag=recent_stats_availability_lag,
             )
             context["taker_flow"] = _fetch_period_endpoint(
                 "/futures/data/takerlongshortRatio",
@@ -370,6 +448,7 @@ def fetch_binance_futures_context(symbol="BTCUSDT", interval="1h", start="2024-0
                 session=session,
                 cache_dir=cache_dir,
                 namespace="taker_flow",
+                availability_lag=recent_stats_availability_lag,
             )
             context["global_long_short"] = _fetch_period_endpoint(
                 "/futures/data/globalLongShortAccountRatio",
@@ -379,6 +458,7 @@ def fetch_binance_futures_context(symbol="BTCUSDT", interval="1h", start="2024-0
                 session=session,
                 cache_dir=cache_dir,
                 namespace="global_long_short",
+                availability_lag=recent_stats_availability_lag,
             )
             context["basis"] = _fetch_period_endpoint(
                 "/futures/data/basis",
@@ -388,6 +468,7 @@ def fetch_binance_futures_context(symbol="BTCUSDT", interval="1h", start="2024-0
                 session=session,
                 cache_dir=cache_dir,
                 namespace="basis",
+                availability_lag=recent_stats_availability_lag,
             )
 
     validated_context, _ = validate_futures_context_bundle(
@@ -421,7 +502,9 @@ def fetch_context_symbol_bars(symbols=None, interval="1h", start="2024-01-01", e
     return validated_frames
 
 
-def build_futures_context_feature_block(base_data, futures_context, rolling_window=20, min_recent_coverage=0.6, ttl_config=None):
+def build_futures_context_feature_block(base_data, futures_context, rolling_window=20,
+                                        min_recent_coverage=0.6, ttl_config=None,
+                                        missing_policy=None):
     """Build normalized derivatives-context features aligned to the base spot index."""
     if not futures_context:
         return _empty_feature_block(base_data.index, block_name="futures_context")
@@ -430,6 +513,7 @@ def build_futures_context_feature_block(base_data, futures_context, rolling_wind
     base_return = close.pct_change()
     feature_frame = pd.DataFrame(index=base_data.index)
     stale_any = pd.Series(False, index=base_data.index, dtype=bool)
+    unknown_any = pd.Series(False, index=base_data.index, dtype=bool)
     ttl_config = dict(ttl_config or {})
     ttl_policy = {
         "mark_price": ttl_config.get("mark_price", "2h"),
@@ -437,18 +521,30 @@ def build_futures_context_feature_block(base_data, futures_context, rolling_wind
         "funding": ttl_config.get("funding", "12h"),
         "recent": ttl_config.get("recent", "4h"),
         "max_stale_rate": float(ttl_config.get("max_stale_rate", 0.2)),
+        "max_unknown_rate": float(ttl_config.get("max_unknown_rate", ttl_config.get("max_stale_rate", 0.2))),
     }
     ttl_sources = {}
 
     def _align_with_ttl(source_name, frame, ttl_key):
         aligned, diagnostics = _asof_reindex_with_ttl(base_data.index, frame, max_age=ttl_policy.get(ttl_key))
         stale_mask = diagnostics["stale_mask"].fillna(False).astype(bool)
+        aligned_columns = [column for column in frame.columns if column in aligned.columns]
+        if aligned_columns:
+            missing_mask = aligned[aligned_columns].isna().all(axis=1)
+        else:
+            missing_mask = pd.Series(True, index=base_data.index, dtype=bool)
+        unknown_mask = stale_mask | missing_mask
         stale_any.loc[stale_mask.index] = stale_any.loc[stale_mask.index] | stale_mask
+        unknown_any.loc[unknown_mask.index] = unknown_any.loc[unknown_mask.index] | unknown_mask
         ttl_value = _coerce_ttl(ttl_policy.get(ttl_key))
         ttl_sources[source_name] = {
             "max_age": str(ttl_value) if ttl_value is not None else None,
             "stale_hit_count": int(stale_mask.sum()),
             "stale_hit_rate": float(stale_mask.mean()) if len(stale_mask) > 0 else 0.0,
+            "missing_hit_count": int(missing_mask.sum()),
+            "missing_hit_rate": float(missing_mask.mean()) if len(missing_mask) > 0 else 0.0,
+            "unknown_hit_count": int(unknown_mask.sum()),
+            "unknown_hit_rate": float(unknown_mask.mean()) if len(unknown_mask) > 0 else 0.0,
         }
         return aligned
 
@@ -475,7 +571,7 @@ def build_futures_context_feature_block(base_data, futures_context, rolling_wind
     funding_frame = futures_context.get("funding")
     if funding_frame is not None and not funding_frame.empty:
         aligned_funding = _align_with_ttl("funding", funding_frame, "funding")
-        funding_rate = aligned_funding["funding_rate"].astype(float).fillna(0.0)
+        funding_rate = aligned_funding["funding_rate"].astype(float)
         funding_window = max(4, min(rolling_window, 24))
         feature_frame["fut_funding_rate"] = funding_rate
         feature_frame["fut_funding_abs"] = funding_rate.abs()
@@ -526,7 +622,12 @@ def build_futures_context_feature_block(base_data, futures_context, rolling_wind
         )
 
     feature_frame["fut_context_stale_any"] = stale_any.astype(float)
-    feature_frame = feature_frame.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    feature_frame, resolved_missing_policy = _finalize_context_feature_frame(
+        feature_frame,
+        missing_policy=missing_policy,
+        unknown_mask=unknown_any,
+        unknown_column="fut_context_unknown_any",
+    )
     laggable_columns = list(feature_frame.columns)
     ttl_report = {
         "enabled": True,
@@ -537,11 +638,18 @@ def build_futures_context_feature_block(base_data, futures_context, rolling_wind
             "funding": str(_coerce_ttl(ttl_policy["funding"])) if _coerce_ttl(ttl_policy["funding"]) is not None else None,
             "recent": str(_coerce_ttl(ttl_policy["recent"])) if _coerce_ttl(ttl_policy["recent"]) is not None else None,
             "max_stale_rate": float(ttl_policy["max_stale_rate"]),
+            "max_unknown_rate": float(ttl_policy["max_unknown_rate"]),
+            "fill_mode": resolved_missing_policy["mode"],
         },
         "sources": ttl_sources,
         "stale_hit_count": int(stale_any.sum()),
         "stale_hit_rate": float(stale_any.mean()) if len(stale_any) > 0 else 0.0,
-        "promotion_pass": bool(float(stale_any.mean()) <= float(ttl_policy["max_stale_rate"])) if len(stale_any) > 0 else True,
+        "unknown_hit_count": int(unknown_any.sum()),
+        "unknown_hit_rate": float(unknown_any.mean()) if len(unknown_any) > 0 else 0.0,
+        "promotion_pass": bool(
+            float(stale_any.mean()) <= float(ttl_policy["max_stale_rate"])
+            and float(unknown_any.mean()) <= float(ttl_policy["max_unknown_rate"])
+        ) if len(unknown_any) > 0 else True,
     }
     return FeatureBlock(
         frame=feature_frame,
@@ -551,7 +659,8 @@ def build_futures_context_feature_block(base_data, futures_context, rolling_wind
     )
 
 
-def build_cross_asset_context_feature_block(base_data, context_symbol_data, rolling_window=20):
+def build_cross_asset_context_feature_block(base_data, context_symbol_data, rolling_window=20,
+                                           ttl_config=None, missing_policy=None):
     """Build a compact cross-asset context block from a small spot leader basket."""
     if not context_symbol_data:
         return _empty_feature_block(base_data.index, block_name="cross_asset_context")
@@ -559,9 +668,13 @@ def build_cross_asset_context_feature_block(base_data, context_symbol_data, roll
     base_close = base_data["close"].astype(float)
     base_return = base_close.pct_change()
     feature_frame = pd.DataFrame(index=base_data.index)
+    unknown_any = pd.Series(False, index=base_data.index, dtype=bool)
     basket_returns = []
     basket_medium_returns = []
     basket_vols = []
+    ttl_policy = _resolve_context_ttl_config(ttl_config)
+    max_age = ttl_policy.get("max_age")
+    ttl_sources = {}
 
     medium_horizon = max(6, min(24, rolling_window))
     for symbol, data in context_symbol_data.items():
@@ -569,11 +682,30 @@ def build_cross_asset_context_feature_block(base_data, context_symbol_data, roll
             continue
 
         prefix = _slug_symbol(symbol)
-        aligned = data.reindex(base_data.index).ffill()
+        if max_age is None:
+            aligned = data.reindex(base_data.index).ffill()
+            required_columns = [column for column in ["close", "volume"] if column in aligned.columns]
+            if required_columns:
+                missing_mask = aligned[required_columns].isna().any(axis=1)
+                unknown_any.loc[missing_mask.index] = unknown_any.loc[missing_mask.index] | missing_mask
+        else:
+            aligned, diagnostics = _asof_reindex_with_ttl(base_data.index, data, max_age=max_age)
+            required_columns = [column for column in ["close", "volume"] if column in aligned.columns]
+            missing_mask = aligned[required_columns].isna().any(axis=1) if required_columns else pd.Series(True, index=base_data.index, dtype=bool)
+            unknown_any.loc[missing_mask.index] = unknown_any.loc[missing_mask.index] | missing_mask
+            ttl_value = _coerce_ttl(max_age)
+            stale_mask = diagnostics["stale_mask"].fillna(False).astype(bool)
+            ttl_sources[prefix] = {
+                "max_age": str(ttl_value) if ttl_value is not None else None,
+                "stale_hit_count": int(stale_mask.sum()),
+                "stale_hit_rate": float(stale_mask.mean()) if len(stale_mask) > 0 else 0.0,
+                "missing_hit_count": int(missing_mask.sum()),
+                "missing_hit_rate": float(missing_mask.mean()) if len(missing_mask) > 0 else 0.0,
+            }
         close = aligned["close"].astype(float)
         volume = aligned["volume"].astype(float)
-        ret_1 = close.pct_change()
-        ret_medium = close.pct_change(medium_horizon)
+        ret_1 = close.pct_change(fill_method=None)
+        ret_medium = close.pct_change(medium_horizon, fill_method=None)
         vol_rolling = ret_1.rolling(rolling_window, min_periods=max(2, rolling_window // 2)).std()
         feature_frame[f"ctx_{prefix}_ret_1"] = ret_1
         feature_frame[f"ctx_{prefix}_ret_{medium_horizon}"] = ret_medium
@@ -598,9 +730,34 @@ def build_cross_asset_context_feature_block(base_data, context_symbol_data, roll
         vol_frame = pd.concat(basket_vols, axis=1)
         feature_frame["ctx_basket_vol_mean"] = vol_frame.mean(axis=1)
 
-    feature_frame = feature_frame.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    feature_frame, resolved_missing_policy = _finalize_context_feature_frame(
+        feature_frame,
+        missing_policy=missing_policy,
+        unknown_mask=unknown_any,
+        unknown_column="cross_asset_context_unknown_any",
+    )
     laggable_columns = list(feature_frame.columns)
-    return FeatureBlock(frame=feature_frame, laggable_columns=laggable_columns, block_name="cross_asset_context")
+    ttl_report = {
+        "enabled": True,
+        "scope": "cross_asset_context",
+        "policy": {
+            "max_age": str(_coerce_ttl(max_age)) if _coerce_ttl(max_age) is not None else None,
+            "max_unknown_rate": float(ttl_policy.get("max_unknown_rate", resolved_missing_policy["max_unknown_rate"])),
+            "fill_mode": resolved_missing_policy["mode"],
+        },
+        "sources": ttl_sources,
+        "unknown_hit_count": int(unknown_any.sum()),
+        "unknown_hit_rate": float(unknown_any.mean()) if len(unknown_any) > 0 else 0.0,
+        "promotion_pass": bool(
+            float(unknown_any.mean()) <= float(ttl_policy.get("max_unknown_rate", resolved_missing_policy["max_unknown_rate"]))
+        ) if len(unknown_any) > 0 else True,
+    }
+    return FeatureBlock(
+        frame=feature_frame,
+        laggable_columns=laggable_columns,
+        block_name="cross_asset_context",
+        metadata={"ttl_report": ttl_report},
+    )
 
 
 def build_multi_timeframe_context_feature_block(base_data, base_interval, timeframes=None, rolling_window=20):

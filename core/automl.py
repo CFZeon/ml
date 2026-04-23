@@ -14,6 +14,7 @@ from .promotion import (
     build_promotion_gate_check_map,
     create_promotion_eligibility_report,
     evaluate_execution_realism_gate,
+    evaluate_stress_realism_gate,
     finalize_promotion_eligibility_report,
     resolve_canonical_promotion_score,
     resolve_promotion_gate_mode,
@@ -3461,6 +3462,25 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         reason=execution_realism.get("reason"),
         details=execution_realism,
     )
+    stress_realism = evaluate_stress_realism_gate(
+        (locked_holdout or {}).get("backtest")
+        or validation_holdout.get("backtest")
+        or best_trial_report.get("backtest")
+        or {},
+        policy=selection_policy,
+    )
+    best_trial_report["selection_policy"]["eligibility_checks"]["stress_realism"] = bool(stress_realism["passed"])
+    promotion_eligibility_report = upsert_promotion_gate(
+        promotion_eligibility_report,
+        group="post_selection",
+        name="stress_realism",
+        passed=bool(stress_realism["passed"]),
+        mode=resolve_promotion_gate_mode(selection_policy, "stress_realism"),
+        measured=stress_realism.get("configured_scenarios"),
+        threshold=stress_realism.get("required_scenarios"),
+        reason=stress_realism.get("reason"),
+        details=stress_realism,
+    )
     best_trial_report["selection_policy"] = _update_selection_policy_report(
         best_trial_report["selection_policy"],
         promotion_eligibility_report,
@@ -3473,6 +3493,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         locked_holdout.get("evaluated_after_freeze", False)
     )
     selection_report["diagnostics"]["execution_realism"] = execution_realism
+    selection_report["diagnostics"]["stress_realism"] = stress_realism
     selection_report["diagnostics"]["replication"] = replication_report
     selection_report["diagnostics"]["promotion_ready"] = bool(best_trial_report["selection_policy"]["promotion_ready"])
     selection_report["diagnostics"]["promotion_reasons"] = list(best_trial_report["selection_policy"]["promotion_reasons"])

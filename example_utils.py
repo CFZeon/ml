@@ -82,7 +82,12 @@ def build_spot_research_config(
             "start": start,
             "end": end,
             "market": "spot",
-            "futures_context": {"enabled": True, "include_recent_stats": True},
+            "duplicate_policy": "fail",
+            "futures_context": {
+                "enabled": True,
+                "include_recent_stats": True,
+                "recent_stats_availability_lag": "period_close",
+            },
             "cross_asset_context": {"symbols": context_symbols},
         },
         "universe": build_example_universe_config(
@@ -98,6 +103,16 @@ def build_spot_research_config(
             "rolling_window": 20,
             "squeeze_quantile": 0.2,
             "context_timeframes": ["4h", "1d"],
+            "context_missing_policy": {"mode": "preserve_missing", "add_indicator": True},
+            "futures_context_ttl": {
+                "mark_price": "2h",
+                "premium_index": "2h",
+                "funding": "12h",
+                "recent": "4h",
+                "max_stale_rate": 0.05,
+                "max_unknown_rate": 0.0,
+            },
+            "cross_asset_context_ttl": {"max_age": "2h", "max_unknown_rate": 0.0},
         },
         "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
         "regime": {"method": "hmm"},
@@ -135,6 +150,7 @@ def build_spot_research_config(
             "slippage_rate": 0.0002,
             "slippage_model": "sqrt_impact",
             "engine": "vectorbt",
+            "evaluation_mode": "research_only",
             "use_open_execution": True,
             "signal_delay_bars": 2,
         },
@@ -164,7 +180,12 @@ def build_futures_research_config(
             "start": start,
             "end": end,
             "market": "um_futures",
-            "futures_context": {"enabled": True, "include_recent_stats": True},
+            "duplicate_policy": "fail",
+            "futures_context": {
+                "enabled": True,
+                "include_recent_stats": True,
+                "recent_stats_availability_lag": "period_close",
+            },
             "cross_asset_context": {"symbols": context_symbols, "market": "um_futures"},
         },
         "universe": build_example_universe_config(
@@ -179,6 +200,16 @@ def build_futures_research_config(
             "frac_diff_d": 0.4,
             "rolling_window": 24,
             "context_timeframes": ["4h"],
+            "context_missing_policy": {"mode": "preserve_missing", "add_indicator": True},
+            "futures_context_ttl": {
+                "mark_price": "2h",
+                "premium_index": "2h",
+                "funding": "12h",
+                "recent": "4h",
+                "max_stale_rate": 0.05,
+                "max_unknown_rate": 0.0,
+            },
+            "cross_asset_context_ttl": {"max_age": "2h", "max_unknown_rate": 0.0},
         },
         "feature_selection": {"enabled": True, "max_features": 64, "min_mi_threshold": 0.0},
         "regime": {"method": "hmm"},
@@ -217,8 +248,10 @@ def build_futures_research_config(
             "slippage_rate": 0.0002,
             "slippage_model": "sqrt_impact",
             "engine": "pandas",
+            "evaluation_mode": "research_only",
             "valuation_price": "mark",
             "apply_funding": True,
+            "funding_missing_policy": {"mode": "strict", "expected_interval": "8h", "max_gap_multiplier": 1.25},
             "allow_short": True,
             "leverage": 1.5,
             "use_open_execution": True,
@@ -252,6 +285,151 @@ def build_futures_research_config(
         },
     }
     return clone_config_with_overrides(config, config_overrides)
+
+
+def build_trade_ready_automl_overrides(
+    *,
+    storage_path,
+    study_name,
+    n_trials=12,
+    seed=42,
+    objective="risk_adjusted_after_costs",
+    validation_fraction=0.2,
+    locked_holdout_fraction=0.2,
+    min_validation_trade_count=20,
+    max_trials_per_model_family=12,
+    search_space=None,
+    extra_automl_fields=None,
+):
+    """Build a hardened AutoML override block for trade-ready research runs.
+
+    This helper intentionally enables the controls that the demo-only AutoML
+    example disables: binding locked holdout checks, selection gating, and
+    post-selection inference. The search space stays constrained enough for
+    consumer hardware while still allowing the study to reject fragile winners.
+    Replication cohorts are also enabled by default so promotion-readiness is
+    judged against alternate windows or sibling symbols instead of one narrative.
+    """
+
+    constrained_search_space = {
+        "features": {
+            "lags": {"type": "categorical", "choices": ["1,3,6", "1,4,12"]},
+            "frac_diff_d": {"type": "categorical", "choices": [0.4, 0.6]},
+            "rolling_window": {"type": "categorical", "choices": [20, 28]},
+            "squeeze_quantile": {"type": "categorical", "choices": [0.15, 0.2]},
+        },
+        "feature_selection": {
+            "enabled": {"type": "categorical", "choices": [True]},
+            "max_features": {"type": "categorical", "choices": [48, 64]},
+            "min_mi_threshold": {"type": "categorical", "choices": [0.0005, 0.001]},
+        },
+        "labels": {
+            "pt_mult": {"type": "categorical", "choices": [1.5, 2.0]},
+            "sl_mult": {"type": "categorical", "choices": [1.5, 2.0]},
+            "max_holding": {"type": "categorical", "choices": [12, 24]},
+            "min_return": {"type": "categorical", "choices": [0.0005, 0.001]},
+            "volatility_window": {"type": "categorical", "choices": [24]},
+            "barrier_tie_break": {"type": "categorical", "choices": ["sl", "pt"]},
+        },
+        "regime": {
+            "n_regimes": {"type": "categorical", "choices": [2, 3]},
+        },
+        "model": {
+            "type": {"type": "categorical", "choices": ["gbm", "logistic"]},
+            "gap": {"type": "categorical", "choices": [24, 48]},
+            "validation_fraction": {"type": "categorical", "choices": [validation_fraction]},
+            "meta_n_splits": {"type": "categorical", "choices": [2]},
+            "params": {
+                "gbm": {
+                    "n_estimators": {"type": "categorical", "choices": [100, 200]},
+                    "learning_rate": {"type": "categorical", "choices": [0.05, 0.1]},
+                    "max_depth": {"type": "categorical", "choices": [2, 3]},
+                    "subsample": {"type": "categorical", "choices": [0.85, 1.0]},
+                    "min_samples_leaf": {"type": "categorical", "choices": [3, 5]},
+                },
+                "logistic": {
+                    "c": {"type": "categorical", "choices": [0.1, 1.0, 5.0]},
+                },
+            },
+        },
+    }
+
+    profile = {
+        "automl": {
+            "enabled": True,
+            "n_trials": int(n_trials),
+            "seed": int(seed),
+            "validation_fraction": float(validation_fraction),
+            "minimum_dsr_threshold": 0.3,
+            "locked_holdout_enabled": True,
+            "locked_holdout_fraction": float(locked_holdout_fraction),
+            "enable_pruning": False,
+            "objective": str(objective),
+            "study_name": str(study_name),
+            "storage": str(storage_path),
+            "selection_policy": {
+                "enabled": True,
+                "max_generalization_gap": 0.25,
+                "max_param_fragility": 0.2,
+                "max_complexity_score": 16.0,
+                "min_validation_trade_count": int(min_validation_trade_count),
+                "require_locked_holdout_pass": True,
+                "min_locked_holdout_score": 0.0,
+                "max_feature_count_ratio": 0.75,
+                "max_trials_per_model_family": int(max_trials_per_model_family),
+                "local_perturbation_limit": 6,
+                "require_fold_stability_pass": True,
+                "required_execution_mode": "event_driven",
+                "required_stress_scenarios": ["downtime", "stale_mark", "halt"],
+            },
+            "replication": {
+                "enabled": True,
+                "include_symbol_cohorts": True,
+                "include_window_cohorts": True,
+                "alternate_window_count": 1,
+                "alternate_window_fraction": 0.5,
+                "min_coverage": 2,
+                "min_pass_rate": 1.0,
+                "min_score": 0.0,
+                "min_rows": 64,
+            },
+            "overfitting_control": {
+                "enabled": True,
+                "selection_mode": "penalized_ranking",
+                "deflated_sharpe": {
+                    "enabled": True,
+                    "use_effective_trial_count": True,
+                    "min_track_record_length": 10,
+                },
+                "pbo": {
+                    "enabled": True,
+                    "n_blocks": 8,
+                    "min_block_size": 5,
+                    "metric": "sharpe_ratio",
+                    "overlap_policy": "strict_intersection",
+                    "min_overlap_fraction": 0.5,
+                },
+                "post_selection": {
+                    "enabled": True,
+                    "require_pass": True,
+                    "pass_rule": "spa",
+                    "alpha": 0.05,
+                    "max_candidates": 5,
+                    "correlation_threshold": 0.9,
+                    "min_overlap_fraction": 0.5,
+                    "min_overlap_observations": 10,
+                    "overlap_policy": "strict_intersection",
+                    "bootstrap_samples": 500,
+                    "random_state": int(seed),
+                },
+            },
+            "search_space": clone_config_with_overrides(
+                constrained_search_space,
+                search_space,
+            ),
+        }
+    }
+    return clone_config_with_overrides(profile, {"automl": extra_automl_fields} if extra_automl_fields else None)
 
 
 def seed_offline_pipeline_state(
@@ -871,3 +1049,29 @@ def print_automl_summary(automl):
             )
         if locked_holdout.get("holdout_warning"):
             print("  holdout warn : Sharpe CI lower bound is below zero")
+
+    evaluation_backtest = (locked_holdout.get("backtest") or validation_holdout.get("backtest") or best_backtest or {})
+    if evaluation_backtest:
+        stress_matrix = evaluation_backtest.get("stress_matrix") or {}
+        print(
+            "  evaluation   : "
+            f"mode={evaluation_backtest.get('evaluation_mode', 'unknown')}  "
+            f"stress_ready={bool(evaluation_backtest.get('stress_realism_ready', False))}  "
+            f"stress_cases={stress_matrix.get('scenario_names') or 'none'}"
+        )
+
+    replication = automl.get("replication") or {}
+    if replication.get("enabled"):
+        print(
+            "  replication  : "
+            f"passed={bool(replication.get('promotion_pass', False))}  "
+            f"coverage={replication.get('completed_cohort_count')}/{replication.get('requested_cohort_count')}  "
+            f"pass_rate={_format_metric(replication.get('pass_rate'))}  "
+            f"min_pass_rate={_format_metric(replication.get('min_pass_rate'))}"
+        )
+        replication_reasons = list(replication.get("reasons") or [])
+        print(f"  replication why: {replication_reasons if replication_reasons else 'none'}")
+
+    print(f"  promotion ok : {bool(automl.get('promotion_ready', False))}")
+    promotion_reasons = list(automl.get("promotion_reasons") or [])
+    print(f"  promotion why: {promotion_reasons if promotion_reasons else 'none'}")

@@ -147,6 +147,46 @@ class ExchangeFailureScenariosTest(unittest.TestCase):
         self.assertIn("downtime", results)
         self.assertGreaterEqual(int(results["base"]["accepted_orders"]), int(results["downtime"]["accepted_orders"]))
 
+    def test_run_backtest_attaches_trade_ready_stress_matrix_summary(self):
+        index = pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC")
+        close = pd.Series([100.0, 100.0, 101.0, 101.0, 100.5, 100.0], index=index)
+        signals = pd.Series([0.0, 1.0, 1.0, 0.0, -1.0, 0.0], index=index)
+
+        result = run_backtest(
+            close=close,
+            signals=signals,
+            execution_prices=close,
+            equity=10_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="pandas",
+            volume=pd.Series(1_000.0, index=index),
+            execution_policy={"adapter": "nautilus", "force_simulation": True, "time_in_force": "IOC", "participation_cap": 1.0},
+            evaluation_mode="trade_ready",
+            required_stress_scenarios=["downtime", "stale_mark", "halt"],
+            scenario_matrix={
+                "downtime": {
+                    "events": [{"event_type": "downtime", "timestamp": index[1]}],
+                    "policy": {"downtime_action": "freeze"},
+                },
+                "stale_mark": {
+                    "events": [{"event_type": "stale_mark", "timestamp": index[2]}],
+                    "policy": {"stale_mark_action": "reject"},
+                },
+                "halt": {
+                    "events": [{"event_type": "halt", "start": index[3], "end": index[4]}],
+                    "policy": {},
+                },
+            },
+        )
+
+        self.assertEqual(result["evaluation_mode"], "trade_ready")
+        self.assertTrue(result["stress_matrix"]["configured"])
+        self.assertEqual(result["stress_matrix"]["scenario_count"], 3)
+        self.assertCountEqual(result["stress_matrix"]["scenario_names"], ["downtime", "stale_mark", "halt"])
+        self.assertTrue(result["stress_realism_ready"])
+
 
 if __name__ == "__main__":
     unittest.main()

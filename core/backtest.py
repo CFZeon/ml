@@ -20,6 +20,7 @@ from .scenarios import (
     apply_scenario_price_policy,
     build_scenario_schedule,
     merge_scenario_lifecycle,
+    run_scenario_matrix,
 )
 from .universe import apply_symbol_lifecycle_policy, build_symbol_lifecycle_frame
 
@@ -1917,6 +1918,58 @@ def _resolve_realized_slippage_paid(cost_report, fallback_total, execution_repor
     return float(fallback_total)
 
 
+def _summarize_stress_matrix_results(results):
+    scenario_names = [str(name) for name in results if str(name) != "base"]
+    stressed_results = [results[name] for name in scenario_names if isinstance(results.get(name), dict)]
+    return {
+        "configured": bool(scenario_names),
+        "scenario_count": int(len(scenario_names)),
+        "scenario_names": scenario_names,
+        "worst_net_profit_pct": min((float(result.get("net_profit_pct", 0.0)) for result in stressed_results), default=None),
+        "worst_sharpe_ratio": min((float(result.get("sharpe_ratio", 0.0)) for result in stressed_results), default=None),
+        "results": {
+            name: {
+                "net_profit_pct": results[name].get("net_profit_pct"),
+                "sharpe_ratio": results[name].get("sharpe_ratio"),
+                "max_drawdown": results[name].get("max_drawdown"),
+                "scenario_report": results[name].get("scenario_report", {}),
+            }
+            for name in scenario_names
+            if isinstance(results.get(name), dict)
+        },
+    }
+
+
+def _attach_backtest_evaluation_metadata(summary, *, evaluation_mode="research_only",
+                                         stress_matrix=None, required_stress_scenarios=None):
+    payload = dict(summary or {})
+    resolved_mode = str(evaluation_mode or "research_only").strip().lower()
+    required = [str(name) for name in list(required_stress_scenarios or [])]
+    stress_summary = dict(stress_matrix or {
+        "configured": False,
+        "scenario_count": 0,
+        "scenario_names": [],
+        "results": {},
+    })
+    configured_names = [str(name) for name in list(stress_summary.get("scenario_names") or [])]
+    missing_required = [name for name in required if name not in configured_names]
+    evaluation_limitations = []
+    if resolved_mode != "trade_ready":
+        evaluation_limitations.append("research_only_evaluation_mode")
+    if required and missing_required:
+        evaluation_limitations.append("stress_scenarios_missing")
+    if resolved_mode == "trade_ready" and not stress_summary.get("configured", False):
+        evaluation_limitations.append("stress_matrix_unconfigured")
+    payload["evaluation_mode"] = resolved_mode
+    payload["required_stress_scenarios"] = required
+    payload["stress_matrix"] = stress_summary
+    payload["stress_realism_ready"] = bool(resolved_mode == "trade_ready" and not missing_required and stress_summary.get("configured", False))
+    payload["trade_ready_evaluation"] = bool(payload["stress_realism_ready"])
+    payload["evaluation_limitations"] = evaluation_limitations
+    payload["research_only"] = bool(resolved_mode != "trade_ready" or bool(evaluation_limitations))
+    return payload
+
+
 def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
                            execution_prices, signal_delay_bars, allow_short,
                            symbol_filters=None, funding_rates=None,
@@ -2055,7 +2108,9 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  liquidity_lag_bars=1, execution_policy=None,
                  futures_contract=None, futures_leverage_brackets=None,
                  symbol_lifecycle=None, symbol_lifecycle_policy=None,
-                 scenario_schedule=None, scenario_policy=None):
+                 scenario_schedule=None, scenario_policy=None,
+                 scenario_matrix=None, evaluation_mode="research_only",
+                 required_stress_scenarios=None):
     """Run a backtest through the configured execution adapter.
 
     Parameters
@@ -2093,6 +2148,53 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
 
     Returns dict with metrics and equity curve.
     """
+    if scenario_matrix is not None:
+        base_kwargs = {
+            "close": close,
+            "signals": signals,
+            "equity": equity,
+            "fee_rate": fee_rate,
+            "slippage_rate": slippage_rate,
+            "execution_prices": execution_prices,
+            "signal_delay_bars": signal_delay_bars,
+            "engine": engine,
+            "market": market,
+            "leverage": leverage,
+            "allow_short": allow_short,
+            "symbol_filters": symbol_filters,
+            "funding_rates": funding_rates,
+            "significance": significance,
+            "benchmark_returns": benchmark_returns,
+            "benchmark_sharpe": benchmark_sharpe,
+            "volume": volume,
+            "slippage_model": slippage_model,
+            "orderbook_depth": orderbook_depth,
+            "execution_price_policy": execution_price_policy,
+            "execution_price_fill_limit": execution_price_fill_limit,
+            "valuation_price_policy": valuation_price_policy,
+            "valuation_price_fill_limit": valuation_price_fill_limit,
+            "futures_account": futures_account,
+            "liquidity_lag_bars": liquidity_lag_bars,
+            "execution_policy": execution_policy,
+            "futures_contract": futures_contract,
+            "futures_leverage_brackets": futures_leverage_brackets,
+            "symbol_lifecycle": symbol_lifecycle,
+            "symbol_lifecycle_policy": symbol_lifecycle_policy,
+            "scenario_schedule": scenario_schedule,
+            "scenario_policy": scenario_policy,
+            "scenario_matrix": None,
+            "evaluation_mode": evaluation_mode,
+            "required_stress_scenarios": required_stress_scenarios,
+        }
+        results = run_scenario_matrix(run_backtest, base_kwargs, scenario_matrix)
+        base_result = dict(results.get("base") or {})
+        return _attach_backtest_evaluation_metadata(
+            base_result,
+            evaluation_mode=evaluation_mode,
+            stress_matrix=_summarize_stress_matrix_results(results),
+            required_stress_scenarios=required_stress_scenarios,
+        )
+
     close = pd.Series(close, copy=False).astype(float)
     signal_series = pd.Series(signals, index=close.index).reindex(close.index).fillna(0.0).astype(float)
     benchmark_returns = _align_benchmark_returns(benchmark_returns, close.index)
@@ -2267,7 +2369,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         leverage_brackets=futures_leverage_brackets,
     )
     if resolved_futures_account is not None:
-        return _run_futures_account_backtest(
+        summary = _run_futures_account_backtest(
             close=valuation_series,
             position=executable_position,
             equity=equity,
@@ -2286,11 +2388,16 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
             orderbook_depth=orderbook_depth,
             execution_report=execution_report,
         )
+        return _attach_backtest_evaluation_metadata(
+            summary,
+            evaluation_mode=evaluation_mode,
+            required_stress_scenarios=required_stress_scenarios,
+        )
 
     selected_engine = (engine or "vectorbt").lower()
     if selected_engine == "vectorbt":
         try:
-            return _run_vectorbt_backtest(
+            summary = _run_vectorbt_backtest(
                 close=valuation_series,
                 position=executable_position,
                 equity=equity,
@@ -2309,10 +2416,15 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                 orderbook_depth=orderbook_depth,
                 execution_report=execution_report,
             )
+            return _attach_backtest_evaluation_metadata(
+                summary,
+                evaluation_mode=evaluation_mode,
+                required_stress_scenarios=required_stress_scenarios,
+            )
         except ImportError:
             selected_engine = "pandas"
 
-    return _run_pandas_backtest(
+    summary = _run_pandas_backtest(
         close=valuation_series,
         position=executable_position,
         equity=equity,
@@ -2328,4 +2440,9 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         slippage_model=slippage_model,
         orderbook_depth=orderbook_depth,
         execution_report=execution_report,
+    )
+    return _attach_backtest_evaluation_metadata(
+        summary,
+        evaluation_mode=evaluation_mode,
+        required_stress_scenarios=required_stress_scenarios,
     )

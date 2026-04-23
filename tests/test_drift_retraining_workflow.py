@@ -6,6 +6,7 @@ import pandas as pd
 
 from core import (
     LocalRegistryStore,
+    ResearchPipeline,
     build_model,
     create_promotion_eligibility_report,
     finalize_promotion_eligibility_report,
@@ -219,6 +220,32 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             self.assertEqual(store.get_champion("BTCUSDT")["version_id"], previous_champion)
             archived_current = next(row for row in store.list_versions("BTCUSDT") if row["version_id"] == current_champion)
             self.assertEqual(archived_current["current_status"], "archived")
+
+    def test_pipeline_wrapper_runs_drift_cycle_from_runtime_state(self):
+        reference_features, current_features, reference_predictions, current_predictions, performance = _make_drift_inputs()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.12)
+
+            pipeline = ResearchPipeline({"data": {"symbol": "BTCUSDT", "interval": "1h"}})
+            pipeline.state["X"] = current_features
+            pipeline.state["training"] = {"oos_probabilities": current_predictions}
+            pipeline.state["backtest"] = {"equity_curve": (1.0 + performance).cumprod()}
+            pipeline.state["operational_monitoring"] = {"healthy": True, "reasons": []}
+
+            result = pipeline.run_drift_retraining_cycle(
+                store=store,
+                reference_features=reference_features,
+                reference_predictions=reference_predictions,
+                bars_since_last_retrain=800,
+                scheduled_window_open=True,
+                train_challenger=lambda: _make_challenger_payload(0.18),
+            )
+
+            self.assertEqual(result["retrain_status"], "promoted")
+            self.assertTrue(result["promotion_decision"]["approved"])
+            self.assertEqual(pipeline.state["drift_cycle"]["candidate_version_id"], result["candidate_version_id"])
 
 
 if __name__ == "__main__":

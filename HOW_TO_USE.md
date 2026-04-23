@@ -21,7 +21,9 @@ Use this map instead of scanning every example manually.
 | Conservative futures research baseline | `example_futures.py` | Shows mark-price valuation, funding, and liquidation-aware futures setup |
 | Attach custom exogenous data | `example_custom_data.py` | Demonstrates point-in-time-safe custom data joins |
 | Run an offline deterministic case | `example_synthetic_derivatives.py` | Seeds `pipeline.state` directly and avoids network fetches |
-| Run AutoML | `example_automl.py` | Shows the searchable config surface and Optuna study settings |
+| Run trade-ready AutoML research | `example_trade_ready_automl.py` | Uses the hardened AutoML profile with locked holdout, replication cohorts, binding selection gates, and promotion-readiness reporting |
+| Run drift-governed retraining flow | `example_drift_retraining_cycle.py` | Shows champion/challenger registration, scheduled retraining, and hybrid rollback |
+| Run AutoML smoke/demo path | `example_automl.py` | Shows the searchable config surface quickly, but intentionally disables promotion-safe controls |
 | Explore FVG-specific features | `example_fvg.py` | Narrow feature example; useful as a feature smoke test |
 | Explore wider indicator families | `example_trend_volume_spot.py` and `example_trend_breakout_futures.py` | Show how to widen the indicator stack without changing the rest of the pipeline |
 
@@ -38,6 +40,13 @@ Start from the shared builders in `example_utils.py`:
 - `seed_offline_pipeline_state(...)`
 
 That gives you one stable base config plus a short diff that contains only your experiment-specific changes.
+
+The shared builders now include strict context and funding integrity guardrails by default. If cross-asset context goes stale or a futures funding event is missing, the pipeline fails closed with an explicit gate error instead of converting that unknown state into zeros.
+They also set `data.duplicate_policy = "fail"`, so conflicting duplicate market bars raise immediately instead of being silently de-duplicated.
+They also set `data.futures_context.recent_stats_availability_lag = "period_close"`, so recent Binance futures statistics are indexed at publication-safe timestamps instead of the interval they summarize.
+They also default to `backtest.evaluation_mode = "research_only"`, so a normal builder-based example is explicitly research-grade unless you promote it to a trade-ready evaluation profile.
+The hardened trade-ready AutoML override also enables replication cohorts by default, so promotion-readiness is checked on alternate windows or sibling symbols instead of a single holdout narrative.
+That hardened trade-ready path now requires a real Nautilus backend. A `force_simulation` surrogate run is still useful, but it should be treated as research-only execution analysis rather than promotion-safe evaluation.
 
 ## Build A New Real-Data Case
 
@@ -87,7 +96,7 @@ What not to remove casually:
 
 1. `universe` when you use cross-asset context
 2. `data.market` for futures cases
-3. `valuation_price`, `apply_funding`, and `futures_account` for realistic futures backtests
+3. `valuation_price`, `apply_funding`, `funding_missing_policy`, and `futures_account` for realistic futures backtests
 
 ## Build A Futures Case
 
@@ -97,8 +106,26 @@ Use `build_futures_research_config(...)` instead of switching a spot config by h
 - futures cross-asset context market
 - mark-price valuation
 - funding application
+- strict funding-event coverage checks for research backtests
 - long/short enablement
 - a liquidation-aware futures account block on the pandas engine
+
+If you intentionally want the old permissive smoke-test behavior, override these explicitly:
+
+1. set `features.context_missing_policy.mode` to `zero_fill`
+2. remove or relax `features.futures_context_ttl` and `features.cross_asset_context_ttl`
+3. set `backtest.funding_missing_policy.mode` to `zero_fill`
+4. set `data.duplicate_policy` to `warn` or `flag`
+5. set `data.futures_context.recent_stats_availability_lag` to `none` only if you intentionally accept non-causal recent-stat alignment
+
+If you want a trade-ready evaluation instead of a research-only one, add these explicitly:
+
+1. set `backtest.evaluation_mode` to `trade_ready`
+2. use a real Nautilus execution policy such as `{"adapter": "nautilus", ...}` and do not set `force_simulation`
+3. provide `backtest.scenario_matrix` with named stress cases such as `downtime`, `stale_mark`, and `halt`
+4. set `backtest.required_stress_scenarios` so the promotion gate knows which cases are mandatory
+
+If you only want a surrogate execution study, keep `backtest.evaluation_mode = "research_only"` and set `execution_policy.force_simulation = true` explicitly.
 
 Minimal pattern:
 
@@ -202,6 +229,29 @@ This is the right path when you need:
 
 Use `example_synthetic_derivatives.py` as the working reference.
 
+## Run Drift-Governed Retraining
+
+Use `example_drift_retraining_cycle.py` when you want the operational path from drift signal to challenger decision.
+
+The important runtime pieces are:
+
+1. a registry store with an existing champion
+2. reference features and current runtime features/predictions
+3. a scheduled retraining window flag
+4. a challenger-training callback that returns a fully formed candidate payload
+5. a rollback policy for critical degradation
+
+`ResearchPipeline.run_drift_retraining_cycle(...)` is the pipeline-facing wrapper around the tested orchestration function. It will reuse current pipeline state for `X`, OOS probabilities, equity-curve performance, and operational monitoring when those are already populated.
+
+Consumer-hardware scheduling assumptions:
+
+1. keep `scheduled_window_open` coarse, typically daily or weekly rather than every bar
+2. set drift guardrails with a non-trivial `min_samples` and `cooldown_bars`
+3. retrain one symbol at a time and keep the challenger search constrained
+4. use `hybrid` rollback mode so only critical degradation auto-rolls back without human review
+
+That keeps the drift loop resumable and comparable without turning every small wobble into a full retrain.
+
 ## Turn A Scenario Into A Test Case
 
 There are three useful test styles in this repository.
@@ -280,6 +330,7 @@ If you only read five files to start building your own cases, read these:
 4. Treating zero-trade outputs as automatically broken. Some conservative examples are intentionally allowed to abstain.
 5. Removing the `universe` snapshot while still asking for cross-asset context. That breaks the causal symbol-eligibility contract.
 6. Running AutoML as if it were the default onboarding path. It is a good advanced demo, not the best first entrypoint.
+7. Treating `example_automl.py` as promotion-safe. The hardened path is `example_trade_ready_automl.py`; the old script is intentionally a short smoke/demo workflow.
 
 ## Suggested First Runs
 

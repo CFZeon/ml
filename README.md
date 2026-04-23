@@ -2,6 +2,10 @@
 
 This repository is a research-first trading stack for Binance crypto that keeps model training, feature generation, validation, and execution assumptions explicit.
 
+Trade-ready example configs now fail closed on stale context and missing futures funding coverage instead of silently zero-filling unknown state.
+They also fail closed on conflicting duplicate market bars instead of silently keeping the first timestamp collision.
+Example builders now mark backtests as `research_only` by default; trade-ready runs must opt into event-style execution plus explicit stress scenarios, and the hardened trade-ready path now requires a real Nautilus backend instead of the surrogate fallback.
+
 The current codebase is built around these constraints:
 
 - one model per symbol
@@ -69,7 +73,8 @@ The repo now includes:
 - `core/lookahead.py`: baseline-plus-prefix replay audit for lookahead bias provocation
 - `example_active_spot.py`, `example_active_futures.py`: runnable active-trading demos
 - `example_trend_volume_spot.py`, `example_trend_breakout_futures.py`: runnable expanded-indicator demos
-- `example.py`, `example_custom_data.py`, `example_futures.py`, `example_fvg.py`, `example_synthetic_derivatives.py`, `example_automl.py`: runnable end-to-end examples and smoke/integration demos
+- `example.py`, `example_custom_data.py`, `example_futures.py`, `example_fvg.py`, `example_synthetic_derivatives.py`, `example_automl.py`, `example_trade_ready_automl.py`: runnable end-to-end examples and smoke/integration demos
+- `example_drift_retraining_cycle.py`: deterministic champion/challenger drift orchestration example with rollback
 - `tests/`: regression coverage for validation, joins, execution semantics, AutoML governance, and futures behavior
 
 ## Example Guide
@@ -90,7 +95,18 @@ The rest of the examples serve different purposes:
 - `example_trend_breakout_futures.py`: futures example focused on ADX plus Donchian trend-breakout context layered onto the existing futures pipeline
 - `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain
 - `example_synthetic_derivatives.py`: offline synthetic derivatives/integration example; may also abstain depending on the generated regime path
-- `example_automl.py`: constrained AutoML study demo
+- `example_trade_ready_automl.py`: hardened AutoML research profile with locked holdout, replication cohorts, DSR/PBO diagnostics, binding post-selection inference, and promotion-readiness reporting on a real Nautilus-backed trade-ready path
+- `example_drift_retraining_cycle.py`: deterministic registry and drift example showing scheduled retraining, challenger promotion, and rollback
+- `example_automl.py`: constrained AutoML smoke/demo path kept for short runtime feedback
+
+The end-to-end remediation program for making the repo trade-ready is tracked in `TRADE_READY_REMEDIATION_PLAN.md`.
+
+The shared example builders in `example_utils.py` now enable strict context-missing and futures-funding coverage policies by default. If a cross-asset leader goes stale, a futures context feed ages out, or an expected funding event is missing, the example path stops with an explicit gate failure instead of treating that unknown state as a tradable zero.
+They also set `data.duplicate_policy = "fail"`, so conflicting duplicate bars or restated timestamp collisions stop the run instead of being silently collapsed.
+They also set `data.futures_context.recent_stats_availability_lag = "period_close"`, so Binance recent-stat context is aligned to publication-safe timestamps rather than the raw interval it summarizes.
+They also default to `backtest.evaluation_mode = "research_only"`. Only the hardened trade-ready AutoML path opts into `trade_ready` evaluation with event-style execution and an explicit stress matrix.
+The hardened trade-ready AutoML override now also enables replication cohorts by default, so a candidate must survive alternate windows or sibling-symbol cohorts before it can present as promotion-ready.
+Surrogate execution remains research-only. If you set `execution_policy.force_simulation = true`, treat that run as execution research rather than promotion-safe evaluation.
 
 ## Installation
 
@@ -158,6 +174,18 @@ Run the test suite:
 
 ```bash
 python -m pytest
+```
+
+Run the hardened AutoML example:
+
+```bash
+python example_trade_ready_automl.py
+```
+
+Run the drift retraining example:
+
+```bash
+python example_drift_retraining_cycle.py
 ```
 
 ## Futures Margin Model

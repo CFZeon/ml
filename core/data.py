@@ -65,6 +65,7 @@ _DEFAULT_RETRY_POLICY = {
     "timeout": 30,
 }
 _VALID_GAP_POLICIES = {"fail", "warn", "flag", "drop_windows"}
+_VALID_DUPLICATE_POLICIES = {"fail", "warn", "flag"}
 
 
 @dataclass(frozen=True)
@@ -247,6 +248,83 @@ def _normalize_output_schema(frame):
     return normalized
 
 
+def _empty_duplicate_report():
+    return {
+        "status": "clean",
+        "exact_duplicate_timestamps": 0,
+        "exact_duplicate_rows": 0,
+        "conflicting_duplicate_timestamps": 0,
+        "conflicting_duplicate_rows": 0,
+        "exact_timestamps": [],
+        "conflicting_timestamps": [],
+    }
+
+
+def _finalize_duplicate_report(report):
+    payload = dict(_empty_duplicate_report())
+    payload.update(dict(report or {}))
+    exact_count = int(payload.get("exact_duplicate_timestamps", 0))
+    conflict_count = int(payload.get("conflicting_duplicate_timestamps", 0))
+    if conflict_count > 0:
+        payload["status"] = "conflicts_detected"
+    elif exact_count > 0:
+        payload["status"] = "exact_duplicates_deduplicated"
+    else:
+        payload["status"] = "clean"
+    return payload
+
+
+def _combine_duplicate_reports(*reports):
+    combined = _empty_duplicate_report()
+    for report in reports:
+        if not report:
+            continue
+        payload = dict(report)
+        combined["exact_duplicate_timestamps"] += int(payload.get("exact_duplicate_timestamps", 0))
+        combined["exact_duplicate_rows"] += int(payload.get("exact_duplicate_rows", 0))
+        combined["conflicting_duplicate_timestamps"] += int(payload.get("conflicting_duplicate_timestamps", 0))
+        combined["conflicting_duplicate_rows"] += int(payload.get("conflicting_duplicate_rows", 0))
+        combined["exact_timestamps"].extend(list(payload.get("exact_timestamps", [])))
+        combined["conflicting_timestamps"].extend(list(payload.get("conflicting_timestamps", [])))
+    return _finalize_duplicate_report(combined)
+
+
+def _deduplicate_timestamp_index(frame):
+    if frame is None or frame.empty:
+        empty = pd.DataFrame(columns=_OUTPUT_COLUMNS)
+        empty.attrs["duplicate_report"] = _empty_duplicate_report()
+        return empty
+
+    working = pd.DataFrame(frame).copy().sort_index()
+    duplicate_mask = working.index.duplicated(keep=False)
+    if not duplicate_mask.any():
+        working.attrs["duplicate_report"] = _empty_duplicate_report()
+        return working
+
+    deduplicated_rows = []
+    report = _empty_duplicate_report()
+    for _, rows in working.groupby(level=0, sort=True):
+        timestamp = rows.index[0]
+        deduplicated_rows.append(rows.iloc[[0]])
+        if len(rows) <= 1:
+            continue
+
+        comparison = rows[_OUTPUT_COLUMNS] if set(_OUTPUT_COLUMNS).issubset(rows.columns) else rows
+        is_conflict = bool((comparison.nunique(dropna=False) > 1).any())
+        if is_conflict:
+            report["conflicting_duplicate_timestamps"] += 1
+            report["conflicting_duplicate_rows"] += int(len(rows) - 1)
+            report["conflicting_timestamps"].append(timestamp)
+        else:
+            report["exact_duplicate_timestamps"] += 1
+            report["exact_duplicate_rows"] += int(len(rows) - 1)
+            report["exact_timestamps"].append(timestamp)
+
+    deduplicated = pd.concat(deduplicated_rows, axis=0).sort_index()
+    deduplicated.attrs["duplicate_report"] = _finalize_duplicate_report(report)
+    return deduplicated
+
+
 def _infer_timestamp_unit(raw_times):
     max_value = pd.to_numeric(raw_times, errors="raise").abs().max()
     return "us" if max_value >= 10**14 else "ms"
@@ -254,7 +332,9 @@ def _infer_timestamp_unit(raw_times):
 
 def _prepare_frame(frame):
     if frame is None or frame.empty:
-        return pd.DataFrame(columns=_OUTPUT_COLUMNS)
+        empty = pd.DataFrame(columns=_OUTPUT_COLUMNS)
+        empty.attrs["duplicate_report"] = _empty_duplicate_report()
+        return empty
 
     prepared = frame.copy()
     if not prepared.empty and str(prepared.iloc[0]["open_time"]).lower() == "open_time":
@@ -272,17 +352,22 @@ def _prepare_frame(frame):
         prepared[column] = prepared[column].astype(float)
     prepared["trades"] = prepared["trades"].astype(int)
     prepared = prepared[_OUTPUT_COLUMNS]
-    prepared = prepared[~prepared.index.duplicated(keep="first")]
-    return prepared
+    return _deduplicate_timestamp_index(prepared)
 
 
 def _merge_frames(frames):
     valid_frames = [frame for frame in frames if frame is not None and not frame.empty]
     if not valid_frames:
-        return pd.DataFrame(columns=_OUTPUT_COLUMNS)
+        empty = pd.DataFrame(columns=_OUTPUT_COLUMNS)
+        empty.attrs["duplicate_report"] = _empty_duplicate_report()
+        return empty
 
     merged = pd.concat([_normalize_output_schema(frame) for frame in valid_frames]).sort_index()
-    merged = merged[~merged.index.duplicated(keep="first")]
+    merged = _deduplicate_timestamp_index(merged[_OUTPUT_COLUMNS])
+    merged.attrs["duplicate_report"] = _combine_duplicate_reports(
+        *(dict(getattr(frame, "attrs", {}).get("duplicate_report") or {}) for frame in valid_frames),
+        merged.attrs.get("duplicate_report"),
+    )
     return merged[_OUTPUT_COLUMNS]
 
 
@@ -502,6 +587,7 @@ def _load_period(symbol, interval, period, request_start, request_end, cache_dir
             "retry_count": 0,
             "downloads": [],
             "dropped_window": False,
+            "duplicate_report": dict((cached.attrs or {}).get("duplicate_report") or {}),
         }
 
     if cache_file is not None:
@@ -531,6 +617,7 @@ def _load_period(symbol, interval, period, request_start, request_end, cache_dir
         "retry_count": int(fetch_report.get("retry_count", 0)),
         "downloads": fetch_report.get("downloads", []),
         "dropped_window": False,
+        "duplicate_report": dict((merged.attrs or {}).get("duplicate_report") or {}),
     }
 
 
@@ -542,17 +629,22 @@ def _build_integrity_report(df, interval, start_dt, end_dt, market, symbol, gap_
     status = "complete" if missing_index.empty else "incomplete"
     if any(report.get("dropped_window") for report in period_reports):
         status = "dropped_windows" if missing_index.size > 0 else "complete"
+    duplicate_report = _combine_duplicate_reports(
+        *(dict(report.get("duplicate_report") or {}) for report in period_reports)
+    )
     return {
         "symbol": symbol,
         "market": market,
         "interval": interval,
         "gap_policy": gap_policy,
+        "duplicate_policy": None,
         "expected_rows": int(len(expected)),
         "observed_rows": int(len(observed)),
         "missing_rows": int(len(missing_index)),
         "missing_segments": _missing_segments(missing_index, interval),
         "status": status,
         "retry_count": int(sum(report.get("retry_count", 0) for report in period_reports)),
+        "duplicate_report": duplicate_report,
         "periods": period_reports,
     }
 
@@ -560,7 +652,7 @@ def _build_integrity_report(df, interval, start_dt, end_dt, market, symbol, gap_
 def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
                          start="2024-01-01", end="2024-03-01",
                          cache_dir=".cache", market="spot", futures_type=None,
-                         gap_policy="warn", retry_policy=None,
+                         gap_policy="warn", duplicate_policy="fail", retry_policy=None,
                          return_report=False):
     """Load spot or futures klines from Binance Vision with periodized local cache files.
 
@@ -574,6 +666,7 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
     market : str – "spot", "um_futures", or "cm_futures"
     futures_type : str or None – backward-compatible alias for futures family
     gap_policy : str – one of {"fail", "warn", "flag", "drop_windows"}
+    duplicate_policy : str – one of {"fail", "warn", "flag"}; only conflicting duplicates trigger policy
     retry_policy : dict or None – bounded download retry/backoff settings
     return_report : bool – when True, return (dataframe, integrity_report)
 
@@ -585,6 +678,9 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
     market = _normalize_market(market, futures_type=futures_type)
     if gap_policy not in _VALID_GAP_POLICIES:
         raise ValueError(f"Unsupported gap_policy={gap_policy!r}")
+    duplicate_policy = str(duplicate_policy or "fail").lower()
+    if duplicate_policy not in _VALID_DUPLICATE_POLICIES:
+        raise ValueError(f"Unsupported duplicate_policy={duplicate_policy!r}")
     start_dt = _parse_bound(start)
     end_dt = _parse_bound(end)
     if end_dt <= start_dt:
@@ -605,6 +701,21 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
                 market=market,
                 retry_policy=retry_policy,
             )
+            duplicate_report = dict(period_report.get("duplicate_report") or {})
+            conflicting_timestamps = list(duplicate_report.get("conflicting_timestamps") or [])
+            if duplicate_report.get("conflicting_duplicate_timestamps", 0) > 0:
+                timestamp_preview = ", ".join(str(pd.Timestamp(ts)) for ts in conflicting_timestamps[:3])
+                if duplicate_policy == "fail":
+                    raise RuntimeError(
+                        f"Conflicting duplicate bars detected for {symbol} {interval} {period_report['period_key']}: "
+                        f"{duplicate_report['conflicting_duplicate_timestamps']} timestamps"
+                        + (f" ({timestamp_preview})" if timestamp_preview else "")
+                    )
+                if duplicate_policy == "warn":
+                    print(
+                        f"  WARNING: conflicting duplicate bars remain in {period_report['period_key']}: "
+                        f"{duplicate_report['conflicting_duplicate_timestamps']} timestamps"
+                    )
             if period_report["missing_rows"] > 0:
                 if gap_policy == "fail":
                     raise RuntimeError(
@@ -623,6 +734,7 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
     df = _merge_frames(period_frames)
     df = df[(df.index >= start_dt) & (df.index < end_dt)]
     integrity_report = _build_integrity_report(df, interval, start_dt, end_dt, market, symbol, gap_policy, period_reports)
+    integrity_report["duplicate_policy"] = duplicate_policy
     df.attrs["integrity_report"] = integrity_report
 
     if df.empty:
@@ -640,8 +752,10 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
             "start": start_dt,
             "end": end_dt,
             "gap_policy": gap_policy,
+            "duplicate_policy": duplicate_policy,
             "integrity_status": integrity_report.get("status"),
             "missing_rows": integrity_report.get("missing_rows"),
+            "duplicate_conflicts": (integrity_report.get("duplicate_report") or {}).get("conflicting_duplicate_timestamps"),
             "retry_count": integrity_report.get("retry_count"),
         },
     )
@@ -656,7 +770,7 @@ def fetch_binance_vision(symbol="BTCUSDT", interval="1h",
 def fetch_binance_bars(symbol="BTCUSDT", interval="1h",
                        start="2024-01-01", end="2024-03-01",
                        cache_dir=".cache", market="spot", futures_type=None,
-                       gap_policy="warn", retry_policy=None,
+                       gap_policy="warn", duplicate_policy="fail", retry_policy=None,
                        return_report=False):
     """Unified market-data entrypoint for Binance Vision spot and futures bars."""
     return fetch_binance_vision(
@@ -668,6 +782,7 @@ def fetch_binance_bars(symbol="BTCUSDT", interval="1h",
         market=market,
         futures_type=futures_type,
         gap_policy=gap_policy,
+        duplicate_policy=duplicate_policy,
         retry_policy=retry_policy,
         return_report=return_report,
     )

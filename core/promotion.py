@@ -69,6 +69,49 @@ def evaluate_execution_realism_gate(backtest_summary=None, policy=None):
     }
 
 
+def evaluate_stress_realism_gate(backtest_summary=None, policy=None):
+    backtest_summary = dict(backtest_summary or {})
+    policy = dict(policy or {})
+    evaluation_mode = str(backtest_summary.get("evaluation_mode") or policy.get("evaluation_mode") or "research_only").lower()
+    stress_matrix = dict(backtest_summary.get("stress_matrix") or {})
+    required_scenarios = [
+        str(name) for name in list(
+            policy.get("required_stress_scenarios")
+            or backtest_summary.get("required_stress_scenarios")
+            or ["downtime", "stale_mark", "halt"]
+        )
+    ]
+    configured_scenarios = [str(name) for name in list(stress_matrix.get("scenario_names") or [])]
+    missing_scenarios = [name for name in required_scenarios if name not in configured_scenarios]
+    configured = bool(stress_matrix.get("configured", False))
+
+    if evaluation_mode != "trade_ready":
+        passed = False
+        reason = "research_only_evaluation"
+    elif not configured:
+        passed = False
+        reason = "stress_scenarios_missing"
+    elif missing_scenarios:
+        passed = False
+        reason = "stress_scenarios_incomplete"
+    else:
+        passed = True
+        reason = None
+
+    return {
+        "passed": passed,
+        "reason": reason,
+        "evaluation_mode": evaluation_mode,
+        "configured": configured,
+        "configured_scenarios": configured_scenarios,
+        "required_scenarios": required_scenarios,
+        "missing_scenarios": missing_scenarios,
+        "worst_net_profit_pct": stress_matrix.get("worst_net_profit_pct"),
+        "worst_sharpe_ratio": stress_matrix.get("worst_sharpe_ratio"),
+        "research_only": not passed,
+    }
+
+
 def set_promotion_score(report, *, basis, value, metadata=None):
     payload = copy.deepcopy(report or create_promotion_eligibility_report())
     payload["score"] = {
@@ -229,6 +272,7 @@ __all__ = [
     "build_promotion_gate_check_map",
     "create_promotion_eligibility_report",
     "evaluate_execution_realism_gate",
+    "evaluate_stress_realism_gate",
     "finalize_promotion_eligibility_report",
     "get_promotion_score",
     "resolve_canonical_promotion_score",
