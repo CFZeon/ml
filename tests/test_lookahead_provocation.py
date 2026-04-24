@@ -112,6 +112,60 @@ class LookaheadProvocationTest(unittest.TestCase):
         self.assertIn("execution_prices", report["artifacts"])
         self.assertIn("execution_volume", report["artifacts"])
 
+    def test_blocking_lookahead_guard_rejects_future_shifted_builder_automatically(self):
+        raw = self._make_raw(seed=31)
+
+        def biased_builder(pipeline, features):
+            built = features.copy()
+            built["future_close"] = pipeline.require("data")["close"].shift(-1)
+            return built
+
+        pipeline = self._make_pipeline(raw, builders=[biased_builder])
+        pipeline.config["features"]["lookahead_guard"] = {
+            "mode": "blocking",
+            "decision_sample_size": 12,
+            "min_prefix_rows": 80,
+        }
+
+        pipeline.build_features()
+        pipeline.detect_regimes()
+        pipeline.build_labels()
+        pipeline.align_data()
+
+        with self.assertRaisesRegex(RuntimeError, "Lookahead guard failed"):
+            pipeline.train_models()
+
+        report = pipeline.state["lookahead_guard_report"]
+        self.assertTrue(report["has_bias"])
+        self.assertFalse(report["promotion_pass"])
+        self.assertIn("future_close", report["biased_columns"])
+
+    def test_advisory_lookahead_guard_records_failure_but_allows_training(self):
+        raw = self._make_raw(seed=41)
+
+        def biased_builder(pipeline, features):
+            built = features.copy()
+            built["future_close"] = pipeline.require("data")["close"].shift(-1)
+            return built
+
+        pipeline = self._make_pipeline(raw, builders=[biased_builder])
+        pipeline.config["features"]["lookahead_guard"] = {
+            "mode": "advisory",
+            "decision_sample_size": 12,
+            "min_prefix_rows": 80,
+        }
+
+        pipeline.build_features()
+        pipeline.detect_regimes()
+        pipeline.build_labels()
+        pipeline.align_data()
+        training = pipeline.train_models()
+
+        self.assertIn("lookahead_guard", training)
+        self.assertTrue(training["lookahead_guard"]["has_bias"])
+        self.assertFalse(training["lookahead_guard"]["promotion_pass"])
+        self.assertFalse(training["promotion_gates"]["lookahead_guard"])
+
 
 if __name__ == "__main__":
     unittest.main()

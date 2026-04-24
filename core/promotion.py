@@ -179,10 +179,14 @@ def finalize_promotion_eligibility_report(report):
 
         for original_gate in group_payload.get("gates") or []:
             gate = copy.deepcopy(original_gate)
-            mode = gate.get("mode", "blocking")
+            warnings = list(gate.get("warnings") or [])
+            mode = str(gate.get("mode", "blocking")).lower()
             if mode not in _VALID_GATE_MODES:
+                warnings.append("unknown_mode_normalized_to_blocking")
+                gate["input_mode"] = mode
                 mode = "blocking"
             gate["mode"] = mode
+            gate["warnings"] = list(dict.fromkeys(warnings))
 
             failed = not bool(gate.get("passed", True))
             gate["status"] = "disabled" if mode == "disabled" else ("fail" if failed else "pass")

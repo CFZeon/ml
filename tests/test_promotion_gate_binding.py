@@ -3,6 +3,8 @@ import unittest
 
 import pandas as pd
 
+from core.automl import _resolve_overfitting_control, _resolve_selection_policy
+from core.promotion import resolve_promotion_gate_mode
 from core import (
     LocalRegistryStore,
     build_model,
@@ -120,6 +122,98 @@ class PromotionGateBindingTest(unittest.TestCase):
 
         self.assertTrue(stress_realism["passed"])
         self.assertFalse(stress_realism["research_only"])
+
+    def test_default_profile_locked_holdout_failure_blocks_promotion(self):
+        selection_policy = _resolve_selection_policy({})
+        report = _make_report(0.15)
+        report = upsert_promotion_gate(
+            report,
+            group="post_selection",
+            name="locked_holdout",
+            passed=False,
+            mode=resolve_promotion_gate_mode(selection_policy, "locked_holdout"),
+            reason="locked_holdout_failed",
+        )
+        report = finalize_promotion_eligibility_report(report)
+
+        decision = evaluate_challenger_promotion(
+            {
+                "promotion_eligibility_report": report,
+                "selection_value": 0.15,
+                "sample_count": 500,
+            }
+        )
+
+        self.assertFalse(decision["approved"])
+        self.assertIn("locked_holdout_failed", decision["promotion_eligibility_report"]["blocking_failures"])
+
+    def test_default_profile_post_selection_failure_blocks_promotion(self):
+        selection_policy = _resolve_selection_policy({})
+        overfitting_control = _resolve_overfitting_control({})
+        self.assertTrue(overfitting_control["post_selection"]["require_pass"])
+
+        report = _make_report(0.15)
+        report = upsert_promotion_gate(
+            report,
+            group="post_selection",
+            name="post_selection",
+            passed=False,
+            mode=resolve_promotion_gate_mode(selection_policy, "post_selection"),
+            reason="post_selection_inference_failed",
+        )
+        report = finalize_promotion_eligibility_report(report)
+
+        decision = evaluate_challenger_promotion(
+            {
+                "promotion_eligibility_report": report,
+                "selection_value": 0.15,
+                "sample_count": 500,
+            }
+        )
+
+        self.assertFalse(decision["approved"])
+        self.assertIn("post_selection_inference_failed", decision["promotion_eligibility_report"]["blocking_failures"])
+
+    def test_advisory_gate_records_failure_without_blocking(self):
+        report = _make_report(0.15)
+        report = upsert_promotion_gate(
+            report,
+            group="post_selection",
+            name="locked_holdout",
+            passed=False,
+            mode="advisory",
+            reason="locked_holdout_failed",
+        )
+        report = finalize_promotion_eligibility_report(report)
+
+        decision = evaluate_challenger_promotion(
+            {
+                "promotion_eligibility_report": report,
+                "selection_value": 0.15,
+                "sample_count": 500,
+            }
+        )
+
+        self.assertTrue(decision["approved"])
+        self.assertNotIn("locked_holdout_failed", decision["promotion_eligibility_report"]["blocking_failures"])
+        self.assertIn("locked_holdout_failed", decision["promotion_eligibility_report"]["advisory_failures"])
+
+    def test_invalid_gate_mode_normalizes_to_blocking_with_warning(self):
+        report = create_promotion_eligibility_report()
+        report = upsert_promotion_gate(
+            report,
+            group="selection",
+            name="feature_portability",
+            passed=False,
+            mode="unexpected_mode",
+            reason="feature_portability_failed",
+        )
+        report = finalize_promotion_eligibility_report(report)
+
+        gate = report["gate_status"]["feature_portability"]
+        self.assertEqual(gate["mode"], "blocking")
+        self.assertIn("unknown_mode_normalized_to_blocking", gate["warnings"])
+        self.assertIn("feature_portability_failed", report["blocking_failures"])
 
     def test_calibration_mode_downgrades_blocking_gate_to_advisory(self):
         report = create_promotion_eligibility_report(calibration_mode=True)

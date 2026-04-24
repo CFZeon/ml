@@ -131,19 +131,29 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
         automl = config["automl"]
         execution_policy = backtest["execution_policy"]
         self.assertEqual(backtest["evaluation_mode"], "trade_ready")
+        self.assertEqual(backtest["execution_profile"], "trade_ready_event_driven")
+        self.assertFalse(bool(backtest.get("research_only_override", False)))
         self.assertEqual(execution_policy["adapter"], "nautilus")
         self.assertFalse(bool(execution_policy.get("force_simulation", False)))
         self.assertEqual(int(automl["n_trials"]), 2)
         self.assertEqual(automl["search_space"]["model"]["type"]["choices"], ["gbm"])
         self.assertEqual(automl["search_space"]["labels"]["barrier_tie_break"]["choices"], ["sl"])
 
-    def test_trade_ready_example_runtime_falls_back_to_research_only_without_nautilus(self):
+    def test_trade_ready_example_runtime_fails_closed_without_explicit_override(self):
         config = build_trade_ready_example_config(automl_storage=Path(".cache") / "automl" / "trade_ready_exec_test.db")
+
+        with self.assertRaisesRegex(RuntimeError, "research_only_override=true"):
+            prepare_trade_ready_runtime_config(config, nautilus_available=False)
+
+    def test_trade_ready_example_runtime_allows_explicit_research_override(self):
+        config = build_trade_ready_example_config(automl_storage=Path(".cache") / "automl" / "trade_ready_exec_test.db")
+        config["backtest"]["research_only_override"] = True
 
         runtime_config, using_research_fallback = prepare_trade_ready_runtime_config(config, nautilus_available=False)
 
         self.assertTrue(using_research_fallback)
         self.assertEqual(runtime_config["backtest"]["evaluation_mode"], "research_only")
+        self.assertEqual(runtime_config["backtest"]["execution_profile"], "research_surrogate")
         self.assertTrue(runtime_config["backtest"]["execution_policy"]["force_simulation"])
         self.assertFalse(runtime_config["automl"]["locked_holdout_enabled"])
         self.assertIsNone(runtime_config["automl"]["minimum_dsr_threshold"])

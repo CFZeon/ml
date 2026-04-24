@@ -1960,13 +1960,21 @@ def _attach_backtest_evaluation_metadata(summary, *, evaluation_mode="research_o
         evaluation_limitations.append("stress_scenarios_missing")
     if resolved_mode == "trade_ready" and not stress_summary.get("configured", False):
         evaluation_limitations.append("stress_matrix_unconfigured")
+    trade_ready_blockers = []
+    if resolved_mode == "trade_ready" and not bool(payload.get("promotion_execution_ready", False)):
+        trade_ready_blockers.append("execution_backend_not_event_driven")
     payload["evaluation_mode"] = resolved_mode
     payload["required_stress_scenarios"] = required
     payload["stress_matrix"] = stress_summary
     payload["stress_realism_ready"] = bool(resolved_mode == "trade_ready" and not missing_required and stress_summary.get("configured", False))
-    payload["trade_ready_evaluation"] = bool(payload["stress_realism_ready"])
+    payload["trade_ready_blockers"] = list(dict.fromkeys(trade_ready_blockers))
+    payload["trade_ready_evaluation"] = bool(payload["stress_realism_ready"] and not payload["trade_ready_blockers"])
     payload["evaluation_limitations"] = evaluation_limitations
-    payload["research_only"] = bool(resolved_mode != "trade_ready" or bool(evaluation_limitations))
+    payload["research_only"] = bool(
+        resolved_mode != "trade_ready"
+        or bool(evaluation_limitations)
+        or bool(payload["trade_ready_blockers"])
+    )
     return payload
 
 

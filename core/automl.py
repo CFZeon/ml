@@ -1293,6 +1293,8 @@ def _evaluate_replication_cohorts(
 
 
 def _resolve_overfitting_control(automl_config=None):
+    policy_profile = _resolve_automl_policy_profile(automl_config)
+    legacy_profile = policy_profile == "legacy_permissive"
     automl_config = automl_config or {}
     control = copy.deepcopy(automl_config.get("overfitting_control", {}))
     dsr_config = dict(control.get("deflated_sharpe", {}))
@@ -1301,6 +1303,8 @@ def _resolve_overfitting_control(automl_config=None):
 
     return {
         "enabled": bool(control.get("enabled", True)),
+        "policy_profile": policy_profile,
+        "deprecation_warning": "legacy_permissive_policy_profile_deprecated" if legacy_profile else None,
         "selection_mode": str(control.get("selection_mode", "penalized_ranking")).lower(),
         "penalized_objectives": {
             str(value).lower()
@@ -1323,7 +1327,7 @@ def _resolve_overfitting_control(automl_config=None):
         },
         "post_selection": {
             "enabled": bool(post_selection_config.get("enabled", True)),
-            "require_pass": bool(post_selection_config.get("require_pass", False)),
+            "require_pass": bool(post_selection_config.get("require_pass", not legacy_profile)),
             "pass_rule": str(post_selection_config.get("pass_rule", "spa")).lower(),
             "alpha": float(post_selection_config.get("alpha", 0.05)),
             "max_candidates": int(post_selection_config.get("max_candidates", 8)),
@@ -1336,6 +1340,24 @@ def _resolve_overfitting_control(automl_config=None):
             "random_state": int(post_selection_config.get("random_state", 42)),
         },
     }
+
+
+def _resolve_automl_policy_profile(automl_config=None):
+    profile = str((automl_config or {}).get("policy_profile", "hardened_default")).strip().lower()
+    if profile == "legacy_permissive":
+        return "legacy_permissive"
+    return "hardened_default"
+
+
+_HARDENED_DEFAULT_SELECTION_GATE_MODES = {
+    "locked_holdout": "blocking",
+    "locked_holdout_gap": "blocking",
+    "replication": "blocking",
+    "execution_realism": "blocking",
+    "stress_realism": "blocking",
+    "param_fragility": "blocking",
+    "lookahead_guard": "blocking",
+}
 
 
 def _infer_periods_per_year(index):
@@ -1428,11 +1450,15 @@ def _build_trial_record(overrides, search_record, validation_record=None):
 
 
 def _resolve_selection_policy(automl_config=None):
+    policy_profile = _resolve_automl_policy_profile(automl_config)
+    legacy_profile = policy_profile == "legacy_permissive"
     policy = copy.deepcopy((automl_config or {}).get("selection_policy") or {})
     enabled = bool(policy.get("enabled", True))
     if not enabled:
         return {
             "enabled": False,
+            "policy_profile": policy_profile,
+            "deprecation_warning": "legacy_permissive_policy_profile_deprecated" if legacy_profile else None,
             "calibration_mode": False,
             "gate_modes": {},
             "max_generalization_gap": float("inf"),
@@ -1446,15 +1472,19 @@ def _resolve_selection_policy(automl_config=None):
             "local_perturbation_limit": 0,
             "require_fold_stability_pass": False,
         }
+    gate_modes = {} if legacy_profile else copy.deepcopy(_HARDENED_DEFAULT_SELECTION_GATE_MODES)
+    gate_modes.update(copy.deepcopy(policy.get("gate_modes") or {}))
     return {
         "enabled": True,
+        "policy_profile": policy_profile,
+        "deprecation_warning": "legacy_permissive_policy_profile_deprecated" if legacy_profile else None,
         "calibration_mode": bool(policy.get("calibration_mode", False)),
-        "gate_modes": copy.deepcopy(policy.get("gate_modes") or {}),
+        "gate_modes": gate_modes,
         "max_generalization_gap": float(policy.get("max_generalization_gap", 0.35)),
         "max_param_fragility": float(policy.get("max_param_fragility", 0.30)),
         "max_complexity_score": float(policy.get("max_complexity_score", 18.0)),
         "min_validation_trade_count": int(policy.get("min_validation_trade_count", 10)),
-        "require_locked_holdout_pass": bool(policy.get("require_locked_holdout_pass", False)),
+        "require_locked_holdout_pass": bool(policy.get("require_locked_holdout_pass", not legacy_profile)),
         "min_locked_holdout_score": float(policy.get("min_locked_holdout_score", 0.0)),
         "max_feature_count_ratio": float(policy.get("max_feature_count_ratio", 1.0)),
         "max_trials_per_model_family": int(policy.get("max_trials_per_model_family", 64)),
@@ -2685,13 +2715,17 @@ def _resolve_objective_gates(automl_config, objective_name):
             "max_log_loss": None,
             "max_calibration_error": None,
             "min_trade_count": None,
+            "min_sharpe_ci_lower": None,
+            "min_net_profit_pct_ci_lower": None,
         }
     return {
         "enabled": True,
-        "min_directional_accuracy": _coerce_float(gate_config.get("min_directional_accuracy", 0.45)),
-        "max_log_loss": _coerce_float(gate_config.get("max_log_loss", 1.0)),
-        "max_calibration_error": _coerce_float(gate_config.get("max_calibration_error", 0.35)),
-        "min_trade_count": int(gate_config.get("min_trade_count", 5)),
+        "min_directional_accuracy": _coerce_float(gate_config.get("min_directional_accuracy", 0.52)),
+        "max_log_loss": _coerce_float(gate_config.get("max_log_loss", 0.78)),
+        "max_calibration_error": _coerce_float(gate_config.get("max_calibration_error", 0.15)),
+        "min_trade_count": int(gate_config.get("min_trade_count", 30)),
+        "min_sharpe_ci_lower": _coerce_float(gate_config.get("min_sharpe_ci_lower")),
+        "min_net_profit_pct_ci_lower": _coerce_float(gate_config.get("min_net_profit_pct_ci_lower")),
     }
 
 
@@ -2725,6 +2759,18 @@ def _evaluate_objective_gates(training, backtest, automl_config, objective_name)
     log_loss_value = _resolve_metric(training, "avg_log_loss")
     calibration_error = _resolve_metric(training, "avg_calibration_error")
     trade_count = _coerce_float((backtest or {}).get("total_trades"))
+    sharpe_ci_lower = _coerce_float(
+        ((
+            (_get_significance_payload(backtest, "sharpe_ratio") or {}).get("confidence_interval")
+            or {}
+        ).get("lower"))
+    )
+    net_profit_pct_ci_lower = _coerce_float(
+        ((
+            (_get_significance_payload(backtest, "net_profit_pct") or {}).get("confidence_interval")
+            or {}
+        ).get("lower"))
+    )
 
     checks = {
         "directional_accuracy": _build_gate_result(
@@ -2748,6 +2794,18 @@ def _evaluate_objective_gates(training, backtest, automl_config, objective_name)
             minimum=float(gates.get("min_trade_count")) if gates.get("min_trade_count") is not None else None,
         ),
     }
+    if gates.get("min_sharpe_ci_lower") is not None:
+        checks["sharpe_ci_lower"] = _build_gate_result(
+            "sharpe_ci_lower",
+            sharpe_ci_lower,
+            minimum=gates.get("min_sharpe_ci_lower"),
+        )
+    if gates.get("min_net_profit_pct_ci_lower") is not None:
+        checks["net_profit_pct_ci_lower"] = _build_gate_result(
+            "net_profit_pct_ci_lower",
+            net_profit_pct_ci_lower,
+            minimum=gates.get("min_net_profit_pct_ci_lower"),
+        )
     report["checks"] = checks
     report["failed"] = [name for name, payload in checks.items() if not payload["passed"]]
     report["passed"] = not report["failed"]
@@ -3481,11 +3539,38 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         reason=stress_realism.get("reason"),
         details=stress_realism,
     )
+    lookahead_guard = dict((best_trial_report.get("training") or {}).get("lookahead_guard") or {})
+    best_trial_report["selection_policy"]["eligibility_checks"]["lookahead_guard"] = bool(
+        lookahead_guard.get("promotion_pass", True)
+    )
+    promotion_eligibility_report = upsert_promotion_gate(
+        promotion_eligibility_report,
+        group="post_selection",
+        name="lookahead_guard",
+        passed=bool(lookahead_guard.get("promotion_pass", True)),
+        mode=resolve_promotion_gate_mode(selection_policy, "lookahead_guard"),
+        measured=lookahead_guard.get("checked_timestamps"),
+        threshold={
+            "mode": lookahead_guard.get("mode"),
+            "min_prefix_rows": lookahead_guard.get("min_prefix_rows"),
+            "decision_sample_size": lookahead_guard.get("decision_sample_size"),
+        },
+        reason=None if lookahead_guard.get("promotion_pass", True) else _first_failure_reason(lookahead_guard, "lookahead_guard_failed"),
+        details=lookahead_guard,
+    )
     best_trial_report["selection_policy"] = _update_selection_policy_report(
         best_trial_report["selection_policy"],
         promotion_eligibility_report,
         include_post_selection=True,
     )
+    blocking_failures = list(
+        (
+            best_trial_report["selection_policy"].get("promotion_eligibility_report") or {}
+        ).get("blocking_failures") or []
+    )
+    if blocking_failures:
+        best_trial_report["selection_policy"]["promotion_ready"] = False
+        best_trial_report["selection_policy"]["promotion_reasons"] = blocking_failures
     best_trial_report["selection_policy"]["holdout_consulted_for_selection"] = False
     selection_report["diagnostics"]["holdout_access_count"] = int(locked_holdout_access_count)
     selection_report["diagnostics"]["holdout_evaluated_once"] = bool(locked_holdout.get("evaluated_once", False))
@@ -3527,11 +3612,17 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         )
 
     data_lineage = _json_ready(base_pipeline.state.get("data_lineage") or {})
+    policy_profile = _resolve_automl_policy_profile(base_config.get("automl") or {})
+    summary_warnings = []
+    if policy_profile == "legacy_permissive":
+        summary_warnings.append("legacy_permissive_policy_profile_deprecated")
 
     summary = {
         "study_name": study.study_name,
         "storage": str(storage_path),
         "objective": objective_name,
+        "policy_profile": policy_profile,
+        "warnings": summary_warnings,
         "selection_metric": selection_report["selection_metric"],
         "selection_mode": selection_report["selection_mode"],
         "feature_schema_version": base_config.get("features", {}).get("schema_version"),

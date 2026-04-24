@@ -33,6 +33,23 @@ class ExecutionAdapterParityTest(unittest.TestCase):
                 execution_policy={"adapter": "nautilus", "time_in_force": "IOC", "participation_cap": 1.0},
             )
 
+    def test_trade_ready_surrogate_backtest_records_execution_blocker(self):
+        index = pd.date_range("2024-01-01", periods=4, freq="h")
+        close = pd.Series([100.0, 101.0, 102.0, 103.0], index=index)
+        signals = pd.Series([0.0, 0.5, 0.5, 0.0], index=index)
+
+        result = run_backtest(
+            close,
+            signals,
+            engine="pandas",
+            signal_delay_bars=0,
+            volume=pd.Series(10_000.0, index=index),
+            evaluation_mode="trade_ready",
+        )
+
+        self.assertTrue(result["research_only"])
+        self.assertIn("execution_backend_not_event_driven", result["trade_ready_blockers"])
+
     def test_legacy_and_default_execution_match_when_liquidity_is_abundant(self):
         index = pd.date_range("2024-01-01", periods=4, freq="h")
         close = pd.Series([100.0, 101.0, 102.0, 103.0], index=index)

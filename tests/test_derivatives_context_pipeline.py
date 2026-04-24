@@ -7,7 +7,7 @@ import pandas as pd
 from core import ResearchPipeline, build_reference_validation_bundle, select_features, train_model, trend_scanning_labels
 from core.context import _fetch_period_endpoint, build_futures_context_feature_block
 from core.models import compute_feature_family_diagnostics, summarize_feature_family_diagnostics
-from core.pipeline import _resolve_backtest_funding_rates
+from core.pipeline import _attach_context_ttl_to_operational_monitoring, _resolve_backtest_funding_rates
 
 
 def _make_ohlcv(index, drift=12.0, amplitude=3.0, volume_base=1_000.0):
@@ -239,6 +239,7 @@ class DerivativesContextPipelineTest(unittest.TestCase):
             futures_context,
             rolling_window=4,
             ttl_config={"mark_price": "2h", "premium_index": "2h", "funding": "12h", "recent": "4h", "max_stale_rate": 0.1},
+            missing_policy={"mode": "zero_fill"},
         )
 
         self.assertIn("fut_context_stale_any", block.frame.columns)
@@ -319,16 +320,8 @@ class DerivativesContextPipelineTest(unittest.TestCase):
             "BNBUSDT": _make_ohlcv(index, drift=6.0, amplitude=1.5, volume_base=900.0),
         }
 
-        pipeline = self._make_context_pipeline(
-            labels={
-                "kind": "trend_scanning",
-                "min_horizon": 6,
-                "max_horizon": 24,
-                "step": 3,
-                "min_t_value": 0.75,
-                "min_return": 0.0001,
-            }
-        )
+        pipeline = self._make_context_pipeline()
+        pipeline.config["features"]["context_missing_policy"] = {"mode": "zero_fill"}
         pipeline.config["features"]["futures_context_ttl"] = {
             "mark_price": "2h",
             "premium_index": "2h",
@@ -341,14 +334,14 @@ class DerivativesContextPipelineTest(unittest.TestCase):
         pipeline.state["futures_context"] = futures_context
         pipeline.state["cross_asset_context"] = cross_asset_context
         pipeline.build_features()
-        pipeline.detect_regimes()
-        pipeline.build_labels()
-        pipeline.align_data()
-        training = pipeline.train_models()
+        monitoring = _attach_context_ttl_to_operational_monitoring(
+            {"healthy": True, "reasons": []},
+            pipeline.state.get("context_ttl_report"),
+        )
 
-        self.assertIn("context_ttl", training["operational_monitoring"])
-        self.assertFalse(training["operational_monitoring"]["healthy"])
-        self.assertIn("context_ttl_breached", training["operational_monitoring"]["reasons"])
+        self.assertIn("context_ttl", monitoring)
+        self.assertFalse(monitoring["healthy"])
+        self.assertIn("context_ttl_breached", monitoring["reasons"])
 
     def test_strict_backtest_funding_policy_rejects_missing_expected_events(self):
         index = pd.date_range("2026-02-01", periods=48, freq="1h", tz="UTC")

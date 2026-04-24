@@ -9,8 +9,8 @@ does enable the controls that a promotion-safe workflow needs: locked holdout,
 replication cohorts, selection gating, DSR/PBO diagnostics, binding post-selection
 inference, and explicit stress scenarios for the post-selection backtest.
 The base config requires a real Nautilus execution backend for the trade-ready
-evaluation path. When Nautilus is unavailable, the script downgrades itself to an
-explicit research-only surrogate run so the example still completes locally.
+evaluation path. When Nautilus is unavailable, the script now fails closed unless
+you explicitly opt into a research-only surrogate override.
 It may still report `promotion ok : False` if the locked holdout, execution,
 replication, or stress gates reject the candidate.
 """
@@ -59,11 +59,14 @@ def build_trade_ready_example_config(*, automl_storage):
                 "engine": "pandas",
                 "signal_delay_bars": 2,
                 "evaluation_mode": "trade_ready",
+                "execution_profile": "trade_ready_event_driven",
+                "research_only_override": False,
                 "required_stress_scenarios": ["downtime", "stale_mark", "halt"],
                 "execution_policy": {
                     "adapter": "nautilus",
                     "time_in_force": "IOC",
-                    "participation_cap": 1.0,
+                    "participation_cap": 0.10,
+                    "min_fill_ratio": 0.25,
                 },
                 "scenario_matrix": {
                     "downtime": {
@@ -139,11 +142,17 @@ def prepare_trade_ready_runtime_config(config, *, nautilus_available=NAUTILUS_AV
     if nautilus_available:
         return config, False
 
+    if not bool((config.get("backtest") or {}).get("research_only_override", False)):
+        raise RuntimeError(
+            "Trade-ready example requires NautilusTrader or backtest.research_only_override=true for an explicit research-only fallback."
+        )
+
     runtime_config = clone_config_with_overrides(
         config,
         {
             "backtest": {
                 "evaluation_mode": "research_only",
+                "execution_profile": "research_surrogate",
                 "execution_policy": {
                     "force_simulation": True,
                 },
@@ -175,7 +184,11 @@ def main():
         automl_storage.unlink()
 
     config = build_trade_ready_example_config(automl_storage=automl_storage)
-    config, using_research_fallback = prepare_trade_ready_runtime_config(config)
+    try:
+        config, using_research_fallback = prepare_trade_ready_runtime_config(config)
+    except RuntimeError as exc:
+        print(str(exc))
+        return
     if using_research_fallback:
         print("NautilusTrader is unavailable; running the hardened AutoML profile in research-only fallback mode.")
         print("Promotion readiness will remain non-deployable until you rerun with a real Nautilus backend.")

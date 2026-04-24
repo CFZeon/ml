@@ -11,6 +11,7 @@ from .automl import run_automl_study
 from .backtest import kelly_fraction, run_backtest
 from .context import (
     _normalize_funding_timestamp_index,
+    _resolve_context_missing_policy,
     build_cross_asset_context_feature_block,
     build_futures_context_feature_block,
     build_multi_timeframe_context_feature_block,
@@ -32,6 +33,7 @@ from .data_contracts import (
     validate_reference_overlay_frame_contract,
 )
 from .data_quality import check_data_quality
+from .execution import resolve_execution_policy
 from .feature_governance import (
     apply_feature_retirement,
     derive_feature_metadata,
@@ -680,29 +682,146 @@ def _resolve_backtest_liquidity_lag_bars(pipeline):
     return max(0, int(configured))
 
 
+def _resolve_pipeline_context_missing_policy(pipeline):
+    features_config = pipeline.section("features") or {}
+    configured = copy.deepcopy(features_config.get("context_missing_policy"))
+    compat_config = dict(pipeline.config.get("compat") or {})
+    legacy_missing_semantics = bool(compat_config.get("legacy_missing_semantics", False))
+
+    if legacy_missing_semantics:
+        if configured is None:
+            configured = {"mode": "zero_fill"}
+        elif isinstance(configured, dict) and "mode" not in configured:
+            configured["mode"] = "zero_fill"
+
+    return _resolve_context_missing_policy(configured)
+
+
+_VALID_BACKTEST_EXECUTION_PROFILES = {"research_surrogate", "trade_ready_event_driven"}
+
+
+def _resolve_backtest_execution_profile(backtest_config):
+    evaluation_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower()
+    default_profile = "trade_ready_event_driven" if evaluation_mode == "trade_ready" else "research_surrogate"
+    execution_profile = str(backtest_config.get("execution_profile", default_profile)).strip().lower()
+    if execution_profile not in _VALID_BACKTEST_EXECUTION_PROFILES:
+        raise ValueError(
+            "backtest.execution_profile must be one of {'research_surrogate', 'trade_ready_event_driven'}"
+        )
+
+    research_only_override = bool(backtest_config.get("research_only_override", False))
+    if (
+        evaluation_mode == "trade_ready"
+        and execution_profile != "trade_ready_event_driven"
+        and not research_only_override
+    ):
+        raise RuntimeError(
+            "Trade-ready evaluation requires execution_profile='trade_ready_event_driven' or backtest.research_only_override=true"
+        )
+    return execution_profile
+
+
+def _resolve_lookahead_guard_config(pipeline):
+    features_config = pipeline.section("features") or {}
+    builders = list(features_config.get("builders") or [])
+    configured = copy.deepcopy(features_config.get("lookahead_guard") or {})
+    enabled = bool(configured.get("enabled", True)) and bool(builders)
+    default_mode = "blocking" if builders else "advisory"
+    mode = str(configured.get("mode", default_mode)).strip().lower()
+    if mode not in {"blocking", "advisory"}:
+        mode = default_mode
+    return {
+        "enabled": enabled,
+        "mode": mode,
+        "decision_sample_size": max(1, int(configured.get("decision_sample_size", 32))),
+        "min_prefix_rows": max(1, int(configured.get("min_prefix_rows", 128))),
+        "builders_present": bool(builders),
+        "builder_count": int(len(builders)),
+    }
+
+
+def _run_pipeline_lookahead_guard(pipeline):
+    guard_config = _resolve_lookahead_guard_config(pipeline)
+    report = {
+        **guard_config,
+        "has_bias": False,
+        "promotion_pass": True,
+        "reasons": [],
+        "biased_columns": [],
+        "checked_timestamps": 0,
+        "requested_timestamps": 0,
+        "skipped_timestamps": [],
+        "artifact_report": {},
+    }
+    if not guard_config["enabled"]:
+        pipeline.state["lookahead_guard_report"] = report
+        return report
+
+    from .lookahead import run_lookahead_analysis
+
+    audit = run_lookahead_analysis(
+        pipeline,
+        step_names=["build_features"],
+        artifact_names=["features"],
+        sample_count=guard_config["decision_sample_size"],
+        min_prefix_rows=guard_config["min_prefix_rows"],
+    )
+    artifact_report = dict((audit.get("artifacts") or {}).get("features") or {})
+    report.update(
+        {
+            "has_bias": bool(audit.get("has_bias", False)),
+            "promotion_pass": not bool(audit.get("has_bias", False)),
+            "reasons": (["lookahead_guard_failed"] if audit.get("has_bias", False) else []),
+            "biased_columns": list(artifact_report.get("biased_columns") or []),
+            "checked_timestamps": int(audit.get("checked_timestamps", 0)),
+            "requested_timestamps": int(audit.get("requested_timestamps", 0)),
+            "skipped_timestamps": list(audit.get("skipped_timestamps") or []),
+            "artifact_report": artifact_report,
+            "audit": audit,
+        }
+    )
+    pipeline.state["lookahead_guard_report"] = report
+    return report
+
+
 def _resolve_backtest_execution_policy(pipeline):
     backtest_config = pipeline.section("backtest") or {}
+    execution_profile = _resolve_backtest_execution_profile(backtest_config)
+    research_only_override = bool(backtest_config.get("research_only_override", False))
     configured = backtest_config.get("execution_policy")
     if configured is not None:
-        return configured
+        resolved_policy = resolve_execution_policy(configured)
+    else:
+        resolved_policy = resolve_execution_policy(
+            {
+                "adapter": backtest_config.get("execution_adapter", "bar_surrogate"),
+                "order_type": backtest_config.get("order_type", "market"),
+                "time_in_force": backtest_config.get("time_in_force", "IOC"),
+                "participation_cap": backtest_config.get("participation_cap", 0.10),
+                "min_fill_ratio": backtest_config.get("min_fill_ratio", 0.25),
+                "action_latency_bars": backtest_config.get("action_latency_bars", 0),
+                "max_order_age_bars": backtest_config.get("max_order_age_bars", 1),
+                "cancel_replace_bars": backtest_config.get("cancel_replace_bars", 1),
+                "force_simulation": backtest_config.get("force_simulation", False),
+            }
+        )
 
-    return {
-        "adapter": backtest_config.get("execution_adapter", "bar_surrogate"),
-        "order_type": backtest_config.get("order_type", "market"),
-        "time_in_force": backtest_config.get("time_in_force", "IOC"),
-        "participation_cap": backtest_config.get("participation_cap", 1.0),
-        "min_fill_ratio": backtest_config.get("min_fill_ratio", 0.0),
-        "action_latency_bars": backtest_config.get("action_latency_bars", 0),
-        "max_order_age_bars": backtest_config.get("max_order_age_bars", 1),
-        "cancel_replace_bars": backtest_config.get("cancel_replace_bars", 1),
-        "force_simulation": backtest_config.get("force_simulation", False),
-    }
+    if (
+        execution_profile == "trade_ready_event_driven"
+        and resolved_policy.adapter != "nautilus"
+        and not research_only_override
+    ):
+        raise RuntimeError(
+            "Trade-ready evaluation requires a Nautilus execution adapter or backtest.research_only_override=true"
+        )
+    return resolved_policy.to_dict()
 
 
 def _resolve_backtest_funding_missing_policy(backtest_config):
     configured = backtest_config.get("funding_missing_policy")
+    evaluation_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower()
     policy = {
-        "mode": "zero_fill",
+        "mode": "strict" if evaluation_mode == "trade_ready" else "zero_fill",
         "expected_interval": "8h",
         "max_gap_multiplier": 1.5,
     }
@@ -805,7 +924,8 @@ def _resolve_backtest_funding_rates(pipeline, index):
         return None
 
     funding_policy = _resolve_backtest_funding_missing_policy(backtest_config)
-    strict_funding_policy = funding_policy["mode"] in {"strict", "preserve", "preserve_missing"}
+    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+    strict_funding_policy = trade_ready_mode or funding_policy["mode"] in {"strict", "preserve", "preserve_missing"}
     futures_context = pipeline.state.get("futures_context") or {}
     funding_frame = futures_context.get("funding")
     if funding_frame is None or funding_frame.empty or "funding_rate" not in funding_frame.columns:
@@ -991,6 +1111,22 @@ def _build_pipeline_operational_monitoring(
             run_id=f"{scope}_{symbol}_{timestamp}",
         )
     return report
+
+
+def _attach_context_ttl_to_operational_monitoring(operational_monitoring, context_ttl_report):
+    payload = dict(operational_monitoring or {})
+    reports = dict(context_ttl_report or {})
+    if not reports:
+        return payload
+
+    payload["context_ttl"] = reports
+    if not all(bool(report.get("promotion_pass", True)) for report in reports.values()):
+        payload["healthy"] = False
+        reasons = list(payload.get("reasons", []))
+        if "context_ttl_breached" not in reasons:
+            reasons.append("context_ttl_breached")
+        payload["reasons"] = reasons
+    return payload
 
 
 def _timed_inference_call(latency_store, func, *args, **kwargs):
@@ -2679,6 +2815,7 @@ class FeaturesStep(PipelineStep):
         raw_data = pipeline.require("raw_data")
         indicator_run = pipeline.state.get("indicator_run")
         config = pipeline.section("features")
+        context_missing_policy = _resolve_pipeline_context_missing_policy(pipeline)
         feature_set = build_feature_set(
             data,
             lags=config.get("lags"),
@@ -2696,7 +2833,7 @@ class FeaturesStep(PipelineStep):
             pipeline.state.get("futures_context"),
             rolling_window=config.get("rolling_window", 20),
             ttl_config=config.get("futures_context_ttl"),
-            missing_policy=config.get("context_missing_policy"),
+            missing_policy=context_missing_policy,
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, futures_context_block)
         ttl_report = dict((futures_context_block.metadata or {}).get("ttl_report") or {})
@@ -2710,7 +2847,7 @@ class FeaturesStep(PipelineStep):
             pipeline.state.get("cross_asset_context"),
             rolling_window=config.get("rolling_window", 20),
             ttl_config=config.get("cross_asset_context_ttl"),
-            missing_policy=config.get("context_missing_policy"),
+            missing_policy=context_missing_policy,
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, cross_asset_context_block)
         ttl_report = dict((cross_asset_context_block.metadata or {}).get("ttl_report") or {})
@@ -3102,12 +3239,15 @@ class TrainModelsStep(PipelineStep):
         oos_paths = []
         signal_decay_segments = []
 
-        context_missing_policy = pipeline.section("features").get("context_missing_policy")
-        if isinstance(context_missing_policy, dict):
-            context_missing_mode = str(context_missing_policy.get("mode", "zero_fill")).strip().lower()
-        else:
-            context_missing_mode = str(context_missing_policy or "zero_fill").strip().lower()
-        if context_missing_mode in {"preserve", "preserve_missing", "strict"}:
+        lookahead_guard_report = _run_pipeline_lookahead_guard(pipeline)
+        if lookahead_guard_report.get("enabled", False) and not lookahead_guard_report.get("promotion_pass", True):
+            if lookahead_guard_report.get("mode") == "blocking":
+                raise RuntimeError("Lookahead guard failed: custom feature builders are not causally safe")
+
+        context_missing_policy = _resolve_pipeline_context_missing_policy(pipeline)
+        context_missing_mode = str(context_missing_policy.get("mode", "preserve_missing")).strip().lower()
+        trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+        if trade_ready_mode or context_missing_mode in {"preserve", "preserve_missing", "strict"}:
             context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
             breached_scopes = [
                 scope for scope, report in context_ttl_report.items()
@@ -3827,13 +3967,10 @@ class TrainModelsStep(PipelineStep):
             scope="training",
         )
         if context_ttl_report:
-            operational_monitoring["context_ttl"] = context_ttl_report
-            if not all(bool(report.get("promotion_pass", True)) for report in context_ttl_report.values()):
-                operational_monitoring["healthy"] = False
-                reasons = list(operational_monitoring.get("reasons", []))
-                if "context_ttl_breached" not in reasons:
-                    reasons.append("context_ttl_breached")
-                operational_monitoring["reasons"] = reasons
+            operational_monitoring = _attach_context_ttl_to_operational_monitoring(
+                operational_monitoring,
+                context_ttl_report,
+            )
         fold_stability = _build_fold_stability_summary(
             fold_metrics,
             fold_backtests,
@@ -3928,6 +4065,7 @@ class TrainModelsStep(PipelineStep):
                 "admission_summary": feature_admission_summary,
                 "folds": fold_feature_governance,
             },
+            "lookahead_guard": lookahead_guard_report,
             "operational_monitoring": operational_monitoring,
             "context_ttl_report": context_ttl_report,
             "promotion_gates": {
@@ -3937,6 +4075,7 @@ class TrainModelsStep(PipelineStep):
                 "operational_health": bool(operational_monitoring.get("healthy", True)),
                 "cross_venue_integrity": bool(reference_integrity_report.get("promotion_pass", True)),
                 "signal_decay": bool(signal_decay.get("promotion_pass", True)),
+                "lookahead_guard": bool(lookahead_guard_report.get("promotion_pass", True)),
             },
             "regime": {
                 "mode": "fold_local",

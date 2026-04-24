@@ -159,9 +159,9 @@ def _coverage_ratio(frame):
 
 def _resolve_context_missing_policy(policy=None):
     resolved = {
-        "mode": "zero_fill",
-        "add_indicator": False,
-        "max_unknown_rate": 1.0,
+        "mode": "preserve_missing",
+        "add_indicator": True,
+        "max_unknown_rate": 0.0,
     }
     if isinstance(policy, str):
         resolved["mode"] = policy
@@ -172,7 +172,7 @@ def _resolve_context_missing_policy(policy=None):
     else:
         policy_mapping = {}
 
-    mode = str(resolved.get("mode", "zero_fill")).strip().lower()
+    mode = str(resolved.get("mode", "preserve_missing")).strip().lower()
     if mode in {"preserve", "preserve_missing", "strict"}:
         resolved["mode"] = "preserve_missing"
         if "add_indicator" not in policy_mapping:
@@ -181,8 +181,14 @@ def _resolve_context_missing_policy(policy=None):
             resolved["max_unknown_rate"] = 0.0
     else:
         resolved["mode"] = "zero_fill"
-    resolved["add_indicator"] = bool(resolved.get("add_indicator", False))
-    resolved["max_unknown_rate"] = float(resolved.get("max_unknown_rate", 1.0))
+        if "add_indicator" not in policy_mapping:
+            resolved["add_indicator"] = False
+        if "max_unknown_rate" not in policy_mapping:
+            resolved["max_unknown_rate"] = 1.0
+    resolved["add_indicator"] = bool(resolved.get("add_indicator", resolved["mode"] == "preserve_missing"))
+    resolved["max_unknown_rate"] = float(
+        resolved.get("max_unknown_rate", 0.0 if resolved["mode"] == "preserve_missing" else 1.0)
+    )
     return resolved
 
 

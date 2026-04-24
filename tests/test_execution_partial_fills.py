@@ -2,10 +2,18 @@ import unittest
 
 import pandas as pd
 
+from core.execution import resolve_execution_policy
 from core import run_backtest
 
 
 class ExecutionPartialFillTest(unittest.TestCase):
+    def test_execution_policy_defaults_are_conservative(self):
+        policy = resolve_execution_policy()
+
+        self.assertAlmostEqual(float(policy.participation_cap), 0.10, places=12)
+        self.assertAlmostEqual(float(policy.min_fill_ratio), 0.25, places=12)
+        self.assertEqual(int(policy.max_order_age_bars), 1)
+
     def test_unified_action_latency_delays_submission_and_reports_fill_delay(self):
         index = pd.date_range("2024-01-01", periods=5, freq="h")
         close = pd.Series([100.0, 100.0, 100.0, 100.0, 100.0], index=index)
@@ -51,6 +59,7 @@ class ExecutionPartialFillTest(unittest.TestCase):
                 "force_simulation": True,
                 "time_in_force": "IOC",
                 "participation_cap": 1.0,
+                "min_fill_ratio": 0.0,
             },
         )
 
@@ -78,6 +87,7 @@ class ExecutionPartialFillTest(unittest.TestCase):
                 "force_simulation": True,
                 "time_in_force": "GTC",
                 "participation_cap": 1.0,
+                "min_fill_ratio": 0.0,
                 "max_order_age_bars": 2,
                 "cancel_replace_bars": 2,
             },

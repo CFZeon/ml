@@ -21,7 +21,7 @@ Use this map instead of scanning every example manually.
 | Conservative futures research baseline | `example_futures.py` | Shows mark-price valuation, funding, and liquidation-aware futures setup |
 | Attach custom exogenous data | `example_custom_data.py` | Demonstrates point-in-time-safe custom data joins |
 | Run an offline deterministic case | `example_synthetic_derivatives.py` | Seeds `pipeline.state` directly and avoids network fetches |
-| Run trade-ready AutoML research | `example_trade_ready_automl.py` | Uses the hardened AutoML profile with locked holdout, replication cohorts, binding selection gates, and promotion-readiness reporting; if Nautilus is unavailable, it downgrades itself to a labeled research-only fallback |
+| Run trade-ready AutoML research | `example_trade_ready_automl.py` | Uses the hardened AutoML profile with locked holdout, replication cohorts, binding selection gates, and promotion-readiness reporting; if Nautilus is unavailable, it fails closed unless you explicitly enable a labeled research-only override |
 | Run drift-governed retraining flow | `example_drift_retraining_cycle.py` | Shows champion/challenger registration, scheduled retraining, and hybrid rollback |
 | Run AutoML smoke/demo path | `example_automl.py` | Shows the searchable config surface quickly, but intentionally disables promotion-safe controls |
 | Explore FVG-specific features | `example_fvg.py` | Narrow feature example; useful as a feature smoke test |
@@ -46,7 +46,17 @@ They also set `data.duplicate_policy = "fail"`, so conflicting duplicate market 
 They also set `data.futures_context.recent_stats_availability_lag = "period_close"`, so recent Binance futures statistics are indexed at publication-safe timestamps instead of the interval they summarize.
 They also default to `backtest.evaluation_mode = "research_only"`, so a normal builder-based example is explicitly research-grade unless you promote it to a trade-ready evaluation profile.
 The hardened trade-ready AutoML override also enables replication cohorts by default, so promotion-readiness is checked on alternate windows or sibling symbols instead of a single holdout narrative.
-That hardened trade-ready config still requires a real Nautilus backend. The shipped `example_trade_ready_automl.py` runner now downgrades itself to a labeled research-only fallback when Nautilus is unavailable so the example can still complete locally.
+That hardened trade-ready config still requires a real Nautilus backend. The shipped `example_trade_ready_automl.py` runner now fails closed unless you explicitly set `backtest.research_only_override = true` for a labeled research-only fallback.
+
+## Hardened Defaults Migration
+
+The remediation cycle changed several defaults that older local configs may have relied on.
+
+1. AutoML now defaults to the hardened promotion policy profile. Locked-holdout and post-selection failures block promotion unless you explicitly opt into `automl.policy_profile = "legacy_permissive"`.
+2. Context features now default to `preserve_missing` semantics with unknown-state indicators instead of zero-filling stale or missing context. If you intentionally want legacy smoke-test behavior, set `compat.legacy_missing_semantics = true` or override `features.context_missing_policy.mode = "zero_fill"`.
+3. Trade-ready backtests now default to strict futures funding coverage and fail closed on surrogate execution. If you want a surrogate study, keep `backtest.evaluation_mode = "research_only"` or set `backtest.research_only_override = true` explicitly.
+4. Custom `features.builders` now trigger an automatic lookahead provocation audit before training. Builder leaks block training in blocking mode and still surface as promotion blockers in advisory mode.
+5. Objective evidence gates are materially stricter by default and can optionally require lower confidence bounds for Sharpe and net profit.
 
 ## Build A New Real-Data Case
 
@@ -121,11 +131,12 @@ If you intentionally want the old permissive smoke-test behavior, override these
 If you want a trade-ready evaluation instead of a research-only one, add these explicitly:
 
 1. set `backtest.evaluation_mode` to `trade_ready`
-2. use a real Nautilus execution policy such as `{"adapter": "nautilus", ...}` and do not set `force_simulation`
-3. provide `backtest.scenario_matrix` with named stress cases such as `downtime`, `stale_mark`, and `halt`
-4. set `backtest.required_stress_scenarios` so the promotion gate knows which cases are mandatory
+2. set `backtest.execution_profile` to `trade_ready_event_driven`
+3. use a real Nautilus execution policy such as `{"adapter": "nautilus", ...}` and do not set `force_simulation`
+4. provide `backtest.scenario_matrix` with named stress cases such as `downtime`, `stale_mark`, and `halt`
+5. set `backtest.required_stress_scenarios` so the promotion gate knows which cases are mandatory
 
-If you only want a surrogate execution study, keep `backtest.evaluation_mode = "research_only"` and set `execution_policy.force_simulation = true` explicitly. `example_trade_ready_automl.py` now makes that downgrade automatically when Nautilus is missing, and it also relaxes the locked-holdout and overfitting gates for that fallback smoke run.
+If you only want a surrogate execution study, keep `backtest.evaluation_mode = "research_only"` and set `execution_policy.force_simulation = true` explicitly. If you start from the hardened trade-ready example, you must also set `backtest.research_only_override = true` before it will downgrade to that labeled fallback path.
 
 Minimal pattern:
 
