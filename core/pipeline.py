@@ -10,6 +10,7 @@ import pandas as pd
 from .automl import run_automl_study
 from .backtest import kelly_fraction, run_backtest
 from .context import (
+    _normalize_funding_timestamp_index,
     build_cross_asset_context_feature_block,
     build_futures_context_feature_block,
     build_multi_timeframe_context_feature_block,
@@ -738,7 +739,9 @@ def _align_backtest_funding_rates(funding_rates, index, policy):
         }
 
     aligned_index = pd.DatetimeIndex(index)
-    observed = pd.Series(funding_rates, copy=False).dropna().sort_index().astype(float)
+    observed = _normalize_funding_timestamp_index(pd.Series(funding_rates, copy=False)).dropna().astype(float)
+    if len(aligned_index) > 0 and not observed.empty:
+        observed = observed.loc[(observed.index >= aligned_index[0]) & (observed.index <= aligned_index[-1])]
     aligned = observed.reindex(aligned_index).fillna(0.0).astype(float)
     expected_interval = policy["expected_interval"]
     max_allowed_gap = expected_interval * float(policy["max_gap_multiplier"])

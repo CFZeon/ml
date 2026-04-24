@@ -3,7 +3,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
-from example_trade_ready_automl import build_trade_ready_example_config
+from example_trade_ready_automl import build_trade_ready_example_config, prepare_trade_ready_runtime_config
 from example_utils import (
     build_futures_research_config,
     build_spot_research_config,
@@ -128,10 +128,27 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
         config = build_trade_ready_example_config(automl_storage=Path(".cache") / "automl" / "trade_ready_exec_test.db")
 
         backtest = config["backtest"]
+        automl = config["automl"]
         execution_policy = backtest["execution_policy"]
         self.assertEqual(backtest["evaluation_mode"], "trade_ready")
         self.assertEqual(execution_policy["adapter"], "nautilus")
         self.assertFalse(bool(execution_policy.get("force_simulation", False)))
+        self.assertEqual(int(automl["n_trials"]), 2)
+        self.assertEqual(automl["search_space"]["model"]["type"]["choices"], ["gbm"])
+        self.assertEqual(automl["search_space"]["labels"]["barrier_tie_break"]["choices"], ["sl"])
+
+    def test_trade_ready_example_runtime_falls_back_to_research_only_without_nautilus(self):
+        config = build_trade_ready_example_config(automl_storage=Path(".cache") / "automl" / "trade_ready_exec_test.db")
+
+        runtime_config, using_research_fallback = prepare_trade_ready_runtime_config(config, nautilus_available=False)
+
+        self.assertTrue(using_research_fallback)
+        self.assertEqual(runtime_config["backtest"]["evaluation_mode"], "research_only")
+        self.assertTrue(runtime_config["backtest"]["execution_policy"]["force_simulation"])
+        self.assertFalse(runtime_config["automl"]["locked_holdout_enabled"])
+        self.assertIsNone(runtime_config["automl"]["minimum_dsr_threshold"])
+        self.assertFalse(runtime_config["automl"]["selection_policy"]["enabled"])
+        self.assertFalse(runtime_config["automl"]["overfitting_control"]["enabled"])
 
 
 if __name__ == "__main__":

@@ -42,6 +42,20 @@ def _write_cache(path, frame):
     write_parquet_frame(path, pd.DataFrame(frame))
 
 
+def _normalize_funding_timestamp_index(frame):
+    if frame is None or not isinstance(frame, (pd.Series, pd.DataFrame)):
+        return frame
+    if frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
+        return frame.copy()
+
+    normalized = frame.copy()
+    normalized.index = pd.DatetimeIndex(normalized.index).round("1s")
+    normalized = normalized.sort_index()
+    if normalized.index.has_duplicates:
+        normalized = normalized[~normalized.index.duplicated(keep="last")]
+    return normalized
+
+
 def _request_json(session, path, params):
     response = session.get(f"{_FAPI_BASE}{path}", params=params, timeout=30)
     response.raise_for_status()
@@ -261,6 +275,8 @@ def _fetch_funding_history(symbol, start_dt, end_dt, session, cache_dir):
     )
     cached = _read_cache(cache_file)
     if cached is not None:
+        cached = _normalize_funding_timestamp_index(cached)
+        _write_cache(cache_file, cached)
         return cached
 
     rows = []
@@ -294,6 +310,7 @@ def _fetch_funding_history(symbol, start_dt, end_dt, session, cache_dir):
             }
         ).set_index("timestamp").sort_index()
 
+    frame = _normalize_funding_timestamp_index(frame)
     if not frame.empty:
         frame = frame[(frame.index >= start_dt) & (frame.index < end_dt)]
     _write_cache(cache_file, frame)

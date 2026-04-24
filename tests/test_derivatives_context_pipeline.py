@@ -374,6 +374,55 @@ class DerivativesContextPipelineTest(unittest.TestCase):
         self.assertIn("backtest_funding", pipeline.state["context_ttl_report"])
         self.assertFalse(pipeline.state["context_ttl_report"]["backtest_funding"]["promotion_pass"])
 
+    def test_strict_backtest_funding_policy_tolerates_subsecond_timestamp_jitter(self):
+        index = pd.date_range("2026-02-01", periods=48, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        futures_context = _make_futures_context(index, raw_data["close"].to_numpy())
+        jittered_funding = futures_context["funding"].copy()
+        jitter = pd.to_timedelta([0, 1, 2, 3, 4, 1], unit="ms")[: len(jittered_funding.index)]
+        jittered_funding.index = jittered_funding.index + jitter
+        futures_context["funding"] = jittered_funding
+
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h", "market": "um_futures"},
+                "backtest": {
+                    "apply_funding": True,
+                    "funding_missing_policy": {"mode": "strict", "expected_interval": "8h", "max_gap_multiplier": 1.25},
+                },
+            }
+        )
+        pipeline.state["futures_context"] = futures_context
+
+        funding_rates = _resolve_backtest_funding_rates(pipeline, index)
+
+        self.assertIsNotNone(funding_rates)
+        self.assertTrue(bool(pipeline.state["context_ttl_report"]["backtest_funding"]["promotion_pass"]))
+        self.assertEqual(pipeline.state["context_ttl_report"]["backtest_funding"]["off_index_event_count"], 0)
+
+    def test_strict_backtest_funding_policy_ignores_events_outside_requested_window(self):
+        index = pd.date_range("2026-02-01", periods=48, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        futures_context = _make_futures_context(index, raw_data["close"].to_numpy())
+        requested_index = index[8:28]
+
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h", "market": "um_futures"},
+                "backtest": {
+                    "apply_funding": True,
+                    "funding_missing_policy": {"mode": "strict", "expected_interval": "8h", "max_gap_multiplier": 1.25},
+                },
+            }
+        )
+        pipeline.state["futures_context"] = futures_context
+
+        funding_rates = _resolve_backtest_funding_rates(pipeline, requested_index)
+
+        self.assertIsNotNone(funding_rates)
+        self.assertTrue(bool(pipeline.state["context_ttl_report"]["backtest_funding"]["promotion_pass"]))
+        self.assertEqual(pipeline.state["context_ttl_report"]["backtest_funding"]["off_index_event_count"], 0)
+
     def test_mark_valuation_strict_policy_rejects_missing_leading_prices(self):
         index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")
         raw_data = _make_ohlcv(index)

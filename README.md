@@ -4,7 +4,7 @@ This repository is a research-first trading stack for Binance crypto that keeps 
 
 Trade-ready example configs now fail closed on stale context and missing futures funding coverage instead of silently zero-filling unknown state.
 They also fail closed on conflicting duplicate market bars instead of silently keeping the first timestamp collision.
-Example builders now mark backtests as `research_only` by default; trade-ready runs must opt into event-style execution plus explicit stress scenarios, and the hardened trade-ready path now requires a real Nautilus backend instead of the surrogate fallback.
+Example builders now mark backtests as `research_only` by default; trade-ready runs must opt into event-style execution plus explicit stress scenarios. The hardened trade-ready config still requires a real Nautilus backend, but `example_trade_ready_automl.py` now downgrades itself to an explicit research-only fallback when Nautilus is unavailable so the example remains runnable.
 
 The current codebase is built around these constraints:
 
@@ -95,7 +95,7 @@ The rest of the examples serve different purposes:
 - `example_trend_breakout_futures.py`: futures example focused on ADX plus Donchian trend-breakout context layered onto the existing futures pipeline
 - `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain
 - `example_synthetic_derivatives.py`: offline synthetic derivatives/integration example; may also abstain depending on the generated regime path
-- `example_trade_ready_automl.py`: hardened AutoML research profile with locked holdout, replication cohorts, DSR/PBO diagnostics, binding post-selection inference, and promotion-readiness reporting on a real Nautilus-backed trade-ready path
+- `example_trade_ready_automl.py`: hardened AutoML research profile with locked holdout, replication cohorts, DSR/PBO diagnostics, binding post-selection inference, and promotion-readiness reporting; when Nautilus is unavailable, the script downgrades to a clearly labeled research-only fallback run
 - `example_drift_retraining_cycle.py`: deterministic registry and drift example showing scheduled retraining, challenger promotion, and rollback
 - `example_automl.py`: constrained AutoML smoke/demo path kept for short runtime feedback
 
@@ -106,7 +106,7 @@ They also set `data.duplicate_policy = "fail"`, so conflicting duplicate bars or
 They also set `data.futures_context.recent_stats_availability_lag = "period_close"`, so Binance recent-stat context is aligned to publication-safe timestamps rather than the raw interval it summarizes.
 They also default to `backtest.evaluation_mode = "research_only"`. Only the hardened trade-ready AutoML path opts into `trade_ready` evaluation with event-style execution and an explicit stress matrix.
 The hardened trade-ready AutoML override now also enables replication cohorts by default, so a candidate must survive alternate windows or sibling-symbol cohorts before it can present as promotion-ready.
-Surrogate execution remains research-only. If you set `execution_policy.force_simulation = true`, treat that run as execution research rather than promotion-safe evaluation.
+Surrogate execution remains research-only. `example_trade_ready_automl.py` now applies that downgrade explicitly when Nautilus is unavailable, and it relaxes the holdout/overfitting gates only for that fallback smoke run.
 
 ## Installation
 
