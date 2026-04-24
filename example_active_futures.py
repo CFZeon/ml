@@ -46,6 +46,9 @@ def main():
                 "lags": [1, 2, 3],
                 "rolling_window": 12,
             },
+            "regime": {
+                "enabled": False,
+            },
             "feature_selection": {"max_features": 40},
             "labels": {
                 "kind": "fixed_horizon",
@@ -121,6 +124,7 @@ def main():
 
     print_section(sep, 4, "Previewing regime features")
     regimes = pipeline.detect_regimes()["regimes"]
+    print("  mode         : disabled for this compact active futures demo")
     print_regime_summary(regimes)
 
     print_section(sep, 5, "Building fixed-horizon labels")

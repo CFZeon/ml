@@ -54,7 +54,7 @@ def main():
                 "context_timeframes": ["4h"],
             },
             "feature_selection": {"enabled": True, "max_features": 56, "min_mi_threshold": 0.0},
-            "regime": {"method": "hmm"},
+            "regime": {"method": "hmm", "enabled": False},
             "labels": {
                 "kind": "fixed_horizon",
                 "horizon": 3,
@@ -149,6 +149,7 @@ def main():
 
     print_section(sep, 4, "Previewing regime features")
     regimes = pipeline.detect_regimes()["regimes"]
+    print("  mode         : disabled for this compact futures breakout demo")
     print_regime_summary(regimes)
 
     print_section(sep, 5, "Building labels")

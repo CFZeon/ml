@@ -62,6 +62,9 @@ def main():
             "features": {
                 "schema_version": "indicator_aware_v7_example_workflow",
             },
+            "regime": {
+                "enabled": False,
+            },
             "signals": {
                 "policy_mode": "validation_calibrated",
             },
@@ -145,6 +148,7 @@ def main():
 
     print_section(sep, 5, "Previewing regime features")
     regimes = pipeline.detect_regimes()["regimes"]
+    print("  mode         : disabled for this compact AutoML demo workflow")
     print_regime_summary(regimes)
 
     print_section(sep, 6, "Building labels and aligning research matrix")

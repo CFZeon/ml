@@ -11,6 +11,7 @@ Usage
 from core import ATR, MACD, RSI, ResearchPipeline
 from example_utils import (
     build_futures_research_config,
+    clone_config_with_overrides,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -34,13 +35,26 @@ def main():
     indicators = [RSI(14), MACD(), ATR(14)]
 
     pipeline = ResearchPipeline(
-        build_futures_research_config(
+        clone_config_with_overrides(
+            build_futures_research_config(
             symbol=symbol,
             interval=interval,
             start=start,
             end=end,
             indicators=indicators,
             context_symbols=context_symbols,
+            ),
+            {
+                "model": {
+                    "cv_method": "walk_forward",
+                    "n_splits": 3,
+                    "train_size": 360,
+                    "test_size": 120,
+                    "gap": 3,
+                    "validation_fraction": 0.2,
+                    "meta_n_splits": 2,
+                }
+            },
         )
     )
 
@@ -92,7 +106,7 @@ def main():
     weights = pipeline.compute_sample_weights()
     print_weight_summary(weights)
 
-    print_section(sep, 7, "CPCV training")
+    print_section(sep, 7, "Walk-forward training")
     training = pipeline.train_models()
     print_training_summary(training)
 

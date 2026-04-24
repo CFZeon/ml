@@ -38,6 +38,15 @@ def build_case_config():
     return clone_config_with_overrides(
         base_config,
         {
+            "model": {
+                "cv_method": "walk_forward",
+                "n_splits": 3,
+                "train_size": 720,
+                "test_size": 168,
+                "gap": 6,
+                "validation_fraction": 0.2,
+                "meta_n_splits": 2,
+            },
             "labels": {
                 "max_holding": 18,
             },
