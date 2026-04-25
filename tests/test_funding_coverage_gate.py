@@ -3,7 +3,12 @@ import unittest
 import pandas as pd
 
 from core import ResearchPipeline
-from core.pipeline import _resolve_backtest_funding_missing_policy, _resolve_backtest_funding_rates
+from core.pipeline import (
+    _resolve_backtest_funding_missing_policy,
+    _resolve_backtest_funding_rates,
+    _resolve_pipeline_data_fetch_config,
+    _resolve_pipeline_data_quality_config,
+)
 
 
 class FundingCoverageGateTest(unittest.TestCase):
@@ -11,6 +16,32 @@ class FundingCoverageGateTest(unittest.TestCase):
         policy = _resolve_backtest_funding_missing_policy({"evaluation_mode": "trade_ready"})
 
         self.assertEqual(policy["mode"], "strict")
+
+    def test_trade_ready_research_override_can_keep_zero_fill_funding_policy(self):
+        policy = _resolve_backtest_funding_missing_policy(
+            {
+                "evaluation_mode": "trade_ready",
+                "research_only_override": True,
+                "funding_missing_policy": {"mode": "zero_fill", "expected_interval": "8h", "max_gap_multiplier": 1.5},
+            }
+        )
+
+        self.assertEqual(policy["mode"], "zero_fill")
+
+    def test_trade_ready_runtime_defaults_fail_closed_data_integrity_and_quarantine(self):
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "backtest": {"evaluation_mode": "trade_ready"},
+            }
+        )
+
+        data_config = _resolve_pipeline_data_fetch_config(pipeline)
+        data_quality_config = _resolve_pipeline_data_quality_config(pipeline)
+
+        self.assertEqual(data_config["gap_policy"], "fail")
+        self.assertEqual(data_config["duplicate_policy"], "fail")
+        self.assertTrue(data_quality_config["block_on_quarantine"])
 
     def test_trade_ready_blocks_missing_funding_even_when_zero_fill_is_requested(self):
         index = pd.date_range("2026-02-01", periods=24, freq="1h", tz="UTC")

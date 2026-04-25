@@ -72,6 +72,17 @@ def _make_eligibility_report(score_value=0.12):
 
 
 class OperationsMonitoringTest(unittest.TestCase):
+    def test_trade_ready_monitoring_profile_uses_finite_thresholds(self):
+        report = build_monitoring_report(policy={"policy_profile": "trade_ready"})
+
+        policy = report["policy"]
+        self.assertEqual(policy["policy_profile"], "trade_ready")
+        self.assertEqual(policy["max_data_lag"], "2h")
+        self.assertEqual(float(policy["min_fill_ratio"]), 0.25)
+        self.assertEqual(float(policy["max_slippage_drift"]), 0.001)
+        self.assertEqual(int(policy["max_queue_backlog"]), 0)
+        self.assertEqual(float(policy["min_signal_half_life_bars"]), 1.0)
+
     def test_freshness_breach_is_reported_and_artifacts_are_written(self):
         index = pd.date_range("2024-01-01", periods=4, freq="h", tz="UTC")
         report = build_monitoring_report(

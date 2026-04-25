@@ -1045,6 +1045,9 @@ def _compute_significance_metrics(strat_ret, equity, periods_per_year, elapsed_y
         "mean_block_length": None,
         "random_state": config.get("random_state"),
         "benchmark_sharpe_ratio": None,
+        "observation_count": None,
+        "min_observations": None,
+        "underpowered": False,
         "metrics": {},
     }
     if not payload["enabled"]:
@@ -1072,9 +1075,12 @@ def _compute_significance_metrics(strat_ret, equity, periods_per_year, elapsed_y
     benchmark_series = benchmark_series.loc[finite_mask] if benchmark_series is not None else None
 
     min_observations = max(2, int(config.get("min_observations", 8)))
+    payload["observation_count"] = int(len(strategy_returns))
+    payload["min_observations"] = int(min_observations)
     if len(strategy_returns) < min_observations:
         payload["enabled"] = False
         payload["reason"] = "insufficient_observations"
+        payload["underpowered"] = True
         return payload
 
     mean_block_length = config.get("mean_block_length")

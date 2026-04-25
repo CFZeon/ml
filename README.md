@@ -4,7 +4,10 @@ This repository is a research-first trading stack for Binance crypto that keeps 
 
 Trade-ready example configs now fail closed on stale context and missing futures funding coverage instead of silently zero-filling unknown state.
 They also fail closed on conflicting duplicate market bars instead of silently keeping the first timestamp collision.
-Example builders now mark backtests as `research_only` by default; trade-ready runs must opt into event-style execution plus explicit stress scenarios. The hardened trade-ready config requires a real Nautilus backend and now fails closed unless you explicitly set `backtest.research_only_override = true` for a labeled surrogate fallback.
+Trade-ready configs now also build one blocking pre-training data-certification verdict that binds market gaps, quarantine disposition, context TTL breaches, and configured reference-validation coverage into a single gate.
+Trade-ready and AutoML training paths now run a blocking baseline-vs-prefix lookahead certification on the causal feature surface before model fitting.
+Example builders now mark backtests as `research_only` by default; trade-ready runs must opt into event-style execution plus explicit stress scenarios. The hardened trade-ready config now fails closed when Nautilus is unavailable; use `example_automl.py` for the explicit research-only surrogate path.
+Trade-ready monitoring now also defaults to a finite policy profile instead of leaving freshness, fill-quality, slippage-drift, and signal-decay thresholds at `inf` or `None`.
 
 The current codebase is built around these constraints:
 
@@ -15,15 +18,6 @@ The current codebase is built around these constraints:
 - walk-forward and CPCV-style validation instead of random CV
 - execution-aware backtests with Binance filter enforcement
 - futures-aware research with funding, mark-price valuation, and a liquidation-capable margin model
-
-## Research-Safe Vs Trade-Ready-Safe
-
-The repository now separates these modes explicitly instead of relying on permissive defaults.
-
-- `research_only` remains the default evaluation mode. It can use surrogate execution, but the resulting backtests are tagged `research_only` and are not promotion-ready.
-- `trade_ready` evaluation now requires `backtest.execution_profile = "trade_ready_event_driven"`, a Nautilus execution adapter, and the required stress scenarios. Without that, the pipeline fails closed unless you explicitly set `backtest.research_only_override = true`.
-- Context and futures funding unknown states now default to preserve-missing semantics. Trade-ready runs fail closed on stale context, missing funding coverage, and non-event-driven execution metadata.
-- Custom `features.builders` now trigger an automatic lookahead provocation audit before model training. Blocking mode is the default when builders are present, and any detected future leak prevents promotion.
 
 ## What Is Implemented
 
@@ -36,13 +30,14 @@ The repo now includes:
 - uniqueness weighting and sequential bootstrap support
 - explicit regime detection and context features
 - AutoML with validation/holdout separation, CPCV/PBO diagnostics, DSR reporting, White RC / Hansen SPA post-selection inference, fragility checks, and stability gating
-- a baseline-vs-prefix lookahead provocation harness for detecting future-informed features, labels, probabilities, signals, and execution inputs
+- a baseline-vs-prefix lookahead provocation harness for detecting future-informed features, labels, probabilities, signals, and execution inputs, with automatic blocking feature-surface certification on trade-ready and AutoML runs
 - a causal liquidity resolver that shifts bar-volume inputs, validates L2 snapshot timestamps, and records liquidity provenance in backtest outputs
 - explicit order-intent and execution-policy objects for backtests, with a legacy full-fill parity path and a default event-style partial-fill/cancel flow
 - a tiered execution cost stack with proxy, L2 depth-curve, and fill-event attribution modes plus stress sweeps
 - feature admission and retirement governance with venue-specific tagging, transform/lineage metadata, robustness screens, and ablation-based promotion diagnostics
 - a dedicated regime layer with explicit instrument-state, market-state, and cross-asset-state inputs, provenance reports, and endogenous-vs-context stability ablations
 - a pre-feature data-quality quarantine layer that flags, nulls, drops, or winsorizes suspicious bars and records structured anomaly reports
+- a unified trade-ready data-certification report that consolidates market-bar integrity, quarantine status, context TTL breaches, and configured cross-venue reference validation into one promotion-facing verdict
 - historical universe snapshots that gate cross-symbol studies by listing status, minimum history, and liquidity, plus lifecycle-aware backtest actions for halts and delists
 - explicit cross-stage embargoes between AutoML search, validation, and locked holdout windows so label horizons and execution delays cannot bleed across stage boundaries
 - safe persistent artifact storage with Parquet/JSON caches and skops-backed model bundles that verify hashes and feature schema before load
@@ -72,10 +67,11 @@ The repo now includes:
 - `core/universe.py`: historical universe snapshots, eligibility gates, and symbol lifecycle handling for halts/delists
 - `core/storage.py`: shared JSON/Parquet persistence helpers and SHA-256 verification primitives for safe caches and model manifests
 - `core/drift.py`: batch and streaming drift detection plus retraining guardrails
+- `core/readiness.py`: operator-facing deploy/hold report that binds promotion status, monitoring health, drift state, backend availability, and rollback readiness
 - `core/registry/`: immutable version manifests, local registry index, and champion/challenger promotion flows
 - `core/execution/intents.py`: order-intent data structures emitted before execution simulation
 - `core/execution/policies.py`: execution adapter and fill-policy resolution for backtests
-- `core/execution/nautilus_adapter.py`: NautilusTrader adapter boundary with surrogate fallback metadata
+- `core/execution/nautilus_adapter.py`: NautilusTrader adapter boundary with explicit unavailability errors and research-only surrogate metadata
 - `core/execution/liquidity.py`: causal bar-volume and order-book liquidity input resolution
 - `core/stat_tests.py`: White Reality Check, Hansen SPA, and aligned candidate return-matrix helpers
 - `core/pipeline.py`: stepwise research pipeline orchestration
@@ -104,18 +100,28 @@ The rest of the examples serve different purposes:
 - `example_trend_breakout_futures.py`: futures example focused on ADX plus Donchian trend-breakout context layered onto the existing futures pipeline
 - `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain
 - `example_synthetic_derivatives.py`: offline synthetic derivatives/integration example; may also abstain depending on the generated regime path
-- `example_trade_ready_automl.py`: hardened AutoML research profile with locked holdout, replication cohorts, DSR/PBO diagnostics, binding post-selection inference, and promotion-readiness reporting; when Nautilus is unavailable, it fails closed unless you explicitly enable a research-only override
-- `example_drift_retraining_cycle.py`: deterministic registry and drift example showing scheduled retraining, challenger promotion, and rollback
+- `example_trade_ready_automl.py`: hardened AutoML certification profile with locked holdout, replication cohorts, DSR/PBO diagnostics, blocking pre-training feature-surface lookahead certification, and promotion-readiness reporting; pass `--smoke` for the explicitly reduced-power local feedback mode, and expect the script to fail closed if Nautilus is unavailable
+- `example_drift_retraining_cycle.py`: deterministic registry and drift example showing scheduled retraining, challenger promotion, rollback, and the final operator deploy/hold decision
 - `example_automl.py`: constrained AutoML smoke/demo path kept for short runtime feedback
 
 The end-to-end remediation program for making the repo trade-ready is tracked in `TRADE_READY_REMEDIATION_PLAN.md`.
+
+The operator path is now distinct from the certification path: certify a candidate with `example_trade_ready_automl.py`, then hand off the promoted champion to `example_drift_retraining_cycle.py` or `ResearchPipeline.inspect_deployment_readiness(...)` for the final deploy-versus-hold decision.
+The hardened trade-ready path now also auto-applies the `trade_ready` monitoring profile, which binds finite thresholds for freshness, custom-data fallback, fill quality, slippage drift, and signal-decay deterioration.
+`example_utils.py` now also exposes `build_trade_ready_runtime_overrides(...)`, which centralizes the fail-closed trade-ready defaults for market-data gaps, duplicate-bar handling, quarantine blocking, and futures funding coverage.
+Trade-ready runs now also inherit a binding significance floor: the runtime enables significance by default, requires a minimum observation count for statistical-significance payloads, and the trade-ready AutoML profile reports explicit underpowered-evidence reasons instead of silently treating missing confidence bounds as a generic gate failure.
 
 The shared example builders in `example_utils.py` now enable strict context-missing and futures-funding coverage policies by default. If a cross-asset leader goes stale, a futures context feed ages out, or an expected funding event is missing, the example path stops with an explicit gate failure instead of treating that unknown state as a tradable zero.
 They also set `data.duplicate_policy = "fail"`, so conflicting duplicate bars or restated timestamp collisions stop the run instead of being silently collapsed.
 They also set `data.futures_context.recent_stats_availability_lag = "period_close"`, so Binance recent-stat context is aligned to publication-safe timestamps rather than the raw interval it summarizes.
 They also default to `backtest.evaluation_mode = "research_only"`. Only the hardened trade-ready AutoML path opts into `trade_ready` evaluation with event-style execution and an explicit stress matrix.
+When you do opt into `trade_ready`, the shared runtime now defaults `data.gap_policy = "fail"`, keeps `data.duplicate_policy = "fail"`, blocks on any quarantined rows, and upgrades futures funding coverage to strict mode unless you explicitly mark the run as research-only with `backtest.research_only_override = true`.
+The hardened trade-ready AutoML profile now also sets a minimum statistical-evidence floor: certification runs require at least 64 significance observations, while `--smoke` keeps a visibly reduced 32-observation floor so local feedback stays distinct from certification-grade evidence.
+The hardened trade-ready AutoML example now also enables a blocking data-certification contract before training. That contract fails closed on market gaps, data-quality quarantine, context TTL breaches, and missing or failing configured reference validation.
+Trade-ready and AutoML runs now also auto-enable a blocking lookahead replay over the causal feature surface before training. You can still widen the audit explicitly, but the default blocking surface is limited to pre-training features so label maturation does not generate false positives.
 The hardened trade-ready AutoML override now also enables replication cohorts by default, so a candidate must survive alternate windows or sibling-symbol cohorts before it can present as promotion-ready.
-Surrogate execution remains research-only. `example_trade_ready_automl.py` now requires an explicit `backtest.research_only_override = true` before it will downgrade to that fallback path.
+The default trade-ready example now uses a stronger certification budget with higher validation-trade, replication-coverage, and post-selection requirements. If you choose `python example_trade_ready_automl.py --smoke`, the script declares the run as reduced-power and keeps that distinction visible in the AutoML summary.
+Surrogate execution remains research-only. `example_trade_ready_automl.py` no longer downgrades itself when Nautilus is unavailable; it exits early and points you to `example_automl.py` or an explicitly `research_only` config for surrogate studies.
 
 ## Installation
 

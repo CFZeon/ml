@@ -287,29 +287,141 @@ def build_futures_research_config(
     return clone_config_with_overrides(config, config_overrides)
 
 
+def build_trade_ready_runtime_overrides(*, market="spot"):
+    """Build shared fail-closed runtime overrides for trade-ready examples."""
+
+    normalized_market = str(market or "spot").strip().lower()
+    backtest_overrides = {"evaluation_mode": "trade_ready"}
+    if normalized_market != "spot":
+        backtest_overrides.update(
+            {
+                "apply_funding": True,
+                "funding_missing_policy": {
+                    "mode": "strict",
+                    "expected_interval": "8h",
+                    "max_gap_multiplier": 1.25,
+                },
+            }
+        )
+    return {
+        "data": {
+            "gap_policy": "fail",
+            "duplicate_policy": "fail",
+        },
+        "data_quality": {
+            "block_on_quarantine": True,
+        },
+        "backtest": backtest_overrides,
+    }
+
+
 def build_trade_ready_automl_overrides(
     *,
     storage_path,
     study_name,
-    n_trials=12,
+    profile="certification",
+    n_trials=None,
     seed=42,
     objective="risk_adjusted_after_costs",
-    validation_fraction=0.2,
-    locked_holdout_fraction=0.2,
-    min_validation_trade_count=20,
-    max_trials_per_model_family=12,
+    validation_fraction=None,
+    locked_holdout_fraction=None,
+    min_validation_trade_count=None,
+    max_trials_per_model_family=None,
     search_space=None,
     extra_automl_fields=None,
 ):
     """Build a hardened AutoML override block for trade-ready research runs.
 
-    This helper intentionally enables the controls that the demo-only AutoML
-    example disables: binding locked holdout checks, selection gating, and
-    post-selection inference. The search space stays constrained enough for
-    consumer hardware while still allowing the study to reject fragile winners.
-    Replication cohorts are also enabled by default so promotion-readiness is
-    judged against alternate windows or sibling symbols instead of one narrative.
+    The default `certification` profile is intended to be promotion-safe rather
+    than fast. Use `profile="smoke"` only when you explicitly want a reduced-
+    power local feedback run.
     """
+
+    profile_name = str(profile or "certification").strip().lower()
+    if profile_name in {"smoke", "demo", "reduced_power", "reduced-power"}:
+        profile_settings = {
+            "name": "smoke",
+            "reduced_power": True,
+            "n_trials": 4,
+            "validation_fraction": 0.20,
+            "locked_holdout_fraction": 0.20,
+            "min_validation_trade_count": 20,
+            "max_trials_per_model_family": 4,
+            "minimum_dsr_threshold": 0.30,
+            "max_generalization_gap": 0.25,
+            "max_param_fragility": 0.20,
+            "local_perturbation_limit": 4,
+            "replication": {
+                "alternate_window_count": 1,
+                "min_coverage": 2,
+                "min_pass_rate": 1.0,
+                "min_rows": 64,
+            },
+            "deflated_sharpe": {"min_track_record_length": 10},
+            "pbo": {"min_block_size": 5},
+            "post_selection": {
+                "max_candidates": 5,
+                "min_overlap_observations": 10,
+                "bootstrap_samples": 500,
+            },
+            "objective_gates": {
+                "min_trade_count": 20,
+                "require_statistical_significance": True,
+                "min_significance_observations": 32,
+                "min_sharpe_ci_lower": None,
+            },
+        }
+    else:
+        profile_settings = {
+            "name": "certification",
+            "reduced_power": False,
+            "n_trials": 12,
+            "validation_fraction": 0.25,
+            "locked_holdout_fraction": 0.25,
+            "min_validation_trade_count": 40,
+            "max_trials_per_model_family": 8,
+            "minimum_dsr_threshold": 0.40,
+            "max_generalization_gap": 0.20,
+            "max_param_fragility": 0.15,
+            "local_perturbation_limit": 8,
+            "replication": {
+                "alternate_window_count": 2,
+                "min_coverage": 3,
+                "min_pass_rate": 1.0,
+                "min_rows": 128,
+            },
+            "deflated_sharpe": {"min_track_record_length": 20},
+            "pbo": {"min_block_size": 8},
+            "post_selection": {
+                "max_candidates": 8,
+                "min_overlap_observations": 20,
+                "bootstrap_samples": 1000,
+            },
+            "objective_gates": {
+                "min_trade_count": 40,
+                "require_statistical_significance": True,
+                "min_significance_observations": 64,
+                "min_sharpe_ci_lower": 0.0,
+            },
+        }
+
+    resolved_n_trials = int(profile_settings["n_trials"] if n_trials is None else n_trials)
+    resolved_validation_fraction = float(
+        profile_settings["validation_fraction"] if validation_fraction is None else validation_fraction
+    )
+    resolved_locked_holdout_fraction = float(
+        profile_settings["locked_holdout_fraction"] if locked_holdout_fraction is None else locked_holdout_fraction
+    )
+    resolved_min_validation_trade_count = int(
+        profile_settings["min_validation_trade_count"]
+        if min_validation_trade_count is None
+        else min_validation_trade_count
+    )
+    resolved_max_trials_per_model_family = int(
+        profile_settings["max_trials_per_model_family"]
+        if max_trials_per_model_family is None
+        else max_trials_per_model_family
+    )
 
     constrained_search_space = {
         "features": {
@@ -337,7 +449,7 @@ def build_trade_ready_automl_overrides(
         "model": {
             "type": {"type": "categorical", "choices": ["gbm", "logistic"]},
             "gap": {"type": "categorical", "choices": [24, 48]},
-            "validation_fraction": {"type": "categorical", "choices": [validation_fraction]},
+            "validation_fraction": {"type": "categorical", "choices": [resolved_validation_fraction]},
             "meta_n_splits": {"type": "categorical", "choices": [2]},
             "params": {
                 "gbm": {
@@ -357,27 +469,41 @@ def build_trade_ready_automl_overrides(
     profile = {
         "automl": {
             "enabled": True,
-            "n_trials": int(n_trials),
+            "n_trials": resolved_n_trials,
             "seed": int(seed),
-            "validation_fraction": float(validation_fraction),
-            "minimum_dsr_threshold": 0.3,
+            "validation_fraction": resolved_validation_fraction,
+            "minimum_dsr_threshold": float(profile_settings["minimum_dsr_threshold"]),
             "locked_holdout_enabled": True,
-            "locked_holdout_fraction": float(locked_holdout_fraction),
+            "locked_holdout_fraction": resolved_locked_holdout_fraction,
             "enable_pruning": False,
             "objective": str(objective),
             "study_name": str(study_name),
             "storage": str(storage_path),
+            "trade_ready_profile": {
+                "name": profile_settings["name"],
+                "reduced_power": bool(profile_settings["reduced_power"]),
+                "promotion_safe_default": not bool(profile_settings["reduced_power"]),
+                "n_trials": resolved_n_trials,
+                "validation_fraction": resolved_validation_fraction,
+                "locked_holdout_fraction": resolved_locked_holdout_fraction,
+                "min_validation_trade_count": resolved_min_validation_trade_count,
+                "min_significance_observations": int(profile_settings["objective_gates"]["min_significance_observations"]),
+                "replication_min_coverage": int(profile_settings["replication"]["min_coverage"]),
+                "replication_alternate_window_count": int(profile_settings["replication"]["alternate_window_count"]),
+                "post_selection_bootstrap_samples": int(profile_settings["post_selection"]["bootstrap_samples"]),
+                "min_track_record_length": int(profile_settings["deflated_sharpe"]["min_track_record_length"]),
+            },
             "selection_policy": {
                 "enabled": True,
-                "max_generalization_gap": 0.25,
-                "max_param_fragility": 0.2,
+                "max_generalization_gap": float(profile_settings["max_generalization_gap"]),
+                "max_param_fragility": float(profile_settings["max_param_fragility"]),
                 "max_complexity_score": 16.0,
-                "min_validation_trade_count": int(min_validation_trade_count),
+                "min_validation_trade_count": resolved_min_validation_trade_count,
                 "require_locked_holdout_pass": True,
                 "min_locked_holdout_score": 0.0,
                 "max_feature_count_ratio": 0.75,
-                "max_trials_per_model_family": int(max_trials_per_model_family),
-                "local_perturbation_limit": 6,
+                "max_trials_per_model_family": resolved_max_trials_per_model_family,
+                "local_perturbation_limit": int(profile_settings["local_perturbation_limit"]),
                 "require_fold_stability_pass": True,
                 "required_execution_mode": "event_driven",
                 "required_stress_scenarios": ["downtime", "stale_mark", "halt"],
@@ -386,12 +512,12 @@ def build_trade_ready_automl_overrides(
                 "enabled": True,
                 "include_symbol_cohorts": True,
                 "include_window_cohorts": True,
-                "alternate_window_count": 1,
+                "alternate_window_count": int(profile_settings["replication"]["alternate_window_count"]),
                 "alternate_window_fraction": 0.5,
-                "min_coverage": 2,
-                "min_pass_rate": 1.0,
+                "min_coverage": int(profile_settings["replication"]["min_coverage"]),
+                "min_pass_rate": float(profile_settings["replication"]["min_pass_rate"]),
                 "min_score": 0.0,
-                "min_rows": 64,
+                "min_rows": int(profile_settings["replication"]["min_rows"]),
             },
             "overfitting_control": {
                 "enabled": True,
@@ -399,12 +525,12 @@ def build_trade_ready_automl_overrides(
                 "deflated_sharpe": {
                     "enabled": True,
                     "use_effective_trial_count": True,
-                    "min_track_record_length": 10,
+                    "min_track_record_length": int(profile_settings["deflated_sharpe"]["min_track_record_length"]),
                 },
                 "pbo": {
                     "enabled": True,
                     "n_blocks": 8,
-                    "min_block_size": 5,
+                    "min_block_size": int(profile_settings["pbo"]["min_block_size"]),
                     "metric": "sharpe_ratio",
                     "overlap_policy": "strict_intersection",
                     "min_overlap_fraction": 0.5,
@@ -414,14 +540,24 @@ def build_trade_ready_automl_overrides(
                     "require_pass": True,
                     "pass_rule": "spa",
                     "alpha": 0.05,
-                    "max_candidates": 5,
+                    "max_candidates": int(profile_settings["post_selection"]["max_candidates"]),
                     "correlation_threshold": 0.9,
                     "min_overlap_fraction": 0.5,
-                    "min_overlap_observations": 10,
+                    "min_overlap_observations": int(profile_settings["post_selection"]["min_overlap_observations"]),
                     "overlap_policy": "strict_intersection",
-                    "bootstrap_samples": 500,
+                    "bootstrap_samples": int(profile_settings["post_selection"]["bootstrap_samples"]),
                     "random_state": int(seed),
                 },
+            },
+            "objective_gates": {
+                "min_trade_count": int(profile_settings["objective_gates"]["min_trade_count"]),
+                "require_statistical_significance": bool(
+                    profile_settings["objective_gates"]["require_statistical_significance"]
+                ),
+                "min_significance_observations": int(
+                    profile_settings["objective_gates"]["min_significance_observations"]
+                ),
+                "min_sharpe_ci_lower": profile_settings["objective_gates"]["min_sharpe_ci_lower"],
             },
             "search_space": clone_config_with_overrides(
                 constrained_search_space,
@@ -939,7 +1075,70 @@ def print_backtest_summary(backtest):
             suffix_text = f"  {'  '.join(suffix)}" if suffix else ""
             print(f"  {label:<12}: {interval}{suffix_text}")
     elif significance.get("reason"):
-        print(f"  stats        : unavailable ({significance.get('reason')})")
+        observation_count = significance.get("observation_count")
+        min_observations = significance.get("min_observations")
+        detail = ""
+        if observation_count is not None and min_observations is not None:
+            detail = f", observations={observation_count}/{min_observations}"
+        print(f"  stats        : unavailable ({significance.get('reason')}{detail})")
+
+
+def print_data_certification_summary(certification, *, label="data cert"):
+    certification = dict(certification or {})
+    if not certification:
+        print(f"  {label:<12}: unavailable")
+        return
+
+    failed_components = (certification.get("summary") or {}).get("failed_components") or []
+    print(
+        f"  {label:<12}: "
+        f"passed={bool(certification.get('promotion_pass', True))}  "
+        f"mode={certification.get('mode')}  "
+        f"failed={failed_components if failed_components else 'none'}"
+    )
+    components = dict(certification.get("components") or {})
+    if components:
+        print(
+            "  data parts  : "
+            + "  ".join(
+                f"{name}={bool(details.get('promotion_pass', True))}"
+                for name, details in components.items()
+            )
+        )
+    reasons = list(certification.get("reasons") or [])
+    print(f"  data cert why: {reasons if reasons else 'none'}")
+
+
+def print_deployment_readiness_summary(report, *, label="deploy ready"):
+    report = dict(report or {})
+    if not report:
+        print(f"  {label:<12}: unavailable")
+        return
+
+    failed_components = (report.get("summary") or {}).get("failed_components") or []
+    print(
+        f"  {label:<12}: "
+        f"ready={bool(report.get('ready', False))}  "
+        f"action={report.get('operator_action')}  "
+        f"failed={failed_components if failed_components else 'none'}"
+    )
+
+    components = dict(report.get("components") or {})
+    if components:
+        print(
+            "  deploy parts: "
+            + "  ".join(
+                f"{name}={bool(details.get('passed', False))}"
+                for name, details in components.items()
+            )
+        )
+
+    reasons = list(report.get("reasons") or [])
+    print(f"  deploy why  : {reasons if reasons else 'none'}")
+
+    actions = list(report.get("recommended_actions") or [])
+    if actions:
+        print(f"  next actions : {actions}")
 
 
 def print_automl_summary(automl):
@@ -952,6 +1151,15 @@ def print_automl_summary(automl):
         print(f"  raw value    : {_format_metric(automl.get('best_value_raw'))}")
     print(f"  best params  : {automl.get('best_params')}")
 
+    trade_ready_profile = automl.get("trade_ready_profile") or {}
+    if trade_ready_profile:
+        print(
+            "  power profile: "
+            f"{trade_ready_profile.get('name')}  "
+            f"reduced_power={bool(trade_ready_profile.get('reduced_power', False))}  "
+            f"n_trials={trade_ready_profile.get('n_trials')}"
+        )
+
     best_training = automl.get("best_training", {})
     if best_training:
         print(
@@ -960,6 +1168,20 @@ def print_automl_summary(automl):
             f"acc={_format_metric(best_training.get('avg_accuracy'))}  "
             f"log_loss={_format_metric(best_training.get('avg_log_loss'))}"
         )
+        lookahead_guard = best_training.get("lookahead_guard") or {}
+        if lookahead_guard.get("enabled"):
+            print(
+                "  lookahead    : "
+                f"passed={bool(lookahead_guard.get('promotion_pass', True))}  "
+                f"mode={lookahead_guard.get('mode')}  "
+                f"scope={lookahead_guard.get('audit_scope')}  "
+                f"checked={lookahead_guard.get('checked_timestamps')}"
+            )
+            lookahead_reasons = list(lookahead_guard.get("reasons") or [])
+            print(f"  lookahead why: {lookahead_reasons if lookahead_reasons else 'none'}")
+        data_certification = best_training.get("data_certification") or {}
+        if data_certification:
+            print_data_certification_summary(data_certification)
 
     best_backtest = automl.get("best_backtest", {})
     if best_backtest:
@@ -989,11 +1211,13 @@ def print_automl_summary(automl):
         gates = best_objective.get("classification_gates") or {}
         if gates.get("enabled"):
             failed = gates.get("failed") or []
+            reasons = gates.get("reasons") or []
             print(
                 "  objective gate: "
                 f"passed={gates.get('passed')}  "
                 f"failed={failed if failed else 'none'}"
             )
+            print(f"  objective why: {reasons if reasons else 'none'}")
 
     best_overfitting = automl.get("best_overfitting", {}).get("deflated_sharpe", {})
     if best_overfitting:
@@ -1059,6 +1283,30 @@ def print_automl_summary(automl):
             f"stress_ready={bool(evaluation_backtest.get('stress_realism_ready', False))}  "
             f"stress_cases={stress_matrix.get('scenario_names') or 'none'}"
         )
+        evaluation_significance = dict(evaluation_backtest.get("statistical_significance") or {})
+        if evaluation_significance.get("reason"):
+            print(
+                "  eval stats   : "
+                f"unavailable ({evaluation_significance.get('reason')})  "
+                f"observations={evaluation_significance.get('observation_count')}/"
+                f"{evaluation_significance.get('min_observations')}"
+            )
+
+    monitoring_report = (
+        evaluation_backtest.get("operational_monitoring")
+        or best_backtest.get("operational_monitoring")
+        or best_training.get("operational_monitoring")
+        or {}
+    )
+    if monitoring_report:
+        monitoring_policy = dict(monitoring_report.get("policy") or {})
+        monitoring_reasons = list(monitoring_report.get("reasons") or [])
+        print(
+            "  monitoring   : "
+            f"healthy={bool(monitoring_report.get('healthy', True))}  "
+            f"profile={monitoring_policy.get('policy_profile', 'custom')}"
+        )
+        print(f"  monitoring why: {monitoring_reasons if monitoring_reasons else 'none'}")
 
     replication = automl.get("replication") or {}
     if replication.get("enabled"):

@@ -31,6 +31,44 @@ _DEFAULT_POLICY = {
     "max_signal_half_life_deterioration": np.inf,
 }
 
+_POLICY_PROFILES = {
+    "research": {},
+    "trade_ready": {
+        "max_data_lag": "2h",
+        "max_custom_ttl_breach_rate": 0.0,
+        "max_fallback_assumption_rate": 0.0,
+        "max_l2_snapshot_age": "5min",
+        "require_l2_snapshots": False,
+        "min_fill_ratio": 0.25,
+        "max_fill_ratio_deterioration": 0.10,
+        "max_slippage_gap_share": 0.50,
+        "max_slippage_drift": 0.001,
+        "max_inference_p95_ms": 250.0,
+        "max_queue_backlog": 0,
+        "require_inference_metrics": False,
+        "min_signal_decay_net_edge_at_delay": 0.0,
+        "min_signal_half_life_bars": 1.0,
+        "max_signal_delay_edge_deterioration": 0.01,
+        "max_signal_half_life_deterioration": 2.0,
+    },
+}
+
+
+def resolve_monitoring_policy(policy=None, *, default_profile="research"):
+    configured = dict(policy or {})
+    requested_profile = str(configured.get("policy_profile", default_profile or "research")).strip().lower()
+    if requested_profile not in _POLICY_PROFILES:
+        fallback_profile = str(default_profile or "research").strip().lower()
+        requested_profile = fallback_profile if fallback_profile in _POLICY_PROFILES else "research"
+
+    resolved = {
+        **_DEFAULT_POLICY,
+        **dict(_POLICY_PROFILES.get(requested_profile) or {}),
+        **configured,
+    }
+    resolved["policy_profile"] = requested_profile
+    return resolved
+
 
 def _coerce_index(value):
     if value is None:
@@ -452,8 +490,9 @@ def build_monitoring_report(
     inference_latencies_ms=None,
     queue_backlog=None,
     policy=None,
+    default_policy_profile="research",
 ):
-    resolved_policy = {**_DEFAULT_POLICY, **dict(policy or {})}
+    resolved_policy = resolve_monitoring_policy(policy, default_profile=default_policy_profile)
     if max_data_lag is not None:
         resolved_policy["max_data_lag"] = max_data_lag
 
@@ -579,5 +618,6 @@ __all__ = [
     "evaluate_l2_snapshot_age",
     "evaluate_raw_data_freshness",
     "evaluate_signal_decay_health",
+    "resolve_monitoring_policy",
     "write_monitoring_artifacts",
 ]

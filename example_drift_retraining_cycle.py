@@ -20,7 +20,7 @@ from core import (
     resolve_canonical_promotion_score,
     upsert_promotion_gate,
 )
-from example_utils import print_section
+from example_utils import print_deployment_readiness_summary, print_section
 
 
 def _fit_logistic_model():
@@ -139,7 +139,15 @@ def main():
     print(f"  new champion      : {store.get_champion(symbol)['version_id']}")
     print(f"  promotion reasons : {promoted['promotion_decision'].get('reasons')}")
 
-    print_section(sep, 2, "Rejecting a challenger and rolling back")
+    print_section(sep, 2, "Operator deployment readiness")
+    readiness = pipeline.inspect_deployment_readiness(
+        store=store,
+        backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+    )
+    print_deployment_readiness_summary(readiness)
+
+    print_section(sep, 3, "Rejecting a challenger and rolling back")
+    pipeline.state["operational_monitoring"] = {"healthy": False, "reasons": ["feature_schema"]}
     rollback_result = pipeline.run_drift_retraining_cycle(
         store=store,
         reference_features=reference_features,
@@ -147,7 +155,7 @@ def main():
         bars_since_last_retrain=900,
         scheduled_window_open=True,
         train_challenger=lambda: _make_challenger_payload(0.08, monitoring_report={"healthy": False, "reasons": ["feature_schema"]}),
-        current_monitoring_report={"healthy": False, "reasons": ["feature_schema"]},
+        current_monitoring_report=pipeline.state["operational_monitoring"],
         rollback_policy={"mode": "hybrid", "critical_reasons": ["feature_schema"]},
     )
     print(f"  retrain status    : {rollback_result['retrain_status']}")
@@ -155,6 +163,13 @@ def main():
     print(f"  rollback status   : {rollback_result['rollback'].get('status')}")
     print(f"  restored champion : {rollback_result['rollback'].get('restored_version_id')}")
     print(f"  current champion  : {store.get_champion(symbol)['version_id']}")
+
+    print_section(sep, 4, "Operator hold decision after rollback")
+    blocked_readiness = pipeline.inspect_deployment_readiness(
+        store=store,
+        backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+    )
+    print_deployment_readiness_summary(blocked_readiness)
 
     print(f"\n{sep}\nDrift retraining example complete. Registry root: {registry_root}\n{sep}")
 

@@ -3,36 +3,43 @@
 Usage
 -----
     python example_trade_ready_automl.py
+    python example_trade_ready_automl.py --smoke
 
-This example keeps the search budget constrained for consumer hardware, but it
-does enable the controls that a promotion-safe workflow needs: locked holdout,
-replication cohorts, selection gating, DSR/PBO diagnostics, binding post-selection
-inference, and explicit stress scenarios for the post-selection backtest.
-The base config requires a real Nautilus execution backend for the trade-ready
-evaluation path. When Nautilus is unavailable, the script now fails closed unless
-you explicitly opt into a research-only surrogate override.
-It may still report `promotion ok : False` if the locked holdout, execution,
-replication, or stress gates reject the candidate.
+The default run uses the stronger certification profile. `--smoke` switches to
+an explicitly reduced-power local feedback profile that is still useful for
+debugging the control flow but is not sufficient promotion evidence.
+The certification path requires a real Nautilus execution backend for the
+trade-ready evaluation path and fails closed when that backend is unavailable.
+Use `example_automl.py` for the explicit research-only surrogate path.
 """
 
+import argparse
 from pathlib import Path
 
 from core import ATR, BollingerBands, MACD, RSI, ResearchPipeline
 from core.execution import NAUTILUS_AVAILABLE
 from example_utils import (
     build_spot_research_config,
+    build_trade_ready_runtime_overrides,
     build_trade_ready_automl_overrides,
     clone_config_with_overrides,
+    print_data_certification_summary,
     print_automl_summary,
     print_section,
 )
 
 
 def build_trade_ready_example_config(*, automl_storage):
+    return _build_trade_ready_example_config(automl_storage=automl_storage, power_profile="certification")
+
+
+def _build_trade_ready_example_config(*, automl_storage, power_profile):
+    power_profile = "smoke" if str(power_profile).strip().lower() == "smoke" else "certification"
+    significance_min_observations = 32 if power_profile == "smoke" else 64
     symbol = "BTCUSDT"
     interval = "1h"
     start = "2024-01-01"
-    end = "2024-05-01"
+    end = "2024-05-01" if power_profile == "smoke" else "2024-07-01"
     context_symbols = ["ETHUSDT"]
 
     config = build_spot_research_config(
@@ -45,91 +52,79 @@ def build_trade_ready_example_config(*, automl_storage):
     )
     config = clone_config_with_overrides(
         config,
-        {
-            "data": {
-                "futures_context": {"enabled": False},
-            },
-            "features": {
-                "schema_version": "indicator_aware_v7_trade_ready_profile",
-            },
-            "signals": {
-                "policy_mode": "validation_calibrated",
-            },
-            "backtest": {
-                "engine": "pandas",
-                "signal_delay_bars": 2,
-                "evaluation_mode": "trade_ready",
-                "execution_profile": "trade_ready_event_driven",
-                "research_only_override": False,
-                "required_stress_scenarios": ["downtime", "stale_mark", "halt"],
-                "execution_policy": {
-                    "adapter": "nautilus",
-                    "time_in_force": "IOC",
-                    "participation_cap": 0.10,
-                    "min_fill_ratio": 0.25,
+        clone_config_with_overrides(
+            build_trade_ready_runtime_overrides(market="spot"),
+            {
+                "data": {
+                    "futures_context": {"enabled": False},
                 },
-                "scenario_matrix": {
-                    "downtime": {
-                        "events": [{"event_type": "downtime", "timestamp": "2024-03-05T12:00:00Z"}],
-                        "policy": {"downtime_action": "freeze"},
-                    },
-                    "stale_mark": {
-                        "events": [{"event_type": "stale_mark", "timestamp": "2024-03-12T12:00:00Z"}],
-                        "policy": {"stale_mark_action": "reject"},
-                    },
-                    "halt": {
-                        "events": [{"event_type": "halt", "start": "2024-03-19T12:00:00Z", "end": "2024-03-19T14:00:00Z"}],
-                        "policy": {},
+                "reference_data": {
+                    "enabled": True,
+                    "spot": {
+                        "venues": ["coinbase", "kraken"],
+                        "partial_coverage_mode": "blocking",
+                        "divergence_mode": "blocking",
+                        "min_coverage_ratio": 0.95,
                     },
                 },
+                "data_certification": {
+                    "enabled": True,
+                    "require_reference_validation": True,
+                },
+                "monitoring": {
+                    "policy_profile": "trade_ready",
+                },
+                "features": {
+                    "schema_version": "indicator_aware_v7_trade_ready_profile",
+                    "lookahead_guard": {
+                        "enabled": True,
+                        "mode": "blocking",
+                        "decision_sample_size": 16,
+                        "min_prefix_rows": 160,
+                        "step_names": ["build_features"],
+                        "artifact_names": ["features"],
+                    },
+                },
+                "signals": {
+                    "policy_mode": "validation_calibrated",
+                },
+                "backtest": {
+                    "engine": "pandas",
+                    "signal_delay_bars": 2,
+                    "significance": {
+                        "bootstrap_samples": 300 if power_profile == "smoke" else 1000,
+                        "min_observations": significance_min_observations,
+                    },
+                    "required_stress_scenarios": ["downtime", "stale_mark", "halt"],
+                    "execution_policy": {
+                        "adapter": "nautilus",
+                        "time_in_force": "IOC",
+                        "participation_cap": 1.0,
+                    },
+                    "scenario_matrix": {
+                        "downtime": {
+                            "events": [{"event_type": "downtime", "timestamp": "2024-03-05T12:00:00Z"}],
+                            "policy": {"downtime_action": "freeze"},
+                        },
+                        "stale_mark": {
+                            "events": [{"event_type": "stale_mark", "timestamp": "2024-03-12T12:00:00Z"}],
+                            "policy": {"stale_mark_action": "reject"},
+                        },
+                        "halt": {
+                            "events": [{"event_type": "halt", "start": "2024-03-19T12:00:00Z", "end": "2024-03-19T14:00:00Z"}],
+                            "policy": {},
+                        },
+                    },
+                },
             },
-        },
+        ),
     )
     config = clone_config_with_overrides(
         config,
         build_trade_ready_automl_overrides(
             storage_path=automl_storage,
-            study_name="BTCUSDT_1h_trade_ready_automl_v1",
-            n_trials=2,
-            search_space={
-                "features": {
-                    "lags": {"type": "categorical", "choices": ["1,4,12"]},
-                    "frac_diff_d": {"type": "categorical", "choices": [0.4]},
-                    "rolling_window": {"type": "categorical", "choices": [20]},
-                    "squeeze_quantile": {"type": "categorical", "choices": [0.2]},
-                },
-                "feature_selection": {
-                    "enabled": {"type": "categorical", "choices": [True]},
-                    "max_features": {"type": "categorical", "choices": [64]},
-                    "min_mi_threshold": {"type": "categorical", "choices": [0.0005]},
-                },
-                "labels": {
-                    "pt_mult": {"type": "categorical", "choices": [1.5]},
-                    "sl_mult": {"type": "categorical", "choices": [2.0]},
-                    "max_holding": {"type": "categorical", "choices": [24]},
-                    "min_return": {"type": "categorical", "choices": [0.0005]},
-                    "volatility_window": {"type": "categorical", "choices": [24]},
-                    "barrier_tie_break": {"type": "categorical", "choices": ["sl"]},
-                },
-                "regime": {
-                    "n_regimes": {"type": "categorical", "choices": [2]},
-                },
-                "model": {
-                    "type": {"type": "categorical", "choices": ["gbm"]},
-                    "gap": {"type": "categorical", "choices": [24]},
-                    "validation_fraction": {"type": "categorical", "choices": [0.2]},
-                    "meta_n_splits": {"type": "categorical", "choices": [2]},
-                    "params": {
-                        "gbm": {
-                            "n_estimators": {"type": "categorical", "choices": [400]},
-                            "learning_rate": {"type": "categorical", "choices": [0.05]},
-                            "max_depth": {"type": "categorical", "choices": [3]},
-                            "subsample": {"type": "categorical", "choices": [0.7]},
-                            "min_samples_leaf": {"type": "categorical", "choices": [3]},
-                        },
-                    },
-                },
-            },
+            study_name=f"BTCUSDT_1h_trade_ready_automl_{power_profile}_v1",
+            profile=power_profile,
             extra_automl_fields={
                 "seed": 42,
             },
@@ -138,87 +133,103 @@ def build_trade_ready_example_config(*, automl_storage):
     return config
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run the trade-ready AutoML certification example.")
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run the explicitly reduced-power smoke profile instead of the default certification profile.",
+    )
+    return parser.parse_args()
+
+
 def prepare_trade_ready_runtime_config(config, *, nautilus_available=NAUTILUS_AVAILABLE):
     if nautilus_available:
-        return config, False
+        return config
 
-    if not bool((config.get("backtest") or {}).get("research_only_override", False)):
-        raise RuntimeError(
-            "Trade-ready example requires NautilusTrader or backtest.research_only_override=true for an explicit research-only fallback."
-        )
-
-    runtime_config = clone_config_with_overrides(
-        config,
-        {
-            "backtest": {
-                "evaluation_mode": "research_only",
-                "execution_profile": "research_surrogate",
-                "execution_policy": {
-                    "force_simulation": True,
-                },
-            },
-            "automl": {
-                "locked_holdout_enabled": False,
-                "minimum_dsr_threshold": None,
-                "selection_policy": {
-                    "enabled": False,
-                },
-                "overfitting_control": {
-                    "enabled": False,
-                    "deflated_sharpe": {"enabled": False},
-                    "pbo": {"enabled": False},
-                    "post_selection": {"enabled": False, "require_pass": False},
-                },
-            },
-        },
+    raise RuntimeError(
+        "Trade-ready certification requires a real Nautilus backend. "
+        "Install/configure NautilusTrader and rerun example_trade_ready_automl.py, "
+        "or use example_automl.py for the explicit research-only surrogate path."
     )
-    return runtime_config, True
 
 
 def main():
+    args = parse_args()
+    power_profile = "smoke" if args.smoke else "certification"
     sep = "=" * 60
 
-    automl_storage = Path(".cache") / "automl" / "example_trade_ready_automl_v1.db"
+    automl_storage = Path(".cache") / "automl" / f"example_trade_ready_automl_{power_profile}_v1.db"
     automl_storage.parent.mkdir(parents=True, exist_ok=True)
     if automl_storage.exists():
         automl_storage.unlink()
 
-    config = build_trade_ready_example_config(automl_storage=automl_storage)
+    config = _build_trade_ready_example_config(automl_storage=automl_storage, power_profile=power_profile)
     try:
-        config, using_research_fallback = prepare_trade_ready_runtime_config(config)
+        config = prepare_trade_ready_runtime_config(config)
     except RuntimeError as exc:
         print(str(exc))
-        return
-    if using_research_fallback:
-        print("NautilusTrader is unavailable; running the hardened AutoML profile in research-only fallback mode.")
-        print("Promotion readiness will remain non-deployable until you rerun with a real Nautilus backend.")
+        raise SystemExit(2) from exc
+    trade_ready_profile = dict((config.get("automl") or {}).get("trade_ready_profile") or {})
 
     pipeline = ResearchPipeline(config)
+    monitoring_config = dict(config.get("monitoring") or {})
+    data_config = dict(config.get("data") or {})
+    data_quality_config = dict(config.get("data_quality") or {})
+    significance_config = dict((config.get("backtest") or {}).get("significance") or {})
 
-    print_section(sep, 1, "Fetching BTCUSDT spot data")
+    print_section(sep, 1, "Trade-ready profile")
+    print(f"  profile      : {trade_ready_profile.get('name')}")
+    print(f"  reduced power: {bool(trade_ready_profile.get('reduced_power', False))}")
+    print(f"  n_trials     : {trade_ready_profile.get('n_trials')}")
+    print(f"  validation bt: {trade_ready_profile.get('min_validation_trade_count')} min trades")
+    print(f"  monitoring   : {monitoring_config.get('policy_profile', 'trade_ready')}")
+    print(
+        "  stats floor  : "
+        f"min_obs={significance_config.get('min_observations', 'default')}  "
+        f"gate_obs={trade_ready_profile.get('min_significance_observations')}"
+    )
+    print(
+        "  data policy  : "
+        f"gap={data_config.get('gap_policy', 'fail')}  "
+        f"duplicate={data_config.get('duplicate_policy', 'fail')}  "
+        f"quarantine_block={bool(data_quality_config.get('block_on_quarantine', True))}"
+    )
+    if trade_ready_profile.get("reduced_power", False):
+        print("  note         : this is a reduced-power smoke run and not sufficient promotion evidence.")
+
+    print_section(sep, 2, "Fetching BTCUSDT spot data")
     data = pipeline.fetch_data()
     print(f"  rows         : {len(data)}")
     print(f"  range        : {data.index[0]} -> {data.index[-1]}")
 
-    print_section(sep, 2, "Running indicators")
+    print_section(sep, 3, "Running data-quality checks")
+    clean = pipeline.check_data_quality()
+    print(f"  clean rows   : {len(clean)}")
+
+    print_section(sep, 4, "Running indicators")
     indicator_run = pipeline.run_indicators()
     print(f"  indicators   : {[result.kind for result in indicator_run.results]}")
 
-    print_section(sep, 3, "Running trade-ready AutoML profile")
+    print_section(sep, 5, "Certifying pre-training data")
+    pipeline.build_features()
+    data_certification = pipeline.inspect_data_certification()
+    print_data_certification_summary(data_certification)
+
+    print_section(sep, 6, "Running trade-ready AutoML profile")
     automl = pipeline.run_automl()
     print_automl_summary(automl)
 
-    print_section(sep, 4, "Trade-ready interpretation")
+    print_section(sep, 7, "Trade-ready interpretation")
     print("  This profile is allowed to reject the winner.")
     print("  A best trial is not automatically a trade-ready trial.")
+    print("  A blocking data-certification contract now runs before training and backtesting.")
+    print("  A blocking lookahead replay now runs on the feature surface before training.")
     print("  Replication must also pass on alternate cohorts before promotion can succeed.")
-    if using_research_fallback:
-        print("  This run used the research-only surrogate fallback because Nautilus was unavailable.")
-        print("  The locked holdout was also disabled so the local smoke run can complete on the full sample.")
-        print("  DSR/PBO/post-selection gates were relaxed for this fallback run.")
-        print("  Re-run with a real Nautilus backend to get a true trade-ready promotion verdict.")
-    else:
-        print("  Trade-ready evaluation now requires explicit stress cases and a real Nautilus backend.")
+    if trade_ready_profile.get("reduced_power", False):
+        print("  This run used the reduced-power smoke profile, so a pass is still not certification-grade evidence.")
+    print("  Trade-ready evaluation now requires explicit stress cases, reference validation, and a real Nautilus backend.")
+    print("  Use example_automl.py when you need the explicit research-only surrogate path.")
     print("  Check 'promotion ok' and 'promotion why' before treating the model as deployable.")
 
 

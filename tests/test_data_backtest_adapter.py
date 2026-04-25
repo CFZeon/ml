@@ -765,6 +765,9 @@ class DataBacktestAdapterTest(unittest.TestCase):
         significance = result["statistical_significance"]
         self.assertFalse(significance["enabled"])
         self.assertEqual(significance["reason"], "insufficient_observations")
+        self.assertEqual(int(significance["observation_count"]), 5)
+        self.assertEqual(int(significance["min_observations"]), 8)
+        self.assertTrue(significance["underpowered"])
 
 
 if __name__ == "__main__":

@@ -1,75 +1,100 @@
 # ISSUES
 
-## Audit Findings
+## Adversarial Audit Findings
+
+Scope: repository state as of 2026-04-25.
+
+Institutional baseline used for cross-reference:
+
+- [Federal Reserve SR 11-7 / OCC 2011-12a](https://www.federalreserve.gov/boarddocs/srletters/2011/sr1107.htm): conceptual soundness, effective challenge, outcomes analysis, ongoing monitoring.
+- [ESMA MiFID II Article 17](https://www.esma.europa.eu/publications-and-data/interactive-single-rulebook/mifid-ii/article-17-algorithmic-trading): tested and resilient algo systems, thresholds and limits, monitoring, business continuity, records.
+- [NIST AI RMF 1.0](https://www.nist.gov/itl/ai-risk-management-framework): validity, reliability, data quality, governance, measurement, monitoring.
+- [Binance Spot Filters](https://developers.binance.com/docs/binance-spot-api-docs/filters), [Klines](https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints#klinecandlestick-data), [Funding History](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Get-Funding-Rate-History): exchange constraints, UTC timestamp semantics, discrete funding events.
+
+The repo is stronger than a toy trading stack: CPCV, walk-forward validation, purging/embargo logic, lookahead provocation, post-selection inference, and promotion gates all exist. The problem is that the default retail path still falls short of institutional-grade evidence because several critical controls are optional, advisory, or disabled in the common fallback path.
+
+### Highest-Impact Flaws
+
+- Critical | `example_trade_ready_automl.py` disables `locked_holdout_enabled`, `selection_policy`, DSR, PBO, and post-selection inference when Nautilus is unavailable. A profitable fallback run is not weaker certification; it is a different experiment with materially weaker protection against noise-fitting. Why it inflates performance: the strongest effective-challenge layer is removed exactly on the path most retail users will run. [SR 11-7, ESMA Art. 17]
+
+- Critical | `core/backtest.py` is still a bar surrogate by default. It rejects passive and limit orders and explicitly reports `bar_surrogate_only`, `no_queue_position_model`, `no_event_driven_ack_latency`, and `no_order_book_matching_engine`. Why it inflates performance: bar volume is treated as executable liquidity and any edge requiring maker rebates, spread capture, queue priority, or intrabar matching is untested. [ESMA Art. 17, Binance]
+
+- Critical | `core/pipeline.py` defaults `funding_missing_policy` to `zero_fill`, and aligned funding is reindexed then `fillna(0.0)`. Missing funding observations become zero carry. Why it inflates performance: futures Sharpe, Calmar, and Kelly sizing improve mechanically whenever the funding feed is incomplete. [Binance Funding History, SR 11-7]
+
+- High | `core/monitoring.py` leaves data-lag, L2-age, slippage-drift, inference-latency, queue-backlog, and signal-decay thresholds at `None`, `False`, or `inf` unless the operator overrides them. Why it gives false comfort: the system can emit live-risk telemetry without making that telemetry economically binding for selection, promotion, or shutdown. [SR 11-7, ESMA Art. 17, NIST AI RMF]
 
 ### Data Integrity & Preprocessing
 
-- Critical | Duplicate timestamp collisions are silently collapsed in `core/data.py` via `duplicated(keep="first")` before quarantine runs. If Binance restates history, cached and refetched windows disagree, or two sources collide, the conflict disappears instead of failing fast. That converts provenance corruption into apparently clean data.
+- High | `core/data.py` defaults market-data gaps to `gap_policy="warn"`. In a 24/7 crypto market, missing candles are often exchange outages, symbol halts, or data transport failures, not harmless nuisance rows. Why it invalidates conclusions: volatility, barrier timing, annualization, and slippage assumptions are biased exactly when market quality is worst. [Binance Klines, NIST AI RMF]
 
-- Critical | Derivatives "recent stats" have no publication-lag model. `openInterestHist`, `takerlongshortRatio`, `globalLongShortAccountRatio`, and `basis` are fetched in `core/context.py` by endpoint timestamp and merged with backward as-of alignment as if they are actionable immediately at that timestamp. For a retail operator on consumer hardware, that can leak end-of-period aggregates into the first bar where they could not yet be known live.
+- High | `check_data_quality()` in `core/data_quality.py` defaults `block_on_quarantine=False`, and return spikes, range spikes, quote-volume mismatches, and trade-count anomalies default to `flag` rather than removal or nulling. Why it inflates performance: the model can still train on rows already identified as suspicious. [SR 11-7, NIST AI RMF]
 
-- Critical | Context missingness can still be converted into tradable numeric states. The library default resolves `context_missing_policy` to `zero_fill`; `build_cross_asset_context_feature_block()` forward-fills when TTL is unset, and `build_multi_timeframe_context_feature_block()` ends with `.fillna(0.0)`. Missing, stale, and genuinely flat states can therefore become the same feature value.
+- High | The anomaly surface is not crypto-complete. It checks OHLC inconsistency, duplicate and retrograde timestamps, spikes, nonpositive volume, quote-volume mismatch, and trade-count anomalies, but not wash trading, spoofing, self-trade bursts, or venue migration. Why it matters: features built from `trades`, `quote_volume`, and taker-flow can learn exchange-specific abuse patterns instead of portable signal. [ESMA Art. 17, NIST AI RMF]
 
-- Critical | Futures funding is only safe when strict coverage is explicitly configured. Base backtest and model utilities still reindex missing funding to `0.0`, so API gaps or incomplete funding history undercharge one of the main short-horizon futures costs exactly when market stress is highest.
-
-- High | Exchange downtime and missing candles are permissive by default. `fetch_binance_bars(..., gap_policy="warn")` allows incomplete windows to stay in research with warnings rather than invalidating the run. In 24/7 crypto, outages and contract interruptions are part of the data-generating process, not harmless nuisance events.
-
-- High | Cross-venue validation can still pass on partial external coverage. `core/reference_data.py` only blocks partial reference coverage if configured to do so, so Binance-local distortions can survive the integrity layer while still carrying a "validated" report.
-
-- High | The quarantine layer does not address crypto-specific manipulation modes. `core/data_quality.py` checks OHLC consistency, spikes, volume, quote-volume mismatch, and trade-count anomalies, but not wash trading, spoofing, self-trade bursts, or fabricated liquidity.
+- Medium | `build_example_universe_config()` in `example_utils.py` fabricates `status="TRADING"`, fixed `listing_start="2020-01-01T00:00:00Z"`, and synthetic liquidity. Why it invalidates conclusions if reused outside demos: delistings, late listings, and historical ineligibility disappear, so survivorship bias is reintroduced. [SR 11-7]
 
 ### Feature Engineering
 
-- Critical | The highest-signal contextual features are timestamp-aligned, not causally modeled. That is not enough for endpoints whose release time lags their economic interval. A feature can be point-in-time safe on paper and still be unavailable at the actual decision time.
+- High | `core/context.py` defaults context missingness to `zero_fill`, uses backward as-of joins, and finalizes unknowns with `fillna(0.0)`. Why it inflates performance: unavailable, stale, and economically neutral states collapse to the same number, so the model can learn API gaps, stale context, or venue outages as alpha. [NIST AI RMF, SR 11-7]
 
-- High | The feature layer can manufacture stability from missingness. Zero-filled or forward-filled context creates long flat runs that the model can interpret as regime information, even when the true source is outage, sparse coverage, or stale leader data.
+- High | The shipped feature surface is still mostly endogenous transforms of one venue's own tape and context: lags, rolling windows, squeeze thresholds, regime counts, indicator interactions, and label settings. Why it is fragile: this is the exact feature family that can backfit a Binance-specific microstructure regime and disappear when liquidity mix or derivatives positioning changes. [SR 11-7]
 
-- High | AutoML does not just tune estimators; it searches feature construction, label construction, and regime specification simultaneously. Lags, fractional differencing, rolling windows, squeeze quantiles, barrier sizes, holding periods, regime count, feature-selection thresholds, model family, and hyperparameters are all in the search surface. On one symbol and one timeframe, that is a large specification search relative to the sample size.
+- Medium | Stationarity screens are being over-credited. Fractional differencing and ADF-style checks reduce trend contamination, but a stationary feature can still be regime-fragile, path-dependent, or microstructure-specific. Why it matters: stationarity is not transportability. [NIST AI RMF]
 
-### AutoML & Validation
+### AutoML Process
 
-- High | Replication is optional and off by default, including in the hardened trade-ready profile. A candidate can clear search, one contiguous validation slice, and one locked holdout without proving it survives alternate windows or related symbols.
+- High | `core/automl.py` is searching economic specifications, not just hyperparameters. It varies lags, frac-diff order, rolling windows, label barriers, holding periods, regime count, validation gap, model family, and model params. Why it inflates performance: many distinct trading theses are being tested on the same symbol and timeframe history; DSR, PBO, SPA, and post-selection inference reduce naive multiple-testing error but cannot recover causal identification after broad specification search. [SR 11-7]
 
-- High | The temporal validation leg is a single contiguous split (`n_splits=1` in the pre-holdout replay). If search, validation, and holdout all sit inside the same dominant market narrative, the winner can still be a regime-specific accident with good DSR/PBO paperwork.
+- High | The lookahead guard is mode-dependent. In `core/pipeline.py`, it auto-enables for custom builders, AutoML, or `trade_ready`, but a plain research pipeline using built-in features can still skip automatic prefix-vs-baseline replay. Why it matters: there is a gap between protected example paths and generic research runs, so leakage regressions are easier to miss. [SR 11-7, NIST AI RMF]
 
-- High | The fragility check is parameter-local only. It perturbs neighboring override values, not data revisions, timestamp jitter, fee shocks, missing-bar patterns, or liquidity shocks. A model can look stable to configuration nudges and still be brittle to the perturbations that happen live.
+- Medium | Robustness checks are mostly on-manifold. Local perturbations in `core/automl.py` vary nearby config values, not dropped bars, timestamp jitter, fee shocks, stale L2, throttling, or revised funding prints. Why it gives false robustness: the system can look stable to tuning noise while remaining brittle to operational noise. [NIST AI RMF]
 
-- High | The statistical corrections are conditional on the same historical path family. DSR, PBO, post-selection inference, and bootstrap lower bounds do reduce naive search bias, but they do not rescue omitted-variable errors like stale context, missing funding, or unrealistic fills. They can certify the wrong simulator.
+- Medium | Lenient overlap policies remain available. PBO and post-selection inference support `pairwise_overlap` and `zero_fill_debug`. Why it matters: if an operator loosens the hardened defaults, candidate return paths become easier to compare than the data actually justify. [SR 11-7]
 
-### Backtesting & Evaluation
+### Backtesting Methodology
 
-- Critical | "Event-driven" execution is still not a real matching engine in the standard setup. `core/execution/nautilus_adapter.py` is only a boundary, `requirements.txt` does not ship NautilusTrader, and the documented trade-ready example explicitly sets `force_simulation=True`. In a normal retail environment, that means the system falls back to the repo's deterministic bar surrogate.
+- High | `core/backtest.py` supports `execution_price_policy` and `valuation_price_policy` values `ffill` and `ffill_with_limit`. Why it inflates performance: stale prices can survive into fills or PnL instead of forcing rejection during outages or stale-mark windows. [ESMA Art. 17, Binance]
 
-- Critical | The fallback engine explicitly lacks the frictions that kill live crypto strategies: `no_queue_position_model`, `no_event_driven_ack_latency`, and `no_order_book_matching_engine`. Bar-level partial fills are deterministic functions of bar volume and participation caps, not of queue position, spread dynamics, or order-book state.
+- High | Stationary-bootstrap significance is enabled by default and accepts `min_observations=8`. Why it gives incorrect confidence: for sparse strategies, the effective sample size is trade count, not bar count, so confidence intervals can look tighter than the number of independent bets warrants. [SR 11-7]
 
-- High | Passive or limit behavior is not falsifiable in the default engine. The bar executor rejects non-market and non-aggressive order types, so any thesis that depends on maker rebates, spread capture, or queue priority cannot be tested here.
+- High | Kelly sizing amplifies every upstream misspecification. If calibration, slippage, funding, or fill probability are optimistic, the error is not additive; it compounds through leverage and notional sizing. Why it matters: small research bias becomes nonlinear drawdown and ruin bias. [SR 11-7]
 
-- High | Stress testing is scenario enumeration, not adversarial market replay. The trade-ready example checks three named scenarios once (`downtime`, `stale_mark`, `halt`), but liquidation cascades, funding spikes, API throttling, cross-venue dislocations, and correlated exchange failures are outside the default objective surface.
+- Medium | `requirements.txt` ships `vectorbt` but not NautilusTrader, while the fully gated trade-ready path still expects a real Nautilus backend. Why it matters: the default retail install is not the execution environment being certified. [ESMA Art. 17]
 
-- High | Confidence intervals are only as good as the execution model underneath them. A stationary-bootstrap Sharpe lower bound from a bar surrogate can still be materially too optimistic once live fills, queue loss, and endpoint latency are introduced.
+### Evaluation Metrics
+
+- High | DSR, PBO, SPA, White reality check, and bootstrap intervals can be mathematically correct about the wrong simulator. Why it matters: if the return path was generated by a bar surrogate, stale-price fill policy, or zero-filled funding, the inference is internally precise and externally wrong. [SR 11-7]
+
+- Medium | Sharpe and Calmar remain fragile to crypto data breaks. When missing candles survive as warnings and suspicious rows survive as flags, volatility, drawdown depth, and annualization are biased. Why it matters: a clean metric can be a timestamp-handling artifact rather than a real edge. [NIST AI RMF]
+
+### Out-of-Sample & Robustness
+
+- High | True OOS evidence is not the default retail experience. The repo supports locked holdouts, CPCV, purging, embargo, and post-selection inference, but the common fallback path explicitly disables the strongest subset. Why it inflates performance: users can confuse a convenient smoke run with deployable evidence. [SR 11-7, ESMA Art. 17]
+
+- High | Replication breadth is still thin relative to crypto regime diversity. The runnable trade-ready example keeps a small trial budget and limited alternate windows to stay feasible on consumer hardware. Why it matters: a pass under that budget mainly shows the stack did not reject the candidate, not that the edge survived multiple independent market narratives. [SR 11-7]
+
+- Medium | Cross-venue portability is not part of the default research path. Many examples remain Binance-only for both training and context. Why it matters: venue-specific distortions can be learned as alpha and then disappear when liquidity fragments or migrates. [NIST AI RMF, ESMA Art. 17]
 
 ### Deployment Realism
 
-- High | The main AutoML and trade-ready study paths do not automatically run drift-triggered retraining. Drift tooling exists, but it is an explicit orchestration call rather than an always-on control loop. The system can look monitored while operational behavior remains manual.
+- High | Drift handling exists as an orchestration hook, not as an autonomous live defense. `run_drift_retraining_cycle()` still needs an external caller and a scheduled window. Why it matters: the design looks adaptive, but operationally it can remain manual and delayed exactly when regime change is fastest. [SR 11-7, NIST AI RMF]
 
-- High | Consumer-hardware latency is part of research validity here, not just ops hygiene. Repeated candidate training, bootstrap significance, post-selection checks, and context fetches can finish after the state that justified the trade has already moved. A nominally adaptive system that reacts late is still stale.
+- High | Consumer-hardware latency is measured more than priced. Inference latency and queue backlog can be reported, but default thresholds are non-binding and the default simulator lacks event-driven acknowledgment latency. Why it matters: a retail machine can clear research gates on edges that vanish before the order reaches market. [ESMA Art. 17]
 
-- High | The documented trade-ready path is promotion-safe only if the operator respects the rejection signal. On a standard install it is still likely to end in surrogate execution or `promotion ok : False`. A retail user who treats the best trial as deployable anyway will be trading a model that the system itself did not certify.
+- Medium | Black-swan handling is still scenario-based rather than adversarial. Named scenarios such as downtime, stale marks, and halts are useful, but they do not cover correlated venue failure, liquidation cascades, funding spikes, or synchronized API and routing degradation. Why it matters: the system can appear stress-tested while still being blind to the failure modes that matter most in crypto. [ESMA Art. 17, NIST AI RMF]
 
-## Failure Modes
+### Failure Modes That Can Look Profitable But Fail In Production
 
-- The strategy looks profitable because missing funding during data gaps is priced as zero carry.
+- Missing funding prints are treated as zero carry, so futures strategies look cleaner than they are and size too aggressively.
 
-- It looks regime-aware because missing or stale context is numerically transformed into stable feature plateaus.
+- Bar volume is treated as executable liquidity, so aggressive entries appear fillable even when a retail trader would lose queue priority or sweep the book.
 
-- It looks point-in-time safe because timestamps are monotone, while derivatives-context endpoints are still consumed without a publication-lag model.
+- A research-only fallback run looks almost trade-ready, but the strongest OOS and multiple-testing controls were switched off.
 
-- It looks cross-venue validated even when external venue coverage is only partial.
+- A model passes DSR, PBO, SPA, or bootstrap significance, but those tests were run on a misspecified fill and cost process.
 
-- It looks statistically robust because DSR, PBO, and bootstrap lower bounds are positive, even though the live execution process was never modeled.
+- Context outages or stale joins become zeros, and the model learns operational failure states as alpha.
 
-- It looks trade-ready because the execution policy says `nautilus`, while the actual backend is still a bar surrogate on a normal retail install.
+- Synthetic universe snapshots make the requested symbols look historically tradable and liquid, masking survivorship and universe-selection bias.
 
-- It looks stable because the winner survives nearby hyperparameter perturbations, but small data revisions, bar drops, fee shocks, or liquidity shocks were never part of the fragility test.
-
-- It survives one validation slice and one locked holdout, then fails live because replication across alternate windows or symbols was never required.
+- A signal survives local hyperparameter perturbations but breaks under one missing-bar burst, one funding API gap, or one stale L2 window.

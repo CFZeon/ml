@@ -11,7 +11,6 @@ from .automl import run_automl_study
 from .backtest import kelly_fraction, run_backtest
 from .context import (
     _normalize_funding_timestamp_index,
-    _resolve_context_missing_policy,
     build_cross_asset_context_feature_block,
     build_futures_context_feature_block,
     build_multi_timeframe_context_feature_block,
@@ -76,6 +75,7 @@ from .models import (
 )
 from .monitoring import build_monitoring_report, write_monitoring_artifacts
 from .orchestration import run_drift_retraining_cycle as orchestrate_drift_retraining_cycle
+from .readiness import build_deployment_readiness_report
 from .regime import (
     build_default_regime_feature_set,
     build_regime_ablation_report,
@@ -682,61 +682,75 @@ def _resolve_backtest_liquidity_lag_bars(pipeline):
     return max(0, int(configured))
 
 
-def _resolve_pipeline_context_missing_policy(pipeline):
-    features_config = pipeline.section("features") or {}
-    configured = copy.deepcopy(features_config.get("context_missing_policy"))
-    compat_config = dict(pipeline.config.get("compat") or {})
-    legacy_missing_semantics = bool(compat_config.get("legacy_missing_semantics", False))
+def _resolve_backtest_execution_policy(pipeline):
+    backtest_config = pipeline.section("backtest") or {}
+    configured = backtest_config.get("execution_policy")
+    policy_config = (
+        dict(configured)
+        if configured is not None
+        else {
+            "adapter": backtest_config.get("execution_adapter", "bar_surrogate"),
+            "order_type": backtest_config.get("order_type", "market"),
+            "time_in_force": backtest_config.get("time_in_force", "IOC"),
+            "participation_cap": backtest_config.get("participation_cap", 1.0),
+            "min_fill_ratio": backtest_config.get("min_fill_ratio", 0.0),
+            "action_latency_bars": backtest_config.get("action_latency_bars", 0),
+            "max_order_age_bars": backtest_config.get("max_order_age_bars", 1),
+            "cancel_replace_bars": backtest_config.get("cancel_replace_bars", 1),
+            "force_simulation": backtest_config.get("force_simulation", False),
+        }
+    )
+    policy = resolve_execution_policy(policy_config)
 
-    if legacy_missing_semantics:
-        if configured is None:
-            configured = {"mode": "zero_fill"}
-        elif isinstance(configured, dict) and "mode" not in configured:
-            configured["mode"] = "zero_fill"
-
-    return _resolve_context_missing_policy(configured)
-
-
-_VALID_BACKTEST_EXECUTION_PROFILES = {"research_surrogate", "trade_ready_event_driven"}
-
-
-def _resolve_backtest_execution_profile(backtest_config):
-    evaluation_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower()
-    default_profile = "trade_ready_event_driven" if evaluation_mode == "trade_ready" else "research_surrogate"
-    execution_profile = str(backtest_config.get("execution_profile", default_profile)).strip().lower()
-    if execution_profile not in _VALID_BACKTEST_EXECUTION_PROFILES:
-        raise ValueError(
-            "backtest.execution_profile must be one of {'research_surrogate', 'trade_ready_event_driven'}"
-        )
-
-    research_only_override = bool(backtest_config.get("research_only_override", False))
-    if (
-        evaluation_mode == "trade_ready"
-        and execution_profile != "trade_ready_event_driven"
-        and not research_only_override
-    ):
+    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+    if trade_ready_mode and (policy.adapter != "nautilus" or policy.force_simulation):
+        execution_profile = str(backtest_config.get("execution_profile", "")).strip().lower()
+        research_only_override = bool(backtest_config.get("research_only_override", False))
+        if execution_profile == "research_surrogate" and research_only_override:
+            return policy.to_dict()
         raise RuntimeError(
-            "Trade-ready evaluation requires execution_profile='trade_ready_event_driven' or backtest.research_only_override=true"
+            "Trade-ready evaluation requires a Nautilus execution adapter with force_simulation=false. "
+            "Use backtest.execution_profile='research_surrogate' together with "
+            "backtest.research_only_override=true only for explicit research-only studies."
         )
-    return execution_profile
+
+    return policy.to_dict()
 
 
 def _resolve_lookahead_guard_config(pipeline):
     features_config = pipeline.section("features") or {}
+    backtest_config = pipeline.section("backtest") or {}
+    automl_config = pipeline.section("automl") or {}
     builders = list(features_config.get("builders") or [])
     configured = copy.deepcopy(features_config.get("lookahead_guard") or {})
-    enabled = bool(configured.get("enabled", True)) and bool(builders)
-    default_mode = "blocking" if builders else "advisory"
+
+    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+    automl_enabled = bool(automl_config.get("enabled", False))
+    default_enabled = bool(builders) or trade_ready_mode or automl_enabled
+    enabled = bool(configured.get("enabled", default_enabled))
+    default_mode = "blocking" if default_enabled else "advisory"
     mode = str(configured.get("mode", default_mode)).strip().lower()
     if mode not in {"blocking", "advisory"}:
         mode = default_mode
+
     return {
         "enabled": enabled,
         "mode": mode,
         "decision_sample_size": max(1, int(configured.get("decision_sample_size", 32))),
         "min_prefix_rows": max(1, int(configured.get("min_prefix_rows", 128))),
+        "step_names": list(
+            configured.get("step_names")
+            or ["build_features"]
+        ),
+        "artifact_names": list(
+            configured.get("artifact_names")
+            or ["features"]
+        ),
+        "audit_scope": str(configured.get("audit_scope", "pre_training_causal_surface")),
         "builders_present": bool(builders),
         "builder_count": int(len(builders)),
+        "trade_ready_mode": trade_ready_mode,
+        "automl_enabled": automl_enabled,
     }
 
 
@@ -748,10 +762,12 @@ def _run_pipeline_lookahead_guard(pipeline):
         "promotion_pass": True,
         "reasons": [],
         "biased_columns": [],
+        "biased_artifacts": [],
         "checked_timestamps": 0,
         "requested_timestamps": 0,
         "skipped_timestamps": [],
         "artifact_report": {},
+        "artifact_reports": {},
     }
     if not guard_config["enabled"]:
         pipeline.state["lookahead_guard_report"] = report
@@ -761,22 +777,43 @@ def _run_pipeline_lookahead_guard(pipeline):
 
     audit = run_lookahead_analysis(
         pipeline,
-        step_names=["build_features"],
-        artifact_names=["features"],
+        step_names=guard_config["step_names"],
+        artifact_names=guard_config["artifact_names"],
         sample_count=guard_config["decision_sample_size"],
         min_prefix_rows=guard_config["min_prefix_rows"],
     )
-    artifact_report = dict((audit.get("artifacts") or {}).get("features") or {})
+
+    artifact_reports = dict(audit.get("artifacts") or {})
+    biased_entries = list(audit.get("biased_columns") or [])
+    primary_artifact_name = None
+    if len(guard_config["artifact_names"]) == 1:
+        primary_artifact_name = guard_config["artifact_names"][0]
+    artifact_report = dict(artifact_reports.get(primary_artifact_name) or {}) if primary_artifact_name else artifact_reports
+
     report.update(
         {
             "has_bias": bool(audit.get("has_bias", False)),
             "promotion_pass": not bool(audit.get("has_bias", False)),
             "reasons": (["lookahead_guard_failed"] if audit.get("has_bias", False) else []),
-            "biased_columns": list(artifact_report.get("biased_columns") or []),
+            "biased_columns": sorted(
+                {
+                    str(entry.get("column"))
+                    for entry in biased_entries
+                    if entry.get("column") is not None
+                }
+            ),
+            "biased_artifacts": sorted(
+                {
+                    str(entry.get("artifact"))
+                    for entry in biased_entries
+                    if entry.get("artifact") is not None
+                }
+            ),
             "checked_timestamps": int(audit.get("checked_timestamps", 0)),
             "requested_timestamps": int(audit.get("requested_timestamps", 0)),
             "skipped_timestamps": list(audit.get("skipped_timestamps") or []),
             "artifact_report": artifact_report,
+            "artifact_reports": artifact_reports,
             "audit": audit,
         }
     )
@@ -784,55 +821,46 @@ def _run_pipeline_lookahead_guard(pipeline):
     return report
 
 
-def _resolve_backtest_execution_policy(pipeline):
-    backtest_config = pipeline.section("backtest") or {}
-    execution_profile = _resolve_backtest_execution_profile(backtest_config)
-    research_only_override = bool(backtest_config.get("research_only_override", False))
-    configured = backtest_config.get("execution_policy")
-    if configured is not None:
-        resolved_policy = resolve_execution_policy(configured)
-    else:
-        resolved_policy = resolve_execution_policy(
-            {
-                "adapter": backtest_config.get("execution_adapter", "bar_surrogate"),
-                "order_type": backtest_config.get("order_type", "market"),
-                "time_in_force": backtest_config.get("time_in_force", "IOC"),
-                "participation_cap": backtest_config.get("participation_cap", 0.10),
-                "min_fill_ratio": backtest_config.get("min_fill_ratio", 0.25),
-                "action_latency_bars": backtest_config.get("action_latency_bars", 0),
-                "max_order_age_bars": backtest_config.get("max_order_age_bars", 1),
-                "cancel_replace_bars": backtest_config.get("cancel_replace_bars", 1),
-                "force_simulation": backtest_config.get("force_simulation", False),
-            }
-        )
-
-    if (
-        execution_profile == "trade_ready_event_driven"
-        and resolved_policy.adapter != "nautilus"
-        and not research_only_override
-    ):
-        raise RuntimeError(
-            "Trade-ready evaluation requires a Nautilus execution adapter or backtest.research_only_override=true"
-        )
-    return resolved_policy.to_dict()
-
-
 def _resolve_backtest_funding_missing_policy(backtest_config):
+    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+    research_only_override = bool(backtest_config.get("research_only_override", False))
     configured = backtest_config.get("funding_missing_policy")
-    evaluation_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower()
     policy = {
-        "mode": "strict" if evaluation_mode == "trade_ready" else "zero_fill",
+        "mode": "strict" if trade_ready_mode and not research_only_override else "zero_fill",
         "expected_interval": "8h",
-        "max_gap_multiplier": 1.5,
+        "max_gap_multiplier": 1.25 if trade_ready_mode and not research_only_override else 1.5,
     }
     if isinstance(configured, str):
         policy["mode"] = configured
     elif isinstance(configured, dict):
         policy.update(configured)
+    if trade_ready_mode and not research_only_override:
+        policy["mode"] = "strict"
     policy["mode"] = str(policy.get("mode", "zero_fill")).strip().lower()
     policy["expected_interval"] = pd.Timedelta(policy.get("expected_interval", "8h"))
     policy["max_gap_multiplier"] = float(policy.get("max_gap_multiplier", 1.5))
     return policy
+
+
+def _resolve_pipeline_data_fetch_config(pipeline):
+    config = dict(pipeline.section("data") or {})
+    backtest_config = pipeline.section("backtest") or {}
+    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+    research_only_override = bool(backtest_config.get("research_only_override", False))
+    if trade_ready_mode and not research_only_override:
+        config.setdefault("gap_policy", "fail")
+        config.setdefault("duplicate_policy", "fail")
+    return config
+
+
+def _resolve_pipeline_data_quality_config(pipeline):
+    config = copy.deepcopy(pipeline.section("data_quality") or {})
+    backtest_config = pipeline.section("backtest") or {}
+    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+    research_only_override = bool(backtest_config.get("research_only_override", False))
+    if trade_ready_mode and not research_only_override:
+        config.setdefault("block_on_quarantine", True)
+    return config
 
 
 def _store_backtest_funding_report(pipeline, report):
@@ -841,6 +869,210 @@ def _store_backtest_funding_report(pipeline, report):
     context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
     context_ttl_report["backtest_funding"] = report
     pipeline.state["context_ttl_report"] = context_ttl_report
+
+
+def _append_unique_reason(reasons, value):
+    if value and value not in reasons:
+        reasons.append(value)
+
+
+def _resolve_data_certification_config(pipeline):
+    configured = copy.deepcopy(pipeline.section("data_certification") or {})
+    backtest_config = pipeline.section("backtest") or {}
+    data_config = pipeline.section("data") or {}
+    reference_config = pipeline.section("reference_data") or {}
+
+    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+    futures_context_config = dict(data_config.get("futures_context") or {})
+    cross_asset_context_config = dict(data_config.get("cross_asset_context") or {})
+    context_sources = []
+    if futures_context_config.get("enabled", True):
+        context_sources.append("futures_context")
+    if list(cross_asset_context_config.get("symbols") or []):
+        context_sources.append("cross_asset_context")
+
+    enabled = bool(configured.get("enabled", trade_ready_mode))
+    default_mode = "blocking" if trade_ready_mode else "advisory"
+    mode = str(configured.get("mode", default_mode)).strip().lower()
+    if mode not in {"blocking", "advisory", "disabled"}:
+        mode = default_mode
+
+    return {
+        "enabled": enabled and mode != "disabled",
+        "mode": mode,
+        "trade_ready_mode": trade_ready_mode,
+        "require_complete_market_data": bool(configured.get("require_complete_market_data", enabled)),
+        "require_data_quality_pass": bool(configured.get("require_data_quality_pass", enabled)),
+        "require_context_validation": bool(
+            configured.get("require_context_validation", enabled and bool(context_sources))
+        ),
+        "require_reference_validation": bool(
+            configured.get(
+                "require_reference_validation",
+                trade_ready_mode and bool(reference_config.get("enabled", False)),
+            )
+        ),
+        "context_sources": context_sources,
+        "reference_configured": bool(reference_config.get("enabled", False)),
+    }
+
+
+def _build_data_certification_report(pipeline):
+    config = _resolve_data_certification_config(pipeline)
+    report = {
+        "enabled": bool(config["enabled"]),
+        "scope": "pre_training_data_contract",
+        "mode": config["mode"],
+        "trade_ready_mode": bool(config["trade_ready_mode"]),
+        "policy": {
+            "require_complete_market_data": bool(config["require_complete_market_data"]),
+            "require_data_quality_pass": bool(config["require_data_quality_pass"]),
+            "require_context_validation": bool(config["require_context_validation"]),
+            "require_reference_validation": bool(config["require_reference_validation"]),
+            "context_sources": list(config["context_sources"]),
+        },
+        "promotion_pass": True,
+        "reason": None,
+        "reasons": [],
+        "warnings": [],
+        "summary": {
+            "failed_components": [],
+            "market_missing_rows": 0,
+            "market_duplicate_conflicts": 0,
+            "quarantined_rows": 0,
+            "context_sources_required": list(config["context_sources"]),
+            "context_sources_breached": [],
+            "reference_configured": bool(config["reference_configured"]),
+        },
+        "components": {},
+    }
+
+    if not config["enabled"]:
+        pipeline.state["data_certification"] = report
+        return report
+
+    integrity_report = dict(pipeline.state.get("data_integrity_report") or {})
+    duplicate_report = dict(integrity_report.get("duplicate_report") or {})
+    market_missing_rows = int(integrity_report.get("missing_rows") or 0)
+    market_duplicate_conflicts = int(duplicate_report.get("conflicting_duplicate_timestamps") or 0)
+    market_reasons = []
+    if not integrity_report:
+        _append_unique_reason(market_reasons, "market_data_integrity_unavailable")
+    if market_missing_rows > 0:
+        _append_unique_reason(market_reasons, "market_data_gaps_detected")
+    if market_duplicate_conflicts > 0:
+        _append_unique_reason(market_reasons, "market_data_duplicate_conflicts")
+    if integrity_report and str(integrity_report.get("status", "complete")).lower() != "complete" and market_missing_rows <= 0:
+        _append_unique_reason(market_reasons, "market_data_incomplete")
+    market_pass = bool(integrity_report) and not market_reasons
+    report["components"]["market_integrity"] = {
+        "observed": bool(integrity_report),
+        "promotion_pass": market_pass,
+        "status": integrity_report.get("status"),
+        "gap_policy": integrity_report.get("gap_policy"),
+        "duplicate_policy": integrity_report.get("duplicate_policy"),
+        "missing_rows": market_missing_rows,
+        "duplicate_conflicts": market_duplicate_conflicts,
+        "reason": market_reasons[0] if market_reasons else None,
+        "reasons": market_reasons,
+    }
+    report["summary"]["market_missing_rows"] = market_missing_rows
+    report["summary"]["market_duplicate_conflicts"] = market_duplicate_conflicts
+
+    data_quality_report = dict(pipeline.state.get("data_quality_report") or {})
+    data_quality_summary = dict(data_quality_report.get("summary") or {})
+    quarantined_rows = int(data_quality_summary.get("quarantined_rows") or 0)
+    data_quality_reasons = []
+    if not data_quality_report:
+        _append_unique_reason(data_quality_reasons, "data_quality_report_unavailable")
+    if str(data_quality_report.get("status", "pass")).lower() != "pass":
+        _append_unique_reason(data_quality_reasons, "data_quality_quarantine")
+    if quarantined_rows > 0:
+        _append_unique_reason(data_quality_reasons, "data_quality_quarantine")
+    data_quality_pass = bool(data_quality_report) and not data_quality_reasons
+    report["components"]["data_quality"] = {
+        "observed": bool(data_quality_report),
+        "promotion_pass": data_quality_pass,
+        "status": data_quality_report.get("status"),
+        "blocking": bool(data_quality_report.get("blocking", False)),
+        "quarantined_rows": quarantined_rows,
+        "action_counts": dict(data_quality_report.get("action_counts") or {}),
+        "reason": data_quality_reasons[0] if data_quality_reasons else None,
+        "reasons": data_quality_reasons,
+    }
+    report["summary"]["quarantined_rows"] = quarantined_rows
+
+    context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
+    missing_context_scopes = [scope for scope in config["context_sources"] if scope not in context_ttl_report]
+    breached_context_scopes = [
+        scope
+        for scope in config["context_sources"]
+        if scope in context_ttl_report and not bool((context_ttl_report.get(scope) or {}).get("promotion_pass", True))
+    ]
+    context_reasons = []
+    if config["require_context_validation"] and config["context_sources"] and missing_context_scopes:
+        _append_unique_reason(context_reasons, "context_ttl_unavailable")
+    if breached_context_scopes:
+        _append_unique_reason(context_reasons, "context_ttl_breached")
+    context_pass = not context_reasons
+    report["components"]["context_ttl"] = {
+        "observed": bool(context_ttl_report),
+        "promotion_pass": context_pass,
+        "required_scopes": list(config["context_sources"]),
+        "missing_scopes": missing_context_scopes,
+        "breached_scopes": breached_context_scopes,
+        "reason": context_reasons[0] if context_reasons else None,
+        "reasons": context_reasons,
+        "reports": context_ttl_report,
+    }
+    report["summary"]["context_sources_breached"] = breached_context_scopes
+
+    reference_report = dict(pipeline.state.get("reference_integrity_report") or {})
+    reference_reasons = []
+    if config["require_reference_validation"] and not config["reference_configured"]:
+        _append_unique_reason(reference_reasons, "reference_validation_unconfigured")
+    elif config["reference_configured"] and not reference_report:
+        _append_unique_reason(reference_reasons, "reference_validation_unavailable")
+    elif reference_report and not bool(reference_report.get("promotion_pass", True)):
+        for reason in list(reference_report.get("reasons") or []):
+            _append_unique_reason(reference_reasons, reason)
+        if not reference_reasons:
+            _append_unique_reason(reference_reasons, "reference_validation_failed")
+    for warning in list(reference_report.get("warnings") or []):
+        _append_unique_reason(report["warnings"], warning)
+    reference_pass = not reference_reasons
+    report["components"]["reference_integrity"] = {
+        "configured": bool(config["reference_configured"]),
+        "observed": bool(reference_report),
+        "promotion_pass": reference_pass,
+        "kind": reference_report.get("kind"),
+        "gate_mode": reference_report.get("gate_mode"),
+        "available_venue_count": reference_report.get("available_venue_count"),
+        "warnings": list(reference_report.get("warnings") or []),
+        "reason": reference_reasons[0] if reference_reasons else None,
+        "reasons": reference_reasons,
+    }
+
+    required_components = []
+    if config["require_complete_market_data"]:
+        required_components.append("market_integrity")
+    if config["require_data_quality_pass"]:
+        required_components.append("data_quality")
+    if config["require_context_validation"]:
+        required_components.append("context_ttl")
+    if config["require_reference_validation"]:
+        required_components.append("reference_integrity")
+
+    for component_name in required_components:
+        component = report["components"][component_name]
+        if not component.get("promotion_pass", True):
+            report["summary"]["failed_components"].append(component_name)
+            _append_unique_reason(report["reasons"], component.get("reason") or f"{component_name}_failed")
+
+    report["promotion_pass"] = not report["summary"]["failed_components"]
+    report["reason"] = report["reasons"][0] if report["reasons"] else None
+    pipeline.state["data_certification"] = report
+    return report
 
 
 def _align_backtest_funding_rates(funding_rates, index, policy):
@@ -924,8 +1156,7 @@ def _resolve_backtest_funding_rates(pipeline, index):
         return None
 
     funding_policy = _resolve_backtest_funding_missing_policy(backtest_config)
-    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
-    strict_funding_policy = trade_ready_mode or funding_policy["mode"] in {"strict", "preserve", "preserve_missing"}
+    strict_funding_policy = funding_policy["mode"] in {"strict", "preserve", "preserve_missing"}
     futures_context = pipeline.state.get("futures_context") or {}
     funding_frame = futures_context.get("funding")
     if funding_frame is None or funding_frame.empty or "funding_rate" not in funding_frame.columns:
@@ -996,7 +1227,7 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
     if allow_short is None:
         allow_short = market != "spot"
 
-    significance_config = backtest_config.get("significance")
+    significance_config = _resolve_backtest_significance_config(backtest_config)
     benchmark_returns = None
     if pipeline.state.get("benchmark_returns") is not None:
         benchmark_returns = pd.Series(pipeline.state["benchmark_returns"], copy=False).reindex(index)
@@ -1048,6 +1279,27 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
     }
 
 
+def _resolve_backtest_significance_config(backtest_config):
+    configured = backtest_config.get("significance")
+    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+    research_only_override = bool(backtest_config.get("research_only_override", False))
+
+    if configured is None:
+        resolved = {}
+    elif isinstance(configured, bool):
+        resolved = {"enabled": bool(configured)}
+    elif isinstance(configured, dict):
+        resolved = copy.deepcopy(configured)
+    else:
+        return configured
+
+    if trade_ready_mode and not research_only_override:
+        resolved["enabled"] = True
+        resolved.setdefault("min_observations", 32)
+
+    return resolved
+
+
 def _resolve_monitoring_reference_index(backtest_reports):
     if backtest_reports is None:
         return pd.DatetimeIndex([])
@@ -1076,6 +1328,8 @@ def _build_pipeline_operational_monitoring(
     scope="training",
 ):
     monitoring_config = dict(pipeline.section("monitoring") or {})
+    backtest_config = pipeline.section("backtest") or {}
+    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
     raw_data = pipeline.state.get("raw_data")
     raw_index = raw_data.index if isinstance(raw_data, (pd.DataFrame, pd.Series)) else pd.DatetimeIndex([])
     orderbook_depth = pipeline.state.get("orderbook_depth")
@@ -1101,6 +1355,7 @@ def _build_pipeline_operational_monitoring(
         inference_latencies_ms=inference_latencies_ms,
         queue_backlog=queue_backlog,
         policy=monitoring_config,
+        default_policy_profile="trade_ready" if trade_ready_mode else "research",
     )
     if monitoring_config.get("write_reports", True):
         symbol = pipeline.section("data").get("symbol", "run")
@@ -1111,22 +1366,6 @@ def _build_pipeline_operational_monitoring(
             run_id=f"{scope}_{symbol}_{timestamp}",
         )
     return report
-
-
-def _attach_context_ttl_to_operational_monitoring(operational_monitoring, context_ttl_report):
-    payload = dict(operational_monitoring or {})
-    reports = dict(context_ttl_report or {})
-    if not reports:
-        return payload
-
-    payload["context_ttl"] = reports
-    if not all(bool(report.get("promotion_pass", True)) for report in reports.values()):
-        payload["healthy"] = False
-        reasons = list(payload.get("reasons", []))
-        if "context_ttl_breached" not in reasons:
-            reasons.append("context_ttl_breached")
-        payload["reasons"] = reasons
-    return payload
 
 
 def _timed_inference_call(latency_store, func, *args, **kwargs):
@@ -2536,7 +2775,7 @@ class FetchDataStep(PipelineStep):
     name = "fetch_data"
 
     def run(self, pipeline):
-        config = dict(pipeline.section("data"))
+        config = _resolve_pipeline_data_fetch_config(pipeline)
         reference_config = dict(pipeline.section("reference_data") or {})
         universe_config = dict(pipeline.section("universe") or {})
         futures_context_config = dict(config.pop("futures_context", {}) or {})
@@ -2724,7 +2963,7 @@ class DataQualityStep(PipelineStep):
         _ensure_pipeline_data_contracts(pipeline)
         raw_data = pipeline.require("raw_data")
         data = pipeline.require("data")
-        config = pipeline.section("data_quality")
+        config = _resolve_pipeline_data_quality_config(pipeline)
         result = check_data_quality(raw_data, config=config)
 
         clean_raw = result.clean_frame
@@ -2815,7 +3054,6 @@ class FeaturesStep(PipelineStep):
         raw_data = pipeline.require("raw_data")
         indicator_run = pipeline.state.get("indicator_run")
         config = pipeline.section("features")
-        context_missing_policy = _resolve_pipeline_context_missing_policy(pipeline)
         feature_set = build_feature_set(
             data,
             lags=config.get("lags"),
@@ -2833,7 +3071,7 @@ class FeaturesStep(PipelineStep):
             pipeline.state.get("futures_context"),
             rolling_window=config.get("rolling_window", 20),
             ttl_config=config.get("futures_context_ttl"),
-            missing_policy=context_missing_policy,
+            missing_policy=config.get("context_missing_policy"),
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, futures_context_block)
         ttl_report = dict((futures_context_block.metadata or {}).get("ttl_report") or {})
@@ -2847,7 +3085,7 @@ class FeaturesStep(PipelineStep):
             pipeline.state.get("cross_asset_context"),
             rolling_window=config.get("rolling_window", 20),
             ttl_config=config.get("cross_asset_context_ttl"),
-            missing_policy=context_missing_policy,
+            missing_policy=config.get("context_missing_policy"),
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, cross_asset_context_block)
         ttl_report = dict((cross_asset_context_block.metadata or {}).get("ttl_report") or {})
@@ -2914,6 +3152,12 @@ class FeaturesStep(PipelineStep):
         pipeline.state["feature_metadata"] = feature_metadata
         pipeline.state["feature_family_summary"] = summarize_feature_families(feature_blocks, columns=features.columns)
         pipeline.state["features"] = features
+        data_certification = _build_data_certification_report(pipeline)
+        if data_certification.get("enabled") and data_certification.get("mode") == "blocking" and not data_certification.get("promotion_pass", True):
+            raise RuntimeError(
+                "Data certification failed: "
+                + ", ".join(data_certification.get("reasons") or ["data_certification_failed"])
+            )
         return features
 
 
@@ -3242,12 +3486,14 @@ class TrainModelsStep(PipelineStep):
         lookahead_guard_report = _run_pipeline_lookahead_guard(pipeline)
         if lookahead_guard_report.get("enabled", False) and not lookahead_guard_report.get("promotion_pass", True):
             if lookahead_guard_report.get("mode") == "blocking":
-                raise RuntimeError("Lookahead guard failed: custom feature builders are not causally safe")
+                raise RuntimeError("Lookahead guard failed: pre-training artifacts are not causally safe")
 
-        context_missing_policy = _resolve_pipeline_context_missing_policy(pipeline)
-        context_missing_mode = str(context_missing_policy.get("mode", "preserve_missing")).strip().lower()
-        trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
-        if trade_ready_mode or context_missing_mode in {"preserve", "preserve_missing", "strict"}:
+        context_missing_policy = pipeline.section("features").get("context_missing_policy")
+        if isinstance(context_missing_policy, dict):
+            context_missing_mode = str(context_missing_policy.get("mode", "zero_fill")).strip().lower()
+        else:
+            context_missing_mode = str(context_missing_policy or "zero_fill").strip().lower()
+        if context_missing_mode in {"preserve", "preserve_missing", "strict"}:
             context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
             breached_scopes = [
                 scope for scope, report in context_ttl_report.items()
@@ -3956,6 +4202,7 @@ class TrainModelsStep(PipelineStep):
         )
         signal_decay = _build_signal_decay_report_for_segments(pipeline, signal_decay_segments, holding_bars)
         context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
+        data_certification_report = dict(pipeline.state.get("data_certification") or {})
         operational_monitoring = _build_pipeline_operational_monitoring(
             pipeline,
             backtest_reports=fold_backtest_reports,
@@ -3967,10 +4214,19 @@ class TrainModelsStep(PipelineStep):
             scope="training",
         )
         if context_ttl_report:
-            operational_monitoring = _attach_context_ttl_to_operational_monitoring(
-                operational_monitoring,
-                context_ttl_report,
-            )
+            operational_monitoring["context_ttl"] = context_ttl_report
+            if not all(bool(report.get("promotion_pass", True)) for report in context_ttl_report.values()):
+                operational_monitoring["healthy"] = False
+                reasons = list(operational_monitoring.get("reasons", []))
+                if "context_ttl_breached" not in reasons:
+                    reasons.append("context_ttl_breached")
+                operational_monitoring["reasons"] = reasons
+        if data_certification_report and not bool(data_certification_report.get("promotion_pass", True)):
+            operational_monitoring["healthy"] = False
+            reasons = list(operational_monitoring.get("reasons", []))
+            if "data_certification_failed" not in reasons:
+                reasons.append("data_certification_failed")
+            operational_monitoring["reasons"] = reasons
         fold_stability = _build_fold_stability_summary(
             fold_metrics,
             fold_backtests,
@@ -4058,14 +4314,15 @@ class TrainModelsStep(PipelineStep):
             "feature_family_diagnostics": feature_family_diagnostics,
             "feature_portability_diagnostics": feature_portability_diagnostics,
             "cross_venue_integrity": reference_integrity_report,
+            "data_certification": data_certification_report,
             "signal_decay": signal_decay,
+            "lookahead_guard": lookahead_guard_report,
             "feature_governance": {
                 "mode": "fold_local",
                 "retirement": pipeline.state.get("feature_retirement", {}),
                 "admission_summary": feature_admission_summary,
                 "folds": fold_feature_governance,
             },
-            "lookahead_guard": lookahead_guard_report,
             "operational_monitoring": operational_monitoring,
             "context_ttl_report": context_ttl_report,
             "promotion_gates": {
@@ -4074,6 +4331,7 @@ class TrainModelsStep(PipelineStep):
                 "regime_stability": bool(regime_ablation_summary.get("promotion_pass", True)),
                 "operational_health": bool(operational_monitoring.get("healthy", True)),
                 "cross_venue_integrity": bool(reference_integrity_report.get("promotion_pass", True)),
+                "data_certification": bool(data_certification_report.get("promotion_pass", True)),
                 "signal_decay": bool(signal_decay.get("promotion_pass", True)),
                 "lookahead_guard": bool(lookahead_guard_report.get("promotion_pass", True)),
             },
@@ -4312,6 +4570,8 @@ class BacktestStep(PipelineStep):
             backtest["signal_decay"] = dict(training.get("signal_decay") or {})
             if pipeline.state.get("reference_integrity_report") is not None:
                 backtest["cross_venue_integrity"] = dict(pipeline.state.get("reference_integrity_report") or {})
+            if pipeline.state.get("data_certification") is not None:
+                backtest["data_certification"] = dict(pipeline.state.get("data_certification") or {})
             pipeline.state["operational_monitoring"] = monitoring_report
             pipeline.state["backtest"] = backtest
             return backtest
@@ -4351,6 +4611,8 @@ class BacktestStep(PipelineStep):
         backtest["signal_decay"] = signal_decay_report
         if pipeline.state.get("reference_integrity_report") is not None:
             backtest["cross_venue_integrity"] = dict(pipeline.state.get("reference_integrity_report") or {})
+        if pipeline.state.get("data_certification") is not None:
+            backtest["data_certification"] = dict(pipeline.state.get("data_certification") or {})
         diagnostic_paths = (signal_state.get("diagnostic_validation") or {}).get("paths") or []
         if diagnostic_paths:
             path_backtests = _run_path_backtests(pipeline, config, diagnostic_paths)
@@ -4420,6 +4682,9 @@ class ResearchPipeline:
 
     def build_features(self):
         return self.run_step("build_features")
+
+    def inspect_data_certification(self):
+        return _build_data_certification_report(self)
 
     def run_automl(self):
         return self.run_step("run_automl")
@@ -4514,6 +4779,43 @@ class ResearchPipeline:
         )
         self.state["drift_cycle"] = result
         return result
+
+    def inspect_deployment_readiness(
+        self,
+        *,
+        store,
+        symbol=None,
+        version_id=None,
+        monitoring_report=None,
+        drift_cycle=None,
+        backend_status=None,
+        policy=None,
+    ):
+        resolved_symbol = symbol or self.section("data").get("symbol")
+        if not resolved_symbol:
+            raise ValueError("inspect_deployment_readiness requires a symbol or data.symbol")
+
+        training = dict(self.state.get("training") or {})
+        if monitoring_report is None:
+            monitoring_report = (
+                self.state.get("operational_monitoring")
+                or (self.state.get("backtest") or {}).get("operational_monitoring")
+                or training.get("operational_monitoring")
+            )
+        if drift_cycle is None:
+            drift_cycle = self.state.get("drift_cycle")
+
+        report = build_deployment_readiness_report(
+            store=store,
+            symbol=resolved_symbol,
+            version_id=version_id,
+            monitoring_report=monitoring_report,
+            drift_cycle=drift_cycle,
+            backend_status=backend_status,
+            policy=policy,
+        )
+        self.state["deployment_readiness"] = report
+        return report
 
     def run(self):
         for step in self.steps:

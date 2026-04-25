@@ -21,8 +21,8 @@ Use this map instead of scanning every example manually.
 | Conservative futures research baseline | `example_futures.py` | Shows mark-price valuation, funding, and liquidation-aware futures setup |
 | Attach custom exogenous data | `example_custom_data.py` | Demonstrates point-in-time-safe custom data joins |
 | Run an offline deterministic case | `example_synthetic_derivatives.py` | Seeds `pipeline.state` directly and avoids network fetches |
-| Run trade-ready AutoML research | `example_trade_ready_automl.py` | Uses the hardened AutoML profile with locked holdout, replication cohorts, binding selection gates, and promotion-readiness reporting; if Nautilus is unavailable, it fails closed unless you explicitly enable a labeled research-only override |
-| Run drift-governed retraining flow | `example_drift_retraining_cycle.py` | Shows champion/challenger registration, scheduled retraining, and hybrid rollback |
+| Run trade-ready AutoML research | `example_trade_ready_automl.py` | Uses the stronger certification profile with locked holdout, replication cohorts, blocking feature-surface lookahead certification, binding selection gates, and promotion-readiness reporting; add `--smoke` for the explicitly reduced-power local feedback mode |
+| Run drift-governed retraining flow | `example_drift_retraining_cycle.py` | Shows champion/challenger registration, scheduled retraining, hybrid rollback, and the final operator deploy/hold decision |
 | Run AutoML smoke/demo path | `example_automl.py` | Shows the searchable config surface quickly, but intentionally disables promotion-safe controls |
 | Explore FVG-specific features | `example_fvg.py` | Narrow feature example; useful as a feature smoke test |
 | Explore wider indicator families | `example_trend_volume_spot.py` and `example_trend_breakout_futures.py` | Show how to widen the indicator stack without changing the rest of the pipeline |
@@ -35,6 +35,7 @@ Start from the shared builders in `example_utils.py`:
 
 - `build_spot_research_config(...)`
 - `build_futures_research_config(...)`
+- `build_trade_ready_runtime_overrides(market="spot" | "um_futures")`
 - `clone_config_with_overrides(base_config, overrides)`
 - `build_custom_data_entry(...)`
 - `seed_offline_pipeline_state(...)`
@@ -45,18 +46,16 @@ The shared builders now include strict context and funding integrity guardrails 
 They also set `data.duplicate_policy = "fail"`, so conflicting duplicate market bars raise immediately instead of being silently de-duplicated.
 They also set `data.futures_context.recent_stats_availability_lag = "period_close"`, so recent Binance futures statistics are indexed at publication-safe timestamps instead of the interval they summarize.
 They also default to `backtest.evaluation_mode = "research_only"`, so a normal builder-based example is explicitly research-grade unless you promote it to a trade-ready evaluation profile.
+If you promote a config to `trade_ready`, use `build_trade_ready_runtime_overrides(...)` as the short diff. That shared helper sets fail-closed gap handling, duplicate-bar blocking, quarantine blocking, and strict futures funding coverage in one place instead of re-stating those guards per example.
+Trade-ready runtime resolution now also forces statistical significance back on and applies a minimum observation floor unless you explicitly set `backtest.research_only_override = true` for a research-grade exception.
+The hardened trade-ready profile now also builds a single data-certification verdict before training. That report binds market gaps, data-quality quarantine, context TTL breaches, and configured reference validation into one blocking trade-ready gate.
+Trade-ready and AutoML runs now auto-enable a blocking baseline-vs-prefix lookahead replay over the causal feature surface before training. If you widen the audit manually, keep in mind that labels are meant to mature with future bars and are not part of the default blocking surface.
+The hardened trade-ready AutoML override now defaults to a stronger certification budget: more validation-trade evidence, wider replication coverage, and heavier post-selection diagnostics than the smoke path.
 The hardened trade-ready AutoML override also enables replication cohorts by default, so promotion-readiness is checked on alternate windows or sibling symbols instead of a single holdout narrative.
-That hardened trade-ready config still requires a real Nautilus backend. The shipped `example_trade_ready_automl.py` runner now fails closed unless you explicitly set `backtest.research_only_override = true` for a labeled research-only fallback.
-
-## Hardened Defaults Migration
-
-The remediation cycle changed several defaults that older local configs may have relied on.
-
-1. AutoML now defaults to the hardened promotion policy profile. Locked-holdout and post-selection failures block promotion unless you explicitly opt into `automl.policy_profile = "legacy_permissive"`.
-2. Context features now default to `preserve_missing` semantics with unknown-state indicators instead of zero-filling stale or missing context. If you intentionally want legacy smoke-test behavior, set `compat.legacy_missing_semantics = true` or override `features.context_missing_policy.mode = "zero_fill"`.
-3. Trade-ready backtests now default to strict futures funding coverage and fail closed on surrogate execution. If you want a surrogate study, keep `backtest.evaluation_mode = "research_only"` or set `backtest.research_only_override = true` explicitly.
-4. Custom `features.builders` now trigger an automatic lookahead provocation audit before training. Builder leaks block training in blocking mode and still surface as promotion blockers in advisory mode.
-5. Objective evidence gates are materially stricter by default and can optionally require lower confidence bounds for Sharpe and net profit.
+The hardened trade-ready AutoML profile now also separates statistical evidence floors by power profile: certification uses a 64-observation significance floor, while `--smoke` keeps a visibly lower 32-observation floor and surfaces underpowered-evidence reasons in the summary.
+If you intentionally choose `python example_trade_ready_automl.py --smoke`, the script prints `reduced power: True` before running and keeps that label in the resulting AutoML summary.
+That hardened trade-ready config now fails closed without a real Nautilus backend. Use `example_automl.py` when you need the explicit research-only surrogate path locally.
+It also auto-applies the `trade_ready` monitoring profile, so the certification path no longer inherits the permissive research monitoring defaults.
 
 ## Build A New Real-Data Case
 
@@ -131,12 +130,16 @@ If you intentionally want the old permissive smoke-test behavior, override these
 If you want a trade-ready evaluation instead of a research-only one, add these explicitly:
 
 1. set `backtest.evaluation_mode` to `trade_ready`
-2. set `backtest.execution_profile` to `trade_ready_event_driven`
-3. use a real Nautilus execution policy such as `{"adapter": "nautilus", ...}` and do not set `force_simulation`
-4. provide `backtest.scenario_matrix` with named stress cases such as `downtime`, `stale_mark`, and `halt`
-5. set `backtest.required_stress_scenarios` so the promotion gate knows which cases are mandatory
+2. use a real Nautilus execution policy such as `{"adapter": "nautilus", ...}` and do not set `force_simulation`
+3. enable `reference_data` and configure blocking coverage/divergence rules for the venues you trust
+4. enable `data_certification` if your config does not already do so and keep it in blocking mode for trade-ready runs
+5. provide `backtest.scenario_matrix` with named stress cases such as `downtime`, `stale_mark`, and `halt`
+6. set `backtest.required_stress_scenarios` so the promotion gate knows which cases are mandatory
+7. set `monitoring.policy_profile` to `trade_ready` if you want the config to declare the binding monitoring profile explicitly; the pipeline will now auto-apply that profile for `trade_ready` runs when you omit it
+8. keep `backtest.research_only_override` unset unless you intentionally want research-grade leniency; the runtime now uses that flag to decide whether trade-ready funding, gap, and quarantine defaults should stay fail-closed
+9. set `backtest.significance.min_observations` only if you intentionally want a different evidence floor; otherwise the runtime will apply the trade-ready default and the AutoML summary will report underpowered significance explicitly
 
-If you only want a surrogate execution study, keep `backtest.evaluation_mode = "research_only"` and set `execution_policy.force_simulation = true` explicitly. If you start from the hardened trade-ready example, you must also set `backtest.research_only_override = true` before it will downgrade to that labeled fallback path.
+If you only want a surrogate execution study, keep `backtest.evaluation_mode = "research_only"` and set `execution_policy.force_simulation = true` explicitly. `example_trade_ready_automl.py` will not make that downgrade for you anymore; it fails closed and you should use `example_automl.py` or your own explicitly research-only config instead.
 
 Minimal pattern:
 
@@ -243,6 +246,7 @@ Use `example_synthetic_derivatives.py` as the working reference.
 ## Run Drift-Governed Retraining
 
 Use `example_drift_retraining_cycle.py` when you want the operational path from drift signal to challenger decision.
+The example now ends with `ResearchPipeline.inspect_deployment_readiness(...)`, which turns the promoted champion, current monitoring state, drift outcome, backend status, and rollback availability into one explicit deploy-or-hold verdict.
 
 The important runtime pieces are:
 
@@ -253,6 +257,13 @@ The important runtime pieces are:
 5. a rollback policy for critical degradation
 
 `ResearchPipeline.run_drift_retraining_cycle(...)` is the pipeline-facing wrapper around the tested orchestration function. It will reuse current pipeline state for `X`, OOS probabilities, equity-curve performance, and operational monitoring when those are already populated.
+`ResearchPipeline.inspect_deployment_readiness(...)` is the follow-up operator gate. It reuses current pipeline monitoring and drift state, then checks five blocking surfaces before a deploy decision is considered ready:
+
+1. the target version is an approved champion
+2. operational monitoring is healthy enough for deployment
+3. drift is not actively demanding a retrain, or the latest drift-triggered retrain already produced a promoted challenger
+4. the required execution backend is available
+5. at least one rollback candidate is archived and ready
 
 Consumer-hardware scheduling assumptions:
 
@@ -262,6 +273,13 @@ Consumer-hardware scheduling assumptions:
 4. use `hybrid` rollback mode so only critical degradation auto-rolls back without human review
 
 That keeps the drift loop resumable and comparable without turning every small wobble into a full retrain.
+
+The intended operator handoff is now:
+
+1. certify the strategy candidate with `example_trade_ready_automl.py`
+2. register and promote the approved champion
+3. run scheduled or drift-triggered retraining through `example_drift_retraining_cycle.py`
+4. call `inspect_deployment_readiness(...)` before any live-facing deploy decision
 
 ## Turn A Scenario Into A Test Case
 

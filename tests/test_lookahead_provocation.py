@@ -91,6 +91,32 @@ class LookaheadProvocationTest(unittest.TestCase):
         self.assertEqual(report["artifacts"]["features"]["biased_columns"], [])
         self.assertEqual(report["artifacts"]["features"]["mismatch_count"], 0)
 
+    def test_trade_ready_pipeline_auto_enables_pre_training_lookahead_guard(self):
+        raw = self._make_raw(seed=24)
+        pipeline = self._make_pipeline(raw)
+        pipeline.config["backtest"]["evaluation_mode"] = "trade_ready"
+        pipeline.config["features"]["lookahead_guard"] = {
+            "decision_sample_size": 8,
+            "min_prefix_rows": 80,
+        }
+
+        pipeline.build_features()
+        pipeline.detect_regimes()
+        pipeline.build_labels()
+        pipeline.align_data()
+        training = pipeline.train_models()
+
+        report = training["lookahead_guard"]
+        self.assertTrue(report["enabled"])
+        self.assertEqual(report["mode"], "blocking")
+        self.assertEqual(report["audit_scope"], "pre_training_causal_surface")
+        self.assertTrue(report["trade_ready_mode"])
+        self.assertFalse(report["builders_present"])
+        self.assertTrue(report["promotion_pass"])
+        self.assertEqual(report["biased_columns"], [])
+        self.assertEqual(sorted(report["artifact_reports"].keys()), ["features"])
+        self.assertTrue(training["promotion_gates"]["lookahead_guard"])
+
     def test_default_audit_surface_reports_probabilities_signals_and_execution_inputs(self):
         raw = self._make_raw(seed=7)
         pipeline = self._make_pipeline(raw)

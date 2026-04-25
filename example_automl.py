@@ -5,8 +5,10 @@ Usage
     python example_automl.py
 
 This example is intentionally optimized for short demo/runtime feedback, not for
-promotion-safe model selection. For the hardened research path, use
-example_trade_ready_automl.py instead.
+promotion-safe model selection. It is also the explicit research-only surrogate
+path when you do not have a real Nautilus backend available locally. For the
+trade-ready certification path, use example_trade_ready_automl.py with a real
+Nautilus backend.
 """
 
 from pathlib import Path
@@ -38,7 +40,8 @@ def main():
     context_symbols = ["ETHUSDT"]
 
     print("This is the demo AutoML workflow. It intentionally disables holdout and overfitting gates for speed.")
-    print("Use example_trade_ready_automl.py when you want the hardened research profile.")
+    print("It is the explicit research-only surrogate path when Nautilus is unavailable locally.")
+    print("Use example_trade_ready_automl.py only when you want the fail-closed certification path with a real Nautilus backend.")
 
     automl_storage = Path(".cache") / "automl" / "example_automl_v3.db"
     automl_storage.parent.mkdir(parents=True, exist_ok=True)

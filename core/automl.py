@@ -559,6 +559,7 @@ def _summarize_training(training):
     feature_governance = training.get("feature_governance") or {}
     operational_monitoring = training.get("operational_monitoring") or {}
     cross_venue_integrity = training.get("cross_venue_integrity") or {}
+    data_certification = training.get("data_certification") or {}
     signal_decay = training.get("signal_decay") or {}
     return {
         "avg_accuracy": primary_training.get("avg_accuracy"),
@@ -602,6 +603,7 @@ def _summarize_training(training):
             "divergence": cross_venue_integrity.get("divergence", {}),
             "overlay_columns": list(cross_venue_integrity.get("overlay_columns", [])),
         },
+        "data_certification": data_certification,
         "signal_decay": signal_decay,
         "promotion_gates": training.get("promotion_gates", {}),
         "fold_stability": primary_training.get("fold_stability", training.get("fold_stability")),
@@ -1355,6 +1357,7 @@ _HARDENED_DEFAULT_SELECTION_GATE_MODES = {
     "replication": "blocking",
     "execution_realism": "blocking",
     "stress_realism": "blocking",
+    "data_certification": "blocking",
     "param_fragility": "blocking",
     "lookahead_guard": "blocking",
 }
@@ -2348,6 +2351,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         feature_admission_summary = dict((training_summary.get("feature_governance") or {}).get("admission_summary") or {})
         feature_portability_diagnostics = dict(training_summary.get("feature_portability_diagnostics") or {})
         cross_venue_integrity = dict(training_summary.get("cross_venue_integrity") or {})
+        data_certification = dict(training_summary.get("data_certification") or {})
         signal_decay = dict(training_summary.get("signal_decay") or {})
         regime_ablation_summary = dict((training_summary.get("regime") or {}).get("ablation_summary") or {})
         operational_monitoring = dict(training_summary.get("operational_monitoring") or {})
@@ -2356,6 +2360,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         regime_stability_pass = bool(promotion_gates.get("regime_stability", True))
         operational_health_pass = bool(promotion_gates.get("operational_health", True))
         cross_venue_integrity_pass = bool(promotion_gates.get("cross_venue_integrity", True))
+        data_certification_pass = bool(promotion_gates.get("data_certification", data_certification.get("promotion_pass", True)))
         signal_decay_pass = bool(promotion_gates.get("signal_decay", signal_decay.get("promotion_pass", True)))
 
         eligibility_checks = {
@@ -2384,6 +2389,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "regime_stability": regime_stability_pass,
             "operational_health": operational_health_pass,
             "cross_venue_integrity": cross_venue_integrity_pass,
+            "data_certification": data_certification_pass,
             "signal_decay": signal_decay_pass,
             "fold_stability": bool(fold_stability_gate["passed"] or not fold_stability_gate["applies"]),
             "param_fragility": None,
@@ -2502,6 +2508,14 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                     "threshold": True,
                     "reason": None if eligibility_checks["cross_venue_integrity"] else _first_failure_reason(cross_venue_integrity, "cross_venue_integrity_failed"),
                     "details": cross_venue_integrity,
+                },
+                {
+                    "name": "data_certification",
+                    "passed": eligibility_checks["data_certification"],
+                    "measured": data_certification.get("promotion_pass"),
+                    "threshold": True,
+                    "reason": None if eligibility_checks["data_certification"] else _first_failure_reason(data_certification, "data_certification_failed"),
+                    "details": data_certification,
                 },
                 {
                     "name": "signal_decay",
@@ -2715,6 +2729,8 @@ def _resolve_objective_gates(automl_config, objective_name):
             "max_log_loss": None,
             "max_calibration_error": None,
             "min_trade_count": None,
+            "require_statistical_significance": False,
+            "min_significance_observations": None,
             "min_sharpe_ci_lower": None,
             "min_net_profit_pct_ci_lower": None,
         }
@@ -2724,6 +2740,8 @@ def _resolve_objective_gates(automl_config, objective_name):
         "max_log_loss": _coerce_float(gate_config.get("max_log_loss", 0.78)),
         "max_calibration_error": _coerce_float(gate_config.get("max_calibration_error", 0.15)),
         "min_trade_count": int(gate_config.get("min_trade_count", 30)),
+        "require_statistical_significance": bool(gate_config.get("require_statistical_significance", False)),
+        "min_significance_observations": _coerce_float(gate_config.get("min_significance_observations")),
         "min_sharpe_ci_lower": _coerce_float(gate_config.get("min_sharpe_ci_lower")),
         "min_net_profit_pct_ci_lower": _coerce_float(gate_config.get("min_net_profit_pct_ci_lower")),
     }
@@ -2750,6 +2768,7 @@ def _evaluate_objective_gates(training, backtest, automl_config, objective_name)
         "enabled": bool(gates.get("enabled", False)),
         "passed": True,
         "failed": [],
+        "reasons": [],
         "checks": {},
     }
     if not report["enabled"]:
@@ -2759,6 +2778,10 @@ def _evaluate_objective_gates(training, backtest, automl_config, objective_name)
     log_loss_value = _resolve_metric(training, "avg_log_loss")
     calibration_error = _resolve_metric(training, "avg_calibration_error")
     trade_count = _coerce_float((backtest or {}).get("total_trades"))
+    significance = (backtest or {}).get("statistical_significance") or {}
+    significance_enabled = bool(significance.get("enabled", False))
+    significance_reason = str(significance.get("reason") or "").strip().lower() or None
+    significance_observation_count = _coerce_float(significance.get("observation_count"))
     sharpe_ci_lower = _coerce_float(
         ((
             (_get_significance_payload(backtest, "sharpe_ratio") or {}).get("confidence_interval")
@@ -2794,6 +2817,29 @@ def _evaluate_objective_gates(training, backtest, automl_config, objective_name)
             minimum=float(gates.get("min_trade_count")) if gates.get("min_trade_count") is not None else None,
         ),
     }
+    if gates.get("require_statistical_significance"):
+        checks["statistical_significance"] = {
+            "name": "statistical_significance",
+            "value": significance_enabled,
+            "minimum": True,
+            "maximum": None,
+            "passed": bool(significance_enabled),
+            "reason": None if significance_enabled else f"statistical_significance_{significance_reason or 'unavailable'}",
+        }
+    if gates.get("min_significance_observations") is not None:
+        required_observations = float(gates.get("min_significance_observations"))
+        observations_pass = (
+            significance_observation_count is not None
+            and significance_observation_count >= required_observations
+        )
+        checks["significance_observation_count"] = {
+            "name": "significance_observation_count",
+            "value": significance_observation_count,
+            "minimum": required_observations,
+            "maximum": None,
+            "passed": bool(observations_pass),
+            "reason": None if observations_pass else "statistical_significance_underpowered",
+        }
     if gates.get("min_sharpe_ci_lower") is not None:
         checks["sharpe_ci_lower"] = _build_gate_result(
             "sharpe_ci_lower",
@@ -2808,6 +2854,11 @@ def _evaluate_objective_gates(training, backtest, automl_config, objective_name)
         )
     report["checks"] = checks
     report["failed"] = [name for name, payload in checks.items() if not payload["passed"]]
+    report["reasons"] = [
+        payload.get("reason") or name
+        for name, payload in checks.items()
+        if not payload["passed"]
+    ]
     report["passed"] = not report["failed"]
     return report
 
@@ -3622,6 +3673,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "storage": str(storage_path),
         "objective": objective_name,
         "policy_profile": policy_profile,
+        "trade_ready_profile": _json_ready((base_config.get("automl") or {}).get("trade_ready_profile") or {}),
         "warnings": summary_warnings,
         "selection_metric": selection_report["selection_metric"],
         "selection_mode": selection_report["selection_mode"],
