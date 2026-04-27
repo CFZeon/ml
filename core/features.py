@@ -53,6 +53,15 @@ class BuiltFeatureSet:
     feature_blocks: dict[str, str]
     feature_families: dict[str, str] = field(default_factory=dict)
     feature_lineage: dict[str, dict] = field(default_factory=dict)
+    feature_availability: dict[str, dict] = field(default_factory=dict)
+
+
+@dataclass
+class FeatureAvailabilityFrame:
+    event_timestamp: str = "index"
+    available_timestamp: str = "index"
+    source: str = "unknown"
+    join_mode: str = "same_index"
 
 
 @dataclass
@@ -87,8 +96,34 @@ def derive_feature_families(feature_blocks, columns=None):
     }
 
 
-def derive_feature_lineage(feature_blocks, columns=None):
+def derive_feature_availability(feature_blocks, columns=None, block_metadata=None):
     blocks = dict(feature_blocks or {})
+    block_metadata = dict(block_metadata or {})
+    selected_columns = list(columns) if columns is not None else list(blocks)
+    availability = {}
+    for column in selected_columns:
+        block_name = blocks.get(column, "unknown")
+        metadata = dict(block_metadata.get(block_name) or {})
+        entry = FeatureAvailabilityFrame(
+            event_timestamp=str(metadata.get("event_timestamp", "index")),
+            available_timestamp=str(metadata.get("available_timestamp", "index")),
+            source=str(metadata.get("source", block_name)),
+            join_mode=str(metadata.get("join_mode", "same_index")),
+        )
+        if "_lag" in column:
+            entry.join_mode = "lagged"
+        availability[column] = {
+            "event_timestamp": entry.event_timestamp,
+            "available_timestamp": entry.available_timestamp,
+            "source": entry.source,
+            "join_mode": entry.join_mode,
+        }
+    return availability
+
+
+def derive_feature_lineage(feature_blocks, columns=None, feature_availability=None):
+    blocks = dict(feature_blocks or {})
+    feature_availability = dict(feature_availability or {})
     selected_columns = list(columns) if columns is not None else list(blocks)
     lineage = {}
     for column in selected_columns:
@@ -109,6 +144,7 @@ def derive_feature_lineage(feature_blocks, columns=None):
             "source_column": source_column,
             "block": block_name,
             "transform_chain": transform_chain,
+            "availability": dict(feature_availability.get(column) or {}),
         }
     return lineage
 
@@ -250,9 +286,18 @@ def _cross_down(series, threshold=0.0):
     return ((series < threshold) & (series.shift(1) >= threshold)).astype(float)
 
 
-def _as_feature_block(frame, laggable_columns, block_name):
+def _as_feature_block(frame, laggable_columns, block_name, metadata=None):
     laggable = [column for column in laggable_columns if column in frame.columns]
-    return FeatureBlock(frame=frame, laggable_columns=laggable, block_name=block_name)
+    availability_policy = dict(getattr(frame, "attrs", {}).get("availability_policy") or {})
+    dataset_manifest = dict(getattr(frame, "attrs", {}).get("dataset_manifest") or {})
+    resolved_metadata = {
+        "event_timestamp": str(availability_policy.get("event_timestamp", availability_policy.get("index", "index"))),
+        "available_timestamp": str(availability_policy.get("available_timestamp", availability_policy.get("index", "index"))),
+        "source": str(dataset_manifest.get("dataset_name") or dataset_manifest.get("name") or block_name),
+        "join_mode": str(availability_policy.get("join_mode", "same_index")),
+    }
+    resolved_metadata.update(dict(metadata or {}))
+    return FeatureBlock(frame=frame, laggable_columns=laggable, block_name=block_name, metadata=resolved_metadata)
 
 
 def _price_volume_features(df, rolling_window):
@@ -1303,12 +1348,14 @@ def build_feature_set(
     features = pd.DataFrame(index=df.index)
     feature_blocks = {}
     laggable_columns = []
+    block_metadata = {}
 
     for block in blocks:
         if block.frame.empty:
             continue
         features = features.join(block.frame)
         laggable_columns.extend(block.laggable_columns)
+        block_metadata[block.block_name] = dict(block.metadata or {})
         for column in block.frame.columns:
             feature_blocks[column] = block.block_name
 
@@ -1324,12 +1371,22 @@ def build_feature_set(
         feature_blocks=feature_blocks,
     )
     feature_families = derive_feature_families(feature_blocks, columns=features.columns)
-    feature_lineage = derive_feature_lineage(feature_blocks, columns=features.columns)
+    feature_availability = derive_feature_availability(
+        feature_blocks,
+        columns=features.columns,
+        block_metadata=block_metadata,
+    )
+    feature_lineage = derive_feature_lineage(
+        feature_blocks,
+        columns=features.columns,
+        feature_availability=feature_availability,
+    )
     return BuiltFeatureSet(
         frame=features,
         feature_blocks=feature_blocks,
         feature_families=feature_families,
         feature_lineage=feature_lineage,
+        feature_availability=feature_availability,
     )
 
 

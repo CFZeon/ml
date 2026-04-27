@@ -138,6 +138,7 @@ def derive_feature_metadata(
                 "venue_scope": venue_scope,
             },
             "transform_chain": transform_chain,
+            "availability": dict(lineage.get("availability") or {}),
             "retirement_status": retirement_status,
             "retired": retirement_status == "retired",
             "retirement_reason": retirement_entry.get("reason"),

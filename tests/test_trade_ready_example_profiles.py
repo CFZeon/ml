@@ -97,17 +97,26 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
         self.assertEqual(int(replication["min_coverage"]), 3)
         self.assertEqual(float(replication["min_pass_rate"]), 1.0)
 
+        portability_contract = automl["portability_contract"]
+        self.assertTrue(portability_contract["enabled"])
+        self.assertEqual(portability_contract["accepted_kinds"], ["symbol", "period"])
+        self.assertTrue(portability_contract["require_frozen_universe"])
+
         objective_gates = automl["objective_gates"]
         self.assertEqual(int(objective_gates["min_trade_count"]), 40)
+        self.assertEqual(int(objective_gates["min_effective_bet_count"]), 40)
         self.assertTrue(objective_gates["require_statistical_significance"])
         self.assertEqual(int(objective_gates["min_significance_observations"]), 64)
         self.assertEqual(float(objective_gates["min_sharpe_ci_lower"]), 0.0)
         self.assertEqual(int(automl["trade_ready_profile"]["min_significance_observations"]), 64)
 
         search_space = automl["search_space"]
-        self.assertIn("features", search_space)
-        self.assertIn("labels", search_space)
-        self.assertIn("model", search_space)
+        self.assertEqual(search_space["features"]["lags"]["choices"], ["1,3,6"])
+        self.assertEqual(search_space["labels"]["barrier_tie_break"]["choices"], ["sl"])
+        self.assertEqual(search_space["regime"]["n_regimes"]["choices"], [2])
+        self.assertEqual(search_space["model"]["type"]["choices"], ["gbm", "logistic"])
+        self.assertEqual(automl["validation_contract"]["search_ranker"], "cpcv")
+        self.assertEqual(automl["validation_contract"]["contiguous_validation"], "walk_forward_replay")
 
     def test_trade_ready_runtime_overrides_share_fail_closed_data_defaults(self):
         overrides = build_trade_ready_runtime_overrides(market="spot")
@@ -115,6 +124,9 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
         self.assertEqual(overrides["data"]["gap_policy"], "fail")
         self.assertEqual(overrides["data"]["duplicate_policy"], "fail")
         self.assertTrue(overrides["data_quality"]["block_on_quarantine"])
+        self.assertTrue(overrides["signals"]["require_paper_verification_for_kelly"])
+        self.assertTrue(overrides["signals"]["require_live_calibration_for_kelly"])
+        self.assertAlmostEqual(float(overrides["signals"]["uncalibrated_kelly_fraction_cap"]), 0.25, places=12)
         self.assertEqual(overrides["backtest"]["evaluation_mode"], "trade_ready")
         self.assertNotIn("funding_missing_policy", overrides["backtest"])
 
@@ -140,7 +152,9 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
         self.assertEqual(int(automl["n_trials"]), 4)
         self.assertEqual(int(automl["selection_policy"]["min_validation_trade_count"]), 20)
         self.assertEqual(int(automl["replication"]["alternate_window_count"]), 1)
+        self.assertTrue(automl["portability_contract"]["enabled"])
         self.assertEqual(int(automl["objective_gates"]["min_trade_count"]), 20)
+        self.assertEqual(int(automl["objective_gates"]["min_effective_bet_count"]), 20)
         self.assertTrue(automl["objective_gates"]["require_statistical_significance"])
         self.assertEqual(int(automl["objective_gates"]["min_significance_observations"]), 32)
         self.assertEqual(int(automl["trade_ready_profile"]["min_significance_observations"]), 32)
@@ -231,7 +245,8 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
         self.assertEqual(int(automl["trade_ready_profile"]["min_significance_observations"]), 64)
         self.assertEqual(int(backtest["significance"]["min_observations"]), 64)
         self.assertEqual(automl["search_space"]["model"]["type"]["choices"], ["gbm", "logistic"])
-        self.assertEqual(automl["search_space"]["labels"]["barrier_tie_break"]["choices"], ["sl", "pt"])
+        self.assertEqual(automl["search_space"]["labels"]["barrier_tie_break"]["choices"], ["sl"])
+        self.assertEqual(automl["search_space"]["features"]["lags"]["choices"], ["1,3,6"])
 
     def test_trade_ready_example_smoke_profile_declares_reduced_power(self):
         config = _build_trade_ready_example_config(

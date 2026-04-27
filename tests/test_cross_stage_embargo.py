@@ -65,11 +65,17 @@ class _TemporalGapPipeline:
             return weights
 
         if name == "train_models":
-            train_size = int(self.config.get("model", {}).get("train_size", 0))
-            test_size = int(self.config.get("model", {}).get("test_size", 0))
             index = self.state["X"].index
-            train_index = index[:train_size]
-            test_index = index[train_size:train_size + test_size]
+            explicit_splits = list((self.config.get("model", {}) or {}).get("explicit_splits") or [])
+            if explicit_splits:
+                split = explicit_splits[0]
+                train_index = index[np.asarray(split.get("train_index", []), dtype=int)]
+                test_index = index[np.asarray(split.get("test_index", []), dtype=int)]
+            else:
+                train_size = int(self.config.get("model", {}).get("train_size", 0))
+                test_size = int(self.config.get("model", {}).get("test_size", 0))
+                train_index = index[:train_size]
+                test_index = index[train_size:train_size + test_size]
             training = {
                 "train_index": train_index,
                 "test_index": test_index,

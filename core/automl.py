@@ -3,6 +3,8 @@
 import copy
 import hashlib
 import json
+import os
+import subprocess
 from itertools import combinations
 from pathlib import Path
 from statistics import NormalDist
@@ -22,6 +24,7 @@ from .promotion import (
     upsert_promotion_gate,
 )
 from .registry import LocalRegistryStore, evaluate_challenger_promotion
+from .storage import frame_fingerprint, payload_sha256, read_json, write_json
 from .stat_tests import compute_post_selection_inference
 
 try:
@@ -114,6 +117,99 @@ _CLASSIFICATION_OBJECTIVES = {
     "neg_calibration_error",
     "calibration_error",
 }
+_THESIS_SPACE_PATHS = {
+    ("features", "lags"),
+    ("features", "frac_diff_d"),
+    ("features", "rolling_window"),
+    ("features", "squeeze_quantile"),
+    ("feature_selection", "enabled"),
+    ("feature_selection", "max_features"),
+    ("feature_selection", "min_mi_threshold"),
+    ("labels", "pt_mult"),
+    ("labels", "sl_mult"),
+    ("labels", "max_holding"),
+    ("labels", "min_return"),
+    ("labels", "volatility_window"),
+    ("labels", "barrier_tie_break"),
+    ("regime", "n_regimes"),
+    ("model", "gap"),
+    ("model", "validation_fraction"),
+}
+_MODEL_FAMILY_SPACE_PATHS = {
+    ("model", "type"),
+}
+
+
+def _spec_allows_variation(spec):
+    if not isinstance(spec, dict):
+        return False
+    if "choices" in spec:
+        return len(list(spec.get("choices") or [])) > 1
+    spec_type = str(spec.get("type", "")).lower()
+    if spec_type in {"float", "int"}:
+        low = spec.get("low")
+        high = spec.get("high")
+        step = spec.get("step")
+        if low is None or high is None:
+            return False
+        if low != high:
+            return True
+        return step not in (None, 0)
+    return False
+
+
+def _classify_search_space(search_space):
+    thesis_space = {}
+    model_family_space = {}
+    hyperparameter_space = {}
+    for section_name, section in dict(search_space or {}).items():
+        section = dict(section or {})
+        for key, spec in section.items():
+            path = (section_name, key)
+            if path in _THESIS_SPACE_PATHS:
+                thesis_space.setdefault(section_name, {})[key] = copy.deepcopy(spec)
+            elif path in _MODEL_FAMILY_SPACE_PATHS:
+                model_family_space.setdefault(section_name, {})[key] = copy.deepcopy(spec)
+            else:
+                hyperparameter_space.setdefault(section_name, {})[key] = copy.deepcopy(spec)
+    return {
+        "thesis_space": thesis_space,
+        "model_family_space": model_family_space,
+        "hyperparameter_space": hyperparameter_space,
+    }
+
+
+def _find_varying_thesis_paths(search_space_tiers):
+    violations = []
+    for section_name, section in dict((search_space_tiers or {}).get("thesis_space") or {}).items():
+        for key, spec in dict(section or {}).items():
+            if _spec_allows_variation(spec):
+                violations.append(f"{section_name}.{key}")
+    return sorted(violations)
+
+
+def _validate_trade_ready_search_space(search_space, automl_config):
+    trade_ready_profile = dict((automl_config or {}).get("trade_ready_profile") or {})
+    if not trade_ready_profile or bool(trade_ready_profile.get("reduced_power", False)):
+        return
+    search_space_tiers = _classify_search_space(search_space)
+    varying_paths = _find_varying_thesis_paths(search_space_tiers)
+    if varying_paths:
+        joined = ", ".join(varying_paths)
+        raise ValueError(
+            "Certification AutoML cannot search thesis_space parameters. Freeze these entries before running the study: "
+            f"{joined}"
+        )
+
+
+def _resolve_experiment_family_id(search_space):
+    tiers = _classify_search_space(search_space)
+    return payload_sha256(
+        {
+            "thesis_space": tiers.get("thesis_space") or {},
+            "model_family_space": tiers.get("model_family_space") or {},
+        }
+    )
 
 
 def _normalize_objective_name(objective_name):
@@ -125,8 +221,6 @@ def _normalize_objective_name(objective_name):
     }
     if objective_name in aliases:
         return aliases[objective_name]
-    if objective_name == "composite":
-        return "accuracy_first"
     return objective_name
 
 
@@ -174,6 +268,251 @@ def _stable_payload_hash(payload):
         separators=(",", ":"),
     )
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _resolve_resume_mode(automl_config):
+    resume_mode = str((automl_config or {}).get("resume_mode", "never")).strip().lower()
+    if resume_mode not in {"never", "if_manifest_matches", "force"}:
+        raise ValueError(
+            "Invalid automl.resume_mode. Expected one of never, if_manifest_matches, or force. "
+            f"Received: {resume_mode!r}"
+        )
+    return resume_mode
+
+
+def _resolve_code_revision(base_config, automl_config):
+    explicit = (
+        (automl_config or {}).get("code_revision")
+        or (base_config or {}).get("code_revision")
+        or os.getenv("BUILD_SOURCEVERSION")
+        or os.getenv("GIT_COMMIT")
+        or os.getenv("GITHUB_SHA")
+    )
+    if explicit:
+        return str(explicit)
+
+    repo_root = Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return "unknown"
+
+    revision = str(result.stdout or "").strip()
+    return revision or "unknown"
+
+
+def _resolve_experiment_storage_root(base_config, automl_config):
+    explicit = (automl_config or {}).get("storage")
+    if explicit:
+        path = Path(explicit)
+        if path.suffix:
+            root = path.parent / path.stem
+        else:
+            root = path
+    else:
+        study_name = _resolve_study_name(base_config, automl_config)
+        root = Path(".cache") / "automl" / study_name
+
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
+def _next_experiment_run_id(runs_dir):
+    existing = []
+    for path in Path(runs_dir).glob("run_*"):
+        suffix = path.name.replace("run_", "", 1)
+        if suffix.isdigit():
+            existing.append(int(suffix))
+    next_id = max(existing, default=0) + 1
+    return f"run_{next_id:04d}"
+
+
+def _build_experiment_manifest(base_config, automl_config, state_bundle, search_space):
+    raw_data_value = state_bundle.get("raw_data")
+    raw_data = pd.DataFrame(raw_data_value, copy=True) if raw_data_value is not None else pd.DataFrame()
+    raw_bounds = {
+        "start_timestamp": None,
+        "end_timestamp": None,
+        "row_count": 0,
+        "raw_data_fingerprint": None,
+    }
+    if not raw_data.empty:
+        raw_bounds = {
+            "start_timestamp": raw_data.index[0].isoformat(),
+            "end_timestamp": raw_data.index[-1].isoformat(),
+            "row_count": int(len(raw_data)),
+            "raw_data_fingerprint": frame_fingerprint(raw_data),
+        }
+
+    feature_contract = {
+        "features": _json_ready(copy.deepcopy(base_config.get("features") or {})),
+        "feature_selection": _json_ready(copy.deepcopy(base_config.get("feature_selection") or {})),
+        "custom_data": _json_ready(copy.deepcopy(base_config.get("custom_data") or {})),
+    }
+    objective_contract = {
+        "objective": _normalize_objective_name((automl_config or {}).get("objective", "risk_adjusted_after_costs")),
+        "objective_gates": _json_ready(copy.deepcopy((automl_config or {}).get("objective_gates") or {})),
+        "selection_policy": _json_ready(copy.deepcopy((automl_config or {}).get("selection_policy") or {})),
+        "overfitting_control": _json_ready(copy.deepcopy((automl_config or {}).get("overfitting_control") or {})),
+        "replication": _json_ready(copy.deepcopy((automl_config or {}).get("replication") or {})),
+        "trade_ready_profile": _json_ready(copy.deepcopy((automl_config or {}).get("trade_ready_profile") or {})),
+    }
+    data_contract = {
+        "symbol": str((base_config.get("data") or {}).get("symbol", "unknown")),
+        "interval": str((base_config.get("data") or {}).get("interval", "unknown")),
+        **raw_bounds,
+        "data_lineage": _json_ready(copy.deepcopy(state_bundle.get("data_lineage") or {})),
+        "symbol_filters": _json_ready(copy.deepcopy(state_bundle.get("symbol_filters") or {})),
+        "universe_policy": _json_ready(copy.deepcopy(state_bundle.get("universe_policy") or {})),
+        "universe_snapshot_meta": _json_ready(copy.deepcopy(state_bundle.get("universe_snapshot_meta") or {})),
+        "eligible_symbols": _json_ready(copy.deepcopy(state_bundle.get("eligible_symbols") or [])),
+    }
+
+    manifest = {
+        "manifest_schema": "automl_experiment_manifest.v1",
+        "study_label": _resolve_study_name(base_config, automl_config),
+        "resume_mode": _resolve_resume_mode(automl_config),
+        "data_contract": data_contract,
+        "feature_contract": feature_contract,
+        "objective_contract": objective_contract,
+        "search_space": _json_ready(copy.deepcopy(search_space)),
+        "search_space_tiers": _json_ready(_classify_search_space(search_space)),
+        "search_space_hash": payload_sha256(search_space),
+        "feature_schema_hash": payload_sha256(feature_contract),
+        "objective_hash": payload_sha256(objective_contract),
+        "data_lineage_hash": payload_sha256(data_contract),
+        "code_revision": _resolve_code_revision(base_config, automl_config),
+    }
+    manifest["experiment_family_id"] = _resolve_experiment_family_id(search_space)
+    manifest["experiment_id"] = payload_sha256(
+        {
+            "data_lineage_hash": manifest["data_lineage_hash"],
+            "feature_schema_hash": manifest["feature_schema_hash"],
+            "objective_hash": manifest["objective_hash"],
+            "search_space_hash": manifest["search_space_hash"],
+            "code_revision": manifest["code_revision"],
+        }
+    )
+    return manifest
+
+
+def _build_experiment_storage_context(base_config, automl_config, experiment_manifest):
+    storage_root = _resolve_experiment_storage_root(base_config, automl_config)
+    experiment_dir = storage_root / "experiments" / experiment_manifest["experiment_id"]
+    resume_mode = experiment_manifest["resume_mode"]
+    if resume_mode == "never":
+        runs_dir = experiment_dir / "runs"
+        run_id = _next_experiment_run_id(runs_dir)
+        run_dir = runs_dir / run_id
+    else:
+        run_id = None
+        run_dir = experiment_dir
+
+    return {
+        "storage_root": storage_root,
+        "experiment_dir": experiment_dir,
+        "run_dir": run_dir,
+        "run_id": run_id,
+        "study_path": run_dir / "study.db",
+        "manifest_path": experiment_dir / "manifest.json",
+        "lineage_path": experiment_dir / "lineage.json",
+        "summary_path": run_dir / "summary.json",
+    }
+
+
+def _validate_resume_manifest(storage_context, experiment_manifest):
+    resume_mode = experiment_manifest["resume_mode"]
+    experiment_dir = Path(storage_context["experiment_dir"])
+    manifest_path = Path(storage_context["manifest_path"])
+    study_path = Path(storage_context["study_path"])
+    stored_manifest = read_json(manifest_path)
+    study_exists = study_path.exists()
+
+    if resume_mode == "never":
+        return {
+            "resume_mode": resume_mode,
+            "load_if_exists": False,
+            "resumed_existing_study": False,
+            "manifest_matches": False,
+            "mismatched_fields": [],
+            "experiment_dir": str(experiment_dir),
+            "study_path": str(study_path),
+        }
+
+    if not study_exists:
+        return {
+            "resume_mode": resume_mode,
+            "load_if_exists": False,
+            "resumed_existing_study": False,
+            "manifest_matches": stored_manifest == experiment_manifest if stored_manifest is not None else False,
+            "mismatched_fields": [],
+            "experiment_dir": str(experiment_dir),
+            "study_path": str(study_path),
+        }
+
+    if resume_mode == "force":
+        mismatched_fields = []
+        if isinstance(stored_manifest, dict):
+            for field in [
+                "experiment_id",
+                "data_lineage_hash",
+                "feature_schema_hash",
+                "objective_hash",
+                "search_space_hash",
+                "code_revision",
+            ]:
+                if stored_manifest.get(field) != experiment_manifest.get(field):
+                    mismatched_fields.append(field)
+        return {
+            "resume_mode": resume_mode,
+            "load_if_exists": True,
+            "resumed_existing_study": True,
+            "manifest_matches": not mismatched_fields,
+            "mismatched_fields": mismatched_fields,
+            "experiment_dir": str(experiment_dir),
+            "study_path": str(study_path),
+        }
+
+    if stored_manifest is None:
+        raise RuntimeError(
+            "AutoML resume requested with resume_mode=if_manifest_matches, but the stored experiment manifest is missing. "
+            f"Archive or delete {experiment_dir} or rerun with resume_mode=force."
+        )
+
+    mismatched_fields = []
+    for field in [
+        "experiment_id",
+        "data_lineage_hash",
+        "feature_schema_hash",
+        "objective_hash",
+        "search_space_hash",
+        "code_revision",
+    ]:
+        if stored_manifest.get(field) != experiment_manifest.get(field):
+            mismatched_fields.append(field)
+
+    if mismatched_fields:
+        raise RuntimeError(
+            "AutoML resume manifest mismatch. "
+            f"stored_experiment_id={stored_manifest.get('experiment_id')} current_experiment_id={experiment_manifest.get('experiment_id')} "
+            f"mismatched_fields={','.join(mismatched_fields)} archive_or_delete={experiment_dir}"
+        )
+
+    return {
+        "resume_mode": resume_mode,
+        "load_if_exists": True,
+        "resumed_existing_study": True,
+        "manifest_matches": True,
+        "mismatched_fields": [],
+        "experiment_dir": str(experiment_dir),
+        "study_path": str(study_path),
+    }
 
 
 def _build_selection_snapshot(best_trial_report):
@@ -242,24 +581,26 @@ def _slice_temporal_value(value, start_timestamp=None, end_timestamp=None):
             for item in value
         )
     return copy.deepcopy(value)
+_TEMPORAL_STATE_KEYS = [
+    "indicator_run", "futures_context", "cross_asset_context",
+    "symbol_lifecycle", "universe_snapshot", "universe_report",
+]
+_DEEP_COPY_STATE_KEYS = [
+    "data_lineage", "symbol_filters", "universe_policy",
+    "universe_snapshot_meta", "eligible_symbols",
+]
 
 
 def _build_state_bundle(base_pipeline):
-    return {
+    bundle = {
         "raw_data": base_pipeline.require("raw_data").copy(),
         "data": base_pipeline.require("data").copy(),
-        "indicator_run": base_pipeline.state.get("indicator_run"),
-        "futures_context": _slice_temporal_value(base_pipeline.state.get("futures_context")),
-        "cross_asset_context": _slice_temporal_value(base_pipeline.state.get("cross_asset_context")),
-        "data_lineage": copy.deepcopy(base_pipeline.state.get("data_lineage")),
-        "symbol_filters": copy.deepcopy(base_pipeline.state.get("symbol_filters")),
-        "symbol_lifecycle": _slice_temporal_value(base_pipeline.state.get("symbol_lifecycle")),
-        "universe_policy": copy.deepcopy(base_pipeline.state.get("universe_policy")),
-        "universe_snapshot": _slice_temporal_value(base_pipeline.state.get("universe_snapshot")),
-        "universe_snapshot_meta": copy.deepcopy(base_pipeline.state.get("universe_snapshot_meta")),
-        "eligible_symbols": copy.deepcopy(base_pipeline.state.get("eligible_symbols")),
-        "universe_report": _slice_temporal_value(base_pipeline.state.get("universe_report")),
     }
+    for k in _TEMPORAL_STATE_KEYS:
+        bundle[k] = _slice_temporal_value(base_pipeline.state.get(k))
+    for k in _DEEP_COPY_STATE_KEYS:
+        bundle[k] = copy.deepcopy(base_pipeline.state.get(k))
+    return bundle
 
 
 def _build_window_state_bundle(full_state_bundle, start_timestamp=None, end_timestamp=None):
@@ -270,49 +611,15 @@ def _build_window_state_bundle(full_state_bundle, start_timestamp=None, end_time
         raw_data = raw_data.loc[raw_data.index <= end_timestamp].copy()
 
     slice_index = raw_data.index
-    return {
+    bundle = {
         "raw_data": raw_data,
         "data": full_state_bundle["data"].reindex(slice_index).copy(),
-        "indicator_run": _slice_temporal_value(
-            full_state_bundle.get("indicator_run"),
-            start_timestamp=start_timestamp,
-            end_timestamp=end_timestamp,
-        ),
-        "futures_context": _slice_temporal_value(
-            full_state_bundle.get("futures_context"),
-            start_timestamp=start_timestamp,
-            end_timestamp=end_timestamp,
-        ),
-        "cross_asset_context": _slice_temporal_value(
-            full_state_bundle.get("cross_asset_context"),
-            start_timestamp=start_timestamp,
-            end_timestamp=end_timestamp,
-        ),
-        "data_lineage": copy.deepcopy(full_state_bundle.get("data_lineage")),
-        "symbol_filters": copy.deepcopy(full_state_bundle.get("symbol_filters")),
-        "symbol_lifecycle": _slice_temporal_value(
-            full_state_bundle.get("symbol_lifecycle"),
-            start_timestamp=start_timestamp,
-            end_timestamp=end_timestamp,
-        ),
-        "universe_policy": copy.deepcopy(full_state_bundle.get("universe_policy")),
-        "universe_snapshot": _slice_temporal_value(
-            full_state_bundle.get("universe_snapshot"),
-            start_timestamp=start_timestamp,
-            end_timestamp=end_timestamp,
-        ),
-        "universe_snapshot_meta": copy.deepcopy(full_state_bundle.get("universe_snapshot_meta")),
-        "eligible_symbols": copy.deepcopy(full_state_bundle.get("eligible_symbols")),
-        "universe_report": _slice_temporal_value(
-            full_state_bundle.get("universe_report"),
-            start_timestamp=start_timestamp,
-            end_timestamp=end_timestamp,
-        ),
     }
-
-
-def _build_temporal_state_bundle(full_state_bundle, end_timestamp=None):
-    return _build_window_state_bundle(full_state_bundle, end_timestamp=end_timestamp)
+    for k in _TEMPORAL_STATE_KEYS:
+        bundle[k] = _slice_temporal_value(full_state_bundle.get(k), start_timestamp=start_timestamp, end_timestamp=end_timestamp)
+    for k in _DEEP_COPY_STATE_KEYS:
+        bundle[k] = copy.deepcopy(full_state_bundle.get(k))
+    return bundle
 
 
 def _resolve_stage_gap_defaults(base_config, automl_config):
@@ -552,6 +859,155 @@ def _resolve_primary_training_payload(training):
     return training, "validation"
 
 
+def _normalize_validation_source_name(source, *, executable=False):
+    value = str(source or "").strip().lower()
+    if not value:
+        return None
+    aliases = {
+        "walk-forward": "walk_forward",
+        "walkforward": "walk_forward",
+        "wf": "walk_forward",
+        "validation": "walk_forward",
+        "executable_validation": "walk_forward_replay",
+    }
+    value = aliases.get(value, value)
+    if executable and value == "walk_forward":
+        return "walk_forward_replay"
+    return value
+
+
+def _resolve_validation_contract(base_config, automl_config, *, training=None, holdout_enabled=None):
+    base_config = base_config or {}
+    automl_config = automl_config or {}
+    trade_ready_profile = dict(automl_config.get("trade_ready_profile") or {})
+    model_config = dict(base_config.get("model") or {})
+    training = training or {}
+    training_validation = dict(training.get("validation") or {})
+    executable_validation = dict(training.get("executable_validation") or {})
+    executable_training = dict(executable_validation.get("training") or {}) if executable_validation.get("enabled") else {}
+    executable_training_validation = dict(executable_training.get("validation") or {})
+
+    primary_source = _normalize_validation_source_name(
+        training_validation.get("method") or model_config.get("cv_method", "cpcv")
+    )
+    tradable_source = _normalize_validation_source_name(
+        executable_training_validation.get("method") or model_config.get("cv_method", "cpcv"),
+        executable=bool(executable_validation.get("enabled")),
+    )
+    if tradable_source == "cpcv" and executable_validation.get("enabled"):
+        tradable_source = "walk_forward_replay"
+
+    replication_enabled = bool((automl_config.get("replication") or {}).get("enabled", False))
+    if holdout_enabled is None:
+        holdout_enabled = bool(
+            automl_config.get("locked_holdout_enabled", False)
+            or automl_config.get("locked_holdout_fraction")
+        )
+
+    if trade_ready_profile:
+        defaults = {
+            "search_ranker": "cpcv",
+            "contiguous_validation": "walk_forward_replay",
+            "locked_holdout": "single_access_contiguous",
+            "replication": "required" if replication_enabled else "disabled",
+        }
+    else:
+        defaults = {
+            "search_ranker": primary_source or "walk_forward",
+            "contiguous_validation": tradable_source or primary_source or "walk_forward",
+            "locked_holdout": "single_access_contiguous" if holdout_enabled else "disabled",
+            "replication": "required" if replication_enabled else "disabled",
+        }
+
+    contract = copy.deepcopy(automl_config.get("validation_contract") or {})
+    return {
+        "search_ranker": str(contract.get("search_ranker", defaults["search_ranker"])),
+        "contiguous_validation": str(contract.get("contiguous_validation", defaults["contiguous_validation"])),
+        "locked_holdout": str(contract.get("locked_holdout", defaults["locked_holdout"])),
+        "replication": str(contract.get("replication", defaults["replication"])),
+    }
+
+
+def _validation_contract_stage_pass(stage_source, *, diagnostic_source, selection_source, tradable_source, enabled):
+    stage_source = _normalize_validation_source_name(stage_source)
+    if stage_source in {None, "disabled"}:
+        return True
+    if stage_source == "cpcv":
+        return diagnostic_source == "cpcv"
+    if stage_source == "single_access_contiguous":
+        return bool(enabled)
+    if stage_source == "required":
+        return bool(enabled)
+    if stage_source == "walk_forward_replay":
+        return tradable_source == "walk_forward_replay"
+    if stage_source == "walk_forward":
+        return tradable_source in {"walk_forward", "walk_forward_replay"} or selection_source in {
+            "walk_forward",
+            "walk_forward_replay",
+        }
+    return bool(enabled)
+
+
+def _resolve_validation_sources(training, backtest, validation_contract, *, holdout_enabled=False, replication_enabled=False):
+    training = training or {}
+    backtest = backtest or {}
+    validation = dict(training.get("validation") or {})
+    executable_validation = dict(training.get("executable_validation") or {})
+    executable_training = dict(executable_validation.get("training") or {}) if executable_validation.get("enabled") else {}
+    executable_training_validation = dict(executable_training.get("validation") or {})
+
+    diagnostic_source = _normalize_validation_source_name(
+        backtest.get("diagnostic_validation_method") or validation.get("method")
+    )
+    selection_source = _normalize_validation_source_name(
+        executable_training_validation.get("method") or backtest.get("validation_method") or validation.get("method"),
+        executable=bool(executable_validation.get("enabled")),
+    )
+    tradable_source = _normalize_validation_source_name(
+        backtest.get("validation_method") or executable_training_validation.get("method") or validation.get("method"),
+        executable=bool(executable_validation.get("enabled")),
+    )
+
+    source_checks = {
+        "search_ranker": _validation_contract_stage_pass(
+            validation_contract.get("search_ranker"),
+            diagnostic_source=diagnostic_source,
+            selection_source=selection_source,
+            tradable_source=tradable_source,
+            enabled=bool(diagnostic_source),
+        ),
+        "contiguous_validation": _validation_contract_stage_pass(
+            validation_contract.get("contiguous_validation"),
+            diagnostic_source=diagnostic_source,
+            selection_source=selection_source,
+            tradable_source=tradable_source,
+            enabled=bool(tradable_source),
+        ),
+        "locked_holdout": _validation_contract_stage_pass(
+            validation_contract.get("locked_holdout"),
+            diagnostic_source=diagnostic_source,
+            selection_source=selection_source,
+            tradable_source=tradable_source,
+            enabled=bool(holdout_enabled),
+        ),
+        "replication": _validation_contract_stage_pass(
+            validation_contract.get("replication"),
+            diagnostic_source=diagnostic_source,
+            selection_source=selection_source,
+            tradable_source=tradable_source,
+            enabled=bool(replication_enabled),
+        ),
+    }
+    return {
+        "validation_contract": dict(validation_contract or {}),
+        "selection_metric_source": selection_source,
+        "diagnostic_metric_source": diagnostic_source,
+        "tradable_metric_source": tradable_source,
+        "required_source_checks": source_checks,
+        "all_required_sources_passed": bool(all(source_checks.values())),
+    }
+
+
 def _summarize_training(training):
     primary_training, primary_source = _resolve_primary_training_payload(training)
     feature_selection = training.get("feature_selection") or {}
@@ -561,6 +1017,7 @@ def _summarize_training(training):
     cross_venue_integrity = training.get("cross_venue_integrity") or {}
     data_certification = training.get("data_certification") or {}
     signal_decay = training.get("signal_decay") or {}
+    validation_sources = dict(training.get("validation_sources") or {})
     return {
         "avg_accuracy": primary_training.get("avg_accuracy"),
         "avg_f1_macro": primary_training.get("avg_f1_macro"),
@@ -571,6 +1028,11 @@ def _summarize_training(training):
         "avg_calibration_error": primary_training.get("avg_calibration_error"),
         "headline_metrics": primary_training.get("headline_metrics", {}),
         "selection_metrics_source": primary_source,
+        "selection_metric_source": validation_sources.get("selection_metric_source", primary_source),
+        "diagnostic_metric_source": validation_sources.get("diagnostic_metric_source"),
+        "tradable_metric_source": validation_sources.get("tradable_metric_source"),
+        "all_required_sources_passed": bool(validation_sources.get("all_required_sources_passed", True)),
+        "validation_sources": validation_sources,
         "feature_selection": {
             "enabled": bool(feature_selection.get("enabled", False)),
             "avg_input_features": feature_selection.get("avg_input_features"),
@@ -689,6 +1151,44 @@ def _execute_trial_candidate(base_config, overrides, pipeline_class, trial_step_
     return candidate.state["training"], candidate.state["backtest"]
 
 
+def _build_explicit_temporal_split(index, train_end_timestamp, test_start_timestamp, excluded_intervals=None):
+    aligned_index = pd.Index(index)
+    if aligned_index.empty:
+        raise RuntimeError("Aligned split empty")
+
+    train_mask = np.asarray(aligned_index <= train_end_timestamp, dtype=bool)
+    test_mask = np.asarray(aligned_index >= test_start_timestamp, dtype=bool)
+    excluded_mask = np.zeros(len(aligned_index), dtype=bool)
+    for interval_start, interval_end in excluded_intervals or []:
+        if interval_start is None or interval_end is None:
+            continue
+        excluded_mask |= np.asarray((aligned_index >= interval_start) & (aligned_index <= interval_end), dtype=bool)
+
+    train_mask &= ~excluded_mask
+    test_mask &= ~excluded_mask
+    gap_mask = ~(train_mask | test_mask)
+
+    train_index = np.flatnonzero(train_mask)
+    test_index = np.flatnonzero(test_mask)
+    gap_index = np.flatnonzero(gap_mask)
+    if len(train_index) <= 0 or len(test_index) <= 0:
+        raise RuntimeError("Aligned split empty")
+
+    return {
+        "split_id": "validation_stage_0",
+        "train_index": train_index.tolist(),
+        "test_index": test_index.tolist(),
+        "gap_index": gap_index.tolist(),
+        "gap_bars": int(len(gap_index)),
+        "source": "staged_holdout_plan",
+        "timestamp_bounds": {
+            "train_end": _json_ready(train_end_timestamp),
+            "test_start": _json_ready(test_start_timestamp),
+        },
+        "excluded_intervals": _json_ready(excluded_intervals or []),
+    }
+
+
 def _execute_temporal_split_candidate(
     base_config,
     overrides,
@@ -715,23 +1215,15 @@ def _execute_temporal_split_candidate(
         ],
     )
 
-    aligned_index = candidate.state["X"].index
-    aligned_mask = (aligned_index <= train_end_timestamp) | (aligned_index >= test_start_timestamp)
-    for interval in excluded_intervals or []:
-        interval_start, interval_end = interval
-        if interval_start is None or interval_end is None:
-            continue
-        aligned_mask &= ~((aligned_index >= interval_start) & (aligned_index <= interval_end))
-    candidate.state["X"] = candidate.state["X"].loc[aligned_mask].copy()
-    candidate.state["y"] = candidate.state["y"].loc[aligned_mask].copy()
-    candidate.state["labels_aligned"] = candidate.state["labels_aligned"].loc[aligned_mask].copy()
-
-    aligned_index = candidate.state["X"].index
-    aligned_train_rows = int((aligned_index <= train_end_timestamp).sum())
-    aligned_test_rows = int((aligned_index >= test_start_timestamp).sum())
-    aligned_gap_rows = int((~aligned_mask).sum())
-    if aligned_train_rows <= 0 or aligned_test_rows <= 0:
-        raise RuntimeError("Aligned split empty")
+    explicit_split = _build_explicit_temporal_split(
+        candidate.state["X"].index,
+        train_end_timestamp,
+        test_start_timestamp,
+        excluded_intervals=excluded_intervals,
+    )
+    aligned_train_rows = int(len(explicit_split["train_index"]))
+    aligned_test_rows = int(len(explicit_split["test_index"]))
+    aligned_gap_rows = int(len(explicit_split["gap_index"]))
 
     candidate.config["model"] = {
         **candidate.config.get("model", {}),
@@ -739,6 +1231,8 @@ def _execute_temporal_split_candidate(
         "n_splits": 1,
         "train_size": aligned_train_rows,
         "test_size": aligned_test_rows,
+        "gap": 0,
+        "explicit_splits": [explicit_split],
     }
     _run_candidate_steps(
         candidate,
@@ -756,6 +1250,13 @@ def _execute_temporal_split_candidate(
         "train_end_timestamp": _json_ready(train_end_timestamp),
         "test_start_timestamp": _json_ready(test_start_timestamp),
         "excluded_intervals": _json_ready(excluded_intervals or []),
+        "gap_audit": {
+            "split_id": explicit_split["split_id"],
+            "source": explicit_split["source"],
+            "gap_rows": int(aligned_gap_rows),
+            "gap_bars": int(explicit_split["gap_bars"]),
+            "timestamp_bounds": dict(explicit_split["timestamp_bounds"]),
+        },
     }
 
 
@@ -945,6 +1446,14 @@ def _resolve_replication_config(base_config, automl_config=None, base_pipeline=N
         symbols = symbols[:max_symbol_cohorts]
 
     requested_defaults = int(include_symbol_cohorts) + int(include_window_cohorts)
+    portability_contract = copy.deepcopy((automl_config or {}).get("portability_contract") or {})
+    accepted_kinds = [
+        str(kind).strip().lower()
+        for kind in (portability_contract.get("accepted_kinds") or ["symbol", "period", "venue"])
+        if str(kind).strip()
+    ]
+    universe_snapshot_meta = dict((base_pipeline.state.get("universe_snapshot_meta") or {}) if base_pipeline is not None else {})
+    universe_snapshot_source = str(universe_snapshot_meta.get("source") or "").strip().lower() or None
     return {
         "enabled": bool(config.get("enabled", False)),
         "metric": _normalize_objective_name(config.get("metric", "risk_adjusted_after_costs")),
@@ -961,7 +1470,97 @@ def _resolve_replication_config(base_config, automl_config=None, base_pipeline=N
         "periods": copy.deepcopy(config.get("periods") or config.get("time_windows") or []),
         "primary_symbol": primary_symbol,
         "timeframe": timeframe,
+        "portability_contract": {
+            "enabled": bool(portability_contract.get("enabled", False)),
+            "accepted_kinds": accepted_kinds,
+            "min_supporting_cohorts": int(portability_contract.get("min_supporting_cohorts", 1)),
+            "min_passed_supporting_cohorts": int(portability_contract.get("min_passed_supporting_cohorts", 1)),
+            "require_frozen_universe": bool(portability_contract.get("require_frozen_universe", False)),
+            "frozen_universe_available": bool(
+                universe_snapshot_meta.get("snapshot_timestamp") is not None and universe_snapshot_source != "exchange_info"
+            ),
+            "universe_snapshot_source": universe_snapshot_meta.get("source"),
+        },
     }
+
+
+def _finalize_portability_contract(report, primary_score=None):
+    contract = dict(report.get("portability_contract") or {})
+    contract.setdefault("enabled", False)
+    contract.setdefault("accepted_kinds", [])
+    contract.setdefault("min_supporting_cohorts", 1)
+    contract.setdefault("min_passed_supporting_cohorts", 1)
+    contract.setdefault("require_frozen_universe", False)
+    contract.setdefault("frozen_universe_available", False)
+    contract.setdefault("universe_snapshot_source", None)
+    contract["supporting_cohort_attempted_count"] = 0
+    contract["supporting_cohort_completed_count"] = 0
+    contract["supporting_cohort_pass_count"] = 0
+    contract["distinct_supporting_kinds"] = []
+    contract["distinct_passed_kinds"] = []
+    contract["median_degradation_vs_primary"] = None
+    contract["tail_degradation_vs_primary"] = None
+    contract["passed"] = True
+    contract["reasons"] = []
+
+    if not bool(contract.get("enabled", False)):
+        report["portability_contract"] = contract
+        return report
+
+    accepted_kinds = {str(kind).strip().lower() for kind in (contract.get("accepted_kinds") or []) if str(kind).strip()}
+    supporting_rows = [
+        cohort
+        for cohort in (report.get("cohorts") or [])
+        if str(cohort.get("kind") or "").strip().lower() in accepted_kinds
+    ]
+    supporting_completed = [cohort for cohort in supporting_rows if cohort.get("completed")]
+    supporting_passed = [cohort for cohort in supporting_completed if cohort.get("passed")]
+    contract["supporting_cohort_attempted_count"] = int(len(supporting_rows))
+    contract["supporting_cohort_completed_count"] = int(len(supporting_completed))
+    contract["supporting_cohort_pass_count"] = int(len(supporting_passed))
+    contract["distinct_supporting_kinds"] = sorted(
+        {str(cohort.get("kind") or "").strip().lower() for cohort in supporting_completed}
+    )
+    contract["distinct_passed_kinds"] = sorted(
+        {str(cohort.get("kind") or "").strip().lower() for cohort in supporting_passed}
+    )
+    degradations = []
+    if primary_score is not None:
+        for cohort in supporting_completed:
+            score = _coerce_float(cohort.get("score"))
+            if score is None:
+                continue
+            degradation = float(primary_score) - float(score)
+            cohort["score_degradation_vs_primary"] = degradation
+            degradations.append(degradation)
+    if degradations:
+        contract["median_degradation_vs_primary"] = float(np.median(degradations))
+        contract["tail_degradation_vs_primary"] = float(max(degradations))
+
+    reasons = []
+    if (
+        bool(contract.get("require_frozen_universe", False))
+        and bool(report.get("include_symbol_cohorts", False))
+        and "symbol" in accepted_kinds
+        and not bool(contract.get("frozen_universe_available", False))
+    ):
+        reasons.append("portability_requires_frozen_universe_snapshot")
+    if int(len(supporting_rows)) < int(contract.get("min_supporting_cohorts", 1)):
+        reasons.append("portability_supporting_cohort_missing")
+    if int(len(supporting_passed)) < int(contract.get("min_passed_supporting_cohorts", 1)):
+        reasons.append("portability_supporting_pass_count_below_minimum")
+
+    deduped = []
+    for reason in list(report.get("reasons") or []) + reasons:
+        text = str(reason or "").strip()
+        if text and text not in deduped:
+            deduped.append(text)
+    report["reasons"] = deduped
+    contract["reasons"] = reasons
+    contract["passed"] = not reasons
+    report["portability_contract"] = contract
+    report["promotion_pass"] = bool(report.get("promotion_pass", True) and contract["passed"])
+    return report
 
 
 def _build_symbol_replication_state_bundle(full_state_bundle, symbol, start_timestamp=None, end_timestamp=None):
@@ -1132,6 +1731,7 @@ def _evaluate_replication_cohorts(
     full_state_bundle,
     holdout_plan,
     base_pipeline=None,
+    primary_score=None,
 ):
     automl_config = base_config.get("automl", {}) or {}
     replication_config = _resolve_replication_config(
@@ -1166,6 +1766,7 @@ def _evaluate_replication_cohorts(
         "warnings": [],
         "cohorts": [],
         "summary_by_kind": {},
+        "portability_contract": copy.deepcopy(replication_config.get("portability_contract") or {}),
     }
     if not report["enabled"]:
         return report
@@ -1182,7 +1783,7 @@ def _evaluate_replication_cohorts(
         report["warnings"].append("replication_cohorts_unavailable")
         if report["min_coverage"] > 0:
             report["reasons"].append("replication_coverage_below_minimum")
-        return report
+        return _finalize_portability_contract(report, primary_score=primary_score)
 
     objective_name = replication_config.get("metric")
     min_score = float(replication_config.get("min_score", 0.0))
@@ -1241,12 +1842,17 @@ def _evaluate_replication_cohorts(
             report["cohorts"].append(cohort_row)
             continue
 
-        score = _coerce_float(evaluation.get("raw_objective_value"))
+        score = _coerce_float((evaluation.get("objective_diagnostics") or {}).get("raw_score"))
+        if score is None:
+            score = _coerce_float(evaluation.get("raw_objective_value"))
         backtest_summary = evaluation.get("backtest") or {}
         cohort_row["completed"] = True
         cohort_row["score"] = score
         cohort_row["net_profit_pct"] = _coerce_float(backtest_summary.get("net_profit_pct"))
         cohort_row["total_trades"] = int(backtest_summary.get("total_trades") or 0)
+        cohort_row["score_degradation_vs_primary"] = (
+            None if primary_score is None or score is None else float(primary_score) - float(score)
+        )
         cohort_row["passed"] = bool(score is not None and score >= min_score)
         report["cohorts"].append(cohort_row)
 
@@ -1291,7 +1897,7 @@ def _evaluate_replication_cohorts(
         report["reasons"].append("replication_pass_rate_below_minimum")
     if completed_count == 0:
         report["reasons"].append("replication_coverage_below_minimum")
-    return report
+    return _finalize_portability_contract(report, primary_score=primary_score)
 
 
 def _resolve_overfitting_control(automl_config=None):
@@ -1514,6 +2120,11 @@ def _first_failure_reason(payload, fallback):
     if reasons:
         return str(reasons[0])
     return fallback
+
+
+def _gs(name, passed, measured, threshold, failure_reason, details):
+    return {"name": name, "passed": passed, "measured": measured,
+            "threshold": threshold, "reason": None if passed else failure_reason, "details": details}
 
 
 def _update_selection_policy_report(policy_report, promotion_eligibility_report, *, include_post_selection=False):
@@ -2261,6 +2872,7 @@ def compute_cpcv_pbo(
 def _build_trial_selection_report(completed_trials, trial_records, objective_name, automl_config):
     control = _resolve_overfitting_control(automl_config)
     selection_policy = _resolve_selection_policy(automl_config)
+    validation_contract = _resolve_validation_contract({}, automl_config)
     explicit_minimum_dsr_threshold = "minimum_dsr_threshold" in (automl_config or {})
     minimum_dsr_threshold = automl_config.get("minimum_dsr_threshold", 0.3)
     if minimum_dsr_threshold is not None:
@@ -2305,6 +2917,16 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "objective_diagnostics": record.get("validation", {}).get("objective_diagnostics"),
             "split": _json_ready(record.get("validation", {}).get("split")),
         }
+        validation_sources = _resolve_validation_sources(
+            record.get("training"),
+            record.get("backtest"),
+            validation_contract,
+            holdout_enabled=bool(
+                (automl_config or {}).get("locked_holdout_enabled", False)
+                or (automl_config or {}).get("locked_holdout_fraction")
+            ),
+            replication_enabled=bool(((automl_config or {}).get("replication") or {}).get("enabled", False)),
+        )
 
         deflated_sharpe = compute_deflated_sharpe_ratio(
             record.get("returns"),
@@ -2412,127 +3034,52 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
 
         selection_policy_enabled = bool(selection_policy.get("enabled", True))
         if selection_policy_enabled:
+            ec = eligibility_checks
             gate_specs = [
-                {
-                    "name": "minimum_dsr",
-                    "passed": eligibility_checks["minimum_dsr"],
-                    "measured": dsr_value,
-                    "threshold": minimum_dsr_threshold if dsr_gate_applies else None,
-                    "reason": None if eligibility_checks["minimum_dsr"] else "deflated_sharpe_below_threshold",
-                    "details": deflated_sharpe,
-                },
-                {
-                    "name": "objective_constraints",
-                    "passed": eligibility_checks["objective_constraints"],
-                    "measured": objective_gate_passed,
-                    "threshold": True,
-                    "reason": None if eligibility_checks["objective_constraints"] else "objective_constraints_failed",
-                    "details": objective_diagnostics,
-                },
-                {
-                    "name": "validation_trade_count",
-                    "passed": eligibility_checks["validation_trade_count"],
-                    "measured": validation_trade_count,
-                    "threshold": int(selection_policy.get("min_validation_trade_count", 0)),
-                    "reason": None if eligibility_checks["validation_trade_count"] else "validation_trade_count_below_minimum",
-                    "details": {"validation_trade_count": validation_trade_count},
-                },
-                {
-                    "name": "complexity",
-                    "passed": eligibility_checks["complexity"],
-                    "measured": complexity["trial_complexity_score"],
-                    "threshold": selection_policy.get("max_complexity_score", np.inf),
-                    "reason": None if eligibility_checks["complexity"] else "complexity_score_above_limit",
-                    "details": complexity,
-                },
-                {
-                    "name": "feature_count_ratio",
-                    "passed": eligibility_checks["feature_count_ratio"],
-                    "measured": complexity.get("feature_count_ratio"),
-                    "threshold": selection_policy.get("max_feature_count_ratio", np.inf),
-                    "reason": None if eligibility_checks["feature_count_ratio"] else "feature_count_ratio_above_limit",
-                    "details": complexity,
-                },
-                {
-                    "name": "generalization_gap",
-                    "passed": eligibility_checks["generalization_gap"],
-                    "measured": (search_gap.get("normalized_degradation") or 0.0),
-                    "threshold": selection_policy.get("max_generalization_gap", np.inf),
-                    "reason": None if eligibility_checks["generalization_gap"] else "search_validation_gap_above_limit",
-                    "details": search_gap,
-                },
-                {
-                    "name": "model_family_trial_count",
-                    "passed": eligibility_checks["model_family_trial_count"],
-                    "measured": model_family_counts.get(model_family, 0),
-                    "threshold": selection_policy.get("max_trials_per_model_family", np.inf),
-                    "reason": None if eligibility_checks["model_family_trial_count"] else "model_family_trial_count_above_limit",
-                    "details": {"model_family": model_family, "trial_count": model_family_counts.get(model_family, 0)},
-                },
-                {
-                    "name": "feature_portability",
-                    "passed": eligibility_checks["feature_portability"],
-                    "measured": feature_portability_diagnostics.get("venue_specific_importance_share"),
-                    "threshold": feature_portability_diagnostics.get("config"),
-                    "reason": None if eligibility_checks["feature_portability"] else _first_failure_reason(feature_portability_diagnostics, "feature_portability_failed"),
-                    "details": feature_portability_diagnostics,
-                },
-                {
-                    "name": "feature_admission",
-                    "passed": eligibility_checks["feature_admission"],
-                    "measured": feature_admission_summary.get("promotion_pass"),
-                    "threshold": True,
-                    "reason": None if eligibility_checks["feature_admission"] else _first_failure_reason(feature_admission_summary, "feature_admission_failed"),
-                    "details": feature_admission_summary,
-                },
-                {
-                    "name": "regime_stability",
-                    "passed": eligibility_checks["regime_stability"],
-                    "measured": regime_ablation_summary.get("stability_improvement"),
-                    "threshold": True,
-                    "reason": None if eligibility_checks["regime_stability"] else _first_failure_reason(regime_ablation_summary, "regime_stability_failed"),
-                    "details": regime_ablation_summary,
-                },
-                {
-                    "name": "operational_health",
-                    "passed": eligibility_checks["operational_health"],
-                    "measured": operational_monitoring.get("healthy"),
-                    "threshold": True,
-                    "reason": None if eligibility_checks["operational_health"] else _first_failure_reason(operational_monitoring, "operational_monitoring_failed"),
-                    "details": operational_monitoring,
-                },
-                {
-                    "name": "cross_venue_integrity",
-                    "passed": eligibility_checks["cross_venue_integrity"],
-                    "measured": cross_venue_integrity.get("promotion_pass"),
-                    "threshold": True,
-                    "reason": None if eligibility_checks["cross_venue_integrity"] else _first_failure_reason(cross_venue_integrity, "cross_venue_integrity_failed"),
-                    "details": cross_venue_integrity,
-                },
-                {
-                    "name": "data_certification",
-                    "passed": eligibility_checks["data_certification"],
-                    "measured": data_certification.get("promotion_pass"),
-                    "threshold": True,
-                    "reason": None if eligibility_checks["data_certification"] else _first_failure_reason(data_certification, "data_certification_failed"),
-                    "details": data_certification,
-                },
-                {
-                    "name": "signal_decay",
-                    "passed": eligibility_checks["signal_decay"],
-                    "measured": signal_decay.get("net_edge_at_effective_delay"),
-                    "threshold": signal_decay.get("policy"),
-                    "reason": None if eligibility_checks["signal_decay"] else _first_failure_reason(signal_decay, "signal_decay_failed"),
-                    "details": signal_decay,
-                },
-                {
-                    "name": "fold_stability",
-                    "passed": eligibility_checks["fold_stability"],
-                    "measured": fold_stability_gate["summary"].get("persistence"),
-                    "threshold": True,
-                    "reason": None if eligibility_checks["fold_stability"] else "fold_stability_failed",
-                    "details": fold_stability_gate["summary"],
-                },
+                _gs("minimum_dsr", ec["minimum_dsr"], dsr_value,
+                    minimum_dsr_threshold if dsr_gate_applies else None,
+                    "deflated_sharpe_below_threshold", deflated_sharpe),
+                _gs("objective_constraints", ec["objective_constraints"],
+                    objective_gate_passed, True, "objective_constraints_failed", objective_diagnostics),
+                _gs("validation_trade_count", ec["validation_trade_count"],
+                    validation_trade_count, int(selection_policy.get("min_validation_trade_count", 0)),
+                    "validation_trade_count_below_minimum", {"validation_trade_count": validation_trade_count}),
+                _gs("complexity", ec["complexity"],
+                    complexity["trial_complexity_score"], selection_policy.get("max_complexity_score", np.inf),
+                    "complexity_score_above_limit", complexity),
+                _gs("feature_count_ratio", ec["feature_count_ratio"],
+                    complexity.get("feature_count_ratio"), selection_policy.get("max_feature_count_ratio", np.inf),
+                    "feature_count_ratio_above_limit", complexity),
+                _gs("generalization_gap", ec["generalization_gap"],
+                    search_gap.get("normalized_degradation") or 0.0, selection_policy.get("max_generalization_gap", np.inf),
+                    "search_validation_gap_above_limit", search_gap),
+                _gs("model_family_trial_count", ec["model_family_trial_count"],
+                    model_family_counts.get(model_family, 0), selection_policy.get("max_trials_per_model_family", np.inf),
+                    "model_family_trial_count_above_limit", {"model_family": model_family, "trial_count": model_family_counts.get(model_family, 0)}),
+                _gs("feature_portability", ec["feature_portability"],
+                    feature_portability_diagnostics.get("venue_specific_importance_share"), feature_portability_diagnostics.get("config"),
+                    _first_failure_reason(feature_portability_diagnostics, "feature_portability_failed"), feature_portability_diagnostics),
+                _gs("feature_admission", ec["feature_admission"],
+                    feature_admission_summary.get("promotion_pass"), True,
+                    _first_failure_reason(feature_admission_summary, "feature_admission_failed"), feature_admission_summary),
+                _gs("regime_stability", ec["regime_stability"],
+                    regime_ablation_summary.get("stability_improvement"), True,
+                    _first_failure_reason(regime_ablation_summary, "regime_stability_failed"), regime_ablation_summary),
+                _gs("operational_health", ec["operational_health"],
+                    operational_monitoring.get("healthy"), True,
+                    _first_failure_reason(operational_monitoring, "operational_monitoring_failed"), operational_monitoring),
+                _gs("cross_venue_integrity", ec["cross_venue_integrity"],
+                    cross_venue_integrity.get("promotion_pass"), True,
+                    _first_failure_reason(cross_venue_integrity, "cross_venue_integrity_failed"), cross_venue_integrity),
+                _gs("data_certification", ec["data_certification"],
+                    data_certification.get("promotion_pass"), True,
+                    _first_failure_reason(data_certification, "data_certification_failed"), data_certification),
+                _gs("signal_decay", ec["signal_decay"],
+                    signal_decay.get("net_edge_at_effective_delay"), signal_decay.get("policy"),
+                    _first_failure_reason(signal_decay, "signal_decay_failed"), signal_decay),
+                _gs("fold_stability", ec["fold_stability"],
+                    fold_stability_gate["summary"].get("persistence"), True,
+                    "fold_stability_failed", fold_stability_gate["summary"]),
             ]
             for gate in gate_specs:
                 promotion_eligibility_report = upsert_promotion_gate(
@@ -2602,6 +3149,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                     "search_to_validation": search_gap,
                     "validation_to_locked_holdout": None,
                 },
+                "validation_sources": validation_sources,
                 "fold_stability": fold_stability_gate["summary"],
                 "param_fragility_score": None,
                 "param_fragility": None,
@@ -2672,6 +3220,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         "enabled": control["enabled"],
         "selection_mode": selection_mode,
         "selection_metric": selection_metric,
+        "validation_contract": validation_contract,
         "minimum_dsr_threshold": minimum_dsr_threshold,
         "selection_policy": selection_policy,
         "trial_count": int(len(completed_trials)),
@@ -2713,6 +3262,95 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
     }
 
 
+def _build_top_trial_reports(selection_report):
+    top_trials = []
+    for report in list((selection_report or {}).get("trial_reports") or [])[:5]:
+        top_trials.append(
+            {
+                "number": int(report["number"]),
+                "value": float(report["selection_value"]),
+                "raw_value": float(report["raw_objective_value"]),
+                "model_family": report.get("model_family"),
+                "params": report["params"],
+                "training": report["training"],
+                "backtest": report["backtest"],
+                "search_metrics": report["search_metrics"],
+                "validation_metrics": report["validation_metrics"],
+                "objective_diagnostics": report.get("objective_diagnostics"),
+                "meets_minimum_dsr_threshold": report["meets_minimum_dsr_threshold"],
+                "trial_complexity_score": report["trial_complexity_score"],
+                "feature_count_ratio": report.get("feature_count_ratio"),
+                "fold_stability": report.get("fold_stability"),
+                "generalization_gap": report.get("generalization_gap"),
+                "param_fragility_score": report.get("param_fragility_score"),
+                "param_fragility": report.get("param_fragility"),
+                "selection_policy": report.get("selection_policy"),
+                "locked_holdout": report.get("locked_holdout"),
+                "replication": report.get("replication"),
+                "overfitting": report["overfitting"],
+            }
+        )
+    return top_trials
+
+
+def _build_selection_outcome(trial_reports, *, best_trial_report=None, selection_snapshot=None, status=None, error=None):
+    reports = list(trial_reports or [])
+    eligible_trial_count = int(
+        sum(1 for report in reports if (report.get("selection_policy") or {}).get("eligible"))
+    )
+    rejection_counts = {}
+    for report in reports:
+        for reason in list((report.get("selection_policy") or {}).get("eligibility_reasons") or []):
+            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+    top_rejection_reasons = [
+        reason
+        for reason, _ in sorted(rejection_counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+    if status is None:
+        status = "selected" if best_trial_report is not None else "abstain_no_eligible_trial"
+
+    return {
+        "status": status,
+        "eligible_trial_count": eligible_trial_count,
+        "completed_trial_count": int(len(reports)),
+        "rejected_trial_count": int(len(reports) - eligible_trial_count),
+        "top_rejection_reasons": top_rejection_reasons,
+        "selection_freeze": selection_snapshot,
+        "promotion_ready": bool(
+            best_trial_report is not None
+            and bool((best_trial_report.get("selection_policy") or {}).get("promotion_ready", False))
+        ),
+        "selected_trial_number": None if best_trial_report is None else int(best_trial_report["number"]),
+        "candidate_hash": None if selection_snapshot is None else selection_snapshot.get("candidate_hash"),
+        "holdout_consulted_for_selection": bool(
+            best_trial_report is not None
+            and bool((best_trial_report.get("selection_policy") or {}).get("holdout_consulted_for_selection", False))
+        ),
+        "evaluated_after_freeze": bool(
+            best_trial_report is not None
+            and bool(((best_trial_report.get("locked_holdout") or {}).get("evaluated_after_freeze", False)))
+        ),
+        "error": error,
+    }
+
+
+def _cleanup_optuna_study_resources(study):
+    storage_backend = getattr(study, "_storage", None)
+    if storage_backend is not None and hasattr(storage_backend, "remove_session"):
+        try:
+            storage_backend.remove_session()
+        except Exception:
+            pass
+
+    engine = getattr(storage_backend, "engine", None)
+    if engine is not None:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+
+
 def _resolve_objective_gates(automl_config, objective_name):
     objective_name = _normalize_objective_name(objective_name)
     gate_config = copy.deepcopy((automl_config or {}).get("objective_gates") or {})
@@ -2729,6 +3367,7 @@ def _resolve_objective_gates(automl_config, objective_name):
             "max_log_loss": None,
             "max_calibration_error": None,
             "min_trade_count": None,
+            "min_effective_bet_count": None,
             "require_statistical_significance": False,
             "min_significance_observations": None,
             "min_sharpe_ci_lower": None,
@@ -2740,6 +3379,7 @@ def _resolve_objective_gates(automl_config, objective_name):
         "max_log_loss": _coerce_float(gate_config.get("max_log_loss", 0.78)),
         "max_calibration_error": _coerce_float(gate_config.get("max_calibration_error", 0.15)),
         "min_trade_count": int(gate_config.get("min_trade_count", 30)),
+        "min_effective_bet_count": _coerce_float(gate_config.get("min_effective_bet_count")),
         "require_statistical_significance": bool(gate_config.get("require_statistical_significance", False)),
         "min_significance_observations": _coerce_float(gate_config.get("min_significance_observations")),
         "min_sharpe_ci_lower": _coerce_float(gate_config.get("min_sharpe_ci_lower")),
@@ -2778,9 +3418,15 @@ def _evaluate_objective_gates(training, backtest, automl_config, objective_name)
     log_loss_value = _resolve_metric(training, "avg_log_loss")
     calibration_error = _resolve_metric(training, "avg_calibration_error")
     trade_count = _coerce_float((backtest or {}).get("total_trades"))
+    effective_bet_count = _coerce_float(
+        (backtest or {}).get("effective_bet_count")
+        or ((backtest or {}).get("statistical_significance") or {}).get("effective_bet_count")
+    )
     significance = (backtest or {}).get("statistical_significance") or {}
     significance_enabled = bool(significance.get("enabled", False))
-    significance_reason = str(significance.get("reason") or "").strip().lower() or None
+    significance_reason = str(
+        significance.get("underpowered_reason") or significance.get("reason") or ""
+    ).strip().lower() or None
     significance_observation_count = _coerce_float(significance.get("observation_count"))
     sharpe_ci_lower = _coerce_float(
         ((
@@ -2817,6 +3463,17 @@ def _evaluate_objective_gates(training, backtest, automl_config, objective_name)
             minimum=float(gates.get("min_trade_count")) if gates.get("min_trade_count") is not None else None,
         ),
     }
+    if gates.get("min_effective_bet_count") is not None:
+        required_effective_bets = float(gates.get("min_effective_bet_count"))
+        effective_pass = effective_bet_count is not None and effective_bet_count >= required_effective_bets
+        checks["effective_bet_count"] = {
+            "name": "effective_bet_count",
+            "value": effective_bet_count,
+            "minimum": required_effective_bets,
+            "maximum": None,
+            "passed": bool(effective_pass),
+            "reason": None if effective_pass else "effective_bet_count_underpowered",
+        }
     if gates.get("require_statistical_significance"):
         checks["statistical_significance"] = {
             "name": "statistical_significance",
@@ -3169,6 +3826,20 @@ def _sample_trial_overrides(trial, search_space):
     return overrides
 
 
+def _count_completed_trials_for_model_family(study, model_family):
+    if not model_family:
+        return 0
+    count = 0
+    for existing_trial in list(getattr(study, "trials", []) or []):
+        if getattr(existing_trial, "state", None) != optuna.trial.TrialState.COMPLETE:
+            continue
+        overrides = dict((getattr(existing_trial, "user_attrs", None) or {}).get("overrides") or {})
+        existing_family = str(((overrides.get("model") or {}).get("type") or "")).strip().lower()
+        if existing_family == str(model_family).strip().lower():
+            count += 1
+    return count
+
+
 def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     """Run an Optuna study against the pipeline's configurable search space."""
     if optuna is None:
@@ -3181,20 +3852,44 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     search_space = copy.deepcopy(DEFAULT_AUTOML_SEARCH_SPACE)
     _deep_merge(search_space, automl_config.get("search_space", {}))
     _validate_signal_policy_search_space(search_space)
+    _validate_trade_ready_search_space(search_space, automl_config)
 
-    storage_path = _build_study_storage_path(base_config, automl_config)
+    full_state_bundle = _build_state_bundle(base_pipeline)
+    experiment_manifest = _build_experiment_manifest(base_config, automl_config, full_state_bundle, search_space)
+    storage_context = _build_experiment_storage_context(base_config, automl_config, experiment_manifest)
+    resume_validation = _validate_resume_manifest(storage_context, experiment_manifest)
+    storage_path = Path(storage_context["study_path"])
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
     storage_url = f"sqlite:///{storage_path.as_posix()}"
     study_name = _resolve_study_name(base_config, automl_config)
     sampler = TPESampler(seed=automl_config.get("seed", 42))
     objective_name = _normalize_objective_name(automl_config.get("objective", "risk_adjusted_after_costs"))
 
-    full_state_bundle = _build_state_bundle(base_pipeline)
+    experiment_dir = Path(storage_context["experiment_dir"])
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    write_json(storage_context["manifest_path"], experiment_manifest)
+    write_json(
+        storage_context["lineage_path"],
+        {
+            "experiment_id": experiment_manifest["experiment_id"],
+            "experiment_family_id": experiment_manifest["experiment_family_id"],
+            "study_label": study_name,
+            "resume_mode": experiment_manifest["resume_mode"],
+            "data_lineage_hash": experiment_manifest["data_lineage_hash"],
+            "feature_schema_hash": experiment_manifest["feature_schema_hash"],
+            "objective_hash": experiment_manifest["objective_hash"],
+            "search_space_hash": experiment_manifest["search_space_hash"],
+            "code_revision": experiment_manifest["code_revision"],
+            "data_lineage": experiment_manifest.get("data_contract", {}).get("data_lineage") or {},
+        },
+    )
+
     holdout_plan = _resolve_holdout_plan(full_state_bundle["raw_data"], automl_config, base_config=base_config)
     search_state_bundle = full_state_bundle
     validation_state_bundle = full_state_bundle
     if holdout_plan["enabled"]:
-        search_state_bundle = _build_temporal_state_bundle(full_state_bundle, holdout_plan["search_end_timestamp"])
-        validation_state_bundle = _build_temporal_state_bundle(full_state_bundle, holdout_plan["validation_end_timestamp"])
+        search_state_bundle = _build_window_state_bundle(full_state_bundle, end_timestamp=holdout_plan["search_end_timestamp"])
+        validation_state_bundle = _build_window_state_bundle(full_state_bundle, end_timestamp=holdout_plan["validation_end_timestamp"])
 
     enable_pruning = bool(automl_config.get("enable_pruning", True))
     study_kwargs = {
@@ -3202,16 +3897,42 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "sampler": sampler,
         "study_name": study_name,
         "storage": storage_url,
-        "load_if_exists": True,
+        "load_if_exists": bool(resume_validation["load_if_exists"]),
     }
     if enable_pruning:
         study_kwargs["pruner"] = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=0)
     study = optuna.create_study(**study_kwargs)
+    if hasattr(study, "set_user_attr"):
+        study.set_user_attr("experiment_id", experiment_manifest["experiment_id"])
+        study.set_user_attr("experiment_family_id", experiment_manifest["experiment_family_id"])
+        study.set_user_attr("experiment_manifest", experiment_manifest)
+        study.set_user_attr("resume_mode", experiment_manifest["resume_mode"])
+        study.set_user_attr("data_lineage_hash", experiment_manifest["data_lineage_hash"])
+        study.set_user_attr("feature_schema_hash", experiment_manifest["feature_schema_hash"])
+        study.set_user_attr("objective_hash", experiment_manifest["objective_hash"])
+        study.set_user_attr("search_space_hash", experiment_manifest["search_space_hash"])
+        study.set_user_attr("code_revision", experiment_manifest["code_revision"])
     trial_records = {}
+    selection_policy = _resolve_selection_policy(automl_config)
 
     def objective(trial):
         overrides = _sample_trial_overrides(trial, search_space)
         _validate_trial_overrides(overrides)
+        model_family = str(((overrides.get("model") or {}).get("type") or "")).strip().lower()
+        max_trials_per_family = selection_policy.get("max_trials_per_model_family", np.inf)
+        if model_family and np.isfinite(max_trials_per_family):
+            completed_for_family = _count_completed_trials_for_model_family(study, model_family)
+            trial.set_user_attr(
+                "model_family_precheck",
+                {
+                    "model_family": model_family,
+                    "completed_trials": int(completed_for_family),
+                    "max_trials_per_family": int(max_trials_per_family),
+                    "passed": bool(completed_for_family < int(max_trials_per_family)),
+                },
+            )
+            if completed_for_family >= int(max_trials_per_family):
+                raise optuna.TrialPruned(f"model_family_trial_cap_reached:{model_family}")
         try:
             search_training, search_backtest = _execute_trial_candidate(
                 base_config,
@@ -3236,6 +3957,15 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             raise
 
         trial.set_user_attr("overrides", _json_ready(_clone_value(overrides)))
+        trial.set_user_attr("experiment_id", experiment_manifest["experiment_id"])
+        trial.set_user_attr("experiment_family_id", experiment_manifest["experiment_family_id"])
+        trial.set_user_attr("experiment_manifest", experiment_manifest)
+        trial.set_user_attr("resume_mode", experiment_manifest["resume_mode"])
+        trial.set_user_attr("data_lineage_hash", experiment_manifest["data_lineage_hash"])
+        trial.set_user_attr("feature_schema_hash", experiment_manifest["feature_schema_hash"])
+        trial.set_user_attr("objective_hash", experiment_manifest["objective_hash"])
+        trial.set_user_attr("search_space_hash", experiment_manifest["search_space_hash"])
+        trial.set_user_attr("code_revision", experiment_manifest["code_revision"])
         trial.set_user_attr(
             "search_metrics",
             {
@@ -3430,15 +4160,162 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             best_trial_report = report
             break
 
+    best_optuna_trial = study.best_trial
+    top_trials = _build_top_trial_reports(selection_report)
+
     if best_trial_report is None:
-        raise RuntimeError("AutoML found no eligible trial under the configured selection policy")
+        validation_contract = _resolve_validation_contract(
+            base_config,
+            automl_config,
+            holdout_enabled=bool(holdout_plan.get("enabled", False)),
+        )
+        selection_outcome = _build_selection_outcome(selection_report.get("trial_reports"))
+        abstention_reasons = list(selection_outcome.get("top_rejection_reasons") or ["no_eligible_trial_under_selection_policy"])
+        validation_sources = _resolve_validation_sources(
+            {},
+            {},
+            validation_contract,
+            holdout_enabled=bool(holdout_plan.get("enabled", False)),
+            replication_enabled=bool((automl_config.get("replication") or {}).get("enabled", False)),
+        )
+        selection_report["diagnostics"]["promoted_trial"] = None
+        selection_report["diagnostics"]["selection_freeze"] = None
+        selection_report["diagnostics"]["holdout_access_count"] = 0
+        selection_report["diagnostics"]["holdout_evaluated_once"] = False
+        selection_report["diagnostics"]["holdout_evaluated_after_freeze"] = False
+        selection_report["diagnostics"]["promotion_ready"] = False
+        selection_report["diagnostics"]["promotion_reasons"] = abstention_reasons
+        selection_report["diagnostics"]["validation_contract"] = validation_contract
+        selection_report["diagnostics"]["validation_sources"] = validation_sources
+
+        data_lineage = _json_ready(base_pipeline.state.get("data_lineage") or {})
+        policy_profile = _resolve_automl_policy_profile(base_config.get("automl") or {})
+        summary_warnings = []
+        if policy_profile == "legacy_permissive":
+            summary_warnings.append("legacy_permissive_policy_profile_deprecated")
+
+        promotion_eligibility_report = create_promotion_eligibility_report()
+        promotion_eligibility_report["blocking_failures"] = list(abstention_reasons)
+        summary = {
+            "study_name": study.study_name,
+            "storage": str(storage_path),
+            "experiment_id": experiment_manifest["experiment_id"],
+            "experiment_family_id": experiment_manifest["experiment_family_id"],
+            "experiment_manifest": experiment_manifest,
+            "resume_mode": experiment_manifest["resume_mode"],
+            "resume_validation": resume_validation,
+            "experiment_artifacts": {
+                "storage_root": str(storage_context["storage_root"]),
+                "experiment_dir": str(storage_context["experiment_dir"]),
+                "run_dir": str(storage_context["run_dir"]),
+                "study": str(storage_context["study_path"]),
+                "manifest": str(storage_context["manifest_path"]),
+                "lineage": str(storage_context["lineage_path"]),
+                "summary": str(storage_context["summary_path"]),
+                "run_id": storage_context.get("run_id"),
+            },
+            "objective": objective_name,
+            "policy_profile": policy_profile,
+            "trade_ready_profile": _json_ready((base_config.get("automl") or {}).get("trade_ready_profile") or {}),
+            "warnings": summary_warnings,
+            "selection_metric": selection_report["selection_metric"],
+            "selection_mode": selection_report["selection_mode"],
+            "selection_outcome": selection_outcome,
+            "validation_contract": validation_contract,
+            "validation_sources": validation_sources,
+            "feature_schema_version": base_config.get("features", {}).get("schema_version"),
+            "best_value": None,
+            "best_value_raw": None,
+            "best_value_penalized": None,
+            "optuna_best_value": float(best_optuna_trial.value),
+            "best_trial_number": None,
+            "optuna_best_trial_number": int(best_optuna_trial.number),
+            "best_params": None,
+            "best_overrides": None,
+            "best_backtest": {},
+            "best_training": {},
+            "best_overfitting": {},
+            "best_objective_diagnostics": None,
+            "best_selection_policy": {},
+            "selection_freeze": None,
+            "validation_holdout": {
+                "enabled": bool(holdout_plan.get("enabled", False)),
+                "evaluated": False,
+                "reason": "selection_abstained_no_eligible_trial",
+            },
+            "locked_holdout": {
+                "enabled": bool(holdout_plan.get("enabled", False)),
+                "evaluated_once": False,
+                "evaluated_after_freeze": False,
+                "reason": "selection_abstained_no_eligible_trial",
+            },
+            "replication": {
+                "enabled": False,
+                "reason": "selection_abstained_no_eligible_trial",
+            },
+            "promotion_ready": False,
+            "promotion_reasons": abstention_reasons,
+            "promotion_eligibility_report": promotion_eligibility_report,
+            "overfitting_diagnostics": selection_report["diagnostics"],
+            "data_lineage": data_lineage,
+            "top_trials": top_trials,
+            "trial_count": len(completed_trials),
+        }
+
+        write_json(
+            storage_context["summary_path"],
+            {
+                "study_name": study.study_name,
+                "storage": str(storage_path),
+                "experiment_id": experiment_manifest["experiment_id"],
+                "experiment_family_id": experiment_manifest["experiment_family_id"],
+                "resume_mode": experiment_manifest["resume_mode"],
+                "resume_validation": resume_validation,
+                "objective": objective_name,
+                "policy_profile": policy_profile,
+                "best_value": None,
+                "best_value_raw": None,
+                "best_trial_number": None,
+                "trial_count": len(completed_trials),
+                "promotion_ready": False,
+                "promotion_reasons": abstention_reasons,
+                "feature_schema_version": base_config.get("features", {}).get("schema_version"),
+                "selection_metric": selection_report["selection_metric"],
+                "selection_mode": selection_report["selection_mode"],
+                "selection_outcome": selection_outcome,
+                "validation_contract": validation_contract,
+                "validation_sources": validation_sources,
+                "selection_freeze": None,
+                "best_selection_policy": {},
+                "validation_holdout": summary["validation_holdout"],
+                "locked_holdout": summary["locked_holdout"],
+                "replication": summary["replication"],
+                "data_lineage": data_lineage,
+                "experiment_artifacts": summary["experiment_artifacts"],
+            },
+        )
+
+        _cleanup_optuna_study_resources(study)
+        return summary
 
     best_trial_number = int(best_trial_report["number"])
-    best_optuna_trial = study.best_trial
     best_overrides = copy.deepcopy(best_trial_report["overrides"])
     best_overrides_summary = _json_ready(_clone_value(best_overrides))
     best_trial_report["selection_policy"]["frozen"] = True
     selection_snapshot = _build_selection_snapshot(best_trial_report)
+    validation_contract = _resolve_validation_contract(
+        base_config,
+        automl_config,
+        training=best_trial_report.get("training"),
+        holdout_enabled=bool(holdout_plan.get("enabled", False)),
+    )
+    validation_sources = _resolve_validation_sources(
+        best_trial_report.get("training"),
+        best_trial_report.get("backtest"),
+        validation_contract,
+        holdout_enabled=bool(holdout_plan.get("enabled", False)),
+        replication_enabled=bool((automl_config.get("replication") or {}).get("enabled", False)),
+    )
 
     selection_report["diagnostics"]["promoted_trial"] = {
         "number": int(best_trial_report["number"]),
@@ -3487,6 +4364,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         full_state_bundle=full_state_bundle,
         holdout_plan=holdout_plan,
         base_pipeline=base_pipeline,
+        primary_score=_coerce_float(best_trial_report.get("raw_objective_value")),
     )
     replication_report["gate_mode"] = resolve_promotion_gate_mode(selection_policy, "replication")
     replication_report = _json_ready(replication_report)
@@ -3633,34 +4511,8 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     selection_report["diagnostics"]["replication"] = replication_report
     selection_report["diagnostics"]["promotion_ready"] = bool(best_trial_report["selection_policy"]["promotion_ready"])
     selection_report["diagnostics"]["promotion_reasons"] = list(best_trial_report["selection_policy"]["promotion_reasons"])
-
-    top_trials = []
-    for report in selection_report["trial_reports"][:5]:
-        top_trials.append(
-            {
-                "number": int(report["number"]),
-                "value": float(report["selection_value"]),
-                "raw_value": float(report["raw_objective_value"]),
-                "model_family": report.get("model_family"),
-                "params": report["params"],
-                "training": report["training"],
-                "backtest": report["backtest"],
-                "search_metrics": report["search_metrics"],
-                "validation_metrics": report["validation_metrics"],
-                "objective_diagnostics": report.get("objective_diagnostics"),
-                "meets_minimum_dsr_threshold": report["meets_minimum_dsr_threshold"],
-                "trial_complexity_score": report["trial_complexity_score"],
-                "feature_count_ratio": report.get("feature_count_ratio"),
-                "fold_stability": report.get("fold_stability"),
-                "generalization_gap": report.get("generalization_gap"),
-                "param_fragility_score": report.get("param_fragility_score"),
-                "param_fragility": report.get("param_fragility"),
-                "selection_policy": report.get("selection_policy"),
-                "locked_holdout": report.get("locked_holdout"),
-                "replication": report.get("replication"),
-                "overfitting": report["overfitting"],
-            }
-        )
+    selection_report["diagnostics"]["validation_contract"] = validation_contract
+    selection_report["diagnostics"]["validation_sources"] = validation_sources
 
     data_lineage = _json_ready(base_pipeline.state.get("data_lineage") or {})
     policy_profile = _resolve_automl_policy_profile(base_config.get("automl") or {})
@@ -3671,12 +4523,34 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     summary = {
         "study_name": study.study_name,
         "storage": str(storage_path),
+        "experiment_id": experiment_manifest["experiment_id"],
+        "experiment_family_id": experiment_manifest["experiment_family_id"],
+        "experiment_manifest": experiment_manifest,
+        "resume_mode": experiment_manifest["resume_mode"],
+        "resume_validation": resume_validation,
+        "experiment_artifacts": {
+            "storage_root": str(storage_context["storage_root"]),
+            "experiment_dir": str(storage_context["experiment_dir"]),
+            "run_dir": str(storage_context["run_dir"]),
+            "study": str(storage_context["study_path"]),
+            "manifest": str(storage_context["manifest_path"]),
+            "lineage": str(storage_context["lineage_path"]),
+            "summary": str(storage_context["summary_path"]),
+            "run_id": storage_context.get("run_id"),
+        },
         "objective": objective_name,
         "policy_profile": policy_profile,
         "trade_ready_profile": _json_ready((base_config.get("automl") or {}).get("trade_ready_profile") or {}),
         "warnings": summary_warnings,
         "selection_metric": selection_report["selection_metric"],
         "selection_mode": selection_report["selection_mode"],
+        "selection_outcome": _build_selection_outcome(
+            selection_report.get("trial_reports"),
+            best_trial_report=best_trial_report,
+            selection_snapshot=selection_snapshot,
+        ),
+        "validation_contract": validation_contract,
+        "validation_sources": validation_sources,
         "feature_schema_version": base_config.get("features", {}).get("schema_version"),
         "best_value": float(best_trial_report["selection_value"]),
         "best_value_raw": float(best_trial_report["raw_objective_value"]),
@@ -3700,6 +4574,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             "replication": best_trial_report.get("replication"),
             "selection_policy": best_trial_report.get("selection_policy"),
             "promotion_eligibility_report": best_trial_report.get("selection_policy", {}).get("promotion_eligibility_report"),
+            "validation_sources": validation_sources,
         },
         "selection_freeze": selection_snapshot,
         "validation_holdout": validation_holdout,
@@ -3785,11 +4660,47 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             "monitoring_report": str(monitoring_path) if monitoring_path is not None else None,
         }
 
-    engine = getattr(getattr(study, "_storage", None), "engine", None)
-    if engine is not None:
-        try:
-            engine.dispose()
-        except Exception:
-            pass
+    write_json(
+        storage_context["summary_path"],
+        {
+            "study_name": study.study_name,
+            "storage": str(storage_path),
+            "experiment_id": experiment_manifest["experiment_id"],
+            "experiment_family_id": experiment_manifest["experiment_family_id"],
+            "resume_mode": experiment_manifest["resume_mode"],
+            "resume_validation": resume_validation,
+            "objective": objective_name,
+            "policy_profile": policy_profile,
+            "best_value": float(best_trial_report["selection_value"]),
+            "best_value_raw": float(best_trial_report["raw_objective_value"]),
+            "best_trial_number": best_trial_number,
+            "trial_count": len(completed_trials),
+            "promotion_ready": bool(best_trial_report["selection_policy"]["promotion_ready"]),
+            "promotion_reasons": list(best_trial_report["selection_policy"]["promotion_reasons"]),
+            "feature_schema_version": base_config.get("features", {}).get("schema_version"),
+            "selection_metric": selection_report["selection_metric"],
+            "selection_mode": selection_report["selection_mode"],
+            "validation_contract": validation_contract,
+            "validation_sources": validation_sources,
+            "selection_freeze": selection_snapshot,
+            "best_selection_policy": _json_ready(summary["best_selection_policy"]),
+            "validation_holdout": _json_ready(validation_holdout),
+            "locked_holdout": _json_ready(locked_holdout),
+            "replication": _json_ready(best_trial_report.get("replication") or {}),
+            "data_lineage": data_lineage,
+            "experiment_artifacts": {
+                "storage_root": str(storage_context["storage_root"]),
+                "experiment_dir": str(storage_context["experiment_dir"]),
+                "run_dir": str(storage_context["run_dir"]),
+                "study": str(storage_context["study_path"]),
+                "manifest": str(storage_context["manifest_path"]),
+                "lineage": str(storage_context["lineage_path"]),
+                "summary": str(storage_context["summary_path"]),
+                "run_id": storage_context.get("run_id"),
+            },
+        },
+    )
+
+    _cleanup_optuna_study_resources(study)
 
     return summary

@@ -42,6 +42,7 @@ _DEFAULT_SIGNIFICANCE_CONFIG = {
     "mean_block_length": None,
     "random_state": 42,
     "min_observations": 8,
+    "min_effective_bets": None,
 }
 
 
@@ -1035,7 +1036,7 @@ def _align_benchmark_returns(benchmark_returns, index):
 def _compute_significance_metrics(strat_ret, equity, periods_per_year, elapsed_years,
                                   sharpe, sortino, calmar, total_ret, max_dd,
                                   significance=None, benchmark_returns=None,
-                                  benchmark_sharpe=None):
+                                  benchmark_sharpe=None, effective_bet_count=None):
     config = _resolve_significance_config(significance)
     payload = {
         "enabled": bool(config.get("enabled", True)),
@@ -1047,7 +1048,10 @@ def _compute_significance_metrics(strat_ret, equity, periods_per_year, elapsed_y
         "benchmark_sharpe_ratio": None,
         "observation_count": None,
         "min_observations": None,
+        "effective_bet_count": None,
+        "min_effective_bets": None,
         "underpowered": False,
+        "underpowered_reason": None,
         "metrics": {},
     }
     if not payload["enabled"]:
@@ -1075,12 +1079,27 @@ def _compute_significance_metrics(strat_ret, equity, periods_per_year, elapsed_y
     benchmark_series = benchmark_series.loc[finite_mask] if benchmark_series is not None else None
 
     min_observations = max(2, int(config.get("min_observations", 8)))
+    min_effective_bets = config.get("min_effective_bets")
+    if min_effective_bets is None:
+        min_effective_bets = min_observations
+    min_effective_bets = max(1, int(min_effective_bets))
     payload["observation_count"] = int(len(strategy_returns))
     payload["min_observations"] = int(min_observations)
+    payload["effective_bet_count"] = None if effective_bet_count is None else int(max(0, int(effective_bet_count)))
+    payload["min_effective_bets"] = int(min_effective_bets)
     if len(strategy_returns) < min_observations:
         payload["enabled"] = False
         payload["reason"] = "insufficient_observations"
         payload["underpowered"] = True
+        payload["underpowered_reason"] = "insufficient_observations"
+        return payload
+
+    resolved_effective_bet_count = payload.get("effective_bet_count")
+    if resolved_effective_bet_count is not None and resolved_effective_bet_count < min_effective_bets:
+        payload["enabled"] = False
+        payload["reason"] = "insufficient_effective_bets"
+        payload["underpowered"] = True
+        payload["underpowered_reason"] = "insufficient_effective_bets"
         return payload
 
     mean_block_length = config.get("mean_block_length")
@@ -1258,12 +1277,13 @@ def _normalize_futures_account_config(futures_account=None, market="spot", lever
 
 
 def _resolve_futures_leverage_bracket(notional, futures_account):
-    brackets = list((futures_account or {}).get("leverage_brackets") or [])
+    account = futures_account or {}
+    brackets = list(account.get("leverage_brackets") or [])
     if not brackets:
         return None
 
     scaled_notional = max(float(notional), 0.0)
-    coef = float((futures_account or {}).get("notional_coef", 1.0) or 1.0)
+    coef = float(account.get("notional_coef", 1.0) or 1.0)
     if coef > 0.0:
         scaled_notional /= coef
 
@@ -1280,7 +1300,8 @@ def _resolve_futures_leverage_bracket(notional, futures_account):
 
 
 def _resolve_futures_leverage_cap(notional, futures_account):
-    configured_leverage = max(1.0, float((futures_account or {}).get("configured_leverage", 1.0)))
+    account = futures_account or {}
+    configured_leverage = max(1.0, float(account.get("configured_leverage", 1.0)))
     bracket = _resolve_futures_leverage_bracket(notional, futures_account)
     if bracket is None:
         return configured_leverage, None
@@ -1302,8 +1323,9 @@ def _compute_futures_maintenance_margin(notional, futures_account, bracket=None)
         ratio = float(bracket.get("maint_margin_ratio") or 0.0)
         cum = float(bracket.get("cum") or 0.0)
     else:
-        ratio = float((futures_account or {}).get("maintenance_margin_ratio", 0.0) or 0.0)
-        cum = float((futures_account or {}).get("maintenance_amount", 0.0) or 0.0)
+        account = futures_account or {}
+        ratio = float(account.get("maintenance_margin_ratio", 0.0) or 0.0)
+        cum = float(account.get("maintenance_amount", 0.0) or 0.0)
     return notional * ratio + cum
 
 
@@ -1313,7 +1335,8 @@ def _cap_futures_target_position(target_position, account_equity, futures_accoun
         requested = 0.0
 
     requested_abs = abs(requested)
-    configured_leverage = max(1.0, float((futures_account or {}).get("configured_leverage", 1.0)))
+    account = futures_account or {}
+    configured_leverage = max(1.0, float(account.get("configured_leverage", 1.0)))
     capped_abs = min(requested_abs, configured_leverage)
     bracket = None
 
@@ -1336,9 +1359,10 @@ def _cap_futures_target_position(target_position, account_equity, futures_accoun
 
 def _enforce_futures_margin_safety(target_position, account_equity, futures_account):
     requested = float(target_position)
-    warning_ratio = max(0.0, float((futures_account or {}).get("warning_margin_ratio", 0.8) or 0.8))
-    margin_mode = str((futures_account or {}).get("margin_mode", "isolated")).lower()
-    mode = str((futures_account or {}).get("margin_safety_mode", "blocking")).lower()
+    account = futures_account or {}
+    warning_ratio = max(0.0, float(account.get("warning_margin_ratio", 0.8) or 0.8))
+    margin_mode = str(account.get("margin_mode", "isolated")).lower()
+    mode = str(account.get("margin_safety_mode", "blocking")).lower()
     requested_abs = abs(requested)
     safe_abs = requested_abs
     bracket = None
@@ -1811,6 +1835,7 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
     trade_win_rate = float(trade_returns.gt(0).mean()) if len(trade_returns) > 0 else 0.0
     avg_trade_return_pct = float(trade_returns.mean()) if len(trade_returns) > 0 else 0.0
     avg_trade_bars = float(trade_ledger["bars"].mean()) if not trade_ledger.empty else 0.0
+    effective_bet_count = int(max(len(trade_ledger), n_trades))
 
     elapsed_years = 0.0
     if len(equity_curve.index) > 1:
@@ -1831,6 +1856,7 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
         significance=significance,
         benchmark_returns=benchmark_returns,
         benchmark_sharpe=benchmark_sharpe,
+        effective_bet_count=effective_bet_count,
     )
 
     funding_paid = max(-float(funding_pnl), 0.0)
@@ -1869,6 +1895,7 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
         "expectancy": _round_metric(expectancy, 2),
         "expectancy_pct": _round_metric(expectancy_pct, 6),
         "total_trades": n_trades,
+        "effective_bet_count": effective_bet_count,
         "win_rate": _round_metric(win_rate, 4),
         "active_bar_win_rate": _round_metric(win_rate, 4),
         "closed_trades": int(len(trade_ledger)),

@@ -260,6 +260,7 @@ class LocalRegistryStore:
             "replication_coverage",
             "replication_pass_rate",
             "latest_drift_report",
+            "latest_paper_report",
             "latest_monitoring_report",
             "latest_promotion_report",
             "locked_holdout_score",
@@ -469,6 +470,22 @@ class LocalRegistryStore:
         index = self._read_index()
         mask = index["version_id"].astype(str) == str(version_id)
         index.loc[mask, "latest_monitoring_report"] = str(report_path)
+        self._write_index(index)
+        return report_path
+
+    def attach_paper_report(self, version_id, paper_report, *, symbol=None):
+        row = self._find_row(version_id, symbol=symbol)
+        if row is None:
+            raise FileNotFoundError(f"Registry version {version_id!r} was not found")
+        version_dir = Path(row["version_dir"])
+        paper_dir = version_dir / "paper"
+        paper_dir.mkdir(parents=True, exist_ok=True)
+        report_path = paper_dir / f"{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d%H%M%S')}.json"
+        write_json(report_path, paper_report)
+
+        index = self._read_index()
+        mask = index["version_id"].astype(str) == str(version_id)
+        index.loc[mask, "latest_paper_report"] = str(report_path)
         self._write_index(index)
         return report_path
 

@@ -44,7 +44,9 @@ from .feature_governance import (
 from .features import (
     build_feature_set,
     check_stationarity,
+    derive_feature_availability,
     derive_feature_families,
+    derive_feature_lineage,
     screen_features_for_stationarity,
     select_features,
     summarize_feature_families,
@@ -227,7 +229,7 @@ def _refresh_active_dataset_manifests(pipeline, *, data_quality_report=None):
 
 
 def _ensure_pipeline_data_contracts(pipeline, *, include_reference=False):
-    config = dict(pipeline.section("data") or {})
+    config = dict(pipeline.section("data"))
     market = config.get("market", "spot")
     interval = config.get("interval", "1h")
     symbol = config.get("symbol", "unknown")
@@ -352,6 +354,154 @@ def _resolve_validation_method(model_config):
     return method
 
 
+def _normalize_validation_source_name(source, *, executable=False):
+    value = str(source or "").strip().lower()
+    if not value:
+        return None
+    aliases = {
+        "walk-forward": "walk_forward",
+        "walkforward": "walk_forward",
+        "wf": "walk_forward",
+        "validation": "walk_forward",
+        "executable_validation": "walk_forward_replay",
+    }
+    value = aliases.get(value, value)
+    if executable and value == "walk_forward":
+        return "walk_forward_replay"
+    return value
+
+
+def _resolve_pipeline_validation_contract(pipeline, training=None, holdout_enabled=False):
+    training = training or {}
+    automl_config = dict(pipeline.section("automl") or {})
+    trade_ready_profile = dict(automl_config.get("trade_ready_profile") or {})
+    model_config = dict(pipeline.section("model") or {})
+    validation = dict(training.get("validation") or {})
+    executable_validation = dict(training.get("executable_validation") or {})
+    executable_training = dict(executable_validation.get("training") or {}) if executable_validation.get("enabled") else {}
+    executable_training_validation = dict(executable_training.get("validation") or {})
+
+    primary_source = _normalize_validation_source_name(
+        validation.get("method") or model_config.get("cv_method", "cpcv")
+    )
+    tradable_source = _normalize_validation_source_name(
+        executable_training_validation.get("method") or model_config.get("cv_method", "cpcv"),
+        executable=bool(executable_validation.get("enabled")),
+    )
+    if tradable_source == "cpcv" and executable_validation.get("enabled"):
+        tradable_source = "walk_forward_replay"
+
+    replication_enabled = bool((automl_config.get("replication") or {}).get("enabled", False))
+    if trade_ready_profile:
+        defaults = {
+            "search_ranker": "cpcv",
+            "contiguous_validation": "walk_forward_replay",
+            "locked_holdout": "single_access_contiguous" if holdout_enabled else "disabled",
+            "replication": "required" if replication_enabled else "disabled",
+        }
+    else:
+        defaults = {
+            "search_ranker": primary_source or "walk_forward",
+            "contiguous_validation": tradable_source or primary_source or "walk_forward",
+            "locked_holdout": "single_access_contiguous" if holdout_enabled else "disabled",
+            "replication": "required" if replication_enabled else "disabled",
+        }
+    contract = copy.deepcopy(automl_config.get("validation_contract") or {})
+    return {
+        "search_ranker": str(contract.get("search_ranker", defaults["search_ranker"])),
+        "contiguous_validation": str(contract.get("contiguous_validation", defaults["contiguous_validation"])),
+        "locked_holdout": str(contract.get("locked_holdout", defaults["locked_holdout"])),
+        "replication": str(contract.get("replication", defaults["replication"])),
+    }
+
+
+def _validation_contract_stage_pass(stage_source, *, diagnostic_source, selection_source, tradable_source, enabled):
+    stage_source = _normalize_validation_source_name(stage_source)
+    if stage_source in {None, "disabled"}:
+        return True
+    if stage_source == "cpcv":
+        return diagnostic_source == "cpcv"
+    if stage_source == "single_access_contiguous":
+        return bool(enabled)
+    if stage_source == "required":
+        return bool(enabled)
+    if stage_source == "walk_forward_replay":
+        return tradable_source == "walk_forward_replay"
+    if stage_source == "walk_forward":
+        return tradable_source in {"walk_forward", "walk_forward_replay"} or selection_source in {
+            "walk_forward",
+            "walk_forward_replay",
+        }
+    return bool(enabled)
+
+
+def _resolve_pipeline_validation_sources(pipeline, training, *, backtest=None, holdout_enabled=False):
+    training = training or {}
+    backtest = backtest or {}
+    validation_contract = _resolve_pipeline_validation_contract(
+        pipeline,
+        training=training,
+        holdout_enabled=holdout_enabled,
+    )
+    validation = dict(training.get("validation") or {})
+    executable_validation = dict(training.get("executable_validation") or {})
+    executable_training = dict(executable_validation.get("training") or {}) if executable_validation.get("enabled") else {}
+    executable_training_validation = dict(executable_training.get("validation") or {})
+    automl_config = dict(pipeline.section("automl") or {})
+
+    diagnostic_source = _normalize_validation_source_name(
+        backtest.get("diagnostic_validation_method") or validation.get("method")
+    )
+    selection_source = _normalize_validation_source_name(
+        executable_training_validation.get("method") or backtest.get("validation_method") or validation.get("method"),
+        executable=bool(executable_validation.get("enabled")),
+    )
+    tradable_source = _normalize_validation_source_name(
+        backtest.get("validation_method") or executable_training_validation.get("method") or validation.get("method"),
+        executable=bool(executable_validation.get("enabled")),
+    )
+    replication_enabled = bool((automl_config.get("replication") or {}).get("enabled", False))
+
+    source_checks = {
+        "search_ranker": _validation_contract_stage_pass(
+            validation_contract.get("search_ranker"),
+            diagnostic_source=diagnostic_source,
+            selection_source=selection_source,
+            tradable_source=tradable_source,
+            enabled=bool(diagnostic_source),
+        ),
+        "contiguous_validation": _validation_contract_stage_pass(
+            validation_contract.get("contiguous_validation"),
+            diagnostic_source=diagnostic_source,
+            selection_source=selection_source,
+            tradable_source=tradable_source,
+            enabled=bool(tradable_source),
+        ),
+        "locked_holdout": _validation_contract_stage_pass(
+            validation_contract.get("locked_holdout"),
+            diagnostic_source=diagnostic_source,
+            selection_source=selection_source,
+            tradable_source=tradable_source,
+            enabled=bool(holdout_enabled),
+        ),
+        "replication": _validation_contract_stage_pass(
+            validation_contract.get("replication"),
+            diagnostic_source=diagnostic_source,
+            selection_source=selection_source,
+            tradable_source=tradable_source,
+            enabled=bool(replication_enabled),
+        ),
+    }
+    return {
+        "validation_contract": validation_contract,
+        "selection_metric_source": selection_source,
+        "diagnostic_metric_source": diagnostic_source,
+        "tradable_metric_source": tradable_source,
+        "required_source_checks": source_checks,
+        "all_required_sources_passed": bool(all(source_checks.values())),
+    }
+
+
 def _resolve_cpcv_block_count(model_config):
     configured = model_config.get("n_blocks")
     if configured is not None:
@@ -400,8 +550,65 @@ def _build_contiguous_test_intervals(index, positions):
     return intervals
 
 
+def _normalize_explicit_split(X, split_number, split_config, configured_gap):
+    split = dict(split_config or {})
+    train_idx = np.asarray(split.get("train_index", split.get("train_idx", [])), dtype=int)
+    test_idx = np.asarray(split.get("test_index", split.get("test_idx", [])), dtype=int)
+    gap_idx = np.asarray(split.get("gap_index", split.get("gap_idx", [])), dtype=int)
+    max_index = len(X)
+
+    for name, values, allow_empty in (
+        ("train_index", train_idx, False),
+        ("test_index", test_idx, False),
+        ("gap_index", gap_idx, True),
+    ):
+        if values.ndim != 1:
+            raise ValueError(f"Explicit split {name} must be one-dimensional")
+        if not allow_empty and len(values) == 0:
+            raise ValueError(f"Explicit split {name} cannot be empty")
+        if len(values) and ((values < 0).any() or (values >= max_index).any()):
+            raise ValueError(f"Explicit split {name} contains out-of-range positions")
+
+    if np.intersect1d(train_idx, test_idx).size > 0:
+        raise ValueError("Explicit split train_index and test_index overlap")
+    if np.intersect1d(train_idx, gap_idx).size > 0:
+        raise ValueError("Explicit split train_index and gap_index overlap")
+    if np.intersect1d(test_idx, gap_idx).size > 0:
+        raise ValueError("Explicit split test_index and gap_index overlap")
+
+    metadata = {
+        "gap_index": gap_idx.tolist(),
+        "gap_rows": int(len(gap_idx)),
+        "gap_bars": int(split.get("gap_bars", len(gap_idx))),
+        "source": str(split.get("source", "explicit_split")),
+        "timestamp_bounds": dict(split.get("timestamp_bounds") or {}),
+        "configured_gap": int(configured_gap),
+        "split_owner": "explicit_splits",
+        "explicit_split": True,
+    }
+    if split.get("excluded_intervals") is not None:
+        metadata["excluded_intervals"] = list(split.get("excluded_intervals") or [])
+
+    return {
+        "fold": split_number,
+        "split_id": str(split.get("split_id", f"explicit_{split_number}")),
+        "validation_method": "walk_forward",
+        "train_idx": train_idx,
+        "test_idx": test_idx,
+        "test_intervals": _build_contiguous_test_intervals(X.index, test_idx),
+        "metadata": metadata,
+    }
+
+
 def _iter_validation_splits(pipeline, X):
     model_config = pipeline.section("model")
+    explicit_splits = list(model_config.get("explicit_splits") or [])
+    configured_gap = int(model_config.get("gap", 0))
+    if explicit_splits:
+        for split_number, split_config in enumerate(explicit_splits):
+            yield _normalize_explicit_split(X, split_number, split_config, configured_gap)
+        return
+
     validation_method = _resolve_validation_method(model_config)
 
     if validation_method == "walk_forward":
@@ -683,7 +890,7 @@ def _resolve_backtest_liquidity_lag_bars(pipeline):
 
 
 def _resolve_backtest_execution_policy(pipeline):
-    backtest_config = pipeline.section("backtest") or {}
+    backtest_config = pipeline.section("backtest")
     configured = backtest_config.get("execution_policy")
     policy_config = (
         dict(configured)
@@ -718,17 +925,19 @@ def _resolve_backtest_execution_policy(pipeline):
 
 
 def _resolve_lookahead_guard_config(pipeline):
-    features_config = pipeline.section("features") or {}
-    backtest_config = pipeline.section("backtest") or {}
-    automl_config = pipeline.section("automl") or {}
+    features_config = pipeline.section("features")
+    backtest_config = pipeline.section("backtest")
+    automl_config = pipeline.section("automl")
     builders = list(features_config.get("builders") or [])
     configured = copy.deepcopy(features_config.get("lookahead_guard") or {})
 
     trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
     automl_enabled = bool(automl_config.get("enabled", False))
-    default_enabled = bool(builders) or trade_ready_mode or automl_enabled
+    default_enabled = True
     enabled = bool(configured.get("enabled", default_enabled))
     default_mode = "blocking" if default_enabled else "advisory"
+    if not (trade_ready_mode or automl_enabled or builders):
+        default_mode = "advisory"
     mode = str(configured.get("mode", default_mode)).strip().lower()
     if mode not in {"blocking", "advisory"}:
         mode = default_mode
@@ -773,11 +982,33 @@ def _run_pipeline_lookahead_guard(pipeline):
         pipeline.state["lookahead_guard_report"] = report
         return report
 
+    available_step_names = [
+        step_name
+        for step_name in list(guard_config.get("step_names") or [])
+        if step_name in pipeline.step_map
+    ]
+    missing_step_names = [
+        step_name
+        for step_name in list(guard_config.get("step_names") or [])
+        if step_name not in pipeline.step_map
+    ]
+    report["available_step_names"] = available_step_names
+    report["missing_step_names"] = missing_step_names
+    if missing_step_names:
+        report["warnings"] = [
+            f"lookahead_step_unavailable:{step_name}"
+            for step_name in missing_step_names
+        ]
+    if not available_step_names:
+        report["audit_skipped"] = True
+        pipeline.state["lookahead_guard_report"] = report
+        return report
+
     from .lookahead import run_lookahead_analysis
 
     audit = run_lookahead_analysis(
         pipeline,
-        step_names=guard_config["step_names"],
+        step_names=available_step_names,
         artifact_names=guard_config["artifact_names"],
         sample_count=guard_config["decision_sample_size"],
         min_prefix_rows=guard_config["min_prefix_rows"],
@@ -790,11 +1021,21 @@ def _run_pipeline_lookahead_guard(pipeline):
         primary_artifact_name = guard_config["artifact_names"][0]
     artifact_report = dict(artifact_reports.get(primary_artifact_name) or {}) if primary_artifact_name else artifact_reports
 
+    failure_reasons = []
+    if audit.get("has_bias", False):
+        failure_reasons.append("lookahead_guard_failed")
+        for entry in biased_entries:
+            artifact = entry.get("artifact")
+            column = entry.get("column")
+            if artifact or column:
+                detail = ":".join(str(value) for value in [artifact, column] if value is not None)
+                failure_reasons.append(f"lookahead_guard_failed:{detail}")
+
     report.update(
         {
             "has_bias": bool(audit.get("has_bias", False)),
             "promotion_pass": not bool(audit.get("has_bias", False)),
-            "reasons": (["lookahead_guard_failed"] if audit.get("has_bias", False) else []),
+            "reasons": failure_reasons,
             "biased_columns": sorted(
                 {
                     str(entry.get("column"))
@@ -843,8 +1084,8 @@ def _resolve_backtest_funding_missing_policy(backtest_config):
 
 
 def _resolve_pipeline_data_fetch_config(pipeline):
-    config = dict(pipeline.section("data") or {})
-    backtest_config = pipeline.section("backtest") or {}
+    config = dict(pipeline.section("data"))
+    backtest_config = pipeline.section("backtest")
     trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
     research_only_override = bool(backtest_config.get("research_only_override", False))
     if trade_ready_mode and not research_only_override:
@@ -854,8 +1095,8 @@ def _resolve_pipeline_data_fetch_config(pipeline):
 
 
 def _resolve_pipeline_data_quality_config(pipeline):
-    config = copy.deepcopy(pipeline.section("data_quality") or {})
-    backtest_config = pipeline.section("backtest") or {}
+    config = copy.deepcopy(pipeline.section("data_quality"))
+    backtest_config = pipeline.section("backtest")
     trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
     research_only_override = bool(backtest_config.get("research_only_override", False))
     if trade_ready_mode and not research_only_override:
@@ -877,10 +1118,10 @@ def _append_unique_reason(reasons, value):
 
 
 def _resolve_data_certification_config(pipeline):
-    configured = copy.deepcopy(pipeline.section("data_certification") or {})
-    backtest_config = pipeline.section("backtest") or {}
-    data_config = pipeline.section("data") or {}
-    reference_config = pipeline.section("reference_data") or {}
+    configured = copy.deepcopy(pipeline.section("data_certification"))
+    backtest_config = pipeline.section("backtest")
+    data_config = pipeline.section("data")
+    reference_config = pipeline.section("reference_data")
 
     trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
     futures_context_config = dict(data_config.get("futures_context") or {})
@@ -1187,7 +1428,7 @@ def _resolve_backtest_futures_account(pipeline):
     if market == "spot":
         return None
 
-    backtest_config = pipeline.section("backtest") or {}
+    backtest_config = pipeline.section("backtest")
     configured = dict(backtest_config.get("futures_account", {}) or {})
     if not configured:
         return None
@@ -1296,6 +1537,7 @@ def _resolve_backtest_significance_config(backtest_config):
     if trade_ready_mode and not research_only_override:
         resolved["enabled"] = True
         resolved.setdefault("min_observations", 32)
+        resolved.setdefault("min_effective_bets", int(resolved["min_observations"]))
 
     return resolved
 
@@ -1327,8 +1569,8 @@ def _build_pipeline_operational_monitoring(
     queue_backlog=None,
     scope="training",
 ):
-    monitoring_config = dict(pipeline.section("monitoring") or {})
-    backtest_config = pipeline.section("backtest") or {}
+    monitoring_config = dict(pipeline.section("monitoring"))
+    backtest_config = pipeline.section("backtest")
     trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
     raw_data = pipeline.state.get("raw_data")
     raw_index = raw_data.index if isinstance(raw_data, (pd.DataFrame, pd.Series)) else pd.DatetimeIndex([])
@@ -1982,7 +2224,7 @@ def _build_signal_decay_segment(
 
     execution_prices = _resolve_backtest_execution_prices(pipeline, signal_index)
     runtime_kwargs = _resolve_backtest_runtime_kwargs(pipeline, signal_index)
-    backtest_config = pipeline.section("backtest") or {}
+    backtest_config = pipeline.section("backtest")
     return {
         "predictions": pd.Series(predictions, copy=False).reindex(signal_index),
         "direction_edge": None if direction_edge is None else pd.Series(direction_edge, copy=False).reindex(signal_index),
@@ -2006,7 +2248,7 @@ def _build_signal_decay_report_for_segments(pipeline, segments, holding_bars):
         holding_bars=holding_bars,
         signal_delay_bars=_resolve_signal_delay_bars(pipeline.section("backtest")),
         execution_policy=_resolve_backtest_execution_policy(pipeline),
-        config=(pipeline.section("signals") or {}).get("decay"),
+        config=pipeline.section("signals").get("decay"),
     )
 
 
@@ -2113,7 +2355,7 @@ def _average_fold_metric(fold_metrics, key):
 
 
 def _resolve_validation_stability_policy(pipeline):
-    validation_config = pipeline.section("validation") or {}
+    validation_config = pipeline.section("validation")
     configured = dict(validation_config.get("stability_policy", {}) or {})
     if not configured and pipeline.section("model").get("stability_policy"):
         configured = dict(pipeline.section("model").get("stability_policy") or {})
@@ -2423,6 +2665,41 @@ def _extend_signal_policy_params(params, signal_config):
     return extended
 
 
+def _resolve_kelly_calibration_guard(signal_config):
+    sizing_mode = str(signal_config.get("sizing_mode", "expected_utility"))
+    trade_ready_mode = bool(signal_config.get("trade_ready_mode", False))
+    require_paper = bool(signal_config.get("require_paper_verification_for_kelly", trade_ready_mode))
+    require_calibration = bool(signal_config.get("require_live_calibration_for_kelly", trade_ready_mode))
+    configured_cap = float(signal_config.get("max_kelly_fraction", 0.5))
+    fallback_cap = float(signal_config.get("uncalibrated_kelly_fraction_cap", min(configured_cap, 0.25)))
+    calibration_error = signal_config.get("live_calibration_error")
+    if calibration_error is None:
+        calibration_error = signal_config.get("calibration_error")
+    max_live_calibration_error = float(signal_config.get("max_live_calibration_error", 0.25))
+
+    reasons = []
+    if sizing_mode == "kelly":
+        if require_paper and not bool(signal_config.get("paper_verified", False)):
+            reasons.append("paper_verification_required")
+        if require_calibration:
+            if calibration_error is None:
+                reasons.append("live_calibration_unavailable")
+            elif float(calibration_error) > max_live_calibration_error:
+                reasons.append("live_calibration_error_above_threshold")
+
+    effective_cap = configured_cap if not reasons else min(configured_cap, fallback_cap)
+    return {
+        "applies": bool(sizing_mode == "kelly" and (require_paper or require_calibration)),
+        "passed": not reasons,
+        "reasons": reasons,
+        "configured_max_kelly_fraction": configured_cap,
+        "effective_max_kelly_fraction": effective_cap,
+        "paper_verified": bool(signal_config.get("paper_verified", False)),
+        "live_calibration_error": calibration_error,
+        "max_live_calibration_error": max_live_calibration_error,
+    }
+
+
 class SignalPolicyBuilder:
     def __init__(self, signal_config, backtest_config):
         self.signal_config = dict(signal_config or {})
@@ -2461,6 +2738,15 @@ class SignalPolicyBuilder:
             )
 
         params = _extend_signal_policy_params(report["params"], self.signal_config)
+        trade_ready_mode = str(self.backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+        params.setdefault("trade_ready_mode", trade_ready_mode)
+        params.setdefault("require_paper_verification_for_kelly", trade_ready_mode)
+        params.setdefault("require_live_calibration_for_kelly", trade_ready_mode)
+        params.setdefault("uncalibrated_kelly_fraction_cap", min(float(params.get("max_kelly_fraction", 0.5)), 0.25))
+        params.setdefault("max_live_calibration_error", float(self.signal_config.get("max_live_calibration_error", 0.25)))
+        for key in ("paper_verified", "live_calibration_error", "calibration_error"):
+            if key in calibration_context:
+                params[key] = calibration_context.get(key)
         break_even_prob = float(avg_loss) / max(float(avg_win) + float(avg_loss), 1e-12)
         policy_quality = {
             "mode": self.mode,
@@ -2519,13 +2805,16 @@ def _build_signal_state(
     holding_bars,
     kelly_trade_count=None,
 ):
+    kelly_calibration_guard = _resolve_kelly_calibration_guard(signal_config)
+    effective_signal_config = dict(signal_config)
+    effective_signal_config["max_kelly_fraction"] = kelly_calibration_guard["effective_max_kelly_fraction"]
     direction = prediction_series.apply(lambda value: 1.0 if value > 0 else (-1.0 if value < 0 else 0.0))
     direction_edge = probability_frame[1] - probability_frame[-1]
     confidence = direction_edge.abs().clip(0.0, 1.0)
     profitability_prob = meta_prob_series.clip(0.0, 1.0)
-    min_trades_for_kelly = int(signal_config.get("min_trades_for_kelly", 30))
+    min_trades_for_kelly = int(effective_signal_config.get("min_trades_for_kelly", 30))
     use_flat_kelly_fallback = (
-        signal_config.get("sizing_mode", "expected_utility") == "kelly"
+        effective_signal_config.get("sizing_mode", "expected_utility") == "kelly"
         and kelly_trade_count is not None
         and int(kelly_trade_count) < min_trades_for_kelly
     )
@@ -2542,26 +2831,29 @@ def _build_signal_state(
     position_size = pd.Series(index=profitability_prob.index, dtype=float)
     expected_trade_edge = pd.Series(index=profitability_prob.index, dtype=float)
     for timestamp, probability in profitability_prob.items():
-        size, edge = _position_size_from_profitability(probability, avg_win, avg_loss, signal_config)
+        size, edge = _position_size_from_profitability(probability, avg_win, avg_loss, effective_signal_config)
         if use_flat_kelly_fallback:
-            size = min(float(signal_config.get("fraction", 0.5)), float(signal_config.get("max_kelly_fraction", 0.5)))
+            size = min(
+                float(effective_signal_config.get("fraction", 0.5)),
+                float(effective_signal_config.get("max_kelly_fraction", 0.5)),
+            )
         position_size.loc[timestamp] = size
         expected_trade_edge.loc[timestamp] = edge
 
     break_even_prob = float(avg_loss) / max(float(avg_win) + float(avg_loss), 1e-12)
-    profitability_threshold = signal_config.get("profitability_threshold")
+    profitability_threshold = effective_signal_config.get("profitability_threshold")
     if profitability_threshold is None:
-        if signal_config.get("sizing_mode", "expected_utility") == "kelly":
-            profitability_threshold = signal_config.get("meta_threshold", 0.55)
+        if effective_signal_config.get("sizing_mode", "expected_utility") == "kelly":
+            profitability_threshold = effective_signal_config.get("meta_threshold", 0.55)
         else:
             profitability_threshold = break_even_prob
 
     event_signals = direction * position_size
     event_signals = event_signals.where(direction.ne(0.0), 0.0)
-    event_signals = event_signals.where(confidence >= signal_config.get("edge_threshold", 0.05), 0.0)
+    event_signals = event_signals.where(confidence >= effective_signal_config.get("edge_threshold", 0.05), 0.0)
     event_signals = event_signals.where(profitability_prob >= profitability_threshold, 0.0)
-    event_signals = event_signals.where(expected_trade_edge >= signal_config.get("expected_edge_threshold", 0.0), 0.0)
-    event_signals = event_signals.where(event_signals.abs() >= signal_config.get("threshold", 0.03), 0.0)
+    event_signals = event_signals.where(expected_trade_edge >= effective_signal_config.get("expected_edge_threshold", 0.0), 0.0)
+    event_signals = event_signals.where(event_signals.abs() >= effective_signal_config.get("threshold", 0.03), 0.0)
 
     continuous = _apply_holding_period(event_signals, holding_bars)
     signals = continuous.apply(lambda value: 1 if value > 1e-12 else (-1 if value < -1e-12 else 0))
@@ -2586,14 +2878,18 @@ def _build_signal_state(
         "avg_loss_used": avg_loss,
         "kelly_trade_count": None if kelly_trade_count is None else int(kelly_trade_count),
         "used_flat_kelly_fallback": bool(use_flat_kelly_fallback),
+        "kelly_calibration_blocked": bool(kelly_calibration_guard["applies"] and not kelly_calibration_guard["passed"]),
+        "kelly_calibration_reasons": list(kelly_calibration_guard["reasons"]),
+        "effective_max_kelly_fraction": float(kelly_calibration_guard["effective_max_kelly_fraction"]),
+        "kelly_calibration_guard": kelly_calibration_guard,
         "tuned_params": {
-            "threshold": float(signal_config.get("threshold", 0.03)),
-            "edge_threshold": float(signal_config.get("edge_threshold", 0.05)),
-            "meta_threshold": float(signal_config.get("meta_threshold", 0.55)),
+            "threshold": float(effective_signal_config.get("threshold", 0.03)),
+            "edge_threshold": float(effective_signal_config.get("edge_threshold", 0.05)),
+            "meta_threshold": float(effective_signal_config.get("meta_threshold", 0.55)),
             "profitability_threshold": float(profitability_threshold),
-            "fraction": float(signal_config.get("fraction", 0.5)),
+            "fraction": float(effective_signal_config.get("fraction", 0.5)),
             "min_trades_for_kelly": min_trades_for_kelly,
-            "max_kelly_fraction": float(signal_config.get("max_kelly_fraction", 0.5)),
+            "max_kelly_fraction": float(effective_signal_config.get("max_kelly_fraction", 0.5)),
         },
     }
 
@@ -2776,8 +3072,8 @@ class FetchDataStep(PipelineStep):
 
     def run(self, pipeline):
         config = _resolve_pipeline_data_fetch_config(pipeline)
-        reference_config = dict(pipeline.section("reference_data") or {})
-        universe_config = dict(pipeline.section("universe") or {})
+        reference_config = dict(pipeline.section("reference_data"))
+        universe_config = dict(pipeline.section("universe"))
         futures_context_config = dict(config.pop("futures_context", {}) or {})
         cross_asset_context_config = dict(config.pop("cross_asset_context", {}) or {})
         custom_data_config = list(config.pop("custom_data", []) or [])
@@ -3065,6 +3361,8 @@ class FeaturesStep(PipelineStep):
         features = feature_set.frame
         feature_blocks = dict(feature_set.feature_blocks)
         feature_families = dict(feature_set.feature_families)
+        feature_availability = dict(getattr(feature_set, "feature_availability", {}) or {})
+        feature_lineage = dict(getattr(feature_set, "feature_lineage", {}) or {})
 
         futures_context_block = build_futures_context_feature_block(
             raw_data,
@@ -3074,6 +3372,13 @@ class FeaturesStep(PipelineStep):
             missing_policy=config.get("context_missing_policy"),
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, futures_context_block)
+        for column in futures_context_block.frame.columns:
+            feature_availability[column] = {
+                "event_timestamp": str((futures_context_block.metadata or {}).get("event_timestamp", "index")),
+                "available_timestamp": str((futures_context_block.metadata or {}).get("available_timestamp", "index")),
+                "source": str((futures_context_block.metadata or {}).get("source", futures_context_block.block_name)),
+                "join_mode": str((futures_context_block.metadata or {}).get("join_mode", "point_in_time")),
+            }
         ttl_report = dict((futures_context_block.metadata or {}).get("ttl_report") or {})
         if ttl_report:
             context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
@@ -3088,6 +3393,13 @@ class FeaturesStep(PipelineStep):
             missing_policy=config.get("context_missing_policy"),
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, cross_asset_context_block)
+        for column in cross_asset_context_block.frame.columns:
+            feature_availability[column] = {
+                "event_timestamp": str((cross_asset_context_block.metadata or {}).get("event_timestamp", "index")),
+                "available_timestamp": str((cross_asset_context_block.metadata or {}).get("available_timestamp", "index")),
+                "source": str((cross_asset_context_block.metadata or {}).get("source", cross_asset_context_block.block_name)),
+                "join_mode": str((cross_asset_context_block.metadata or {}).get("join_mode", "point_in_time")),
+            }
         ttl_report = dict((cross_asset_context_block.metadata or {}).get("ttl_report") or {})
         if ttl_report:
             context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
@@ -3101,6 +3413,13 @@ class FeaturesStep(PipelineStep):
             rolling_window=config.get("rolling_window", 20),
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, multi_timeframe_block)
+        for column in multi_timeframe_block.frame.columns:
+            feature_availability[column] = {
+                "event_timestamp": str((multi_timeframe_block.metadata or {}).get("event_timestamp", "index")),
+                "available_timestamp": str((multi_timeframe_block.metadata or {}).get("available_timestamp", "index")),
+                "source": str((multi_timeframe_block.metadata or {}).get("source", multi_timeframe_block.block_name)),
+                "join_mode": str((multi_timeframe_block.metadata or {}).get("join_mode", "point_in_time")),
+            }
 
         reference_overlay_block = build_reference_overlay_feature_block(
             raw_data,
@@ -3112,6 +3431,13 @@ class FeaturesStep(PipelineStep):
             rolling_window=config.get("rolling_window", 20),
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, reference_overlay_block)
+        for column in reference_overlay_block.frame.columns:
+            feature_availability[column] = {
+                "event_timestamp": str((reference_overlay_block.metadata or {}).get("event_timestamp", "index")),
+                "available_timestamp": str((reference_overlay_block.metadata or {}).get("available_timestamp", "index")),
+                "source": str((reference_overlay_block.metadata or {}).get("source", reference_overlay_block.block_name)),
+                "join_mode": str((reference_overlay_block.metadata or {}).get("join_mode", "point_in_time")),
+            }
 
         for builder in config.get("builders", []):
             built = builder(pipeline, features.copy())
@@ -3122,8 +3448,41 @@ class FeaturesStep(PipelineStep):
                 column: feature_blocks.get(column, config.get("custom_block_name", "custom"))
                 for column in features.columns
             }
+            for column in features.columns:
+                feature_availability.setdefault(
+                    column,
+                    {
+                        "event_timestamp": "index",
+                        "available_timestamp": "index",
+                        "source": feature_blocks.get(column, config.get("custom_block_name", "custom")),
+                        "join_mode": "custom_builder",
+                    },
+                )
 
         feature_families = derive_feature_families(feature_blocks, columns=features.columns)
+        feature_availability = derive_feature_availability(
+            feature_blocks,
+            columns=features.columns,
+            block_metadata={
+                block_name: {
+                    "event_timestamp": metadata.get("event_timestamp", "index"),
+                    "available_timestamp": metadata.get("available_timestamp", "index"),
+                    "source": metadata.get("source", block_name),
+                    "join_mode": metadata.get("join_mode", "same_index"),
+                }
+                for block_name, metadata in {
+                    **{
+                        feature_blocks.get(column, "unknown"): values
+                        for column, values in feature_availability.items()
+                    }
+                }.items()
+            },
+        )
+        feature_lineage = derive_feature_lineage(
+            feature_blocks,
+            columns=features.columns,
+            feature_availability=feature_availability,
+        )
 
         screening_result = screen_features_for_stationarity(
             features,
@@ -3138,17 +3497,21 @@ class FeaturesStep(PipelineStep):
             feature_families=feature_families,
             columns=features.columns,
             screening_report=screening_report,
-            feature_lineage=getattr(feature_set, "feature_lineage", {}),
-            retired_features=(pipeline.section("feature_governance") or {}).get("retired_features"),
+            feature_lineage=feature_lineage,
+            retired_features=pipeline.section("feature_governance").get("retired_features"),
         )
 
         pipeline.state["raw_features"] = features
         pipeline.state["feature_blocks_raw"] = feature_blocks
         pipeline.state["feature_families_raw"] = feature_families
+        pipeline.state["feature_availability_raw"] = feature_availability
+        pipeline.state["feature_lineage_raw"] = feature_lineage
         pipeline.state["feature_metadata_raw"] = feature_metadata
         pipeline.state["feature_screening"] = screening_report
         pipeline.state["feature_blocks"] = feature_blocks
         pipeline.state["feature_families"] = feature_families
+        pipeline.state["feature_availability"] = feature_availability
+        pipeline.state["feature_lineage"] = feature_lineage
         pipeline.state["feature_metadata"] = feature_metadata
         pipeline.state["feature_family_summary"] = summarize_feature_families(feature_blocks, columns=features.columns)
         pipeline.state["features"] = features
@@ -3425,10 +3788,30 @@ class TrainModelsStep(PipelineStep):
             },
         )
         close_all = raw_data["close"]
-        validation_method = _resolve_validation_method(config)
+        explicit_splits = list(config.get("explicit_splits") or [])
+        validation_method = "walk_forward" if explicit_splits else _resolve_validation_method(config)
         stability_policy = _resolve_validation_stability_policy(pipeline)
         validation_details = {"method": validation_method}
-        if validation_method == "cpcv":
+        if explicit_splits:
+            validation_details.update(
+                {
+                    "gap": 0,
+                    "n_splits": int(len(explicit_splits)),
+                    "split_owner": "explicit_splits",
+                    "gap_audit": [
+                        {
+                            "split_id": str(split.get("split_id", f"explicit_{position}")),
+                            "source": str(split.get("source", "explicit_split")),
+                            "gap_rows": int(len(split.get("gap_index", split.get("gap_idx", [])) or [])),
+                            "gap_bars": int(split.get("gap_bars", len(split.get("gap_index", split.get("gap_idx", [])) or []))),
+                            "timestamp_bounds": dict(split.get("timestamp_bounds") or {}),
+                            "configured_gap": int(config.get("gap", 0)),
+                        }
+                        for position, split in enumerate(explicit_splits)
+                    ],
+                }
+            )
+        elif validation_method == "cpcv":
             validation_details.update(
                 {
                     "n_blocks": _resolve_cpcv_block_count(config),
@@ -3618,7 +4001,7 @@ class TrainModelsStep(PipelineStep):
                     "validation_method": validation_method,
                     "outer_purged_rows": int(outer_purged),
                     "inner_purged_rows": int(inner_purged),
-                    "embargo_rows": int(split_meta.get("embargo_rows", 0)),
+                    "embargo_rows": int(split_meta.get("embargo_rows", split_meta.get("gap_rows", 0))),
                     "fit_rows": int(len(X_fit)),
                     "validation_rows": int(len(X_val)) if X_val is not None else 0,
                     "test_rows": int(len(X_test)),
@@ -4378,6 +4761,7 @@ class TrainModelsStep(PipelineStep):
             executable_validation = _build_executable_validation_training(pipeline)
             if executable_validation is not None:
                 training["executable_validation"] = executable_validation
+        training["validation_sources"] = _resolve_pipeline_validation_sources(pipeline, training)
         pipeline.state["training"] = training
         pipeline.state["operational_monitoring"] = operational_monitoring
         return training
@@ -4572,6 +4956,11 @@ class BacktestStep(PipelineStep):
                 backtest["cross_venue_integrity"] = dict(pipeline.state.get("reference_integrity_report") or {})
             if pipeline.state.get("data_certification") is not None:
                 backtest["data_certification"] = dict(pipeline.state.get("data_certification") or {})
+            backtest["validation_sources"] = _resolve_pipeline_validation_sources(
+                pipeline,
+                training,
+                backtest=backtest,
+            )
             pipeline.state["operational_monitoring"] = monitoring_report
             pipeline.state["backtest"] = backtest
             return backtest
@@ -4624,6 +5013,11 @@ class BacktestStep(PipelineStep):
             backtest["debug"] = {
                 "cpcv_path_backtests": path_backtests,
             }
+        backtest["validation_sources"] = _resolve_pipeline_validation_sources(
+            pipeline,
+            training,
+            backtest=backtest,
+        )
         pipeline.state["operational_monitoring"] = monitoring_report
         pipeline.state["backtest"] = backtest
         return backtest
@@ -4789,6 +5183,9 @@ class ResearchPipeline:
         monitoring_report=None,
         drift_cycle=None,
         backend_status=None,
+        paper_report=None,
+        operational_limits=None,
+        release_request=None,
         policy=None,
     ):
         resolved_symbol = symbol or self.section("data").get("symbol")
@@ -4804,6 +5201,12 @@ class ResearchPipeline:
             )
         if drift_cycle is None:
             drift_cycle = self.state.get("drift_cycle")
+        if paper_report is None:
+            paper_report = self.state.get("paper_calibration")
+        if operational_limits is None:
+            operational_limits = self.state.get("operational_limits")
+        if release_request is None:
+            release_request = self.state.get("release_request")
 
         report = build_deployment_readiness_report(
             store=store,
@@ -4812,6 +5215,9 @@ class ResearchPipeline:
             monitoring_report=monitoring_report,
             drift_cycle=drift_cycle,
             backend_status=backend_status,
+            paper_report=paper_report,
+            operational_limits=operational_limits,
+            release_request=release_request,
             policy=policy,
         )
         self.state["deployment_readiness"] = report

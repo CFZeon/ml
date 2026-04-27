@@ -311,6 +311,12 @@ def build_trade_ready_runtime_overrides(*, market="spot"):
         "data_quality": {
             "block_on_quarantine": True,
         },
+        "signals": {
+            "require_paper_verification_for_kelly": True,
+            "require_live_calibration_for_kelly": True,
+            "uncalibrated_kelly_fraction_cap": 0.25,
+            "max_live_calibration_error": 0.25,
+        },
         "backtest": backtest_overrides,
     }
 
@@ -366,6 +372,7 @@ def build_trade_ready_automl_overrides(
             },
             "objective_gates": {
                 "min_trade_count": 20,
+                "min_effective_bet_count": 20,
                 "require_statistical_significance": True,
                 "min_significance_observations": 32,
                 "min_sharpe_ci_lower": None,
@@ -399,6 +406,7 @@ def build_trade_ready_automl_overrides(
             },
             "objective_gates": {
                 "min_trade_count": 40,
+                "min_effective_bet_count": 40,
                 "require_statistical_significance": True,
                 "min_significance_observations": 64,
                 "min_sharpe_ci_lower": 0.0,
@@ -465,6 +473,30 @@ def build_trade_ready_automl_overrides(
             },
         },
     }
+    if not bool(profile_settings["reduced_power"]):
+        constrained_search_space["features"] = {
+            "lags": {"type": "categorical", "choices": ["1,3,6"]},
+            "frac_diff_d": {"type": "categorical", "choices": [0.4]},
+            "rolling_window": {"type": "categorical", "choices": [20]},
+            "squeeze_quantile": {"type": "categorical", "choices": [0.15]},
+        }
+        constrained_search_space["feature_selection"] = {
+            "enabled": {"type": "categorical", "choices": [True]},
+            "max_features": {"type": "categorical", "choices": [48]},
+            "min_mi_threshold": {"type": "categorical", "choices": [0.0005]},
+        }
+        constrained_search_space["labels"] = {
+            "pt_mult": {"type": "categorical", "choices": [1.5]},
+            "sl_mult": {"type": "categorical", "choices": [1.5]},
+            "max_holding": {"type": "categorical", "choices": [24]},
+            "min_return": {"type": "categorical", "choices": [0.0005]},
+            "volatility_window": {"type": "categorical", "choices": [24]},
+            "barrier_tie_break": {"type": "categorical", "choices": ["sl"]},
+        }
+        constrained_search_space["regime"] = {
+            "n_regimes": {"type": "categorical", "choices": [2]},
+        }
+        constrained_search_space["model"]["gap"] = {"type": "categorical", "choices": [24]}
 
     profile = {
         "automl": {
@@ -493,6 +525,12 @@ def build_trade_ready_automl_overrides(
                 "post_selection_bootstrap_samples": int(profile_settings["post_selection"]["bootstrap_samples"]),
                 "min_track_record_length": int(profile_settings["deflated_sharpe"]["min_track_record_length"]),
             },
+            "validation_contract": {
+                "search_ranker": "cpcv",
+                "contiguous_validation": "walk_forward_replay",
+                "locked_holdout": "single_access_contiguous",
+                "replication": "required",
+            },
             "selection_policy": {
                 "enabled": True,
                 "max_generalization_gap": float(profile_settings["max_generalization_gap"]),
@@ -518,6 +556,13 @@ def build_trade_ready_automl_overrides(
                 "min_pass_rate": float(profile_settings["replication"]["min_pass_rate"]),
                 "min_score": 0.0,
                 "min_rows": int(profile_settings["replication"]["min_rows"]),
+            },
+            "portability_contract": {
+                "enabled": True,
+                "accepted_kinds": ["symbol", "period"],
+                "min_supporting_cohorts": 1,
+                "min_passed_supporting_cohorts": 1,
+                "require_frozen_universe": True,
             },
             "overfitting_control": {
                 "enabled": True,
@@ -551,6 +596,7 @@ def build_trade_ready_automl_overrides(
             },
             "objective_gates": {
                 "min_trade_count": int(profile_settings["objective_gates"]["min_trade_count"]),
+                "min_effective_bet_count": int(profile_settings["objective_gates"]["min_effective_bet_count"]),
                 "require_statistical_significance": bool(
                     profile_settings["objective_gates"]["require_statistical_significance"]
                 ),
@@ -754,6 +800,7 @@ def print_weight_summary(weights):
 
 def print_training_summary(training):
     validation = training.get("validation", {})
+    validation_sources = training.get("validation_sources") or {}
     if validation:
         if validation.get("method") == "cpcv":
             print(
@@ -769,6 +816,14 @@ def print_training_summary(training):
                 f"walk_forward  splits={validation.get('split_count')}  "
                 f"gap={validation.get('gap')}"
             )
+    if validation_sources:
+        print(
+            "  val sources  : "
+            f"select={validation_sources.get('selection_metric_source')}  "
+            f"diagnostic={validation_sources.get('diagnostic_metric_source')}  "
+            f"tradable={validation_sources.get('tradable_metric_source')}"
+        )
+        print(f"  val gates    : {bool(validation_sources.get('all_required_sources_passed', True))}")
 
     for metric in training.get("fold_metrics", []):
         split_label = metric.get("split_id") or f"fold {metric.get('fold')}"
@@ -1150,6 +1205,15 @@ def print_automl_summary(automl):
     if automl.get("best_value_raw") is not None:
         print(f"  raw value    : {_format_metric(automl.get('best_value_raw'))}")
     print(f"  best params  : {automl.get('best_params')}")
+    validation_sources = automl.get("validation_sources") or {}
+    if validation_sources:
+        print(
+            "  val sources  : "
+            f"select={validation_sources.get('selection_metric_source')}  "
+            f"diagnostic={validation_sources.get('diagnostic_metric_source')}  "
+            f"tradable={validation_sources.get('tradable_metric_source')}"
+        )
+        print(f"  val gates    : {bool(validation_sources.get('all_required_sources_passed', True))}")
 
     trade_ready_profile = automl.get("trade_ready_profile") or {}
     if trade_ready_profile:

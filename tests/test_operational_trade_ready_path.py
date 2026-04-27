@@ -7,6 +7,7 @@ from core import (
     LocalRegistryStore,
     ResearchPipeline,
     build_deployment_readiness_report,
+    build_live_calibration_report,
     build_model,
     create_promotion_eligibility_report,
     finalize_promotion_eligibility_report,
@@ -62,6 +63,23 @@ def _register_champion(store, symbol, score_value):
     return version_id
 
 
+def _make_paper_report(*, duration_days=35.0):
+    return build_live_calibration_report(
+        certified_expectations={"modeled_slippage_bps": 1.8, "modeled_fill_ratio": 0.94},
+        paper_metrics={
+            "mode": "paper",
+            "duration_days": duration_days,
+            "modeled_slippage_bps": 1.8,
+            "realized_slippage_bps": 1.92,
+            "modeled_fill_ratio": 0.94,
+            "realized_fill_ratio": 0.90,
+            "data_breaches": 0,
+            "funding_breaches": 0,
+            "kill_switch_triggers": 0,
+        },
+    )
+
+
 class OperationalTradeReadyPathTest(unittest.TestCase):
     def test_pipeline_trade_ready_mode_auto_applies_trade_ready_monitoring_profile(self):
         index = pd.date_range("2024-01-01", periods=4, freq="h", tz="UTC")
@@ -100,10 +118,13 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
                     "retrain_status": "not_recommended",
                 },
                 backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+                paper_report=_make_paper_report(),
             )
 
             self.assertTrue(report["ready"])
-            self.assertEqual(report["operator_action"], "deploy")
+            self.assertFalse(report["capital_release_eligible"])
+            self.assertEqual(report["capital_release_stage"], "paper_verified")
+            self.assertEqual(report["operator_action"], "paper")
             self.assertEqual(report["version_id"], current_champion)
             self.assertEqual(report["summary"]["failed_components"], [])
             self.assertTrue(report["components"]["rollback"]["available"])
@@ -122,6 +143,7 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
                     "retrain_status": "scheduled_window_pending",
                 },
                 backend_status={"adapter": "nautilus", "available": False, "reasons": ["maintenance"]},
+                paper_report=_make_paper_report(),
             )
 
             self.assertFalse(report["ready"])
@@ -149,11 +171,14 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
             report = pipeline.inspect_deployment_readiness(
                 store=store,
                 backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+                paper_report=_make_paper_report(),
             )
 
             self.assertTrue(report["ready"])
+            self.assertFalse(report["capital_release_eligible"])
+            self.assertEqual(report["capital_release_stage"], "paper_verified")
             self.assertEqual(report["version_id"], current_champion)
-            self.assertEqual(pipeline.state["deployment_readiness"]["operator_action"], "deploy")
+            self.assertEqual(pipeline.state["deployment_readiness"]["operator_action"], "paper")
 
 
 if __name__ == "__main__":
