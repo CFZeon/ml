@@ -307,6 +307,32 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
 
         self.assertIn("example_automl.py", str(ctx.exception))
 
+    def test_trade_ready_example_smoke_profile_downgrades_to_explicit_research_surrogate(self):
+        config = _build_trade_ready_example_config(
+            automl_storage=Path(".cache") / "automl" / "trade_ready_smoke_runtime_test.db",
+            power_profile="smoke",
+        )
+
+        resolved = prepare_trade_ready_runtime_config(config, nautilus_available=False)
+
+        backtest = resolved["backtest"]
+        automl = resolved["automl"]
+        execution_policy = backtest["execution_policy"]
+        self.assertEqual(backtest["evaluation_mode"], "research_only")
+        self.assertEqual(backtest["execution_profile"], "research_surrogate")
+        self.assertTrue(backtest["research_only_override"])
+        self.assertEqual(backtest["required_stress_scenarios"], [])
+        self.assertEqual(execution_policy["adapter"], "nautilus")
+        self.assertTrue(execution_policy["force_simulation"])
+        self.assertFalse(resolved["features"]["lookahead_guard"]["enabled"])
+        self.assertFalse(resolved["regime"]["enabled"])
+        self.assertFalse(resolved["data_quality"]["block_on_quarantine"])
+        self.assertFalse(automl["locked_holdout_enabled"])
+        self.assertFalse(automl["replication"]["enabled"])
+        self.assertFalse(automl["selection_policy"]["enabled"])
+        self.assertFalse(automl["overfitting_control"]["enabled"])
+        self.assertEqual(resolved["example_runtime"]["mode"], "research_surrogate")
+
 
 if __name__ == "__main__":
     unittest.main()

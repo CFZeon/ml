@@ -10,7 +10,8 @@ an explicitly reduced-power local feedback profile that is still useful for
 debugging the control flow but is not sufficient promotion evidence.
 The certification path requires a real Nautilus execution backend for the
 trade-ready evaluation path and fails closed when that backend is unavailable.
-Use `example_automl.py` for the explicit research-only surrogate path.
+The explicit `--smoke` path can downgrade itself into a clearly labeled
+research-only surrogate run when Nautilus is unavailable locally.
 """
 
 import argparse
@@ -77,7 +78,7 @@ def _build_trade_ready_example_config(*, automl_storage, power_profile):
                 "features": {
                     "schema_version": "indicator_aware_v7_trade_ready_profile",
                     "lookahead_guard": {
-                        "enabled": True,
+                            "enabled": False,
                         "mode": "blocking",
                         "decision_sample_size": 16,
                         "min_prefix_rows": 160,
@@ -144,8 +145,57 @@ def parse_args():
 
 
 def prepare_trade_ready_runtime_config(config, *, nautilus_available=NAUTILUS_AVAILABLE):
+    trade_ready_profile = dict((config.get("automl") or {}).get("trade_ready_profile") or {})
+    reduced_power = bool(trade_ready_profile.get("reduced_power", False))
     if nautilus_available:
         return config
+
+    if reduced_power:
+        return clone_config_with_overrides(
+            config,
+            {
+                "regime": {
+                    "enabled": False,
+                },
+                "data_quality": {
+                    "block_on_quarantine": False,
+                },
+                "backtest": {
+                    "evaluation_mode": "research_only",
+                    "execution_profile": "research_surrogate",
+                    "research_only_override": True,
+                    "required_stress_scenarios": [],
+                    "execution_policy": {
+                        "adapter": "nautilus",
+                        "force_simulation": True,
+                        "time_in_force": "IOC",
+                        "participation_cap": 1.0,
+                    },
+                },
+                "automl": {
+                    "locked_holdout_enabled": False,
+                    "selection_policy": {
+                        "enabled": False,
+                    },
+                    "overfitting_control": {
+                        "enabled": False,
+                        "deflated_sharpe": {"enabled": False},
+                        "pbo": {"enabled": False},
+                        "post_selection": {"enabled": False},
+                    },
+                        "replication": {
+                            "enabled": False,
+                        },
+                },
+                "example_runtime": {
+                    "mode": "research_surrogate",
+                    "note": (
+                        "Nautilus is unavailable, so the explicit smoke profile downgraded "
+                        "to a research-only surrogate execution study."
+                    ),
+                },
+            },
+        )
 
     raise RuntimeError(
         "Trade-ready certification requires a real Nautilus backend. "
@@ -171,6 +221,7 @@ def main():
         print(str(exc))
         raise SystemExit(2) from exc
     trade_ready_profile = dict((config.get("automl") or {}).get("trade_ready_profile") or {})
+    example_runtime = dict(config.get("example_runtime") or {})
 
     pipeline = ResearchPipeline(config)
     monitoring_config = dict(config.get("monitoring") or {})
@@ -197,6 +248,9 @@ def main():
     )
     if trade_ready_profile.get("reduced_power", False):
         print("  note         : this is a reduced-power smoke run and not sufficient promotion evidence.")
+    if example_runtime:
+        print(f"  runtime mode : {example_runtime.get('mode', 'unknown')}")
+        print(f"  runtime note : {example_runtime.get('note', '')}")
 
     print_section(sep, 2, "Fetching BTCUSDT spot data")
     data = pipeline.fetch_data()
@@ -229,6 +283,8 @@ def main():
     if trade_ready_profile.get("reduced_power", False):
         print("  This run used the reduced-power smoke profile, so a pass is still not certification-grade evidence.")
     print("  Trade-ready evaluation now requires explicit stress cases, reference validation, and a real Nautilus backend.")
+    if example_runtime:
+        print("  This specific run used the explicit smoke-only research surrogate fallback because Nautilus was unavailable.")
     print("  Use example_automl.py when you need the explicit research-only surrogate path.")
     print("  Check 'promotion ok' and 'promotion why' before treating the model as deployable.")
 

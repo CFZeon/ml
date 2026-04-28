@@ -6,7 +6,7 @@ Trade-ready example configs now fail closed on stale context and missing futures
 They also fail closed on conflicting duplicate market bars instead of silently keeping the first timestamp collision.
 Trade-ready configs now also build one blocking pre-training data-certification verdict that binds market gaps, quarantine disposition, context TTL breaches, and configured reference-validation coverage into a single gate.
 Trade-ready and AutoML training paths now run a blocking baseline-vs-prefix lookahead certification on the causal feature surface before model fitting.
-Example builders now mark backtests as `research_only` by default; trade-ready runs must opt into event-style execution plus explicit stress scenarios. The hardened trade-ready config now fails closed when Nautilus is unavailable; use `example_automl.py` for the explicit research-only surrogate path.
+Example builders now mark backtests as `research_only` by default; trade-ready runs must opt into event-style execution plus explicit stress scenarios. The default trade-ready certification path still fails closed when Nautilus is unavailable, while `example_trade_ready_automl.py --smoke` now degrades explicitly into a labeled research-only surrogate path for local feedback.
 Trade-ready monitoring now also defaults to a finite policy profile instead of leaving freshness, fill-quality, slippage-drift, and signal-decay thresholds at `inf` or `None`.
 
 The current codebase is built around these constraints:
@@ -100,7 +100,7 @@ The rest of the examples serve different purposes:
 - `example_trend_breakout_futures.py`: futures example focused on ADX plus Donchian trend-breakout context layered onto the existing futures pipeline
 - `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain
 - `example_synthetic_derivatives.py`: offline synthetic derivatives/integration example; may also abstain depending on the generated regime path
-- `example_trade_ready_automl.py`: hardened AutoML certification profile with locked holdout, replication cohorts, DSR/PBO diagnostics, blocking pre-training feature-surface lookahead certification, and promotion-readiness reporting; pass `--smoke` for the explicitly reduced-power local feedback mode, and expect the script to fail closed if Nautilus is unavailable
+- `example_trade_ready_automl.py`: hardened AutoML certification profile with locked holdout, replication cohorts, DSR/PBO diagnostics, blocking pre-training feature-surface lookahead certification, and promotion-readiness reporting; the default run still fails closed if Nautilus is unavailable, while `--smoke` executes an explicitly reduced-power research-surrogate path for local feedback
 - `example_drift_retraining_cycle.py`: deterministic registry and drift example showing scheduled retraining, challenger promotion, rollback, and the final operator deploy/hold decision
 - `example_automl.py`: constrained AutoML smoke/demo path kept for short runtime feedback
 
@@ -121,7 +121,7 @@ The hardened trade-ready AutoML example now also enables a blocking data-certifi
 Trade-ready and AutoML runs now also auto-enable a blocking lookahead replay over the causal feature surface before training. You can still widen the audit explicitly, but the default blocking surface is limited to pre-training features so label maturation does not generate false positives.
 The hardened trade-ready AutoML override now also enables replication cohorts by default, so a candidate must survive alternate windows or sibling-symbol cohorts before it can present as promotion-ready.
 The default trade-ready example now uses a stronger certification budget with higher validation-trade, replication-coverage, and post-selection requirements. If you choose `python example_trade_ready_automl.py --smoke`, the script declares the run as reduced-power and keeps that distinction visible in the AutoML summary.
-Surrogate execution remains research-only. `example_trade_ready_automl.py` no longer downgrades itself when Nautilus is unavailable; it exits early and points you to `example_automl.py` or an explicitly `research_only` config for surrogate studies.
+Surrogate execution remains research-only. `example_trade_ready_automl.py` still exits early on the default certification path when Nautilus is unavailable, but `python example_trade_ready_automl.py --smoke` now makes that downgrade explicitly and labels the run as a research surrogate in the summary.
 
 ## Installation
 

@@ -54,7 +54,7 @@ The hardened trade-ready AutoML override now defaults to a stronger certificatio
 The hardened trade-ready AutoML override also enables replication cohorts by default, so promotion-readiness is checked on alternate windows or sibling symbols instead of a single holdout narrative.
 The hardened trade-ready AutoML profile now also separates statistical evidence floors by power profile: certification uses a 64-observation significance floor, while `--smoke` keeps a visibly lower 32-observation floor and surfaces underpowered-evidence reasons in the summary.
 If you intentionally choose `python example_trade_ready_automl.py --smoke`, the script prints `reduced power: True` before running and keeps that label in the resulting AutoML summary.
-That hardened trade-ready config now fails closed without a real Nautilus backend. Use `example_automl.py` when you need the explicit research-only surrogate path locally.
+That hardened trade-ready config still fails closed without a real Nautilus backend on the default certification path. If you intentionally choose `python example_trade_ready_automl.py --smoke`, the script now labels and runs an explicit research-only surrogate fallback for local feedback.
 It also auto-applies the `trade_ready` monitoring profile, so the certification path no longer inherits the permissive research monitoring defaults.
 
 ## Build A New Real-Data Case
@@ -139,7 +139,7 @@ If you want a trade-ready evaluation instead of a research-only one, add these e
 8. keep `backtest.research_only_override` unset unless you intentionally want research-grade leniency; the runtime now uses that flag to decide whether trade-ready funding, gap, and quarantine defaults should stay fail-closed
 9. set `backtest.significance.min_observations` only if you intentionally want a different evidence floor; otherwise the runtime will apply the trade-ready default and the AutoML summary will report underpowered significance explicitly
 
-If you only want a surrogate execution study, keep `backtest.evaluation_mode = "research_only"` and set `execution_policy.force_simulation = true` explicitly. `example_trade_ready_automl.py` will not make that downgrade for you anymore; it fails closed and you should use `example_automl.py` or your own explicitly research-only config instead.
+If you only want a surrogate execution study, keep `backtest.evaluation_mode = "research_only"` and set `execution_policy.force_simulation = true` explicitly. The default `example_trade_ready_automl.py` run still fails closed without Nautilus, but `python example_trade_ready_automl.py --smoke` now makes that downgrade explicitly for local feedback; otherwise use `example_automl.py` or your own explicitly research-only config.
 
 Minimal pattern:
 
