@@ -1134,11 +1134,12 @@ def _resolve_data_certification_config(pipeline):
     mode = str(configured.get("mode", default_mode)).strip().lower()
     if mode not in {"blocking", "advisory", "disabled"}:
         mode = default_mode
+    trade_ready_mode = evaluation_mode.is_capital_facing
 
     return {
         "enabled": enabled and mode != "disabled",
         "mode": mode,
-        "trade_ready_mode": evaluation_mode.is_capital_facing,
+        "trade_ready_mode": trade_ready_mode,
         "require_complete_market_data": bool(configured.get("require_complete_market_data", enabled)),
         "require_data_quality_pass": bool(configured.get("require_data_quality_pass", enabled)),
         "require_context_validation": bool(
