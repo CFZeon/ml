@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .automl_contracts import validate_summary_contract
+from .evaluation_modes import resolve_evaluation_mode
 from .promotion import (
     build_promotion_gate_check_map,
     create_promotion_eligibility_report,
@@ -781,6 +782,195 @@ def _resolve_holdout_plan(raw_data, automl_config, base_config=None):
         }
     )
     return plan
+
+
+def _build_capital_evidence_contract(base_config, *, holdout_plan=None, base_pipeline=None):
+    automl_config = dict((base_config or {}).get("automl") or {})
+    evaluation_mode = resolve_evaluation_mode((base_config or {}).get("backtest") or {})
+    selection_policy = _resolve_selection_policy(automl_config)
+    overfitting_control = _resolve_overfitting_control(automl_config)
+    replication_config = _resolve_replication_config(base_config or {}, automl_config, base_pipeline=base_pipeline)
+    trade_ready_profile = dict(automl_config.get("trade_ready_profile") or {})
+
+    required_controls = {
+        "locked_holdout": bool(evaluation_mode.is_capital_facing),
+        "selection_policy": bool(evaluation_mode.is_capital_facing),
+        "post_selection": bool(evaluation_mode.is_capital_facing),
+        "replication": bool(evaluation_mode.is_capital_facing),
+    }
+    observed_controls = {
+        "locked_holdout": bool((holdout_plan or {}).get("enabled", False)),
+        "selection_policy": bool(selection_policy.get("enabled", False)),
+        "post_selection": bool(
+            overfitting_control.get("enabled", False) and overfitting_control.get("post_selection", {}).get("enabled", False)
+        ),
+        "replication": bool(replication_config.get("enabled", False)),
+    }
+
+    blocking_reasons = []
+    if evaluation_mode.is_capital_facing:
+        for control_name, required in required_controls.items():
+            if required and not observed_controls.get(control_name, False):
+                blocking_reasons.append(f"required_control_disabled:{control_name}")
+        if bool(trade_ready_profile.get("reduced_power", False)):
+            blocking_reasons.append("reduced_power_profile_not_capital_eligible")
+
+    return {
+        "requested_mode": evaluation_mode.requested_mode,
+        "effective_mode": evaluation_mode.effective_mode,
+        "capital_path_eligible": bool(evaluation_mode.is_capital_facing and not blocking_reasons),
+        "required_controls": required_controls,
+        "observed_controls": observed_controls,
+        "blocking_reasons": blocking_reasons,
+    }
+
+
+def _validate_capital_evidence_contract(base_config, *, holdout_plan=None, base_pipeline=None):
+    contract = _build_capital_evidence_contract(
+        base_config,
+        holdout_plan=holdout_plan,
+        base_pipeline=base_pipeline,
+    )
+    hard_failures = [
+        reason for reason in contract.get("blocking_reasons", []) if str(reason).startswith("required_control_disabled:")
+    ]
+    if hard_failures:
+        raise RuntimeError(
+            "Capital-facing AutoML configuration is invalid because required evidence controls are disabled: "
+            f"{', '.join(hard_failures)}"
+        )
+    return contract
+
+
+def _build_oos_evidence(base_config, *, holdout_plan=None, selection_diagnostics=None, training=None, base_pipeline=None):
+    base_config = base_config or {}
+    automl_config = dict(base_config.get("automl") or {})
+    model_config = dict(base_config.get("model") or {})
+    evaluation_mode = resolve_evaluation_mode(base_config.get("backtest") or {})
+    validation_contract = _resolve_validation_contract(
+        base_config,
+        automl_config,
+        training=training,
+        holdout_enabled=bool((holdout_plan or {}).get("enabled", False)),
+    )
+    overfitting_control = _resolve_overfitting_control(automl_config)
+    replication_config = _resolve_replication_config(base_config, automl_config, base_pipeline=base_pipeline)
+    post_selection_report = dict((selection_diagnostics or {}).get("post_selection") or {})
+
+    search_ranker = _normalize_validation_source_name(validation_contract.get("search_ranker"))
+    model_validation_method = _normalize_validation_source_name(model_config.get("cv_method", "cpcv"))
+    purging_rows = 0
+    for row in list((training or {}).get("purging") or []):
+        purging_rows += int(row.get("outer_purged_rows", 0))
+        purging_rows += int(row.get("inner_purged_rows", 0))
+        purging_rows += int(row.get("embargo_rows", 0))
+
+    configured_embargo_bars = int((holdout_plan or {}).get("configured_embargo_bars", 0))
+    search_stage_method = search_ranker or model_validation_method or "walk_forward"
+    purged_temporal_search = bool(
+        search_stage_method in {"walk_forward", "walk_forward_replay"}
+        and max(configured_embargo_bars, purging_rows) > 0
+    )
+
+    controls = {
+        "cpcv_or_purged_temporal_search": {
+            "required": bool(evaluation_mode.is_capital_facing),
+            "complete": bool(search_stage_method == "cpcv" or purged_temporal_search),
+            "provenance": {
+                "validation_contract": search_ranker,
+                "model_cv_method": model_validation_method,
+                "configured_embargo_bars": configured_embargo_bars,
+                "observed_purging_rows": int(purging_rows),
+            },
+        },
+        "search_stage_embargo": {
+            "required": bool(evaluation_mode.is_capital_facing),
+            "complete": bool(int((holdout_plan or {}).get("search_validation_gap_bars", 0)) > 0),
+            "provenance": {
+                "gap_rows": int((holdout_plan or {}).get("search_validation_gap_bars", 0)),
+                "gap_start": _json_ready((holdout_plan or {}).get("search_validation_gap_start_timestamp")),
+                "gap_end": _json_ready((holdout_plan or {}).get("search_validation_gap_end_timestamp")),
+            },
+        },
+        "validation_holdout_gap": {
+            "required": bool(evaluation_mode.is_capital_facing),
+            "complete": bool(int((holdout_plan or {}).get("validation_holdout_gap_bars", 0)) > 0),
+            "provenance": {
+                "gap_rows": int((holdout_plan or {}).get("validation_holdout_gap_bars", 0)),
+                "gap_start": _json_ready((holdout_plan or {}).get("validation_holdout_gap_start_timestamp")),
+                "gap_end": _json_ready((holdout_plan or {}).get("validation_holdout_gap_end_timestamp")),
+            },
+        },
+        "locked_holdout": {
+            "required": bool(evaluation_mode.is_capital_facing),
+            "complete": bool(
+                validation_contract.get("locked_holdout") == "single_access_contiguous"
+                and bool((holdout_plan or {}).get("enabled", False))
+            ),
+            "provenance": {
+                "validation_contract": validation_contract.get("locked_holdout"),
+                "enabled": bool((holdout_plan or {}).get("enabled", False)),
+                "holdout_rows": int((holdout_plan or {}).get("holdout_rows", 0)),
+            },
+        },
+        "post_selection_inference": {
+            "required": bool(evaluation_mode.is_capital_facing),
+            "complete": bool(
+                overfitting_control.get("enabled", False)
+                and overfitting_control.get("post_selection", {}).get("enabled", False)
+            ),
+            "provenance": {
+                "overfitting_enabled": bool(overfitting_control.get("enabled", False)),
+                "configured": bool(overfitting_control.get("post_selection", {}).get("enabled", False)),
+                "report_enabled": bool(post_selection_report.get("enabled", False)),
+                "require_pass": bool(post_selection_report.get("require_pass", False)),
+                "passed": bool(post_selection_report.get("passed", True)),
+                "reason": post_selection_report.get("reason"),
+            },
+        },
+        "replication": {
+            "required": bool(evaluation_mode.is_capital_facing),
+            "complete": bool(replication_config.get("enabled", False)),
+            "provenance": {
+                "configured": bool(replication_config.get("enabled", False)),
+                "min_coverage": int(replication_config.get("min_coverage", 0)),
+                "include_symbol_cohorts": bool(replication_config.get("include_symbol_cohorts", False)),
+                "include_window_cohorts": bool(replication_config.get("include_window_cohorts", False)),
+            },
+        },
+    }
+
+    evidence_stack_complete = bool(all(bool(control.get("complete", False)) for control in controls.values()))
+    blocking_reasons = [
+        f"oos_control_incomplete:{name}" for name, control in controls.items() if not bool(control.get("complete", False))
+    ]
+    any_complete = any(bool(control.get("complete", False)) for control in controls.values())
+    oos_class = "adversarial_oos" if evidence_stack_complete else ("partial_oos" if any_complete else "search_only")
+
+    return {
+        "class": oos_class,
+        "evidence_stack_complete": evidence_stack_complete,
+        "controls": controls,
+        "blocking_reasons": blocking_reasons,
+    }
+
+
+def _validate_oos_evidence_preconditions(base_config, *, holdout_plan=None, base_pipeline=None):
+    oos_evidence = _build_oos_evidence(
+        base_config,
+        holdout_plan=holdout_plan,
+        selection_diagnostics=None,
+        training=None,
+        base_pipeline=base_pipeline,
+    )
+    if resolve_evaluation_mode((base_config or {}).get("backtest") or {}).is_capital_facing and not oos_evidence[
+        "evidence_stack_complete"
+    ]:
+        raise RuntimeError(
+            "Capital-facing AutoML requires a complete adversarial OOS evidence stack before optimization starts: "
+            f"{', '.join(oos_evidence['blocking_reasons'])}"
+        )
+    return oos_evidence
 
 
 def _sample_from_spec(trial, name, spec):
@@ -3903,6 +4093,17 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         search_state_bundle = _build_window_state_bundle(full_state_bundle, end_timestamp=holdout_plan["search_end_timestamp"])
         validation_state_bundle = _build_window_state_bundle(full_state_bundle, end_timestamp=holdout_plan["validation_end_timestamp"])
 
+    capital_evidence_contract = _validate_capital_evidence_contract(
+        base_config,
+        holdout_plan=holdout_plan,
+        base_pipeline=base_pipeline,
+    )
+    _validate_oos_evidence_preconditions(
+        base_config,
+        holdout_plan=holdout_plan,
+        base_pipeline=base_pipeline,
+    )
+
     enable_pruning = bool(automl_config.get("enable_pruning", True))
     study_kwargs = {
         "direction": "maximize",
@@ -4212,6 +4413,13 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
 
         promotion_eligibility_report = create_promotion_eligibility_report()
         promotion_eligibility_report["blocking_failures"] = list(abstention_reasons)
+        oos_evidence = _build_oos_evidence(
+            base_config,
+            holdout_plan=holdout_plan,
+            selection_diagnostics=selection_report["diagnostics"],
+            training=None,
+            base_pipeline=base_pipeline,
+        )
         summary = {
             "study_name": study.study_name,
             "storage": str(storage_path),
@@ -4233,6 +4441,8 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             "objective": objective_name,
             "policy_profile": policy_profile,
             "trade_ready_profile": _json_ready((base_config.get("automl") or {}).get("trade_ready_profile") or {}),
+            "capital_evidence_contract": _json_ready(copy.deepcopy(capital_evidence_contract)),
+            "oos_evidence": _json_ready(oos_evidence),
             "warnings": summary_warnings,
             "selection_metric": selection_report["selection_metric"],
             "selection_mode": selection_report["selection_mode"],
@@ -4532,6 +4742,16 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "objective": objective_name,
         "policy_profile": policy_profile,
         "trade_ready_profile": _json_ready((base_config.get("automl") or {}).get("trade_ready_profile") or {}),
+        "capital_evidence_contract": _json_ready(copy.deepcopy(capital_evidence_contract)),
+        "oos_evidence": _json_ready(
+            _build_oos_evidence(
+                base_config,
+                holdout_plan=holdout_plan,
+                selection_diagnostics=selection_report["diagnostics"],
+                training=best_trial_report.get("training"),
+                base_pipeline=base_pipeline,
+            )
+        ),
         "warnings": summary_warnings,
         "selection_metric": selection_report["selection_metric"],
         "selection_mode": selection_report["selection_mode"],
@@ -4579,6 +4799,39 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "top_trials": top_trials,
         "trial_count": len(completed_trials),
     }
+
+    if not bool((summary.get("oos_evidence") or {}).get("evidence_stack_complete", False)):
+        promotion_reasons = list(summary.get("promotion_reasons") or [])
+        if "oos_evidence_incomplete" not in promotion_reasons:
+            promotion_reasons.append("oos_evidence_incomplete")
+        summary["promotion_ready"] = False
+        summary["promotion_reasons"] = promotion_reasons
+        promotion_report = dict(summary.get("promotion_eligibility_report") or {})
+        blocking_failures = list(promotion_report.get("blocking_failures") or [])
+        if "oos_evidence_incomplete" not in blocking_failures:
+            blocking_failures.append("oos_evidence_incomplete")
+        promotion_report["blocking_failures"] = blocking_failures
+        promotion_report["promotion_ready"] = False
+        promotion_report["approved"] = False
+        summary["promotion_eligibility_report"] = promotion_report
+        capital_contract = dict(summary.get("capital_evidence_contract") or {})
+        blocking_reasons = list(capital_contract.get("blocking_reasons") or [])
+        for reason in list((summary.get("oos_evidence") or {}).get("blocking_reasons") or []):
+            if reason not in blocking_reasons:
+                blocking_reasons.append(reason)
+        capital_contract["blocking_reasons"] = blocking_reasons
+        capital_contract["capital_path_eligible"] = False
+        summary["capital_evidence_contract"] = capital_contract
+        best_selection_policy = dict(summary.get("best_selection_policy") or {})
+        selection_policy_report = dict(best_selection_policy.get("selection_policy") or {})
+        if selection_policy_report:
+            selection_policy_report["promotion_ready"] = False
+            policy_reasons = list(selection_policy_report.get("promotion_reasons") or [])
+            if "oos_evidence_incomplete" not in policy_reasons:
+                policy_reasons.append("oos_evidence_incomplete")
+            selection_policy_report["promotion_reasons"] = policy_reasons
+            best_selection_policy["selection_policy"] = selection_policy_report
+            summary["best_selection_policy"] = best_selection_policy
 
     summary = validate_summary_contract(summary)
 

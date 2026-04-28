@@ -29,10 +29,38 @@ _DEFAULT_POLICY = {
     "min_signal_half_life_bars": -np.inf,
     "max_signal_delay_edge_deterioration": np.inf,
     "max_signal_half_life_deterioration": np.inf,
+    "required_components": [],
 }
 
 _POLICY_PROFILES = {
     "research": {},
+    "local_certification": {
+        "max_data_lag": "4h",
+        "max_custom_ttl_breach_rate": 0.0,
+        "max_fallback_assumption_rate": 0.0,
+        "max_l2_snapshot_age": "15min",
+        "require_l2_snapshots": False,
+        "min_fill_ratio": 0.25,
+        "max_fill_ratio_deterioration": 0.15,
+        "max_slippage_gap_share": 0.75,
+        "max_slippage_drift": 0.002,
+        "max_inference_p95_ms": 500.0,
+        "max_queue_backlog": 0,
+        "require_inference_metrics": True,
+        "min_signal_decay_net_edge_at_delay": 0.0,
+        "min_signal_half_life_bars": 1.0,
+        "max_signal_delay_edge_deterioration": 0.02,
+        "max_signal_half_life_deterioration": 3.0,
+        "required_components": [
+            "raw_data_freshness",
+            "feature_schema",
+            "execution_quality",
+            "signal_decay",
+            "inference",
+            "l2_snapshot_age",
+            "fallback_assumptions",
+        ],
+    },
     "trade_ready": {
         "max_data_lag": "2h",
         "max_custom_ttl_breach_rate": 0.0,
@@ -45,11 +73,20 @@ _POLICY_PROFILES = {
         "max_slippage_drift": 0.001,
         "max_inference_p95_ms": 250.0,
         "max_queue_backlog": 0,
-        "require_inference_metrics": False,
+        "require_inference_metrics": True,
         "min_signal_decay_net_edge_at_delay": 0.0,
         "min_signal_half_life_bars": 1.0,
         "max_signal_delay_edge_deterioration": 0.01,
         "max_signal_half_life_deterioration": 2.0,
+        "required_components": [
+            "raw_data_freshness",
+            "feature_schema",
+            "execution_quality",
+            "signal_decay",
+            "inference",
+            "l2_snapshot_age",
+            "fallback_assumptions",
+        ],
     },
 }
 
@@ -111,6 +148,14 @@ def _round_metric(value, digits=6):
     if not np.isfinite(numeric):
         return numeric
     return round(numeric, digits)
+
+
+def _coerce_backtest_reports(backtest_reports):
+    if backtest_reports is None:
+        return []
+    if isinstance(backtest_reports, dict):
+        return [dict(backtest_reports or {})]
+    return [dict(report or {}) for report in backtest_reports]
 
 
 def evaluate_raw_data_freshness(index, *, expected_end=None, expected_interval=None, max_lag=None, source_name="raw_data"):
@@ -198,6 +243,69 @@ def evaluate_custom_data_ttl(custom_data_report=None, policy=None):
     }
 
 
+def evaluate_fallback_assumptions(custom_data_report=None, backtest_reports=None, policy=None):
+    policy = {**_DEFAULT_POLICY, **dict(policy or {})}
+    rows = []
+    source_count = 0
+    fallback_source_count = 0
+
+    for row in list(custom_data_report or []):
+        fallback_rate = float(row.get("fallback_assumption_rate") or 0.0)
+        fallback_used = fallback_rate > 0.0
+        source_count += 1
+        fallback_source_count += int(fallback_used)
+        rows.append(
+            {
+                "source": f"custom_data:{row.get('name') or source_count}",
+                "fallback_used": bool(fallback_used),
+                "fallback_assumption_rate": fallback_rate,
+            }
+        )
+
+    for offset, report in enumerate(_coerce_backtest_reports(backtest_reports)):
+        execution_evidence = dict(report.get("execution_evidence") or {})
+        if execution_evidence:
+            execution_class = str(execution_evidence.get("class") or "").strip().lower()
+            execution_mode = str(execution_evidence.get("execution_mode") or "").strip().lower()
+            fallback_used = execution_class == "research_surrogate" or "surrogate" in execution_mode
+            source_count += 1
+            fallback_source_count += int(fallback_used)
+            rows.append(
+                {
+                    "source": f"execution:{offset}",
+                    "fallback_used": bool(fallback_used),
+                    "detail": execution_evidence.get("class") or execution_evidence.get("execution_mode"),
+                }
+            )
+
+        funding_report = dict(report.get("funding_coverage_report") or {})
+        funding_status = str(funding_report.get("coverage_status") or "not_applicable").strip().lower()
+        if funding_report and funding_status != "not_applicable":
+            fallback_used = funding_status == "fallback"
+            source_count += 1
+            fallback_source_count += int(fallback_used)
+            rows.append(
+                {
+                    "source": f"funding:{offset}",
+                    "fallback_used": bool(fallback_used),
+                    "detail": funding_status,
+                }
+            )
+
+    observed = source_count > 0
+    fallback_assumption_rate = _safe_ratio(fallback_source_count, source_count, default=0.0)
+    healthy = fallback_assumption_rate <= float(policy.get("max_fallback_assumption_rate", 1.0))
+    return {
+        "healthy": bool(healthy),
+        "observed": bool(observed),
+        "source_count": int(source_count),
+        "fallback_source_count": int(fallback_source_count),
+        "fallback_assumption_rate": fallback_assumption_rate,
+        "reason": None if healthy else "fallback_assumption_rate_breach",
+        "sources": rows,
+    }
+
+
 def evaluate_l2_snapshot_age(reference_index=None, snapshot_index=None, policy=None):
     policy = {**_DEFAULT_POLICY, **dict(policy or {})}
     decisions = _coerce_index(reference_index)
@@ -282,12 +390,7 @@ def evaluate_feature_schema_health(expected_feature_columns=None, actual_feature
 
 def evaluate_execution_health(backtest_reports=None, baseline_report=None, policy=None):
     policy = {**_DEFAULT_POLICY, **dict(policy or {})}
-    if backtest_reports is None:
-        reports = []
-    elif isinstance(backtest_reports, dict):
-        reports = [backtest_reports]
-    else:
-        reports = [dict(report or {}) for report in backtest_reports]
+    reports = _coerce_backtest_reports(backtest_reports)
 
     if not reports:
         return {
@@ -525,9 +628,56 @@ def build_monitoring_report(
             queue_backlog=queue_backlog,
             policy=resolved_policy,
         ),
+        "fallback_assumptions": evaluate_fallback_assumptions(
+            custom_data_report=custom_data_report,
+            backtest_reports=backtest_reports,
+            policy=resolved_policy,
+        ),
     }
 
     unhealthy_components = [name for name, component in components.items() if not component.get("healthy", True)]
+    required_components = [str(name) for name in list(resolved_policy.get("required_components") or [])]
+    missing_metrics = [
+        name for name in required_components
+        if name in components and not bool((components.get(name) or {}).get("observed", False))
+    ]
+    monitoring_gate_report = {
+        "configured_thresholds": {
+            "max_data_lag": resolved_policy.get("max_data_lag"),
+            "max_l2_snapshot_age": resolved_policy.get("max_l2_snapshot_age"),
+            "max_fill_ratio_deterioration": resolved_policy.get("max_fill_ratio_deterioration"),
+            "max_slippage_gap_share": resolved_policy.get("max_slippage_gap_share"),
+            "max_slippage_drift": resolved_policy.get("max_slippage_drift"),
+            "max_inference_p95_ms": resolved_policy.get("max_inference_p95_ms"),
+            "max_queue_backlog": resolved_policy.get("max_queue_backlog"),
+            "min_signal_decay_net_edge_at_delay": resolved_policy.get("min_signal_decay_net_edge_at_delay"),
+            "max_fallback_assumption_rate": resolved_policy.get("max_fallback_assumption_rate"),
+        },
+        "measured_values": {
+            "data_lag": components["raw_data_freshness"].get("observed_lag"),
+            "l2_snapshot_age": components["l2_snapshot_age"].get("max_snapshot_age"),
+            "fill_ratio_deterioration": _round_metric(components["execution_quality"].get("fill_ratio_deterioration")),
+            "slippage_gap_share": _round_metric(components["execution_quality"].get("slippage_gap_share")),
+            "slippage_drift": _round_metric(components["execution_quality"].get("slippage_drift")),
+            "inference_p95_ms": _round_metric(components["inference"].get("p95_latency_ms")),
+            "queue_backlog": components["inference"].get("queue_backlog_max"),
+            "signal_decay_net_edge_at_delay": _round_metric(components["signal_decay"].get("net_edge_at_effective_delay")),
+            "fallback_assumption_rate": _round_metric(components["fallback_assumptions"].get("fallback_assumption_rate")),
+        },
+        "required_components": required_components,
+        "missing_metrics": missing_metrics,
+        "promotion_pass": False,
+        "blocking_reasons": [],
+    }
+    for name in required_components:
+        if name in missing_metrics:
+            monitoring_gate_report["blocking_reasons"].append(f"{name}_missing")
+    for name in unhealthy_components:
+        reason = (components.get(name) or {}).get("reason") or name
+        if reason not in monitoring_gate_report["blocking_reasons"]:
+            monitoring_gate_report["blocking_reasons"].append(reason)
+    monitoring_gate_report["promotion_pass"] = len(monitoring_gate_report["blocking_reasons"]) == 0
+    top_level_reasons = list(dict.fromkeys(unhealthy_components + [f"{name}_missing" for name in missing_metrics]))
     summary = {
         "healthy_component_count": int(sum(1 for component in components.values() if component.get("healthy", True))),
         "component_count": int(len(components)),
@@ -537,13 +687,16 @@ def build_monitoring_report(
         "max_inference_p95_ms": components["inference"].get("p95_latency_ms"),
         "signal_half_life_bars": components["signal_decay"].get("half_life_bars"),
         "net_edge_at_effective_delay": components["signal_decay"].get("net_edge_at_effective_delay"),
+        "fallback_assumption_rate": components["fallback_assumptions"].get("fallback_assumption_rate"),
     }
     return {
-        "healthy": not unhealthy_components,
+        "healthy": not top_level_reasons,
+        "promotion_pass": bool(monitoring_gate_report["promotion_pass"]),
         "policy": resolved_policy,
         "summary": summary,
         "components": components,
-        "reasons": unhealthy_components,
+        "monitoring_gate_report": monitoring_gate_report,
+        "reasons": top_level_reasons,
     }
 
 

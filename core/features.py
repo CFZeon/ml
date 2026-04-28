@@ -310,21 +310,21 @@ def _price_volume_features(df, rolling_window):
     close_location = _safe_divide(close - low, intrabar_range)
 
     frame = pd.DataFrame(index=df.index)
-    frame["return_1"] = close.pct_change(1)
-    frame["return_5"] = close.pct_change(5)
-    frame["return_10"] = close.pct_change(10)
+    frame["return_1"] = close.pct_change(1, fill_method=None)
+    frame["return_5"] = close.pct_change(5, fill_method=None)
+    frame["return_10"] = close.pct_change(10, fill_method=None)
     frame["log_return"] = np.log(close / close.shift(1))
     frame["intrabar_return"] = _safe_divide(close - open_, open_)
     frame["range_pct"] = _safe_divide(intrabar_range, close)
     frame["close_to_range_mid"] = close_location - 0.5
-    frame["vol_change"] = volume.pct_change(1)
+    frame["vol_change"] = volume.pct_change(1, fill_method=None)
     frame["vol_zscore"] = _rolling_zscore(volume, rolling_window)
 
     if "quote_volume" in df.columns:
-        frame["quote_vol_change"] = df["quote_volume"].astype(float).pct_change(1)
+        frame["quote_vol_change"] = df["quote_volume"].astype(float).pct_change(1, fill_method=None)
         frame["quote_vol_zscore"] = _rolling_zscore(df["quote_volume"].astype(float), rolling_window)
     if "trades" in df.columns:
-        frame["trades_change"] = df["trades"].astype(float).pct_change(1)
+        frame["trades_change"] = df["trades"].astype(float).pct_change(1, fill_method=None)
         frame["trades_zscore"] = _rolling_zscore(df["trades"].astype(float), rolling_window)
 
     if "taker_buy_base_vol" in df.columns and "volume" in df.columns:
@@ -570,7 +570,7 @@ def _extract_obv_features(result, df, rolling_window=20, **_):
     obv_delta = obv.diff()
     pressure = _safe_divide(obv_delta.rolling(rolling_window).sum(), rolling_volume)
     flow = _safe_divide(obv_delta, volume.rolling(rolling_window).mean().replace(0.0, np.nan))
-    price_pressure = close.pct_change(rolling_window)
+    price_pressure = close.pct_change(rolling_window, fill_method=None)
 
     frame = pd.DataFrame(
         {
@@ -827,8 +827,8 @@ def _indicator_interaction_features(df, indicator_run, rolling_window=20):
 
     if atr_pct is not None:
         atr_pct_safe = atr_pct.replace(0.0, np.nan)
-        frame["return_1_to_atr"] = close.pct_change(1) / atr_pct_safe
-        frame["return_5_to_atr"] = close.pct_change(5) / atr_pct_safe
+        frame["return_1_to_atr"] = close.pct_change(1, fill_method=None) / atr_pct_safe
+        frame["return_5_to_atr"] = close.pct_change(5, fill_method=None) / atr_pct_safe
         frame["range_to_atr_interaction"] = _safe_divide(high - low, close * atr_pct_safe)
         laggable.extend(["return_1_to_atr", "return_5_to_atr", "range_to_atr_interaction"])
 
@@ -933,7 +933,7 @@ def _apply_stationarity_transform(series, transform_name, rolling_window, frac_d
     if transform_name == "pct_change":
         if clean.abs().min() < 1e-12:
             return None
-        return series.pct_change()
+        return series.pct_change(fill_method=None)
 
     if transform_name == "diff":
         return series.diff()

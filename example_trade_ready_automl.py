@@ -10,8 +10,8 @@ an explicitly reduced-power local feedback profile that is still useful for
 debugging the control flow but is not sufficient promotion evidence.
 The certification path requires a real Nautilus execution backend for the
 trade-ready evaluation path and fails closed when that backend is unavailable.
-The explicit `--smoke` path can downgrade itself into a clearly labeled
-research-only surrogate run when Nautilus is unavailable locally.
+The explicit `--smoke` path still requires the same event-driven backend and
+never downgrades itself into a surrogate research run.
 """
 
 import argparse
@@ -134,57 +134,8 @@ def parse_args():
 
 
 def prepare_trade_ready_runtime_config(config, *, nautilus_available=NAUTILUS_AVAILABLE):
-    trade_ready_profile = dict((config.get("automl") or {}).get("trade_ready_profile") or {})
-    reduced_power = bool(trade_ready_profile.get("reduced_power", False))
     if nautilus_available:
         return config
-
-    if reduced_power:
-        return clone_config_with_overrides(
-            config,
-            {
-                "regime": {
-                    "enabled": False,
-                },
-                "data_quality": {
-                    "block_on_quarantine": False,
-                },
-                "backtest": {
-                    "evaluation_mode": "research_only",
-                    "execution_profile": "research_surrogate",
-                    "research_only_override": True,
-                    "required_stress_scenarios": [],
-                    "execution_policy": {
-                        "adapter": "nautilus",
-                        "force_simulation": True,
-                        "time_in_force": "IOC",
-                        "participation_cap": 1.0,
-                    },
-                },
-                "automl": {
-                    "locked_holdout_enabled": False,
-                    "selection_policy": {
-                        "enabled": False,
-                    },
-                    "overfitting_control": {
-                        "enabled": False,
-                        "deflated_sharpe": {"enabled": False},
-                        "pbo": {"enabled": False},
-                        "post_selection": {"enabled": False},
-                    },
-                        "replication": {
-                            "enabled": False,
-                        },
-                },
-                "example_runtime": {
-                    "mode": "research_surrogate",
-                    "note": (
-                        "Nautilus is unavailable, so the explicit smoke profile downgraded "
-                        "to a research-only surrogate execution study."
-                    ),
-                },
-            },
-        )
 
     raise RuntimeError(
         "Trade-ready certification requires a real Nautilus backend. "
@@ -267,14 +218,16 @@ def main():
     print_section(sep, 7, "Trade-ready interpretation")
     print("  This profile is allowed to reject the winner.")
     print("  A best trial is not automatically a trade-ready trial.")
+    print("  Read 'oos evidence' before Sharpe or return; that line tells you whether the full adversarial OOS stack was exercised.")
+    print("  Read 'execution' before any certification claim; only event-driven execution evidence is promotion-relevant.")
+    print("  Read 'funding cov' before any futures PnL claim; strict is certification-capable, fallback is research-only missing-event leniency.")
+    print("  Read 'op envelope' before promotion language; missing telemetry or fallback assumptions now block capital-facing runs.")
     print("  A blocking data-certification contract now runs before training and backtesting.")
     print("  A blocking lookahead replay now runs on the feature surface before training.")
     print("  Replication must also pass on alternate cohorts before promotion can succeed.")
     if trade_ready_profile.get("reduced_power", False):
         print("  This run used the reduced-power smoke profile, so a pass is still not certification-grade evidence.")
     print("  Trade-ready evaluation now requires explicit stress cases, reference validation, and a real Nautilus backend.")
-    if example_runtime:
-        print("  This specific run used the explicit smoke-only research surrogate fallback because Nautilus was unavailable.")
     print("  Use example_automl.py when you need the explicit research-only surrogate path.")
     print("  Check 'promotion ok' and 'promotion why' before treating the model as deployable.")
 

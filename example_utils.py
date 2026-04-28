@@ -322,6 +322,28 @@ def build_trade_ready_runtime_overrides(*, market="spot"):
     }
 
 
+def build_research_demo_runtime_overrides(*, market="spot"):
+    """Build the explicit research-demo runtime profile."""
+
+    normalized_market = str(market or "spot").strip().lower()
+    backtest_overrides = {
+        "evaluation_mode": "research_only",
+        "execution_profile": "research_surrogate",
+    }
+    if normalized_market != "spot":
+        backtest_overrides.update(
+            {
+                "apply_funding": True,
+                "funding_missing_policy": {
+                    "mode": "zero_fill",
+                    "expected_interval": "8h",
+                    "max_gap_multiplier": 1.5,
+                },
+            }
+        )
+    return {"backtest": backtest_overrides}
+
+
 def build_default_certification_scenario_matrix():
     """Build a conservative default stress matrix for local certification examples."""
 
@@ -353,7 +375,7 @@ def build_local_certification_runtime_overrides(*, market="spot"):
     scenario_matrix = build_default_certification_scenario_matrix()
     local_backtest = {
         "engine": "pandas",
-        "evaluation_mode": "trade_ready",
+        "evaluation_mode": "local_certification",
         "execution_profile": "local_l1_certification",
         "required_stress_scenarios": list(scenario_matrix),
         "scenario_matrix": scenario_matrix,
@@ -373,7 +395,7 @@ def build_local_certification_runtime_overrides(*, market="spot"):
         overrides,
         {
             "backtest": local_backtest,
-            "monitoring": {"policy_profile": "trade_ready"},
+            "monitoring": {"policy_profile": "local_certification"},
             "data_certification": {"enabled": True},
         },
     )
@@ -1389,6 +1411,15 @@ def print_automl_summary(automl):
     print(f"  study name   : {automl.get('study_name')}")
     if automl.get("evidence_class"):
         print(f"  evidence cls : {automl.get('evidence_class')}")
+    oos_evidence = automl.get("oos_evidence") or {}
+    if oos_evidence:
+        print(
+            "  oos evidence : "
+            f"class={oos_evidence.get('class')}  "
+            f"complete={bool(oos_evidence.get('evidence_stack_complete', False))}"
+        )
+        oos_reasons = list(oos_evidence.get("blocking_reasons") or [])
+        print(f"  oos why      : {oos_reasons if oos_reasons else 'none'}")
     print(f"  objective    : {automl.get('objective')}")
     print(f"  selection    : {automl.get('selection_metric')} ({automl.get('selection_mode')})")
     print(f"  trials       : {automl.get('trial_count')}")
@@ -1414,6 +1445,17 @@ def print_automl_summary(automl):
             f"reduced_power={bool(trade_ready_profile.get('reduced_power', False))}  "
             f"n_trials={trade_ready_profile.get('n_trials')}"
         )
+
+    capital_evidence = automl.get("capital_evidence_contract") or {}
+    if capital_evidence:
+        print(
+            "  capital mode : "
+            f"requested={capital_evidence.get('requested_mode')}  "
+            f"effective={capital_evidence.get('effective_mode')}  "
+            f"eligible={bool(capital_evidence.get('capital_path_eligible', False))}"
+        )
+        capital_reasons = list(capital_evidence.get("blocking_reasons") or [])
+        print(f"  capital why  : {capital_reasons if capital_reasons else 'none'}")
 
     best_training = automl.get("best_training", {})
     if best_training:
@@ -1532,12 +1574,36 @@ def print_automl_summary(automl):
     evaluation_backtest = (locked_holdout.get("backtest") or validation_holdout.get("backtest") or best_backtest or {})
     if evaluation_backtest:
         stress_matrix = evaluation_backtest.get("stress_matrix") or {}
+        execution_evidence = evaluation_backtest.get("execution_evidence") or {}
+        funding_coverage = evaluation_backtest.get("funding_coverage_report") or {}
         print(
             "  evaluation   : "
             f"mode={evaluation_backtest.get('evaluation_mode', 'unknown')}  "
             f"stress_ready={bool(evaluation_backtest.get('stress_realism_ready', False))}  "
             f"stress_cases={stress_matrix.get('scenario_names') or 'none'}"
         )
+        if execution_evidence:
+            print(
+                "  execution    : "
+                f"class={execution_evidence.get('class')}  "
+                f"mode={execution_evidence.get('execution_mode')}  "
+                f"ready={bool(execution_evidence.get('promotion_execution_ready', False))}"
+            )
+            execution_reasons = list(execution_evidence.get("blocking_reasons") or [])
+            print(f"  execution why: {execution_reasons if execution_reasons else 'none'}")
+        if funding_coverage:
+            print(
+                "  funding cov  : "
+                f"status={evaluation_backtest.get('funding_coverage_status', funding_coverage.get('coverage_status'))}  "
+                f"missing={funding_coverage.get('missing_event_count', 0)}  "
+                f"pass={bool(funding_coverage.get('promotion_pass', True))}"
+            )
+            funding_reasons = []
+            if funding_coverage.get("coverage_reason"):
+                funding_reasons.append(funding_coverage.get("coverage_reason"))
+            if funding_coverage.get("fallback_assumption"):
+                funding_reasons.append(funding_coverage.get("fallback_assumption"))
+            print(f"  funding why  : {funding_reasons if funding_reasons else 'none'}")
         evaluation_significance = dict(evaluation_backtest.get("statistical_significance") or {})
         if evaluation_significance.get("reason"):
             print(
@@ -1556,12 +1622,21 @@ def print_automl_summary(automl):
     if monitoring_report:
         monitoring_policy = dict(monitoring_report.get("policy") or {})
         monitoring_reasons = list(monitoring_report.get("reasons") or [])
+        monitoring_gate = dict(monitoring_report.get("monitoring_gate_report") or {})
         print(
             "  monitoring   : "
             f"healthy={bool(monitoring_report.get('healthy', True))}  "
             f"profile={monitoring_policy.get('policy_profile', 'custom')}"
         )
         print(f"  monitoring why: {monitoring_reasons if monitoring_reasons else 'none'}")
+        if monitoring_gate:
+            print(
+                "  op envelope : "
+                f"pass={bool(monitoring_gate.get('promotion_pass', True))}  "
+                f"missing={monitoring_gate.get('missing_metrics') or 'none'}"
+            )
+            gate_reasons = list(monitoring_gate.get("blocking_reasons") or [])
+            print(f"  envelope why: {gate_reasons if gate_reasons else 'none'}")
 
     replication = automl.get("replication") or {}
     if replication.get("enabled"):

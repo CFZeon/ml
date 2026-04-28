@@ -22,7 +22,7 @@ Use this map instead of scanning every example manually.
 | Attach custom exogenous data | `example_custom_data.py` | Demonstrates point-in-time-safe custom data joins |
 | Run an offline deterministic case | `example_synthetic_derivatives.py` | Seeds `pipeline.state` directly and avoids network fetches |
 | Run strict local certification AutoML | `example_local_certification_automl.py` | Keeps fail-closed data policies, locked holdout, replication, and local Nautilus execution requirements without the full operator-facing workflow |
-| Run trade-ready AutoML research | `example_trade_ready_automl.py` | Uses the stronger certification profile with locked holdout, replication cohorts, blocking feature-surface lookahead certification, binding selection gates, and promotion-readiness reporting; add `--smoke` for the explicitly reduced-power local feedback mode |
+| Run trade-ready AutoML research | `example_trade_ready_automl.py` | Uses the stronger certification profile with locked holdout, replication cohorts, blocking feature-surface lookahead certification, binding selection gates, and promotion-readiness reporting; add `--smoke` for a visibly reduced-power run that still requires Nautilus, and read `oos_evidence.class`, `execution_evidence.class`, plus `funding_coverage_status` before any Sharpe or net-profit number |
 | Run drift-governed retraining flow | `example_drift_retraining_cycle.py` | Shows champion/challenger registration, scheduled retraining, hybrid rollback, and the final operator deploy/hold decision |
 | Run AutoML smoke/demo path | `example_automl.py` | Shows the searchable config surface quickly, but intentionally disables promotion-safe controls |
 | Explore FVG-specific features | `example_fvg.py` | Narrow feature example; useful as a feature smoke test |
@@ -50,6 +50,7 @@ Start from the shared builders in `example_utils.py`:
 
 - `build_spot_research_config(...)`
 - `build_futures_research_config(...)`
+- `build_research_demo_runtime_overrides(market="spot" | "um_futures")`
 - `build_local_certification_runtime_overrides(market="spot" | "um_futures")`
 - `build_trade_ready_runtime_overrides(market="spot" | "um_futures")`
 - `build_local_certification_automl_overrides(...)`
@@ -68,14 +69,20 @@ They also default to `backtest.evaluation_mode = "research_only"`, so a normal b
 If you promote a config to local certification, use `build_local_certification_runtime_overrides(...)` as the short diff.
 If you promote a config to `trade_ready`, use `build_trade_ready_runtime_overrides(...)` as the short diff. Those shared helpers set fail-closed gap handling, duplicate-bar blocking, quarantine blocking, and strict futures funding coverage in one place instead of re-stating those guards per example.
 If you want an example script to expose the same path on its CLI, use `parse_local_certification_args(...)` plus `prepare_example_runtime_config(...)` and keep the runtime mode explicit in the printed summary.
-Trade-ready runtime resolution now also forces statistical significance back on and applies a minimum observation floor unless you explicitly set `backtest.research_only_override = true` for a research-grade exception.
+Trade-ready and local-certification runtime resolution now also force statistical significance back on and apply a minimum observation floor. If you want a research-grade exception, switch the config to `backtest.evaluation_mode = "research_only"`; capital-facing modes now reject `backtest.research_only_override = true`.
+Local certification now also uses an explicit `local_certification` monitoring profile instead of reusing research defaults, and both capital-facing profiles emit a blocking `monitoring_gate_report` when required telemetry is missing or fallback assumptions appear.
 The hardened trade-ready profile now also builds a single data-certification verdict before training. That report binds market gaps, data-quality quarantine, context TTL breaches, and configured reference validation into one blocking trade-ready gate.
 Trade-ready and AutoML runs now auto-enable a blocking baseline-vs-prefix lookahead replay over the causal feature surface before training. If you widen the audit manually, keep in mind that labels are meant to mature with future bars and are not part of the default blocking surface.
 The hardened trade-ready AutoML override now defaults to a stronger certification budget: more validation-trade evidence, wider replication coverage, and heavier post-selection diagnostics than the smoke path.
 The hardened trade-ready AutoML override also enables replication cohorts by default, so promotion-readiness is checked on alternate windows or sibling symbols instead of a single holdout narrative.
 The hardened trade-ready AutoML profile now also separates statistical evidence floors by power profile: certification uses a 64-observation significance floor, while `--smoke` keeps a visibly lower 32-observation floor and surfaces underpowered-evidence reasons in the summary.
-If you intentionally choose `python example_trade_ready_automl.py --smoke`, the script prints `reduced power: True` before running and keeps that label in the resulting AutoML summary.
-That hardened trade-ready config still fails closed without a real Nautilus backend on the default certification path. If you intentionally choose `python example_trade_ready_automl.py --smoke`, the script now labels and runs an explicit research-only surrogate fallback for local feedback.
+The printed AutoML summary now starts with `oos_evidence.class` and `oos_evidence.evidence_stack_complete`, so you can see whether the run exercised the full adversarial OOS stack before reading Sharpe, return, or trade counts.
+The same summary now also prints `execution_evidence.class`, `execution_evidence.execution_mode`, and `promotion_execution_ready`. If that line says `research_surrogate`, the run is research-only execution evidence even if the strategy metrics are attractive.
+The same summary now also prints `funding_coverage_status`, missing-event count, and whether the funding gate passed. On futures cases, treat `fallback` as research-only leniency and `strict` as the certification-capable path.
+The same summary now also prints the monitoring envelope verdict, missing metrics, and blocking reasons. In capital-facing modes, treat any missing telemetry there as a release blocker rather than a cosmetic warning.
+If you intentionally choose `python example_trade_ready_automl.py --smoke`, the script prints `reduced power: True` before running and keeps that label in the resulting AutoML summary together with `capital_evidence_contract.requested_mode`, `effective_mode`, and `capital_path_eligible`.
+That hardened trade-ready config still fails closed without a real Nautilus backend on the default certification path, and `--smoke` now fails closed the same way. Use `example_automl.py` or `build_research_demo_runtime_overrides(...)` when you intentionally want the explicit research-only surrogate path.
+For AutoML certification-capable modes, CPCV or purged temporal search, search-stage embargo, validation-to-holdout gap, locked holdout, post-selection inference, and replication are now treated as one OOS evidence stack. If any of those controls are disabled, the run aborts before optimization instead of soft-disclaiming the result later.
 It also auto-applies the `trade_ready` monitoring profile, so the certification path no longer inherits the permissive research monitoring defaults.
 
 ## Build A New Real-Data Case
@@ -148,19 +155,22 @@ If you intentionally want the old permissive smoke-test behavior, override these
 4. set `data.duplicate_policy` to `warn` or `flag`
 5. set `data.futures_context.recent_stats_availability_lag` to `none` only if you intentionally accept non-causal recent-stat alignment
 
-If you want a trade-ready evaluation instead of a research-only one, add these explicitly:
+If you do set `backtest.funding_missing_policy.mode` to `zero_fill`, expect the resulting backtest summary to show `funding_coverage_status = "fallback"` so the missing-event leniency stays visible.
 
-1. set `backtest.evaluation_mode` to `trade_ready`
+If you want a capital-facing evaluation instead of a research-only one, add these explicitly:
+
+1. set `backtest.evaluation_mode` to `local_certification` for paper or pre-capital certification, or `trade_ready` for the stricter operator-facing path
 2. use a real Nautilus execution policy such as `{"adapter": "nautilus", ...}` and do not set `force_simulation`
 3. enable `reference_data` and configure blocking coverage/divergence rules for the venues you trust
 4. enable `data_certification` if your config does not already do so and keep it in blocking mode for trade-ready runs
 5. provide `backtest.scenario_matrix` with named stress cases such as `downtime`, `stale_mark`, and `halt`
 6. set `backtest.required_stress_scenarios` so the promotion gate knows which cases are mandatory
-7. set `monitoring.policy_profile` to `trade_ready` if you want the config to declare the binding monitoring profile explicitly; the pipeline will now auto-apply that profile for `trade_ready` runs when you omit it
-8. keep `backtest.research_only_override` unset unless you intentionally want research-grade leniency; the runtime now uses that flag to decide whether trade-ready funding, gap, and quarantine defaults should stay fail-closed
+7. set `monitoring.policy_profile` to `trade_ready` if you want the config to declare the binding monitoring profile explicitly; the pipeline will now auto-apply that profile for `local_certification` and `trade_ready` runs when you omit it
+8. leave `backtest.research_only_override` unset for capital-facing runs; if you intentionally want research-grade leniency, switch back to `backtest.evaluation_mode = "research_only"`
 9. set `backtest.significance.min_observations` only if you intentionally want a different evidence floor; otherwise the runtime will apply the trade-ready default and the AutoML summary will report underpowered significance explicitly
 
-If you only want a surrogate execution study, keep `backtest.evaluation_mode = "research_only"` and set `execution_policy.force_simulation = true` explicitly. The default `example_trade_ready_automl.py` run still fails closed without Nautilus, but `python example_trade_ready_automl.py --smoke` now makes that downgrade explicitly for local feedback; otherwise use `example_automl.py` or your own explicitly research-only config.
+If you only want a surrogate execution study, keep `backtest.evaluation_mode = "research_only"` and set `execution_policy.force_simulation = true` explicitly. The default `example_trade_ready_automl.py` run still fails closed without Nautilus, and `python example_trade_ready_automl.py --smoke` no longer downgrades around that requirement; otherwise use `example_automl.py` or your own explicitly research-only config.
+Capital-facing evaluation now also requires `execution_evidence.class == "event_driven_certification"`. Surrogate execution remains available, but only as `research_demo` evidence.
 
 If you want the shortest strict path before the operator-facing workflow, use `python example_local_certification_automl.py`. That entrypoint does not silently downgrade when Nautilus is unavailable; it aborts and tells you to use `example_automl.py` for the explicit research-only path.
 If you want the same local-certification runtime on a non-AutoML real-data demo, run that example with `--local-certification` instead of creating a separate script first.

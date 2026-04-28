@@ -7,7 +7,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from .automl import run_automl_study
+from .automl import _json_ready, run_automl_study
 from .backtest import kelly_fraction, run_backtest
 from .context import (
     _normalize_funding_timestamp_index,
@@ -32,6 +32,7 @@ from .data_contracts import (
     validate_reference_overlay_frame_contract,
 )
 from .data_quality import check_data_quality
+from .evaluation_modes import resolve_evaluation_mode
 from .execution import resolve_execution_policy
 from .feature_governance import (
     apply_feature_retirement,
@@ -891,6 +892,7 @@ def _resolve_backtest_liquidity_lag_bars(pipeline):
 
 def _resolve_backtest_execution_policy(pipeline):
     backtest_config = pipeline.section("backtest")
+    evaluation_mode = resolve_evaluation_mode(backtest_config)
     configured = backtest_config.get("execution_policy")
     policy_config = (
         dict(configured)
@@ -909,16 +911,11 @@ def _resolve_backtest_execution_policy(pipeline):
     )
     policy = resolve_execution_policy(policy_config)
 
-    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
-    if trade_ready_mode and (policy.adapter != "nautilus" or policy.force_simulation):
-        execution_profile = str(backtest_config.get("execution_profile", "")).strip().lower()
-        research_only_override = bool(backtest_config.get("research_only_override", False))
-        if execution_profile == "research_surrogate" and research_only_override:
-            return policy.to_dict()
+    if evaluation_mode.is_capital_facing and (policy.adapter != "nautilus" or policy.force_simulation):
+        mode_label = "Trade-ready" if evaluation_mode.effective_mode == "trade_ready" else "Local certification"
         raise RuntimeError(
-            "Trade-ready evaluation requires a Nautilus execution adapter with force_simulation=false. "
-            "Use backtest.execution_profile='research_surrogate' together with "
-            "backtest.research_only_override=true only for explicit research-only studies."
+            f"{mode_label} evaluation requires a Nautilus execution adapter "
+            "with force_simulation=false. Use backtest.evaluation_mode='research_only' for explicit research-only studies."
         )
 
     return policy.to_dict()
@@ -927,16 +924,16 @@ def _resolve_backtest_execution_policy(pipeline):
 def _resolve_lookahead_guard_config(pipeline):
     features_config = pipeline.section("features")
     backtest_config = pipeline.section("backtest")
+    evaluation_mode = resolve_evaluation_mode(backtest_config)
     automl_config = pipeline.section("automl")
     builders = list(features_config.get("builders") or [])
     configured = copy.deepcopy(features_config.get("lookahead_guard") or {})
 
-    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
     automl_enabled = bool(automl_config.get("enabled", False))
     default_enabled = True
     enabled = bool(configured.get("enabled", default_enabled))
     default_mode = "blocking" if default_enabled else "advisory"
-    if not (trade_ready_mode or automl_enabled or builders):
+    if not (evaluation_mode.is_capital_facing or automl_enabled or builders):
         default_mode = "advisory"
     mode = str(configured.get("mode", default_mode)).strip().lower()
     if mode not in {"blocking", "advisory"}:
@@ -958,7 +955,7 @@ def _resolve_lookahead_guard_config(pipeline):
         "audit_scope": str(configured.get("audit_scope", "pre_training_causal_surface")),
         "builders_present": bool(builders),
         "builder_count": int(len(builders)),
-        "trade_ready_mode": trade_ready_mode,
+        "trade_ready_mode": evaluation_mode.is_capital_facing,
         "automl_enabled": automl_enabled,
     }
 
@@ -1063,32 +1060,33 @@ def _run_pipeline_lookahead_guard(pipeline):
 
 
 def _resolve_backtest_funding_missing_policy(backtest_config):
-    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
-    research_only_override = bool(backtest_config.get("research_only_override", False))
+    evaluation_mode = resolve_evaluation_mode(backtest_config)
     configured = backtest_config.get("funding_missing_policy")
     policy = {
-        "mode": "strict" if trade_ready_mode and not research_only_override else "zero_fill",
+        "mode": "strict" if evaluation_mode.is_capital_facing else "zero_fill",
         "expected_interval": "8h",
-        "max_gap_multiplier": 1.25 if trade_ready_mode and not research_only_override else 1.5,
+        "max_gap_multiplier": 1.25 if evaluation_mode.is_capital_facing else 1.5,
+        "allow_missing_events": not evaluation_mode.is_capital_facing,
     }
     if isinstance(configured, str):
         policy["mode"] = configured
     elif isinstance(configured, dict):
         policy.update(configured)
-    if trade_ready_mode and not research_only_override:
+    if evaluation_mode.is_capital_facing:
         policy["mode"] = "strict"
+        policy["allow_missing_events"] = False
     policy["mode"] = str(policy.get("mode", "zero_fill")).strip().lower()
     policy["expected_interval"] = pd.Timedelta(policy.get("expected_interval", "8h"))
     policy["max_gap_multiplier"] = float(policy.get("max_gap_multiplier", 1.5))
+    policy["allow_missing_events"] = bool(policy.get("allow_missing_events", policy["mode"] not in {"strict", "preserve", "preserve_missing"}))
     return policy
 
 
 def _resolve_pipeline_data_fetch_config(pipeline):
     config = dict(pipeline.section("data"))
     backtest_config = pipeline.section("backtest")
-    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
-    research_only_override = bool(backtest_config.get("research_only_override", False))
-    if trade_ready_mode and not research_only_override:
+    evaluation_mode = resolve_evaluation_mode(backtest_config)
+    if evaluation_mode.is_capital_facing:
         config.setdefault("gap_policy", "fail")
         config.setdefault("duplicate_policy", "fail")
     return config
@@ -1097,9 +1095,8 @@ def _resolve_pipeline_data_fetch_config(pipeline):
 def _resolve_pipeline_data_quality_config(pipeline):
     config = copy.deepcopy(pipeline.section("data_quality"))
     backtest_config = pipeline.section("backtest")
-    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
-    research_only_override = bool(backtest_config.get("research_only_override", False))
-    if trade_ready_mode and not research_only_override:
+    evaluation_mode = resolve_evaluation_mode(backtest_config)
+    if evaluation_mode.is_capital_facing:
         config.setdefault("block_on_quarantine", True)
     return config
 
@@ -1120,10 +1117,10 @@ def _append_unique_reason(reasons, value):
 def _resolve_data_certification_config(pipeline):
     configured = copy.deepcopy(pipeline.section("data_certification"))
     backtest_config = pipeline.section("backtest")
+    evaluation_mode = resolve_evaluation_mode(backtest_config)
     data_config = pipeline.section("data")
     reference_config = pipeline.section("reference_data")
 
-    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
     futures_context_config = dict(data_config.get("futures_context") or {})
     cross_asset_context_config = dict(data_config.get("cross_asset_context") or {})
     context_sources = []
@@ -1132,8 +1129,8 @@ def _resolve_data_certification_config(pipeline):
     if list(cross_asset_context_config.get("symbols") or []):
         context_sources.append("cross_asset_context")
 
-    enabled = bool(configured.get("enabled", trade_ready_mode))
-    default_mode = "blocking" if trade_ready_mode else "advisory"
+    enabled = bool(configured.get("enabled", evaluation_mode.is_capital_facing))
+    default_mode = "blocking" if evaluation_mode.is_capital_facing else "advisory"
     mode = str(configured.get("mode", default_mode)).strip().lower()
     if mode not in {"blocking", "advisory", "disabled"}:
         mode = default_mode
@@ -1141,7 +1138,7 @@ def _resolve_data_certification_config(pipeline):
     return {
         "enabled": enabled and mode != "disabled",
         "mode": mode,
-        "trade_ready_mode": trade_ready_mode,
+        "trade_ready_mode": evaluation_mode.is_capital_facing,
         "require_complete_market_data": bool(configured.get("require_complete_market_data", enabled)),
         "require_data_quality_pass": bool(configured.get("require_data_quality_pass", enabled)),
         "require_context_validation": bool(
@@ -1325,18 +1322,34 @@ def _align_backtest_funding_rates(funding_rates, index, policy):
                 "mode": policy["mode"],
                 "expected_interval": str(policy["expected_interval"]),
                 "max_gap_multiplier": float(policy["max_gap_multiplier"]),
+                "allow_missing_events": bool(policy.get("allow_missing_events", False)),
             },
+            "coverage_status": "fallback" if bool(policy.get("allow_missing_events", False)) else "strict",
+            "expected_timestamps": [],
+            "observed_timestamps": [],
+            "missing_event_count": 0,
+            "max_consecutive_gap": str(pd.Timedelta(0)),
+            "coverage_ratio": 0.0,
             "coverage_reason": "funding_unavailable",
-            "promotion_pass": policy["mode"] not in {"strict", "preserve", "preserve_missing"},
+            "promotion_pass": bool(policy.get("allow_missing_events", False)),
         }
 
     aligned_index = pd.DatetimeIndex(index)
     observed = _normalize_funding_timestamp_index(pd.Series(funding_rates, copy=False)).dropna().astype(float)
     if len(aligned_index) > 0 and not observed.empty:
         observed = observed.loc[(observed.index >= aligned_index[0]) & (observed.index <= aligned_index[-1])]
-    aligned = observed.reindex(aligned_index).fillna(0.0).astype(float)
     expected_interval = policy["expected_interval"]
     max_allowed_gap = expected_interval * float(policy["max_gap_multiplier"])
+    expected_timestamps = pd.DatetimeIndex([])
+    if len(aligned_index) > 0:
+        step_ns = int(expected_interval.value)
+        expected_mask = (aligned_index.asi8 % step_ns) == 0
+        expected_timestamps = aligned_index[expected_mask]
+    aligned = pd.Series(0.0, index=aligned_index, dtype=float)
+    aligned.loc[observed.index.intersection(aligned.index)] = observed.reindex(aligned.index).dropna()
+    missing_expected_timestamps = expected_timestamps.difference(observed.index)
+    if missing_expected_timestamps.size > 0 and not bool(policy.get("allow_missing_events", False)):
+        aligned.loc[missing_expected_timestamps] = np.nan
 
     if observed.empty:
         report = {
@@ -1346,9 +1359,16 @@ def _align_backtest_funding_rates(funding_rates, index, policy):
                 "mode": policy["mode"],
                 "expected_interval": str(expected_interval),
                 "max_gap_multiplier": float(policy["max_gap_multiplier"]),
+                "allow_missing_events": bool(policy.get("allow_missing_events", False)),
             },
+            "coverage_status": "fallback" if bool(policy.get("allow_missing_events", False)) else "strict",
+            "expected_timestamps": [_json_ready(timestamp) for timestamp in expected_timestamps],
+            "observed_timestamps": [],
+            "missing_event_count": int(len(expected_timestamps)),
+            "max_consecutive_gap": str(max_allowed_gap if len(expected_timestamps) > 0 else pd.Timedelta(0)),
+            "coverage_ratio": 0.0,
             "coverage_reason": "no_observed_funding_events",
-            "promotion_pass": policy["mode"] not in {"strict", "preserve", "preserve_missing"},
+            "promotion_pass": bool(policy.get("allow_missing_events", False)),
         }
         return aligned, report
 
@@ -1369,6 +1389,8 @@ def _align_backtest_funding_rates(funding_rates, index, policy):
         breach_reasons.append("internal_event_gap")
     if off_index_event_count > 0:
         breach_reasons.append("off_index_funding_timestamps")
+    if len(missing_expected_timestamps) > 0:
+        breach_reasons.append("missing_expected_funding_events")
 
     report = {
         "enabled": True,
@@ -1377,7 +1399,14 @@ def _align_backtest_funding_rates(funding_rates, index, policy):
             "mode": policy["mode"],
             "expected_interval": str(expected_interval),
             "max_gap_multiplier": float(policy["max_gap_multiplier"]),
+            "allow_missing_events": bool(policy.get("allow_missing_events", False)),
         },
+        "coverage_status": "fallback" if bool(policy.get("allow_missing_events", False)) else "strict",
+        "expected_timestamps": [_json_ready(timestamp) for timestamp in expected_timestamps],
+        "observed_timestamps": [_json_ready(timestamp) for timestamp in observed_index],
+        "missing_event_count": int(len(missing_expected_timestamps)),
+        "max_consecutive_gap": str(max(max_observed_gap, max_allowed_gap if len(missing_expected_timestamps) > 0 else pd.Timedelta(0))),
+        "coverage_ratio": float(1.0 if len(expected_timestamps) == 0 else max(0.0, 1.0 - (len(missing_expected_timestamps) / len(expected_timestamps)))),
         "observed_event_count": int(len(observed_index)),
         "leading_gap": str(leading_gap),
         "trailing_gap": str(trailing_gap),
@@ -1394,6 +1423,27 @@ def _resolve_backtest_funding_rates(pipeline, index):
     backtest_config = pipeline.section("backtest")
     market = _resolve_backtest_market(pipeline)
     if not backtest_config.get("apply_funding", market != "spot"):
+        _store_backtest_funding_report(
+            pipeline,
+            {
+                "enabled": False,
+                "scope": "backtest_funding",
+                "policy": {
+                    "mode": "not_applicable",
+                    "expected_interval": None,
+                    "max_gap_multiplier": None,
+                    "allow_missing_events": False,
+                },
+                "coverage_status": "not_applicable",
+                "expected_timestamps": [],
+                "observed_timestamps": [],
+                "missing_event_count": 0,
+                "max_consecutive_gap": str(pd.Timedelta(0)),
+                "coverage_ratio": None,
+                "coverage_reason": None,
+                "promotion_pass": True,
+            },
+        )
         return None
 
     funding_policy = _resolve_backtest_funding_missing_policy(backtest_config)
@@ -1408,7 +1458,14 @@ def _resolve_backtest_funding_rates(pipeline, index):
                 "mode": funding_policy["mode"],
                 "expected_interval": str(funding_policy["expected_interval"]),
                 "max_gap_multiplier": float(funding_policy["max_gap_multiplier"]),
+                "allow_missing_events": bool(funding_policy.get("allow_missing_events", False)),
             },
+            "coverage_status": "fallback" if bool(funding_policy.get("allow_missing_events", False)) else "strict",
+            "expected_timestamps": [],
+            "observed_timestamps": [],
+            "missing_event_count": 0,
+            "max_consecutive_gap": str(pd.Timedelta(0)),
+            "coverage_ratio": 0.0,
             "coverage_reason": "funding_frame_missing",
             "promotion_pass": not strict_funding_policy,
         }
@@ -1522,8 +1579,7 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
 
 def _resolve_backtest_significance_config(backtest_config):
     configured = backtest_config.get("significance")
-    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
-    research_only_override = bool(backtest_config.get("research_only_override", False))
+    evaluation_mode = resolve_evaluation_mode(backtest_config)
 
     if configured is None:
         resolved = {}
@@ -1534,7 +1590,7 @@ def _resolve_backtest_significance_config(backtest_config):
     else:
         return configured
 
-    if trade_ready_mode and not research_only_override:
+    if evaluation_mode.is_capital_facing:
         resolved["enabled"] = True
         resolved.setdefault("min_observations", 32)
         resolved.setdefault("min_effective_bets", int(resolved["min_observations"]))
@@ -1558,6 +1614,28 @@ def _resolve_monitoring_reference_index(backtest_reports):
     return pd.DatetimeIndex([])
 
 
+def _resolve_capital_monitoring_required_components(pipeline, scope):
+    required = {
+        "training": ["raw_data_freshness", "feature_schema", "signal_decay", "inference", "fallback_assumptions"],
+        "backtest": ["raw_data_freshness", "feature_schema", "execution_quality", "signal_decay", "l2_snapshot_age", "fallback_assumptions"],
+        "backtest_paths": ["raw_data_freshness", "feature_schema", "execution_quality", "signal_decay", "l2_snapshot_age", "fallback_assumptions"],
+    }.get(scope, ["raw_data_freshness", "feature_schema", "fallback_assumptions"])
+    if pipeline.state.get("custom_data_report"):
+        required = list(required) + ["custom_data_ttl"]
+    return list(dict.fromkeys(required))
+
+
+def _resolve_bound_monitoring_profile(monitoring_config, evaluation_mode):
+    requested_profile = str(monitoring_config.get("policy_profile") or "").strip().lower()
+    if not evaluation_mode.is_capital_facing:
+        return requested_profile or "research"
+    if evaluation_mode.effective_mode == "trade_ready":
+        return "trade_ready"
+    if requested_profile in {"local_certification", "trade_ready"}:
+        return requested_profile
+    return "local_certification"
+
+
 def _build_pipeline_operational_monitoring(
     pipeline,
     *,
@@ -1571,7 +1649,15 @@ def _build_pipeline_operational_monitoring(
 ):
     monitoring_config = dict(pipeline.section("monitoring"))
     backtest_config = pipeline.section("backtest")
-    trade_ready_mode = str(backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+    evaluation_mode = resolve_evaluation_mode(backtest_config)
+    monitoring_config["policy_profile"] = _resolve_bound_monitoring_profile(monitoring_config, evaluation_mode)
+    if evaluation_mode.is_capital_facing:
+        configured_required = list(monitoring_config.get("required_components") or [])
+        monitoring_config["required_components"] = list(
+            dict.fromkeys(
+                _resolve_capital_monitoring_required_components(pipeline, scope) + [str(name) for name in configured_required]
+            )
+        )
     raw_data = pipeline.state.get("raw_data")
     raw_index = raw_data.index if isinstance(raw_data, (pd.DataFrame, pd.Series)) else pd.DatetimeIndex([])
     orderbook_depth = pipeline.state.get("orderbook_depth")
@@ -1597,7 +1683,7 @@ def _build_pipeline_operational_monitoring(
         inference_latencies_ms=inference_latencies_ms,
         queue_backlog=queue_backlog,
         policy=monitoring_config,
-        default_policy_profile="trade_ready" if trade_ready_mode else "research",
+        default_policy_profile=monitoring_config.get("policy_profile", "research"),
     )
     if monitoring_config.get("write_reports", True):
         symbol = pipeline.section("data").get("symbol", "run")
@@ -2193,6 +2279,7 @@ def _build_execution_trade_outcomes(pipeline, predictions, holding_bars, cutoff_
         slippage_model=runtime_kwargs.get("slippage_model"),
         orderbook_depth=runtime_kwargs.get("orderbook_depth"),
         liquidity_lag_bars=runtime_kwargs.get("liquidity_lag_bars", 1),
+        evaluation_mode=resolve_evaluation_mode(backtest_config).effective_mode,
     )
 
 
@@ -2738,7 +2825,7 @@ class SignalPolicyBuilder:
             )
 
         params = _extend_signal_policy_params(report["params"], self.signal_config)
-        trade_ready_mode = str(self.backtest_config.get("evaluation_mode", "research_only")).strip().lower() == "trade_ready"
+        trade_ready_mode = resolve_evaluation_mode(self.backtest_config).is_capital_facing
         params.setdefault("trade_ready_mode", trade_ready_mode)
         params.setdefault("require_paper_verification_for_kelly", trade_ready_mode)
         params.setdefault("require_live_calibration_for_kelly", trade_ready_mode)
@@ -4925,6 +5012,12 @@ class BacktestStep(PipelineStep):
             )
             backtest["operational_monitoring"] = monitoring_report
             backtest["signal_decay"] = dict(training.get("signal_decay") or {})
+            funding_coverage_report = dict((pipeline.state.get("context_ttl_report") or {}).get("backtest_funding") or {})
+            if funding_coverage_report:
+                backtest["funding_coverage_report"] = funding_coverage_report
+                backtest["funding_coverage_status"] = str(
+                    funding_coverage_report.get("coverage_status") or "not_applicable"
+                )
             if pipeline.state.get("reference_integrity_report") is not None:
                 backtest["cross_venue_integrity"] = dict(pipeline.state.get("reference_integrity_report") or {})
             if pipeline.state.get("data_certification") is not None:
@@ -4971,6 +5064,12 @@ class BacktestStep(PipelineStep):
         )
         backtest["operational_monitoring"] = monitoring_report
         backtest["signal_decay"] = signal_decay_report
+        funding_coverage_report = dict((pipeline.state.get("context_ttl_report") or {}).get("backtest_funding") or {})
+        if funding_coverage_report:
+            backtest["funding_coverage_report"] = funding_coverage_report
+            backtest["funding_coverage_status"] = str(
+                funding_coverage_report.get("coverage_status") or "not_applicable"
+            )
         if pipeline.state.get("reference_integrity_report") is not None:
             backtest["cross_venue_integrity"] = dict(pipeline.state.get("reference_integrity_report") or {})
         if pipeline.state.get("data_certification") is not None:

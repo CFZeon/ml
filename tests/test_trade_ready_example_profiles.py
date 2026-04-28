@@ -171,6 +171,17 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
                     "trial_count": 2,
                     "best_value": 0.1,
                     "best_params": {},
+                    "oos_evidence": {
+                        "class": "partial_oos",
+                        "evidence_stack_complete": False,
+                        "blocking_reasons": ["oos_control_incomplete:replication"],
+                    },
+                    "capital_evidence_contract": {
+                        "requested_mode": "trade_ready",
+                        "effective_mode": "trade_ready",
+                        "capital_path_eligible": False,
+                        "blocking_reasons": ["reduced_power_profile_not_capital_eligible"],
+                    },
                     "replication": {
                         "enabled": True,
                         "promotion_pass": False,
@@ -180,10 +191,47 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
                         "min_pass_rate": 1.0,
                         "reasons": ["replication_pass_rate_below_minimum"],
                     },
+                    "best_backtest": {
+                        "funding_coverage_status": "fallback",
+                        "funding_coverage_report": {
+                            "coverage_status": "fallback",
+                            "missing_event_count": 1,
+                            "promotion_pass": True,
+                            "coverage_reason": "missing_funding_events",
+                            "fallback_assumption": "zero_fill_missing_funding_events",
+                        },
+                        "execution_evidence": {
+                            "class": "research_surrogate",
+                            "execution_mode": "conservative_bar_surrogate",
+                            "promotion_execution_ready": False,
+                            "blocking_reasons": ["execution_backend_not_event_driven", "bar_surrogate_only"],
+                        },
+                        "operational_monitoring": {
+                            "healthy": False,
+                            "policy": {"policy_profile": "local_certification"},
+                            "reasons": ["inference_missing"],
+                            "monitoring_gate_report": {
+                                "promotion_pass": False,
+                                "missing_metrics": ["inference"],
+                                "blocking_reasons": ["inference_missing"],
+                            },
+                        },
+                    },
                 }
             )
 
         rendered = buffer.getvalue()
+        self.assertIn("oos evidence : class=partial_oos  complete=False", rendered)
+        self.assertIn("oos why      : ['oos_control_incomplete:replication']", rendered)
+        self.assertIn("capital mode : requested=trade_ready  effective=trade_ready  eligible=False", rendered)
+        self.assertIn("capital why  : ['reduced_power_profile_not_capital_eligible']", rendered)
+        self.assertIn("execution    : class=research_surrogate  mode=conservative_bar_surrogate  ready=False", rendered)
+        self.assertIn("execution why: ['execution_backend_not_event_driven', 'bar_surrogate_only']", rendered)
+        self.assertIn("funding cov  : status=fallback  missing=1  pass=True", rendered)
+        self.assertIn("funding why  : ['missing_funding_events', 'zero_fill_missing_funding_events']", rendered)
+        self.assertIn("monitoring   : healthy=False  profile=local_certification", rendered)
+        self.assertIn("op envelope : pass=False  missing=['inference']", rendered)
+        self.assertIn("envelope why: ['inference_missing']", rendered)
         self.assertIn("replication  : passed=False", rendered)
         self.assertIn("replication why: ['replication_pass_rate_below_minimum']", rendered)
 
@@ -307,31 +355,14 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
 
         self.assertIn("example_automl.py", str(ctx.exception))
 
-    def test_trade_ready_example_smoke_profile_downgrades_to_explicit_research_surrogate(self):
+    def test_trade_ready_example_smoke_profile_fails_closed_without_nautilus(self):
         config = _build_trade_ready_example_config(
             automl_storage=Path(".cache") / "automl" / "trade_ready_smoke_runtime_test.db",
             power_profile="smoke",
         )
 
-        resolved = prepare_trade_ready_runtime_config(config, nautilus_available=False)
-
-        backtest = resolved["backtest"]
-        automl = resolved["automl"]
-        execution_policy = backtest["execution_policy"]
-        self.assertEqual(backtest["evaluation_mode"], "research_only")
-        self.assertEqual(backtest["execution_profile"], "research_surrogate")
-        self.assertTrue(backtest["research_only_override"])
-        self.assertEqual(backtest["required_stress_scenarios"], [])
-        self.assertEqual(execution_policy["adapter"], "nautilus")
-        self.assertTrue(execution_policy["force_simulation"])
-        self.assertFalse(resolved["features"]["lookahead_guard"]["enabled"])
-        self.assertFalse(resolved["regime"]["enabled"])
-        self.assertFalse(resolved["data_quality"]["block_on_quarantine"])
-        self.assertFalse(automl["locked_holdout_enabled"])
-        self.assertFalse(automl["replication"]["enabled"])
-        self.assertFalse(automl["selection_policy"]["enabled"])
-        self.assertFalse(automl["overfitting_control"]["enabled"])
-        self.assertEqual(resolved["example_runtime"]["mode"], "research_surrogate")
+        with self.assertRaisesRegex(RuntimeError, "Trade-ready certification requires a real Nautilus backend"):
+            prepare_trade_ready_runtime_config(config, nautilus_available=False)
 
 
 if __name__ == "__main__":

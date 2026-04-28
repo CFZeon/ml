@@ -208,6 +208,8 @@ class AutoMLStudySummary:
     evidence_class: str
     best_trial_number: int | None
     best_overrides: dict[str, Any]
+    capital_evidence_contract: dict[str, Any]
+    oos_evidence: dict[str, Any]
     selection_outcome: SelectionOutcome
     locked_holdout: LockedHoldoutReport
     replication: ReplicationReport
@@ -283,6 +285,26 @@ def validate_summary_contract(summary: dict[str, Any]) -> dict[str, Any]:
     payload["promotion_eligibility_report"] = normalized_promotion_report
     payload["evidence_class"] = _as_text(payload.get("evidence_class"), "selection_evidence") or "selection_evidence"
 
+    capital_evidence_payload = _clone_dict(payload.get("capital_evidence_contract"))
+    normalized_capital_evidence = {
+        "requested_mode": _as_text(capital_evidence_payload.get("requested_mode"), "research_only") or "research_only",
+        "effective_mode": _as_text(capital_evidence_payload.get("effective_mode"), "research_demo") or "research_demo",
+        "capital_path_eligible": _as_bool(capital_evidence_payload.get("capital_path_eligible"), False),
+        "required_controls": _clone_dict(capital_evidence_payload.get("required_controls")),
+        "observed_controls": _clone_dict(capital_evidence_payload.get("observed_controls")),
+        "blocking_reasons": [str(value) for value in _clone_list(capital_evidence_payload.get("blocking_reasons"))],
+    }
+    payload["capital_evidence_contract"] = normalized_capital_evidence
+
+    oos_evidence_payload = _clone_dict(payload.get("oos_evidence"))
+    normalized_oos_evidence = {
+        "class": _as_text(oos_evidence_payload.get("class"), "search_only") or "search_only",
+        "evidence_stack_complete": _as_bool(oos_evidence_payload.get("evidence_stack_complete"), False),
+        "controls": _clone_dict(oos_evidence_payload.get("controls")),
+        "blocking_reasons": [str(value) for value in _clone_list(oos_evidence_payload.get("blocking_reasons"))],
+    }
+    payload["oos_evidence"] = normalized_oos_evidence
+
     payload["best_backtest"] = _merge_normalized_backtest(payload.get("best_backtest"), evidence_class="outer_replay")
     validation_holdout = _clone_dict(payload.get("validation_holdout"))
     validation_holdout["evidence_class"] = _as_text(
@@ -325,6 +347,8 @@ def validate_summary_contract(summary: dict[str, Any]) -> dict[str, Any]:
         evidence_class=payload["evidence_class"],
         best_trial_number=best_trial_number,
         best_overrides=copy.deepcopy(best_overrides),
+        capital_evidence_contract=copy.deepcopy(normalized_capital_evidence),
+        oos_evidence=copy.deepcopy(normalized_oos_evidence),
         selection_outcome=selection_outcome,
         locked_holdout=locked_holdout,
         replication=replication,

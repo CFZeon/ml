@@ -17,16 +17,22 @@ class FundingCoverageGateTest(unittest.TestCase):
 
         self.assertEqual(policy["mode"], "strict")
 
-    def test_trade_ready_research_override_can_keep_zero_fill_funding_policy(self):
-        policy = _resolve_backtest_funding_missing_policy(
-            {
-                "evaluation_mode": "trade_ready",
-                "research_only_override": True,
-                "funding_missing_policy": {"mode": "zero_fill", "expected_interval": "8h", "max_gap_multiplier": 1.5},
-            }
-        )
-
-        self.assertEqual(policy["mode"], "zero_fill")
+    def test_trade_ready_research_override_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "backtest.research_only_override=true is only valid when backtest.evaluation_mode='research_only'",
+        ):
+            _resolve_backtest_funding_missing_policy(
+                {
+                    "evaluation_mode": "trade_ready",
+                    "research_only_override": True,
+                    "funding_missing_policy": {
+                        "mode": "zero_fill",
+                        "expected_interval": "8h",
+                        "max_gap_multiplier": 1.5,
+                    },
+                }
+            )
 
     def test_trade_ready_runtime_defaults_fail_closed_data_integrity_and_quarantine(self):
         pipeline = ResearchPipeline(

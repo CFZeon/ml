@@ -11,12 +11,14 @@ class ObjectiveGateConfidenceBoundsTest(unittest.TestCase):
         self.assertTrue(config["enabled"])
         self.assertEqual(int(config["min_observations"]), 32)
 
-    def test_research_override_can_disable_trade_ready_significance_floor(self):
-        config = _resolve_backtest_significance_config(
-            {"evaluation_mode": "trade_ready", "research_only_override": True, "significance": False}
-        )
-
-        self.assertFalse(config["enabled"])
+    def test_trade_ready_research_override_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "backtest.research_only_override=true is only valid when backtest.evaluation_mode='research_only'",
+        ):
+            _resolve_backtest_significance_config(
+                {"evaluation_mode": "trade_ready", "research_only_override": True, "significance": False}
+            )
 
     def test_sharpe_ci_lower_bound_gate_fails_when_evidence_is_weak(self):
         training = {

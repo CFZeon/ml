@@ -418,6 +418,50 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
 
         self.assertGreater(accurate_score, profitable_score)
 
+    def test_local_certification_aborts_when_post_selection_control_is_disabled(self):
+        raw = _build_market_frame(120)
+        storage_path = _make_storage_path()
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "backtest": {"evaluation_mode": "local_certification"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 1,
+                    "objective": "accuracy_first",
+                    "policy_profile": "hardened_default",
+                    "seed": 5,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_bars": 24,
+                    "locked_holdout_min_search_rows": 48,
+                    "storage": storage_path,
+                    "study_name": "automl_post_selection_required_test",
+                    "selection_policy": {"enabled": True},
+                    "overfitting_control": {"enabled": True, "post_selection": {"enabled": False}},
+                    "replication": {
+                        "enabled": True,
+                        "symbols": ["ETHUSDT"],
+                        "include_window_cohorts": False,
+                        "min_coverage": 1,
+                        "min_pass_rate": 0.0,
+                        "min_score": -1.0,
+                    },
+                },
+                "features": {"schema_version": "test_v1"},
+                "model": {"type": "gbm", "cv_method": "cpcv"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "required evidence controls are disabled"):
+            run_automl_study(
+                base_pipeline,
+                pipeline_class=_AutoMLDummyPipeline,
+                trial_step_classes=[],
+            )
+
     def test_objective_uses_executable_validation_metrics_when_present(self):
         training = {
             "avg_accuracy": 0.12,
@@ -2071,6 +2115,53 @@ class AutoMLHoldoutObjectiveTest(unittest.TestCase):
         gate_report = summary["promotion_eligibility_report"]
         self.assertIn("replication", gate_report["gate_status"])
         self.assertEqual(gate_report["gate_status"]["replication"]["reason"], "replication_pass_rate_below_minimum")
+
+    def test_local_certification_aborts_when_post_selection_control_is_disabled(self):
+        raw = _build_market_frame(120)
+        storage_path = _make_storage_path()
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "backtest": {"evaluation_mode": "local_certification"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 1,
+                    "seed": 13,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_bars": 24,
+                    "locked_holdout_min_search_rows": 48,
+                    "enable_pruning": False,
+                    "minimum_dsr_threshold": None,
+                    "objective": "sharpe_ratio",
+                    "objective_use_confidence_lower_bound": False,
+                    "storage": storage_path,
+                    "study_name": "automl_local_certification_missing_post_selection",
+                    "selection_policy": {"enabled": True},
+                    "overfitting_control": {"enabled": True, "post_selection": {"enabled": False}},
+                    "replication": {
+                        "enabled": True,
+                        "symbols": ["ETHUSDT"],
+                        "include_window_cohorts": False,
+                        "min_coverage": 1,
+                        "min_pass_rate": 0.0,
+                        "min_score": -1.0,
+                    },
+                },
+                "model": {"type": "gbm", "cv_method": "cpcv", "gap": 2},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "required evidence controls are disabled") as ctx:
+            run_automl_study(
+                base_pipeline,
+                pipeline_class=_ScenarioAutoMLPipeline,
+                trial_step_classes=[],
+            )
+
+        self.assertIn("required_control_disabled:post_selection", str(ctx.exception))
 
 
 if __name__ == "__main__":

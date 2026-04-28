@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 
+from .evaluation_modes import resolve_evaluation_mode
 from .execution import (
     ExecutionAdapterUnavailableError,
     NautilusExecutionAdapter,
@@ -44,6 +45,49 @@ _DEFAULT_SIGNIFICANCE_CONFIG = {
     "min_observations": 8,
     "min_effective_bets": None,
 }
+
+
+def _build_default_funding_coverage_report(*, enabled=False, coverage_status="not_applicable"):
+    return {
+        "enabled": bool(enabled),
+        "coverage_status": str(coverage_status),
+        "missing_event_count": 0,
+        "coverage_reason": None,
+        "promotion_pass": True,
+    }
+
+
+def _normalize_runtime_funding_rates(funding_rates, index, *, evaluation_mode="research_only"):
+    if funding_rates is None:
+        return None, _build_default_funding_coverage_report(enabled=False, coverage_status="not_applicable")
+
+    resolved_mode = resolve_evaluation_mode({"evaluation_mode": evaluation_mode})
+    aligned = pd.Series(funding_rates, copy=False).reindex(index)
+    missing_event_count = int(aligned.isna().sum())
+    coverage_status = "strict" if resolved_mode.is_capital_facing else "fallback"
+    report = {
+        "enabled": True,
+        "coverage_status": coverage_status,
+        "missing_event_count": missing_event_count,
+        "coverage_reason": "missing_funding_events" if missing_event_count > 0 else None,
+        "promotion_pass": bool(not resolved_mode.is_capital_facing or missing_event_count == 0),
+    }
+    if not resolved_mode.is_capital_facing:
+        report["fallback_assumption"] = "zero_fill_missing_funding_events"
+        return aligned.fillna(0.0).astype(float), report
+    if missing_event_count > 0:
+        raise RuntimeError("Funding coverage breach: missing_funding_events")
+    return aligned.astype(float), report
+
+
+def _require_complete_funding_series(funding_rates, index):
+    if funding_rates is None:
+        return pd.Series(0.0, index=index, dtype=float)
+
+    aligned = pd.Series(funding_rates, copy=False).reindex(index)
+    if aligned.isna().any():
+        raise RuntimeError("Funding coverage breach: missing_funding_events")
+    return aligned.astype(float)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -97,6 +141,35 @@ def _safe_ratio(numerator, denominator, default=0.0):
             return float("inf")
         return default
     return numerator / denominator
+
+
+def _build_execution_evidence(
+    execution_mode,
+    promotion_execution_ready,
+    execution_limitations,
+    *,
+    execution_adapter=None,
+    execution_backend=None,
+):
+    resolved_mode = str(execution_mode or "unknown").strip().lower()
+    limitations = [str(value) for value in list(execution_limitations or []) if str(value)]
+    blocking_reasons = []
+    if resolved_mode != "event_driven":
+        blocking_reasons.append("execution_backend_not_event_driven")
+    if not bool(promotion_execution_ready):
+        blocking_reasons.append("promotion_execution_not_ready")
+    for limitation in limitations:
+        if limitation not in blocking_reasons:
+            blocking_reasons.append(limitation)
+    return {
+        "class": "event_driven_certification" if resolved_mode == "event_driven" and bool(promotion_execution_ready) else "research_surrogate",
+        "execution_mode": resolved_mode,
+        "promotion_execution_ready": bool(promotion_execution_ready),
+        "execution_adapter": execution_adapter,
+        "execution_backend": execution_backend,
+        "blocking_reasons": blocking_reasons,
+        "execution_limitations": limitations,
+    }
 
 
 def _apply_action_latency(requested_position, action_latency_bars):
@@ -469,6 +542,13 @@ def _build_execution_contract(close, requested_position, equity, execution_price
             "no_partial_fill_model",
             "no_event_driven_matching",
         ]
+        report["execution_evidence"] = _build_execution_evidence(
+            report["execution_mode"],
+            report["promotion_execution_ready"],
+            report["execution_limitations"],
+            execution_adapter=report["execution_adapter"],
+            execution_backend=report["execution_backend"],
+        )
         report["execution_policy"] = policy.to_dict()
         report["partial_fill_orders"] = 0
         report["cancelled_orders"] = 0
@@ -891,6 +971,13 @@ def _build_execution_contract(close, requested_position, equity, execution_price
         "execution_mode": execution_mode,
         "promotion_execution_ready": promotion_execution_ready,
         "execution_limitations": execution_limitations,
+        "execution_evidence": _build_execution_evidence(
+            execution_mode,
+            promotion_execution_ready,
+            execution_limitations,
+            execution_adapter=policy.adapter,
+            execution_backend=adapter_boundary.backend if adapter_boundary is not None else policy.adapter,
+        ),
         "execution_adapter_scenarios": adapter_boundary.describe_scenarios() if adapter_boundary is not None else {},
         "execution_policy": policy.to_dict(),
         "blocked_orders": int((order_ledger.get("status") == "rejected").sum()) if not order_ledger.empty else 0,
@@ -1219,7 +1306,7 @@ def _compute_funding_cash(position, funding_rates, equity_curve):
     if funding_rates is None:
         return pd.Series(0.0, index=position.index, dtype=float)
 
-    funding = pd.Series(funding_rates, index=position.index).reindex(position.index).fillna(0.0).astype(float)
+    funding = _require_complete_funding_series(funding_rates, position.index)
     prev_equity = equity_curve.shift(1).fillna(equity_curve.iloc[0])
     return prev_equity * (-position.astype(float) * funding)
 
@@ -1456,7 +1543,7 @@ def _run_futures_account_backtest(close, position, equity, fee_rate, slippage_ra
     requested_position = pd.Series(position, index=valuation_series.index, copy=False).reindex(valuation_series.index).fillna(0.0).astype(float)
     aligned_funding = pd.Series(0.0, index=valuation_series.index, dtype=float)
     if funding_rates is not None:
-        aligned_funding = pd.Series(funding_rates, index=valuation_series.index).reindex(valuation_series.index).fillna(0.0).astype(float)
+        aligned_funding = _require_complete_funding_series(funding_rates, valuation_series.index)
 
     requested_trade_notional = _build_futures_trade_notional(
         requested_position,
@@ -1927,6 +2014,7 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
                 "execution_mode": execution_report.get("execution_mode"),
                 "promotion_execution_ready": bool(execution_report.get("promotion_execution_ready", False)),
                 "execution_limitations": list(execution_report.get("execution_limitations") or []),
+                "execution_evidence": execution_report.get("execution_evidence", {}),
                 "execution_policy": execution_report.get("execution_policy", {}),
                 "execution_cost_report": execution_report.get("execution_cost_report", {}),
                 "order_intents": execution_report.get("order_intents", pd.DataFrame()),
@@ -1977,6 +2065,7 @@ def _attach_backtest_evaluation_metadata(summary, *, evaluation_mode="research_o
                                          stress_matrix=None, required_stress_scenarios=None):
     payload = dict(summary or {})
     resolved_mode = str(evaluation_mode or "research_only").strip().lower()
+    capital_facing_mode = resolved_mode in {"local_certification", "trade_ready"}
     required = [str(name) for name in list(required_stress_scenarios or [])]
     stress_summary = dict(stress_matrix or {
         "configured": False,
@@ -1987,25 +2076,43 @@ def _attach_backtest_evaluation_metadata(summary, *, evaluation_mode="research_o
     configured_names = [str(name) for name in list(stress_summary.get("scenario_names") or [])]
     missing_required = [name for name in required if name not in configured_names]
     evaluation_limitations = []
-    if resolved_mode != "trade_ready":
+    if not capital_facing_mode:
         evaluation_limitations.append("research_only_evaluation_mode")
     if required and missing_required:
         evaluation_limitations.append("stress_scenarios_missing")
-    if resolved_mode == "trade_ready" and not stress_summary.get("configured", False):
+    if capital_facing_mode and not stress_summary.get("configured", False):
         evaluation_limitations.append("stress_matrix_unconfigured")
     trade_ready_blockers = []
-    if resolved_mode == "trade_ready" and not bool(payload.get("promotion_execution_ready", False)):
+    if capital_facing_mode and not bool(payload.get("promotion_execution_ready", False)):
         trade_ready_blockers.append("execution_backend_not_event_driven")
+    if payload.get("execution_mode") or payload.get("execution_limitations") or payload.get("execution_evidence"):
+        payload["execution_evidence"] = payload.get("execution_evidence") or _build_execution_evidence(
+            payload.get("execution_mode"),
+            payload.get("promotion_execution_ready", False),
+            payload.get("execution_limitations") or [],
+            execution_adapter=payload.get("execution_adapter"),
+            execution_backend=payload.get("execution_backend"),
+        )
+    funding_coverage_report = dict(payload.get("funding_coverage_report") or {})
+    if not funding_coverage_report:
+        funding_coverage_report = _build_default_funding_coverage_report(
+            enabled=False,
+            coverage_status="not_applicable",
+        )
+    payload["funding_coverage_report"] = funding_coverage_report
+    payload["funding_coverage_status"] = str(
+        funding_coverage_report.get("coverage_status") or "not_applicable"
+    )
     payload["evidence_class"] = str(payload.get("evidence_class") or "standalone_backtest")
     payload["evaluation_mode"] = resolved_mode
     payload["required_stress_scenarios"] = required
     payload["stress_matrix"] = stress_summary
-    payload["stress_realism_ready"] = bool(resolved_mode == "trade_ready" and not missing_required and stress_summary.get("configured", False))
+    payload["stress_realism_ready"] = bool(capital_facing_mode and not missing_required and stress_summary.get("configured", False))
     payload["trade_ready_blockers"] = list(dict.fromkeys(trade_ready_blockers))
     payload["trade_ready_evaluation"] = bool(payload["stress_realism_ready"] and not payload["trade_ready_blockers"])
     payload["evaluation_limitations"] = evaluation_limitations
     payload["research_only"] = bool(
-        resolved_mode != "trade_ready"
+        not capital_facing_mode
         or bool(evaluation_limitations)
         or bool(payload["trade_ready_blockers"])
     )
@@ -2106,7 +2213,7 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
     slippage = turnover * slippage_rates
     funding_returns = pd.Series(0.0, index=position.index, dtype=float)
     if funding_rates is not None:
-        funding_returns = -held_position * pd.Series(funding_rates, index=position.index).reindex(position.index).fillna(0.0)
+        funding_returns = -held_position * _require_complete_funding_series(funding_rates, position.index)
 
     strat_ret = held_position * returns + funding_returns - fees - slippage
     equity_curve = equity * (1.0 + strat_ret).cumprod()
@@ -2402,6 +2509,11 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     valuation_series = execution_report["valuation_series"]
     execution_series = execution_report["execution_series"]
     executable_position = execution_report["position"]
+    funding_rates, funding_coverage_report = _normalize_runtime_funding_rates(
+        funding_rates,
+        executable_position.index,
+        evaluation_mode=evaluation_mode,
+    )
 
     resolved_futures_account = _normalize_futures_account_config(
         futures_account=futures_account,
@@ -2430,6 +2542,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
             orderbook_depth=orderbook_depth,
             execution_report=execution_report,
         )
+        summary["funding_coverage_report"] = dict(funding_coverage_report)
         return _attach_backtest_evaluation_metadata(
             summary,
             evaluation_mode=evaluation_mode,
@@ -2458,6 +2571,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                 orderbook_depth=orderbook_depth,
                 execution_report=execution_report,
             )
+            summary["funding_coverage_report"] = dict(funding_coverage_report)
             return _attach_backtest_evaluation_metadata(
                 summary,
                 evaluation_mode=evaluation_mode,
@@ -2483,6 +2597,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         orderbook_depth=orderbook_depth,
         execution_report=execution_report,
     )
+    summary["funding_coverage_report"] = dict(funding_coverage_report)
     return _attach_backtest_evaluation_metadata(
         summary,
         evaluation_mode=evaluation_mode,

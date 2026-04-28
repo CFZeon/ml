@@ -18,7 +18,7 @@ class TradeReadyExecutionFailClosedTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Trade-ready evaluation requires a Nautilus execution adapter"):
             _resolve_backtest_execution_policy(pipeline)
 
-    def test_trade_ready_profile_allows_explicit_research_override(self):
+    def test_trade_ready_profile_rejects_explicit_research_override(self):
         pipeline = ResearchPipeline(
             {
                 "backtest": {
@@ -30,9 +30,11 @@ class TradeReadyExecutionFailClosedTest(unittest.TestCase):
             }
         )
 
-        policy = _resolve_backtest_execution_policy(pipeline)
-
-        self.assertEqual(policy["adapter"], "bar_surrogate")
+        with self.assertRaisesRegex(
+            ValueError,
+            "backtest.research_only_override=true is only valid when backtest.evaluation_mode='research_only'",
+        ):
+            _resolve_backtest_execution_policy(pipeline)
 
 
 if __name__ == "__main__":

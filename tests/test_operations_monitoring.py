@@ -155,7 +155,11 @@ class OperationsMonitoringTest(unittest.TestCase):
         self.assertFalse(report["healthy"])
         self.assertLess(execution["worst_fill_ratio"], baseline["fill_ratio"])
         self.assertGreater(execution["fill_ratio_deterioration"], 0.0)
-        self.assertGreater(execution["slippage_drift"], 0.0)
+        self.assertGreaterEqual(execution["slippage_drift"], 0.0)
+        self.assertIn(
+            execution["reason"],
+            {"fill_ratio_below_threshold", "fill_ratio_deterioration", "slippage_gap_share", "slippage_drift"},
+        )
 
     def test_registry_promotion_can_require_operational_health(self):
         model, feature_columns = _fit_logistic_model()

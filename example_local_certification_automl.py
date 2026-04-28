@@ -118,6 +118,8 @@ def main():
     print(f"  eval mode    : {config.get('backtest', {}).get('evaluation_mode')}")
     print(f"  exec profile : {config.get('backtest', {}).get('execution_profile')}")
     print("  note         : this run is certification-grade evidence for paper or micro-capital gating, not a live release.")
+    print("  funding note : futures cases must keep 'funding cov' at strict before you treat any PnL as certification-grade.")
+    print("  monitor note : 'op envelope' must pass with no missing telemetry before local certification can be treated as admissible.")
 
     print_section(sep, 2, "Fetching BTCUSDT spot data")
     data = pipeline.fetch_data()

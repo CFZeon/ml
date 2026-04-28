@@ -15,6 +15,7 @@ from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .evaluation_modes import resolve_evaluation_mode
 from .execution import resolve_liquidity_inputs
 from .features import ENDOGENOUS_FEATURE_FAMILIES, resolve_feature_family
 from .labeling import sequential_bootstrap
@@ -30,6 +31,19 @@ except ImportError:  # pragma: no cover
     skops_dump = None
     skops_get_untrusted_types = None
     skops_load = None
+
+
+def _normalize_execution_outcome_funding_rates(funding_rates, index, *, evaluation_mode="research_only"):
+    if funding_rates is None:
+        return None
+
+    resolved_mode = resolve_evaluation_mode({"evaluation_mode": evaluation_mode})
+    aligned = pd.Series(funding_rates, copy=False).reindex(index)
+    if resolved_mode.is_capital_facing and aligned.isna().any():
+        raise RuntimeError("Execution outcome funding coverage breach: missing_funding_events")
+    if not resolved_mode.is_capital_facing:
+        aligned = aligned.fillna(0.0)
+    return aligned.astype(float)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -517,7 +531,8 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
                                   funding_rates=None, cutoff_timestamp=None,
                                   equity=10_000.0, volume=None,
                                   slippage_model=None, orderbook_depth=None,
-                                  liquidity_lag_bars=1):
+                                  liquidity_lag_bars=1,
+                                  evaluation_mode="research_only"):
     """Build execution-aligned trade outcomes for a directional prediction series.
 
     Outcomes are computed using the same delayed, bar-by-bar return semantics as
@@ -536,7 +551,11 @@ def build_execution_outcome_frame(primary_preds, valuation_prices, execution_pri
 
     funding_series = None
     if funding_rates is not None:
-        funding_series = pd.Series(funding_rates, copy=False).reindex(valuation_series.index).fillna(0.0).astype(float)
+        funding_series = _normalize_execution_outcome_funding_rates(
+            funding_rates,
+            valuation_series.index,
+            evaluation_mode=evaluation_mode,
+        )
 
     holding_bars = max(1, int(holding_bars))
     signal_delay_bars = max(0, int(signal_delay_bars))
