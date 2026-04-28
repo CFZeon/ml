@@ -78,7 +78,7 @@ The repo now includes:
 - `core/lookahead.py`: baseline-plus-prefix replay audit for lookahead bias provocation
 - `example_active_spot.py`, `example_active_futures.py`: runnable active-trading demos
 - `example_trend_volume_spot.py`, `example_trend_breakout_futures.py`: runnable expanded-indicator demos
-- `example.py`, `example_custom_data.py`, `example_futures.py`, `example_fvg.py`, `example_synthetic_derivatives.py`, `example_automl.py`, `example_trade_ready_automl.py`: runnable end-to-end examples and smoke/integration demos
+- `example.py`, `example_custom_data.py`, `example_futures.py`, `example_fvg.py`, `example_synthetic_derivatives.py`, `example_automl.py`, `example_local_certification_automl.py`, `example_trade_ready_automl.py`: runnable end-to-end examples and smoke/integration demos
 - `example_drift_retraining_cycle.py`: deterministic champion/challenger drift orchestration example with rollback
 - `tests/`: regression coverage for validation, joins, execution semantics, AutoML governance, and futures behavior
 
@@ -100,13 +100,20 @@ The rest of the examples serve different purposes:
 - `example_trend_breakout_futures.py`: futures example focused on ADX plus Donchian trend-breakout context layered onto the existing futures pipeline
 - `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain
 - `example_synthetic_derivatives.py`: offline synthetic derivatives/integration example; may also abstain depending on the generated regime path
+- `example_local_certification_automl.py`: strict local certification path with locked holdout, replication, fail-closed data handling, and a hard local Nautilus requirement; intended for paper or pre-capital certification on consumer hardware
 - `example_trade_ready_automl.py`: hardened AutoML certification profile with locked holdout, replication cohorts, DSR/PBO diagnostics, blocking pre-training feature-surface lookahead certification, and promotion-readiness reporting; the default run still fails closed if Nautilus is unavailable, while `--smoke` executes an explicitly reduced-power research-surrogate path for local feedback
 - `example_drift_retraining_cycle.py`: deterministic registry and drift example showing scheduled retraining, challenger promotion, rollback, and the final operator deploy/hold decision
-- `example_automl.py`: constrained AutoML smoke/demo path kept for short runtime feedback
+- `example_automl.py`: constrained AutoML smoke/demo path kept for short runtime feedback; any post-selection rebuild is explicitly labeled as a research refit artifact, not untouched OOS evidence
 
 The end-to-end remediation program for making the repo trade-ready is tracked in `TRADE_READY_REMEDIATION_PLAN.md`.
 
-The operator path is now distinct from the certification path: certify a candidate with `example_trade_ready_automl.py`, then hand off the promoted champion to `example_drift_retraining_cycle.py` or `ResearchPipeline.inspect_deployment_readiness(...)` for the final deploy-versus-hold decision.
+The user-facing entry points are now intentionally separated:
+
+- `example_automl.py`: research-only demo
+- `example_local_certification_automl.py`: strict local certification on consumer hardware
+- `example_trade_ready_automl.py`: stricter operator-facing certification and promotion path
+
+The operator path is now distinct from the certification path: certify a candidate with `example_local_certification_automl.py` or `example_trade_ready_automl.py`, then hand off the promoted champion to `example_drift_retraining_cycle.py` or `ResearchPipeline.inspect_deployment_readiness(...)` for the final deploy-versus-hold decision.
 The hardened trade-ready path now also auto-applies the `trade_ready` monitoring profile, which binds finite thresholds for freshness, custom-data fallback, fill quality, slippage drift, and signal-decay deterioration.
 `example_utils.py` now also exposes `build_trade_ready_runtime_overrides(...)`, which centralizes the fail-closed trade-ready defaults for market-data gaps, duplicate-bar handling, quarantine blocking, and futures funding coverage.
 Trade-ready runs now also inherit a binding significance floor: the runtime enables significance by default, requires a minimum observation count for statistical-significance payloads, and the trade-ready AutoML profile reports explicit underpowered-evidence reasons instead of silently treating missing confidence bounds as a generic gate failure.
@@ -195,6 +202,12 @@ Run the hardened AutoML example:
 
 ```bash
 python example_trade_ready_automl.py
+```
+
+Run the local certification AutoML example:
+
+```bash
+python example_local_certification_automl.py
 ```
 
 Run the drift retraining example:

@@ -1996,6 +1996,7 @@ def _attach_backtest_evaluation_metadata(summary, *, evaluation_mode="research_o
     trade_ready_blockers = []
     if resolved_mode == "trade_ready" and not bool(payload.get("promotion_execution_ready", False)):
         trade_ready_blockers.append("execution_backend_not_event_driven")
+    payload["evidence_class"] = str(payload.get("evidence_class") or "standalone_backtest")
     payload["evaluation_mode"] = resolved_mode
     payload["required_stress_scenarios"] = required
     payload["stress_matrix"] = stress_summary

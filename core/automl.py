@@ -12,6 +12,7 @@ from statistics import NormalDist
 import numpy as np
 import pandas as pd
 
+from .automl_contracts import validate_summary_contract
 from .promotion import (
     build_promotion_gate_check_map,
     create_promotion_eligibility_report,
@@ -1079,7 +1080,7 @@ def _summarize_training(training):
     }
 
 
-def _summarize_backtest(backtest):
+def _summarize_backtest(backtest, *, evidence_class=None):
     keys = [
         "net_profit",
         "net_profit_pct",
@@ -1105,6 +1106,7 @@ def _summarize_backtest(backtest):
         summary["statistical_significance"] = backtest.get("statistical_significance")
     if backtest.get("signal_decay") is not None:
         summary["signal_decay"] = backtest.get("signal_decay")
+    summary["evidence_class"] = str(evidence_class or backtest.get("evidence_class") or "backtest_payload")
     return summary
 
 
@@ -1262,6 +1264,7 @@ def _execute_temporal_split_candidate(
 
 def _build_validation_holdout_report(best_trial_report, holdout_plan):
     report = {
+        "evidence_class": "outer_replay",
         "enabled": bool(holdout_plan.get("enabled", False)),
         "reason": holdout_plan.get("reason"),
         "start_timestamp": _json_ready(holdout_plan.get("validation_start_timestamp")),
@@ -1354,6 +1357,7 @@ def _extract_sharpe_ci_lower(backtest_summary):
 
 def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_step_classes, full_state_bundle, holdout_plan):
     report = {
+        "evidence_class": "locked_holdout",
         "enabled": bool(holdout_plan.get("enabled", False)),
         "reason": holdout_plan.get("reason"),
         "start_timestamp": _json_ready(holdout_plan.get("holdout_start_timestamp")),
@@ -1409,7 +1413,7 @@ def _evaluate_locked_holdout(base_config, best_overrides, pipeline_class, trial_
     report["aligned_holdout_rows"] = int(split["aligned_test_rows"])
     report["aligned_gap_rows"] = int(split.get("aligned_gap_rows", 0))
     report["training"] = _json_ready(_summarize_training(training))
-    report["backtest"] = _json_ready(_summarize_backtest(backtest))
+    report["backtest"] = _json_ready(_summarize_backtest(backtest, evidence_class="locked_holdout"))
     report["objective_diagnostics"] = _build_objective_diagnostics(
         base_config.get("automl", {}).get("objective", "risk_adjusted_after_costs"),
         report["training"],
@@ -1836,6 +1840,7 @@ def _evaluate_replication_cohorts(
                 backtest,
                 objective_name,
                 automl_config,
+                evidence_class="replication",
             )
         except RuntimeError as exc:
             cohort_row["reason"] = str(exc)
@@ -2011,9 +2016,9 @@ def _compute_period_sharpe(returns):
     return float(series.mean() / volatility)
 
 
-def _build_evaluation_record(training, backtest, objective_name, automl_config, split=None):
+def _build_evaluation_record(training, backtest, objective_name, automl_config, split=None, *, evidence_class=None):
     training_summary = _json_ready(_summarize_training(training))
-    backtest_summary = _json_ready(_summarize_backtest(backtest))
+    backtest_summary = _json_ready(_summarize_backtest(backtest, evidence_class=evidence_class))
     returns = _extract_backtest_returns(backtest)
     period_sharpe = _compute_period_sharpe(returns)
     objective_diagnostics = _build_objective_diagnostics(
@@ -2423,7 +2428,13 @@ def _evaluate_candidate_fragility(
                     trial_step_classes,
                     evaluation_state_bundle,
                 )
-                evaluation = _build_evaluation_record(training, backtest, objective_name, automl_config)
+                evaluation = _build_evaluation_record(
+                    training,
+                    backtest,
+                    objective_name,
+                    automl_config,
+                    evidence_class="outer_replay",
+                )
             else:
                 training, backtest, split = _execute_temporal_split_candidate(
                     base_config,
@@ -2441,6 +2452,7 @@ def _evaluate_candidate_fragility(
                     objective_name,
                     automl_config,
                     split=split,
+                    evidence_class="outer_replay",
                 )
             value = _coerce_float(evaluation.get("raw_objective_value"))
         except (RuntimeError, ValueError, KeyError) as exc:
@@ -3946,6 +3958,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 search_backtest,
                 objective_name,
                 automl_config,
+                evidence_class="search_cv_diagnostic",
             )
         except RuntimeError as exc:
             if (
@@ -4013,6 +4026,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 objective_name,
                 automl_config,
                 split=validation_split,
+                evidence_class="outer_replay",
             )
             trial.report(float(validation_record["raw_objective_value"]), step=1)
 
@@ -4068,6 +4082,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 search_backtest,
                 objective_name,
                 automl_config,
+                evidence_class="search_cv_diagnostic",
             )
             validation_record = search_record
             if holdout_plan["enabled"]:
@@ -4092,6 +4107,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                     objective_name,
                     automl_config,
                     split=validation_split,
+                    evidence_class="outer_replay",
                 )
         except RuntimeError:
             continue
@@ -4262,37 +4278,11 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             "trial_count": len(completed_trials),
         }
 
+        summary = validate_summary_contract(summary)
+
         write_json(
             storage_context["summary_path"],
-            {
-                "study_name": study.study_name,
-                "storage": str(storage_path),
-                "experiment_id": experiment_manifest["experiment_id"],
-                "experiment_family_id": experiment_manifest["experiment_family_id"],
-                "resume_mode": experiment_manifest["resume_mode"],
-                "resume_validation": resume_validation,
-                "objective": objective_name,
-                "policy_profile": policy_profile,
-                "best_value": None,
-                "best_value_raw": None,
-                "best_trial_number": None,
-                "trial_count": len(completed_trials),
-                "promotion_ready": False,
-                "promotion_reasons": abstention_reasons,
-                "feature_schema_version": base_config.get("features", {}).get("schema_version"),
-                "selection_metric": selection_report["selection_metric"],
-                "selection_mode": selection_report["selection_mode"],
-                "selection_outcome": selection_outcome,
-                "validation_contract": validation_contract,
-                "validation_sources": validation_sources,
-                "selection_freeze": None,
-                "best_selection_policy": {},
-                "validation_holdout": summary["validation_holdout"],
-                "locked_holdout": summary["locked_holdout"],
-                "replication": summary["replication"],
-                "data_lineage": data_lineage,
-                "experiment_artifacts": summary["experiment_artifacts"],
-            },
+            summary,
         )
 
         _cleanup_optuna_study_resources(study)
@@ -4367,6 +4357,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         primary_score=_coerce_float(best_trial_report.get("raw_objective_value")),
     )
     replication_report["gate_mode"] = resolve_promotion_gate_mode(selection_policy, "replication")
+    replication_report["evidence_class"] = "replication"
     replication_report = _json_ready(replication_report)
     best_trial_report["locked_holdout"] = locked_holdout
     best_trial_report["replication"] = replication_report
@@ -4589,6 +4580,8 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "trial_count": len(completed_trials),
     }
 
+    summary = validate_summary_contract(summary)
+
     registry_config = dict(base_config.get("registry") or {})
     if registry_config.get("enabled", False):
         symbol = base_config.get("data", {}).get("symbol", "unknown")
@@ -4660,46 +4653,8 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             "monitoring_report": str(monitoring_path) if monitoring_path is not None else None,
         }
 
-    write_json(
-        storage_context["summary_path"],
-        {
-            "study_name": study.study_name,
-            "storage": str(storage_path),
-            "experiment_id": experiment_manifest["experiment_id"],
-            "experiment_family_id": experiment_manifest["experiment_family_id"],
-            "resume_mode": experiment_manifest["resume_mode"],
-            "resume_validation": resume_validation,
-            "objective": objective_name,
-            "policy_profile": policy_profile,
-            "best_value": float(best_trial_report["selection_value"]),
-            "best_value_raw": float(best_trial_report["raw_objective_value"]),
-            "best_trial_number": best_trial_number,
-            "trial_count": len(completed_trials),
-            "promotion_ready": bool(best_trial_report["selection_policy"]["promotion_ready"]),
-            "promotion_reasons": list(best_trial_report["selection_policy"]["promotion_reasons"]),
-            "feature_schema_version": base_config.get("features", {}).get("schema_version"),
-            "selection_metric": selection_report["selection_metric"],
-            "selection_mode": selection_report["selection_mode"],
-            "validation_contract": validation_contract,
-            "validation_sources": validation_sources,
-            "selection_freeze": selection_snapshot,
-            "best_selection_policy": _json_ready(summary["best_selection_policy"]),
-            "validation_holdout": _json_ready(validation_holdout),
-            "locked_holdout": _json_ready(locked_holdout),
-            "replication": _json_ready(best_trial_report.get("replication") or {}),
-            "data_lineage": data_lineage,
-            "experiment_artifacts": {
-                "storage_root": str(storage_context["storage_root"]),
-                "experiment_dir": str(storage_context["experiment_dir"]),
-                "run_dir": str(storage_context["run_dir"]),
-                "study": str(storage_context["study_path"]),
-                "manifest": str(storage_context["manifest_path"]),
-                "lineage": str(storage_context["lineage_path"]),
-                "summary": str(storage_context["summary_path"]),
-                "run_id": storage_context.get("run_id"),
-            },
-        },
-    )
+    summary = validate_summary_contract(summary)
+    write_json(storage_context["summary_path"], summary)
 
     _cleanup_optuna_study_resources(study)
 

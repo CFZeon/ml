@@ -321,6 +321,41 @@ def build_trade_ready_runtime_overrides(*, market="spot"):
     }
 
 
+def build_local_certification_runtime_overrides(*, market="spot"):
+    """Build a strict but locally runnable certification profile.
+
+    This profile is intended to sit between the research demo and the fully
+    trade-ready operator path. It keeps fail-closed data rules and binding
+    validation, while staying small enough for a local certification run.
+    """
+
+    overrides = build_trade_ready_runtime_overrides(market=market)
+    local_backtest = {
+        "evaluation_mode": "trade_ready",
+        "execution_profile": "local_l1_certification",
+        "required_stress_scenarios": ["downtime", "stale_mark", "halt"],
+        "liquidity_lag_bars": 1,
+        "participation_cap": 0.05,
+        "min_fill_ratio": 0.25,
+        "price_protection_points": 100,
+        "execution_policy": {
+            "adapter": "nautilus",
+            "time_in_force": "IOC",
+            "participation_cap": 0.05,
+            "min_fill_ratio": 0.25,
+            "force_simulation": False,
+        },
+    }
+    return clone_config_with_overrides(
+        overrides,
+        {
+            "backtest": local_backtest,
+            "monitoring": {"policy_profile": "trade_ready"},
+            "data_certification": {"enabled": True},
+        },
+    )
+
+
 def build_trade_ready_automl_overrides(
     *,
     storage_path,
@@ -612,6 +647,77 @@ def build_trade_ready_automl_overrides(
         }
     }
     return clone_config_with_overrides(profile, {"automl": extra_automl_fields} if extra_automl_fields else None)
+
+
+def build_local_certification_automl_overrides(
+    *,
+    storage_path,
+    study_name,
+    n_trials=6,
+    seed=42,
+    extra_automl_fields=None,
+):
+    """Build a local-certification AutoML profile.
+
+    The profile keeps locked holdout, selection policy, replication, and
+    overfitting controls enabled, but uses a smaller search budget than the
+    full trade-ready certification example.
+    """
+
+    base = build_trade_ready_automl_overrides(
+        storage_path=storage_path,
+        study_name=study_name,
+        profile="certification",
+        n_trials=n_trials,
+        seed=seed,
+        validation_fraction=0.20,
+        locked_holdout_fraction=0.20,
+        min_validation_trade_count=20,
+        max_trials_per_model_family=4,
+        extra_automl_fields=extra_automl_fields,
+    )
+    return clone_config_with_overrides(
+        base,
+        {
+            "automl": {
+                "trade_ready_profile": {
+                    "name": "local_certification",
+                    "reduced_power": False,
+                    "promotion_safe_default": True,
+                    "n_trials": int(n_trials),
+                    "validation_fraction": 0.20,
+                    "locked_holdout_fraction": 0.20,
+                    "min_validation_trade_count": 20,
+                    "min_significance_observations": 48,
+                    "replication_min_coverage": 2,
+                    "replication_alternate_window_count": 1,
+                    "post_selection_bootstrap_samples": 500,
+                    "min_track_record_length": 12,
+                },
+                "replication": {
+                    "alternate_window_count": 1,
+                    "min_coverage": 2,
+                    "min_pass_rate": 1.0,
+                    "min_rows": 96,
+                },
+                "selection_policy": {
+                    "min_validation_trade_count": 20,
+                },
+                "overfitting_control": {
+                    "deflated_sharpe": {"min_track_record_length": 12},
+                    "pbo": {"min_block_size": 6},
+                    "post_selection": {"bootstrap_samples": 500, "min_overlap_observations": 12},
+                },
+                "objective_gates": {
+                    "min_trade_count": 20,
+                    "min_effective_bet_count": 20,
+                    "require_statistical_significance": True,
+                    "min_significance_observations": 48,
+                    "min_sharpe_ci_lower": 0.0,
+                },
+            }
+        },
+    )
 
 
 def seed_offline_pipeline_state(
@@ -1198,6 +1304,8 @@ def print_deployment_readiness_summary(report, *, label="deploy ready"):
 
 def print_automl_summary(automl):
     print(f"  study name   : {automl.get('study_name')}")
+    if automl.get("evidence_class"):
+        print(f"  evidence cls : {automl.get('evidence_class')}")
     print(f"  objective    : {automl.get('objective')}")
     print(f"  selection    : {automl.get('selection_metric')} ({automl.get('selection_mode')})")
     print(f"  trials       : {automl.get('trial_count')}")

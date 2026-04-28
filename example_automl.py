@@ -7,8 +7,9 @@ Usage
 This example is intentionally optimized for short demo/runtime feedback, not for
 promotion-safe model selection. It is also the explicit research-only surrogate
 path when you do not have a real Nautilus backend available locally. For the
-trade-ready certification path, use example_trade_ready_automl.py with a real
-Nautilus backend.
+accessible local certification path, use example_local_certification_automl.py.
+For the stricter operator-facing certification path, use
+example_trade_ready_automl.py with a real Nautilus backend.
 """
 
 from pathlib import Path
@@ -41,7 +42,8 @@ def main():
 
     print("This is the demo AutoML workflow. It intentionally disables holdout and overfitting gates for speed.")
     print("It is the explicit research-only surrogate path when Nautilus is unavailable locally.")
-    print("Use example_trade_ready_automl.py only when you want the fail-closed certification path with a real Nautilus backend.")
+    print("Use example_local_certification_automl.py for the strict local certification path.")
+    print("Use example_trade_ready_automl.py only when you want the stricter operator-facing certification path with a real Nautilus backend.")
 
     automl_storage = Path(".cache") / "automl" / "example_automl_v3.db"
     automl_storage.parent.mkdir(parents=True, exist_ok=True)
@@ -143,39 +145,47 @@ def main():
     automl = pipeline.run_automl()
     print_automl_summary(automl)
 
-    print_section(sep, 4, "Rebuilding the canonical workflow with the selected config")
-    features = pipeline.build_features()
+    print_section(sep, 4, "Building explicit research refit artifact")
+    print("  warning      : this refit is a post-selection research artifact, not untouched OOS evidence.")
+    refit = pipeline.refit_selected_candidate(automl)
+    refit_pipeline = refit["pipeline"]
+
+    features = refit_pipeline.state["features"]
     print(f"  feature count: {features.shape[1]}")
-    stationarity = pipeline.check_stationarity()
+    stationarity = refit_pipeline.state["stationarity"]
     print_stationarity_summary(stationarity)
 
     print_section(sep, 5, "Previewing regime features")
-    regimes = pipeline.detect_regimes()["regimes"]
+    regimes = refit_pipeline.state["regimes"]
     print("  mode         : disabled for this compact AutoML demo workflow")
     print_regime_summary(regimes)
 
     print_section(sep, 6, "Building labels and aligning research matrix")
-    labels = pipeline.build_labels()
+    labels = refit_pipeline.state["labels"]
     print_label_summary(labels)
-    aligned = pipeline.align_data()
+    aligned = {
+        "X": refit_pipeline.state["X"],
+        "y": refit_pipeline.state["y"],
+        "labels": refit_pipeline.state["labels_aligned"],
+    }
     print_alignment_summary(aligned)
 
     print_section(sep, 7, "Previewing feature-selection and weighting")
-    selection = pipeline.select_features()
+    selection = refit_pipeline.state["feature_selection"]
     print_feature_selection_summary(selection)
-    weights = pipeline.compute_sample_weights()
+    weights = refit_pipeline.state["sample_weights"]
     print_weight_summary(weights)
 
     print_section(sep, 8, "CPCV training")
-    training = pipeline.train_models()
+    training = refit["training"]
     print_training_summary(training)
 
     print_section(sep, 9, "Generating signals")
-    signals = pipeline.generate_signals()
+    signals = refit["signals"]
     print_signal_summary(signals, allow_short=False)
 
     print_section(sep, 10, "Backtesting")
-    backtest = pipeline.run_backtest()
+    backtest = refit["backtest"]
     print_backtest_summary(backtest)
 
 

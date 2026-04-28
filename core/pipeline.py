@@ -3310,33 +3310,6 @@ class AutoMLStep(PipelineStep):
             ],
         )
 
-        best_overrides = copy.deepcopy(summary.get("best_overrides", {}))
-        for section, values in best_overrides.items():
-            current = pipeline.config.get(section, {})
-            if isinstance(current, dict) and isinstance(values, dict):
-                merged = dict(current)
-                merged.update(values)
-                pipeline.config[section] = merged
-            else:
-                pipeline.config[section] = values
-
-        for key in [
-            "features",
-            "stationarity",
-            "regime_features",
-            "regimes",
-            "labels",
-            "X",
-            "y",
-            "labels_aligned",
-            "feature_selection",
-            "sample_weights",
-            "training",
-            "signals",
-            "backtest",
-        ]:
-            pipeline.state.pop(key, None)
-
         pipeline.state["automl"] = summary
         return summary
 
@@ -5082,6 +5055,94 @@ class ResearchPipeline:
 
     def run_automl(self):
         return self.run_step("run_automl")
+
+    def prepare_selected_candidate_refit(self, summary=None):
+        resolved_summary = copy.deepcopy(summary or self.state.get("automl") or {})
+        best_overrides = copy.deepcopy(resolved_summary.get("best_overrides") or {})
+        if not best_overrides:
+            raise ValueError("prepare_selected_candidate_refit requires a selected AutoML summary with best_overrides")
+
+        if "raw_data" not in self.state or "data" not in self.state:
+            raise RuntimeError("prepare_selected_candidate_refit requires fetched pipeline state")
+
+        merged_config = copy.deepcopy(self.config)
+        for section, values in best_overrides.items():
+            current = merged_config.get(section, {})
+            if isinstance(current, dict) and isinstance(values, dict):
+                merged = dict(current)
+                merged.update(copy.deepcopy(values))
+                merged_config[section] = merged
+            else:
+                merged_config[section] = copy.deepcopy(values)
+
+        refit_pipeline = type(self)(merged_config, steps=[step.__class__ for step in self.steps])
+        for key in [
+            "raw_data",
+            "raw_data_original",
+            "data",
+            "indicator_run",
+            "data_quality_mask",
+            "data_quality_report",
+            "custom_data_report",
+            "data_lineage",
+            "futures_context",
+            "cross_asset_context",
+            "multi_timeframe_context",
+            "reference_data",
+            "reference_overlay_data",
+            "reference_integrity_report",
+            "symbol_filters",
+            "symbol_lifecycle",
+            "universe_policy",
+            "universe_snapshot",
+            "universe_snapshot_meta",
+            "eligible_symbols",
+            "universe_report",
+            "context_ttl_report",
+            "data_certification",
+            "operational_monitoring",
+        ]:
+            if key in self.state:
+                value = self.state[key]
+                if isinstance(value, (pd.DataFrame, pd.Series)):
+                    refit_pipeline.state[key] = value.copy()
+                else:
+                    refit_pipeline.state[key] = copy.deepcopy(value)
+
+        refit_pipeline.state["selection_freeze"] = copy.deepcopy(resolved_summary.get("selection_freeze"))
+        refit_pipeline.state["automl_selection_evidence"] = copy.deepcopy(resolved_summary)
+        return refit_pipeline
+
+    def refit_selected_candidate(self, summary=None):
+        resolved_summary = copy.deepcopy(summary or self.state.get("automl") or {})
+        refit_pipeline = self.prepare_selected_candidate_refit(resolved_summary)
+
+        refit_pipeline.build_features()
+        refit_pipeline.check_stationarity()
+        refit_pipeline.detect_regimes()
+        refit_pipeline.build_labels()
+        refit_pipeline.align_data()
+        refit_pipeline.select_features()
+        refit_pipeline.compute_sample_weights()
+        refit_pipeline.train_models()
+        refit_pipeline.generate_signals()
+        backtest = refit_pipeline.run_backtest()
+        if isinstance(backtest, dict):
+            backtest["evidence_class"] = "post_selection_refit"
+            refit_pipeline.state["backtest"] = backtest
+
+        artifact = {
+            "evidence_class": "post_selection_refit",
+            "warning": "post_selection_refit_is_not_untouched_oos_evidence",
+            "selection_freeze": copy.deepcopy(resolved_summary.get("selection_freeze")),
+            "best_overrides": copy.deepcopy(resolved_summary.get("best_overrides") or {}),
+            "training": copy.deepcopy(refit_pipeline.state.get("training") or {}),
+            "signals": copy.deepcopy(refit_pipeline.state.get("signals") or {}),
+            "backtest": copy.deepcopy(refit_pipeline.state.get("backtest") or {}),
+            "pipeline": refit_pipeline,
+        }
+        self.state["post_selection_refit"] = artifact
+        return artifact
 
     def check_stationarity(self):
         return self.run_step("check_stationarity")
