@@ -3,12 +3,16 @@
 Usage
 -----
     python example_test_case_template.py
+    python example_test_case_template.py --local-certification
 """
 
 from core import ATR, BollingerBands, MACD, RSI, ResearchPipeline
+from core.execution import NAUTILUS_AVAILABLE
 from example_utils import (
     build_spot_research_config,
     clone_config_with_overrides,
+    parse_local_certification_args,
+    prepare_example_runtime_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -67,13 +71,31 @@ def build_case_config():
 
 
 def main():
+    args = parse_local_certification_args("Run the copy-and-edit research template.")
     sep = "=" * 60
-    pipeline = ResearchPipeline(build_case_config())
+    config = build_case_config()
+    try:
+        config = prepare_example_runtime_config(
+            config,
+            market="spot",
+            local_certification=args.local_certification,
+            nautilus_available=NAUTILUS_AVAILABLE,
+            example_name="example_test_case_template.py",
+        )
+    except RuntimeError as exc:
+        print(str(exc))
+        raise SystemExit(2) from exc
+
+    pipeline = ResearchPipeline(config)
 
     print_section(sep, 1, "Fetching data")
     data = pipeline.fetch_data()
+    example_runtime = dict(config.get("example_runtime") or {})
     print(f"  rows         : {len(data)}")
     print(f"  range        : {data.index[0]} -> {data.index[-1]}")
+    if example_runtime:
+        print(f"  runtime mode : {example_runtime.get('mode')}")
+        print(f"  runtime note : {example_runtime.get('note')}")
 
     print_section(sep, 2, "Running indicators")
     indicator_run = pipeline.run_indicators()

@@ -88,17 +88,17 @@ If your goal is to build your own scenario instead of just running the shipped d
 
 If you want examples that reliably place trades under the current pipeline contracts, start with the active demos:
 
-- `example_active_spot.py`: spot workflow using cross-asset context, CPCV training, and a more permissive signal policy so the demo produces executed spot trades instead of mostly abstaining
-- `example_active_futures.py`: USDT-M futures workflow using mark-price valuation, isolated-margin account rules, and an active long/short signal policy on the pandas execution adapter
+- `example_active_spot.py`: spot workflow using cross-asset context, CPCV training, and a more permissive signal policy so the demo produces executed spot trades instead of mostly abstaining; add `--local-certification` to reuse the same case under the strict local certification runtime
+- `example_active_futures.py`: USDT-M futures workflow using mark-price valuation, isolated-margin account rules, and an active long/short signal policy on the pandas execution adapter; add `--local-certification` to reuse the same case under the strict local certification runtime
 
 The rest of the examples serve different purposes:
 
-- `example.py`: baseline end-to-end spot research workflow with conservative settings
-- `example_custom_data.py`: point-in-time-safe custom-data join example
-- `example_futures.py`: conservative futures example using real Binance data and the liquidation-aware adapter
-- `example_trend_volume_spot.py`: spot example that blends RSI/MACD/Bollinger/ATR with ADX, stochastic, OBV, and Donchian features
-- `example_trend_breakout_futures.py`: futures example focused on ADX plus Donchian trend-breakout context layered onto the existing futures pipeline
-- `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain
+- `example.py`: baseline end-to-end spot research workflow with conservative settings; add `--local-certification` to switch the same data case into the strict local certification runtime
+- `example_custom_data.py`: point-in-time-safe custom-data join example; add `--local-certification` to certify the same joined feature surface under strict local runtime guards
+- `example_futures.py`: conservative futures example using real Binance data and the liquidation-aware adapter; add `--local-certification` to run it under the strict local certification runtime
+- `example_trend_volume_spot.py`: spot example that blends RSI/MACD/Bollinger/ATR with ADX, stochastic, OBV, and Donchian features; add `--local-certification` to promote the same scenario into the strict local certification runtime
+- `example_trend_breakout_futures.py`: futures example focused on ADX plus Donchian trend-breakout context layered onto the existing futures pipeline; add `--local-certification` to promote the same scenario into the strict local certification runtime
+- `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain; add `--local-certification` when you want the same scenario to run under strict local certification runtime defaults
 - `example_synthetic_derivatives.py`: offline synthetic derivatives/integration example; may also abstain depending on the generated regime path
 - `example_local_certification_automl.py`: strict local certification path with locked holdout, replication, fail-closed data handling, and a hard local Nautilus requirement; intended for paper or pre-capital certification on consumer hardware
 - `example_trade_ready_automl.py`: hardened AutoML certification profile with locked holdout, replication cohorts, DSR/PBO diagnostics, blocking pre-training feature-surface lookahead certification, and promotion-readiness reporting; the default run still fails closed if Nautilus is unavailable, while `--smoke` executes an explicitly reduced-power research-surrogate path for local feedback
@@ -112,6 +112,20 @@ The user-facing entry points are now intentionally separated:
 - `example_automl.py`: research-only demo
 - `example_local_certification_automl.py`: strict local certification on consumer hardware
 - `example_trade_ready_automl.py`: stricter operator-facing certification and promotion path
+
+For the builder-based real-data demos, local certification is also available as a shared runtime switch instead of a separate script. These examples now accept `--local-certification`:
+
+- `example.py`
+- `example_futures.py`
+- `example_custom_data.py`
+- `example_active_spot.py`
+- `example_active_futures.py`
+- `example_trend_volume_spot.py`
+- `example_trend_breakout_futures.py`
+- `example_fvg.py`
+- `example_test_case_template.py`
+
+That switch applies the strict local-certification runtime profile, requires a local Nautilus installation, and fails closed rather than silently downgrading to research mode.
 
 The operator path is now distinct from the certification path: certify a candidate with `example_local_certification_automl.py` or `example_trade_ready_automl.py`, then hand off the promoted champion to `example_drift_retraining_cycle.py` or `ResearchPipeline.inspect_deployment_readiness(...)` for the final deploy-versus-hold decision.
 The hardened trade-ready path now also auto-applies the `trade_ready` monitoring profile, which binds finite thresholds for freshness, custom-data fallback, fill quality, slippage drift, and signal-decay deterioration.
@@ -144,6 +158,12 @@ Run the active spot example:
 python example_active_spot.py
 ```
 
+Run the same active spot example under the shared local-certification runtime:
+
+```bash
+python example_active_spot.py --local-certification
+```
+
 Open the guided onboarding doc:
 
 ```bash
@@ -154,6 +174,12 @@ Run the copy-and-edit template:
 
 ```bash
 python example_test_case_template.py
+```
+
+Run the copy-and-edit template under the shared local-certification runtime:
+
+```bash
+python example_test_case_template.py --local-certification
 ```
 
 Run the active futures example:

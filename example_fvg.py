@@ -3,6 +3,7 @@
 Usage
 -----
     python example_fvg.py
+    python example_fvg.py --local-certification
 """
 
 import pandas as pd
@@ -10,7 +11,10 @@ import pandas as pd
 from core import (
     ResearchPipeline,
 )
+from core.execution import NAUTILUS_AVAILABLE
 from example_utils import (
+    parse_local_certification_args,
+    prepare_example_runtime_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -37,77 +41,93 @@ def build_fvg_regime_features(pipeline):
 
 
 def main():
+    args = parse_local_certification_args("Run the Fair Value Gap feature example.")
     sep = "=" * 60
-    pipeline = ResearchPipeline(
-        {
-            "data": {
-                "symbol": "BTCUSDT",
-                "interval": "1h",
-                "start": "2024-01-01",
-                "end": "2024-06-01",
-                "futures_context": {"enabled": False},
-            },
-            "indicators": [
-                {"kind": "rsi", "params": {"period": 14}},
-                {"kind": "atr", "params": {"period": 14}},
-                {"kind": "fvg", "params": {"name": "fvg_main", "min_gap_pct": 0.0005}},
-            ],
-            "features": {
-                "lags": [1, 3, 6],
-                "frac_diff_d": 0.4,
-                "rolling_window": 20,
-                "squeeze_quantile": 0.2,
-            },
-            "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
-            "regime": {"method": "hmm", "builder": build_fvg_regime_features},  # HMM with stable norm-sorted state ordering
-            "labels": {
-                "kind": "triple_barrier",
-                "pt_sl": (2.0, 2.0),
-                "max_holding": 24,
-                "min_return": 0.001,
-                "volatility_window": 24,
-                "barrier_tie_break": "sl",
-            },
-            "model": {
-                "type": "gbm",
-                "cv_method": "cpcv",
-                "n_blocks": 4,
-                "test_blocks": 2,
-                "validation_fraction": 0.2,
-                "meta_n_splits": 2,
-            },
-            "signals": {
-                "policy_mode": "frozen_manual",
-                "avg_win": 0.04,
-                "avg_loss": 0.01,
-                "shrinkage_alpha": 0.5,
-                "fraction": 0.75,
-                "min_trades_for_kelly": 30,
-                "max_kelly_fraction": 0.5,
-                "threshold": 0.0,
-                "edge_threshold": 0.0,
-                "meta_threshold": 0.0,
-                "profitability_threshold": 0.0,
-                "expected_edge_threshold": 0.0,
-                "sizing_mode": "expected_utility",
-                "tuning_min_trades": 5,
-            },
-            "backtest": {
-                "equity": 10_000,
-                "fee_rate": 0.001,
-                "slippage_rate": 0.0002,
-                "slippage_model": "sqrt_impact",
-                "engine": "vectorbt",
-                "use_open_execution": True,
-                "signal_delay_bars": 2,
-            },
-        }
-    )
+    config = {
+        "data": {
+            "symbol": "BTCUSDT",
+            "interval": "1h",
+            "start": "2024-01-01",
+            "end": "2024-06-01",
+            "futures_context": {"enabled": False},
+        },
+        "indicators": [
+            {"kind": "rsi", "params": {"period": 14}},
+            {"kind": "atr", "params": {"period": 14}},
+            {"kind": "fvg", "params": {"name": "fvg_main", "min_gap_pct": 0.0005}},
+        ],
+        "features": {
+            "lags": [1, 3, 6],
+            "frac_diff_d": 0.4,
+            "rolling_window": 20,
+            "squeeze_quantile": 0.2,
+        },
+        "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
+        "regime": {"method": "hmm", "builder": build_fvg_regime_features},
+        "labels": {
+            "kind": "triple_barrier",
+            "pt_sl": (2.0, 2.0),
+            "max_holding": 24,
+            "min_return": 0.001,
+            "volatility_window": 24,
+            "barrier_tie_break": "sl",
+        },
+        "model": {
+            "type": "gbm",
+            "cv_method": "cpcv",
+            "n_blocks": 4,
+            "test_blocks": 2,
+            "validation_fraction": 0.2,
+            "meta_n_splits": 2,
+        },
+        "signals": {
+            "policy_mode": "frozen_manual",
+            "avg_win": 0.04,
+            "avg_loss": 0.01,
+            "shrinkage_alpha": 0.5,
+            "fraction": 0.75,
+            "min_trades_for_kelly": 30,
+            "max_kelly_fraction": 0.5,
+            "threshold": 0.0,
+            "edge_threshold": 0.0,
+            "meta_threshold": 0.0,
+            "profitability_threshold": 0.0,
+            "expected_edge_threshold": 0.0,
+            "sizing_mode": "expected_utility",
+            "tuning_min_trades": 5,
+        },
+        "backtest": {
+            "equity": 10_000,
+            "fee_rate": 0.001,
+            "slippage_rate": 0.0002,
+            "slippage_model": "sqrt_impact",
+            "engine": "vectorbt",
+            "use_open_execution": True,
+            "signal_delay_bars": 2,
+        },
+    }
+    try:
+        config = prepare_example_runtime_config(
+            config,
+            market="spot",
+            local_certification=args.local_certification,
+            nautilus_available=NAUTILUS_AVAILABLE,
+            example_name="example_fvg.py",
+        )
+    except RuntimeError as exc:
+        print(str(exc))
+        raise SystemExit(2) from exc
+
+    pipeline = ResearchPipeline(config)
 
     print_section(sep, 1, "Fetching BTCUSDT spot data")
     df = pipeline.fetch_data()
+    example_runtime = dict(config.get("example_runtime") or {})
     print(f"  rows         : {len(df)}")
     print(f"  range        : {df.index[0]} -> {df.index[-1]}")
+    if example_runtime:
+        print(f"  runtime mode : {example_runtime.get('mode')}")
+        print(f"  runtime note : {example_runtime.get('note')}")
 
     print_section(sep, 2, "Running config-driven indicators")
     indicator_run = pipeline.run_indicators()

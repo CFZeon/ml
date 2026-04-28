@@ -15,6 +15,7 @@ from pathlib import Path
 from core import ATR, BollingerBands, MACD, RSI, ResearchPipeline
 from core.execution import NAUTILUS_AVAILABLE
 from example_utils import (
+    build_default_certification_scenario_matrix,
     build_local_certification_automl_overrides,
     build_local_certification_runtime_overrides,
     build_spot_research_config,
@@ -32,6 +33,7 @@ def build_local_certification_example_config(*, automl_storage):
     end = "2024-06-01"
     context_symbols = ["ETHUSDT"]
 
+    scenario_matrix = build_default_certification_scenario_matrix()
     config = build_spot_research_config(
         symbol=symbol,
         interval=interval,
@@ -58,32 +60,12 @@ def build_local_certification_example_config(*, automl_storage):
                     "policy_mode": "validation_calibrated",
                 },
                 "backtest": {
-                    "engine": "pandas",
                     "signal_delay_bars": 2,
                     "significance": {
                         "bootstrap_samples": 400,
                         "min_observations": 48,
                     },
-                    "execution_policy": {
-                        "adapter": "nautilus",
-                        "time_in_force": "IOC",
-                        "participation_cap": 0.05,
-                        "min_fill_ratio": 0.25,
-                    },
-                    "scenario_matrix": {
-                        "downtime": {
-                            "events": [{"event_type": "downtime", "timestamp": "2024-03-05T12:00:00Z"}],
-                            "policy": {"downtime_action": "freeze"},
-                        },
-                        "stale_mark": {
-                            "events": [{"event_type": "stale_mark", "timestamp": "2024-03-12T12:00:00Z"}],
-                            "policy": {"stale_mark_action": "reject"},
-                        },
-                        "halt": {
-                            "events": [{"event_type": "halt", "start": "2024-03-19T12:00:00Z", "end": "2024-03-19T14:00:00Z"}],
-                            "policy": {},
-                        },
-                    },
+                    "scenario_matrix": scenario_matrix,
                 },
             },
         ),

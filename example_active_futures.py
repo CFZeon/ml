@@ -3,12 +3,16 @@
 Usage
 -----
     python example_active_futures.py
+    python example_active_futures.py --local-certification
 """
 
 from core import ATR, MACD, RSI, ResearchPipeline
+from core.execution import NAUTILUS_AVAILABLE
 from example_utils import (
     build_futures_research_config,
     clone_config_with_overrides,
+    parse_local_certification_args,
+    prepare_example_runtime_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -23,6 +27,7 @@ from example_utils import (
 
 
 def main():
+    args = parse_local_certification_args("Run the active futures demo.")
     sep = "=" * 60
     symbol = "BTCUSDT"
     interval = "1h"
@@ -91,15 +96,30 @@ def main():
             },
         },
     )
+    try:
+        config = prepare_example_runtime_config(
+            config,
+            market="um_futures",
+            local_certification=args.local_certification,
+            nautilus_available=NAUTILUS_AVAILABLE,
+            example_name="example_active_futures.py",
+        )
+    except RuntimeError as exc:
+        print(str(exc))
+        raise SystemExit(2) from exc
 
     pipeline = ResearchPipeline(config)
 
     print_section(sep, 1, "Fetching active futures dataset")
     data = pipeline.fetch_data()
+    example_runtime = dict(config.get("example_runtime") or {})
     filters = pipeline.state.get("symbol_filters", {})
     contract_spec = pipeline.state.get("futures_contract_spec", {})
     print(f"  rows         : {len(data)}")
     print(f"  range        : {data.index[0]} -> {data.index[-1]}")
+    if example_runtime:
+        print(f"  runtime mode : {example_runtime.get('mode')}")
+        print(f"  runtime note : {example_runtime.get('note')}")
     print(
         "  symbol filters: "
         f"tick={filters.get('tick_size')}  step={filters.get('step_size')}  min_notional={filters.get('min_notional')}"

@@ -20,6 +20,7 @@ from pathlib import Path
 from core import ATR, BollingerBands, MACD, RSI, ResearchPipeline
 from core.execution import NAUTILUS_AVAILABLE
 from example_utils import (
+    build_default_certification_scenario_matrix,
     build_spot_research_config,
     build_trade_ready_runtime_overrides,
     build_trade_ready_automl_overrides,
@@ -37,6 +38,7 @@ def build_trade_ready_example_config(*, automl_storage):
 def _build_trade_ready_example_config(*, automl_storage, power_profile):
     power_profile = "smoke" if str(power_profile).strip().lower() == "smoke" else "certification"
     significance_min_observations = 32 if power_profile == "smoke" else 64
+    scenario_matrix = build_default_certification_scenario_matrix()
     symbol = "BTCUSDT"
     interval = "1h"
     start = "2024-01-01"
@@ -102,20 +104,7 @@ def _build_trade_ready_example_config(*, automl_storage, power_profile):
                         "time_in_force": "IOC",
                         "participation_cap": 1.0,
                     },
-                    "scenario_matrix": {
-                        "downtime": {
-                            "events": [{"event_type": "downtime", "timestamp": "2024-03-05T12:00:00Z"}],
-                            "policy": {"downtime_action": "freeze"},
-                        },
-                        "stale_mark": {
-                            "events": [{"event_type": "stale_mark", "timestamp": "2024-03-12T12:00:00Z"}],
-                            "policy": {"stale_mark_action": "reject"},
-                        },
-                        "halt": {
-                            "events": [{"event_type": "halt", "start": "2024-03-19T12:00:00Z", "end": "2024-03-19T14:00:00Z"}],
-                            "policy": {},
-                        },
-                    },
+                    "scenario_matrix": scenario_matrix,
                 },
             },
         ),
@@ -200,7 +189,8 @@ def prepare_trade_ready_runtime_config(config, *, nautilus_available=NAUTILUS_AV
     raise RuntimeError(
         "Trade-ready certification requires a real Nautilus backend. "
         "Install/configure NautilusTrader and rerun example_trade_ready_automl.py, "
-        "or use example_automl.py for the explicit research-only surrogate path."
+        "or use example_local_certification_automl.py for the strict local certification path, "
+        "or example_automl.py for the explicit research-only surrogate path."
     )
 
 

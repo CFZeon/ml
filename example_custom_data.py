@@ -3,16 +3,20 @@
 Usage
 -----
     python example_custom_data.py
+    python example_custom_data.py --local-certification
 """
 
 import numpy as np
 import pandas as pd
 
 from core import ATR, BollingerBands, RSI, ResearchPipeline, fetch_binance_bars
+from core.execution import NAUTILUS_AVAILABLE
 from example_utils import (
     build_custom_data_entry,
     build_spot_research_config,
     clone_config_with_overrides,
+    parse_local_certification_args,
+    prepare_example_runtime_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -45,6 +49,7 @@ def build_custom_feed(symbol, interval, start, end):
 
 
 def main():
+    args = parse_local_certification_args("Run the custom-data spot example.")
     sep = "=" * 60
     symbol = "BTCUSDT"
     interval = "1h"
@@ -112,14 +117,29 @@ def main():
             },
         },
     )
+    try:
+        config = prepare_example_runtime_config(
+            config,
+            market="spot",
+            local_certification=args.local_certification,
+            nautilus_available=NAUTILUS_AVAILABLE,
+            example_name="example_custom_data.py",
+        )
+    except RuntimeError as exc:
+        print(str(exc))
+        raise SystemExit(2) from exc
 
     pipeline = ResearchPipeline(config)
 
     print_section(sep, 2, "Fetching market data and joining custom feed")
     data = pipeline.fetch_data()
+    example_runtime = dict(config.get("example_runtime") or {})
     custom_report = pipeline.state["custom_data_report"][0]
     exogenous_columns = [column for column in data.columns if column.startswith("exo_")]
     print(f"  rows          : {len(data)}")
+    if example_runtime:
+        print(f"  runtime mode  : {example_runtime.get('mode')}")
+        print(f"  runtime note  : {example_runtime.get('note')}")
     print(f"  joined cols   : {custom_report['joined_columns']}")
     print(f"  join coverage : {custom_report['coverage']:.2%}")
     print(f"  stale hits    : {custom_report['stale_hit_count']}")

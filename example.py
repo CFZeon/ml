@@ -3,11 +3,15 @@
 Usage
 -----
     python example.py
+    python example.py --local-certification
 """
 
 from core import RSI, ATR, BollingerBands, MACD, ResearchPipeline
+from core.execution import NAUTILUS_AVAILABLE
 from example_utils import (
     build_spot_research_config,
+    parse_local_certification_args,
+    prepare_example_runtime_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -22,6 +26,7 @@ from example_utils import (
 
 
 def main():
+    args = parse_local_certification_args("Run the baseline spot research example.")
     SEP = "=" * 60
     symbol = "BTCUSDT"
     interval = "1h"
@@ -30,21 +35,36 @@ def main():
     context_symbols = ["ETHUSDT", "SOLUSDT", "BNBUSDT"]
     indicators = [RSI(14), MACD(), BollingerBands(20), ATR(14)]
 
-    pipeline = ResearchPipeline(
-        build_spot_research_config(
-            symbol=symbol,
-            interval=interval,
-            start=start,
-            end=end,
-            indicators=indicators,
-            context_symbols=context_symbols,
-        )
+    config = build_spot_research_config(
+        symbol=symbol,
+        interval=interval,
+        start=start,
+        end=end,
+        indicators=indicators,
+        context_symbols=context_symbols,
     )
+    try:
+        config = prepare_example_runtime_config(
+            config,
+            market="spot",
+            local_certification=args.local_certification,
+            nautilus_available=NAUTILUS_AVAILABLE,
+            example_name="example.py",
+        )
+    except RuntimeError as exc:
+        print(str(exc))
+        raise SystemExit(2) from exc
+
+    pipeline = ResearchPipeline(config)
 
     print_section(SEP, 1, "Fetching BTCUSDT spot data")
     df = pipeline.fetch_data()
+    example_runtime = dict(config.get("example_runtime") or {})
     print(f"  rows         : {len(df)}")
     print(f"  range        : {df.index[0]} -> {df.index[-1]}")
+    if example_runtime:
+        print(f"  runtime mode : {example_runtime.get('mode')}")
+        print(f"  runtime note : {example_runtime.get('note')}")
 
     print_section(SEP, 2, "Running indicators")
     indicator_run = pipeline.run_indicators()

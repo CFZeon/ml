@@ -3,6 +3,7 @@
 Usage
 -----
     python example_trend_volume_spot.py
+    python example_trend_volume_spot.py --local-certification
 """
 
 from core import (
@@ -16,8 +17,11 @@ from core import (
     ResearchPipeline,
     StochasticOscillator,
 )
+from core.execution import NAUTILUS_AVAILABLE
 from example_utils import (
     build_example_universe_config,
+    parse_local_certification_args,
+    prepare_example_runtime_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -32,6 +36,7 @@ from example_utils import (
 
 
 def main():
+    args = parse_local_certification_args("Run the trend-volume spot example.")
     sep = "=" * 60
     symbol = "BTCUSDT"
     interval = "1h"
@@ -39,86 +44,101 @@ def main():
     end = "2024-06-01"
     context_symbols = ["ETHUSDT", "SOLUSDT", "BNBUSDT"]
 
-    pipeline = ResearchPipeline(
-        {
-            "data": {
-                "symbol": symbol,
-                "interval": interval,
-                "start": start,
-                "end": end,
-                "futures_context": {"enabled": True, "include_recent_stats": True},
-                "cross_asset_context": {"symbols": context_symbols},
-            },
-            "universe": build_example_universe_config(
-                symbol,
-                context_symbols=context_symbols,
-                market="spot",
-                snapshot_timestamp=start,
-            ),
-            "indicators": [
-                RSI(14),
-                MACD(),
-                BollingerBands(20),
-                ATR(14),
-                ADX(14),
-                StochasticOscillator(14, 3, 3),
-                OnBalanceVolume(),
-                DonchianChannels(20),
-            ],
-            "features": {
-                "lags": [1, 3, 6],
-                "frac_diff_d": 0.4,
-                "rolling_window": 20,
-                "squeeze_quantile": 0.2,
-                "context_timeframes": ["4h", "1d"],
-            },
-            "feature_selection": {"enabled": True, "max_features": 120, "min_mi_threshold": 0.0},
-            "regime": {"method": "hmm"},
-            "labels": {
-                "kind": "triple_barrier",
-                "pt_sl": (2.0, 2.0),
-                "max_holding": 24,
-                "min_return": 0.001,
-                "volatility_window": 24,
-                "barrier_tie_break": "sl",
-            },
-            "model": {
-                "type": "gbm",
-                "cv_method": "cpcv",
-                "n_blocks": 4,
-                "test_blocks": 2,
-                "validation_fraction": 0.2,
-                "meta_n_splits": 2,
-            },
-            "signals": {
-                "threshold": 0.0,
-                "edge_threshold": 0.0,
-                "shrinkage_alpha": 0.5,
-                "fraction": 0.75,
-                "min_trades_for_kelly": 30,
-                "max_kelly_fraction": 0.5,
-                "meta_threshold": 0.5,
-                "profitability_threshold": 0.5,
-                "expected_edge_threshold": 0.0,
-                "sizing_mode": "expected_utility",
-                "tuning_min_trades": 5,
-            },
-            "backtest": {
-                "equity": 10_000,
-                "fee_rate": 0.001,
-                "slippage_rate": 0.0002,
-                "slippage_model": "sqrt_impact",
-                "engine": "vectorbt",
-                "use_open_execution": True,
-                "signal_delay_bars": 1,
-            },
-        }
-    )
+    config = {
+        "data": {
+            "symbol": symbol,
+            "interval": interval,
+            "start": start,
+            "end": end,
+            "futures_context": {"enabled": True, "include_recent_stats": True},
+            "cross_asset_context": {"symbols": context_symbols},
+        },
+        "universe": build_example_universe_config(
+            symbol,
+            context_symbols=context_symbols,
+            market="spot",
+            snapshot_timestamp=start,
+        ),
+        "indicators": [
+            RSI(14),
+            MACD(),
+            BollingerBands(20),
+            ATR(14),
+            ADX(14),
+            StochasticOscillator(14, 3, 3),
+            OnBalanceVolume(),
+            DonchianChannels(20),
+        ],
+        "features": {
+            "lags": [1, 3, 6],
+            "frac_diff_d": 0.4,
+            "rolling_window": 20,
+            "squeeze_quantile": 0.2,
+            "context_timeframes": ["4h", "1d"],
+        },
+        "feature_selection": {"enabled": True, "max_features": 120, "min_mi_threshold": 0.0},
+        "regime": {"method": "hmm"},
+        "labels": {
+            "kind": "triple_barrier",
+            "pt_sl": (2.0, 2.0),
+            "max_holding": 24,
+            "min_return": 0.001,
+            "volatility_window": 24,
+            "barrier_tie_break": "sl",
+        },
+        "model": {
+            "type": "gbm",
+            "cv_method": "cpcv",
+            "n_blocks": 4,
+            "test_blocks": 2,
+            "validation_fraction": 0.2,
+            "meta_n_splits": 2,
+        },
+        "signals": {
+            "threshold": 0.0,
+            "edge_threshold": 0.0,
+            "shrinkage_alpha": 0.5,
+            "fraction": 0.75,
+            "min_trades_for_kelly": 30,
+            "max_kelly_fraction": 0.5,
+            "meta_threshold": 0.5,
+            "profitability_threshold": 0.5,
+            "expected_edge_threshold": 0.0,
+            "sizing_mode": "expected_utility",
+            "tuning_min_trades": 5,
+        },
+        "backtest": {
+            "equity": 10_000,
+            "fee_rate": 0.001,
+            "slippage_rate": 0.0002,
+            "slippage_model": "sqrt_impact",
+            "engine": "vectorbt",
+            "use_open_execution": True,
+            "signal_delay_bars": 1,
+        },
+    }
+    try:
+        config = prepare_example_runtime_config(
+            config,
+            market="spot",
+            local_certification=args.local_certification,
+            nautilus_available=NAUTILUS_AVAILABLE,
+            example_name="example_trend_volume_spot.py",
+        )
+    except RuntimeError as exc:
+        print(str(exc))
+        raise SystemExit(2) from exc
+
+    pipeline = ResearchPipeline(config)
 
     print_section(sep, 1, "Fetching spot data")
     data = pipeline.fetch_data()
+    example_runtime = dict(config.get("example_runtime") or {})
     print(f"  rows         : {len(data)}")
     print(f"  range        : {data.index[0]} -> {data.index[-1]}")
+    if example_runtime:
+        print(f"  runtime mode : {example_runtime.get('mode')}")
+        print(f"  runtime note : {example_runtime.get('note')}")
 
     print_section(sep, 2, "Running trend, volume, and breakout indicators")
     indicator_run = pipeline.run_indicators()

@@ -6,12 +6,16 @@ by default so the context block does not treat summarized periods as instantly k
 Usage
 -----
     python example_futures.py
+    python example_futures.py --local-certification
 """
 
 from core import ATR, MACD, RSI, ResearchPipeline
+from core.execution import NAUTILUS_AVAILABLE
 from example_utils import (
     build_futures_research_config,
     clone_config_with_overrides,
+    parse_local_certification_args,
+    prepare_example_runtime_config,
     print_alignment_summary,
     print_backtest_summary,
     print_feature_selection_summary,
@@ -26,6 +30,7 @@ from example_utils import (
 
 
 def main():
+    args = parse_local_certification_args("Run the baseline futures research example.")
     sep = "=" * 60
     symbol = "BTCUSDT"
     interval = "1h"
@@ -34,37 +39,52 @@ def main():
     context_symbols = ["ETHUSDT", "SOLUSDT"]
     indicators = [RSI(14), MACD(), ATR(14)]
 
-    pipeline = ResearchPipeline(
-        clone_config_with_overrides(
-            build_futures_research_config(
+    config = clone_config_with_overrides(
+        build_futures_research_config(
             symbol=symbol,
             interval=interval,
             start=start,
             end=end,
             indicators=indicators,
             context_symbols=context_symbols,
-            ),
-            {
-                "model": {
-                    "cv_method": "walk_forward",
-                    "n_splits": 3,
-                    "train_size": 360,
-                    "test_size": 120,
-                    "gap": 3,
-                    "validation_fraction": 0.2,
-                    "meta_n_splits": 2,
-                }
-            },
-        )
+        ),
+        {
+            "model": {
+                "cv_method": "walk_forward",
+                "n_splits": 3,
+                "train_size": 360,
+                "test_size": 120,
+                "gap": 3,
+                "validation_fraction": 0.2,
+                "meta_n_splits": 2,
+            }
+        },
     )
+    try:
+        config = prepare_example_runtime_config(
+            config,
+            market="um_futures",
+            local_certification=args.local_certification,
+            nautilus_available=NAUTILUS_AVAILABLE,
+            example_name="example_futures.py",
+        )
+    except RuntimeError as exc:
+        print(str(exc))
+        raise SystemExit(2) from exc
+
+    pipeline = ResearchPipeline(config)
 
     print_section(sep, 1, "Fetching BTCUSDT futures data")
     data = pipeline.fetch_data()
+    example_runtime = dict(config.get("example_runtime") or {})
     filters = pipeline.state.get("symbol_filters", {})
     futures_context = pipeline.state.get("futures_context", {})
     contract_spec = pipeline.state.get("futures_contract_spec", {})
     print(f"  rows         : {len(data)}")
     print(f"  range        : {data.index[0]} -> {data.index[-1]}")
+    if example_runtime:
+        print(f"  runtime mode : {example_runtime.get('mode')}")
+        print(f"  runtime note : {example_runtime.get('note')}")
     print(
         "  symbol filters: "
         f"tick={filters.get('tick_size')}  step={filters.get('step_size')}  min_notional={filters.get('min_notional')}"

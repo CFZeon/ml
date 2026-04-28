@@ -1,5 +1,6 @@
 """Shared helpers for the repository example scripts."""
 
+import argparse
 import copy
 from math import isfinite
 
@@ -321,6 +322,25 @@ def build_trade_ready_runtime_overrides(*, market="spot"):
     }
 
 
+def build_default_certification_scenario_matrix():
+    """Build a conservative default stress matrix for local certification examples."""
+
+    return {
+        "downtime": {
+            "events": [{"event_type": "downtime", "timestamp": "2024-03-05T12:00:00Z"}],
+            "policy": {"downtime_action": "freeze"},
+        },
+        "stale_mark": {
+            "events": [{"event_type": "stale_mark", "timestamp": "2024-03-12T12:00:00Z"}],
+            "policy": {"stale_mark_action": "reject"},
+        },
+        "halt": {
+            "events": [{"event_type": "halt", "start": "2024-03-19T12:00:00Z", "end": "2024-03-19T14:00:00Z"}],
+            "policy": {},
+        },
+    }
+
+
 def build_local_certification_runtime_overrides(*, market="spot"):
     """Build a strict but locally runnable certification profile.
 
@@ -330,10 +350,13 @@ def build_local_certification_runtime_overrides(*, market="spot"):
     """
 
     overrides = build_trade_ready_runtime_overrides(market=market)
+    scenario_matrix = build_default_certification_scenario_matrix()
     local_backtest = {
+        "engine": "pandas",
         "evaluation_mode": "trade_ready",
         "execution_profile": "local_l1_certification",
-        "required_stress_scenarios": ["downtime", "stale_mark", "halt"],
+        "required_stress_scenarios": list(scenario_matrix),
+        "scenario_matrix": scenario_matrix,
         "liquidity_lag_bars": 1,
         "participation_cap": 0.05,
         "min_fill_ratio": 0.25,
@@ -353,6 +376,56 @@ def build_local_certification_runtime_overrides(*, market="spot"):
             "monitoring": {"policy_profile": "trade_ready"},
             "data_certification": {"enabled": True},
         },
+    )
+
+def parse_local_certification_args(description):
+    """Parse the shared --local-certification flag used by builder-based examples."""
+
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument(
+        "--local-certification",
+        action="store_true",
+        help=(
+            "Run this example with the strict local-certification runtime profile. "
+            "Requires a local Nautilus installation and is intended for paper or pre-capital checks."
+        ),
+    )
+    return parser.parse_args()
+
+
+def prepare_example_runtime_config(
+    config,
+    *,
+    market="spot",
+    local_certification=False,
+    nautilus_available=True,
+    example_name="this example",
+):
+    """Optionally promote a research example into the strict local-certification runtime profile."""
+
+    resolved = clone_config_with_overrides(config)
+    if not local_certification:
+        return resolved
+
+    if not nautilus_available:
+        raise RuntimeError(
+            "Local certification requires a local Nautilus installation. "
+            f"Install/configure NautilusTrader and rerun {example_name} --local-certification, "
+            "or rerun without --local-certification for the research-only path."
+        )
+
+    return clone_config_with_overrides(
+        resolved,
+        clone_config_with_overrides(
+            build_local_certification_runtime_overrides(market=market),
+            {
+                "example_runtime": {
+                    "mode": "local_certification",
+                    "risk_level": "paper_or_pre_capital_only",
+                    "note": "strict local certification is enabled; treat results as paper or pre-capital evidence, not a live release.",
+                }
+            },
+        ),
     )
 
 
@@ -1107,6 +1180,16 @@ def print_backtest_summary(backtest):
             f"aggregate={backtest.get('aggregate_mode')}  "
             f"paths={backtest.get('path_count')}"
         )
+
+    runtime_details = []
+    if backtest.get("evaluation_mode") is not None:
+        runtime_details.append(f"mode={backtest.get('evaluation_mode')}")
+    if backtest.get("execution_profile") is not None:
+        runtime_details.append(f"profile={backtest.get('execution_profile')}")
+    if backtest.get("evidence_class") is not None:
+        runtime_details.append(f"evidence={backtest.get('evidence_class')}")
+    if runtime_details:
+        print(f"  runtime      : {'  '.join(runtime_details)}")
 
     for label, key, formatter in [
         ("engine", "engine", None),
