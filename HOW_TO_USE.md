@@ -67,9 +67,11 @@ That gives you one stable base config plus a short diff that contains only your 
 
 The shared builders now include strict context and funding integrity guardrails by default. If cross-asset context goes stale or a futures funding event is missing, the pipeline fails closed with an explicit gate error instead of converting that unknown state into zeros.
 They also set `data.duplicate_policy = "fail"`, so conflicting duplicate market bars raise immediately instead of being silently de-duplicated.
+They also set a non-advisory `data_quality` baseline for research examples: structural anomalies are dropped, softer anomalies are nulled, and flagged-only quarantine rows are excluded from modeling unless you explicitly opt back into anomaly tolerance.
 They also set `data.futures_context.recent_stats_availability_lag = "period_close"`, so recent Binance futures statistics are indexed at publication-safe timestamps instead of the interval they summarize.
 Those context z-scores are also trailing and prefix-invariant at cutoffs, so normalized derivatives features stay causal when you replay a fold boundary locally.
 They also default to `backtest.evaluation_mode = "research_only"`, so a normal builder-based example is explicitly research-grade unless you promote it to a trade-ready evaluation profile.
+Direct `run_backtest(...)` calls now require explicit `execution_prices` in `local_certification` and `trade_ready` modes. If you omit `execution_prices` in `research_only`, the result is marked with `same_bar_execution_fallback` so the close-fill assumption stays visible.
 If you promote a config to local certification, use `build_local_certification_runtime_overrides(...)` as the short diff.
 If you promote a config to `trade_ready`, use `build_trade_ready_runtime_overrides(...)` as the short diff. Those shared helpers set fail-closed gap handling, duplicate-bar blocking, quarantine blocking, and strict futures funding coverage in one place instead of re-stating those guards per example.
 If you want an example script to expose the same path on its CLI, use `parse_local_certification_args(...)` plus `prepare_example_runtime_config(...)` and keep the runtime mode explicit in the printed summary.

@@ -66,9 +66,11 @@ class SignalDecayMetricsTest(unittest.TestCase):
             },
         )
 
-        self.assertTrue(report["promotion_pass"])
+        self.assertEqual(report["status"], "unknown")
+        self.assertFalse(report["promotion_pass"])
         self.assertEqual(report["gate_mode"], "advisory")
         self.assertTrue(report["low_sample_advisory"])
+        self.assertIn("signal_decay_evidence_insufficient", report["reasons"])
         self.assertIn("insufficient_realized_decay_trade_count", report["warnings"])
 
 

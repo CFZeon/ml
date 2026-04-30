@@ -3,10 +3,11 @@
 This repository is a research-first trading stack for Binance crypto that keeps model training, feature generation, validation, and execution assumptions explicit.
 
 Trade-ready example configs now fail closed on stale context and missing futures funding coverage instead of silently zero-filling unknown state.
-They also fail closed on conflicting duplicate market bars instead of silently keeping the first timestamp collision.
+They also set `data.duplicate_policy = "fail"`, so conflicting duplicate bars raise immediately instead of being silently de-duplicated.
 Trade-ready configs now also build one blocking pre-training data-certification verdict that binds market gaps, quarantine disposition, context TTL breaches, and configured reference-validation coverage into a single gate.
 Trade-ready and AutoML training paths now run a blocking baseline-vs-prefix lookahead certification on the causal feature surface before model fitting.
 Example builders now mark backtests as `research_only` by default; capital-facing runs must opt into explicit `local_certification` or `trade_ready` evaluation modes with event-style execution plus explicit stress scenarios. The default trade-ready certification path still fails closed when Nautilus is unavailable, and `example_trade_ready_automl.py --smoke` remains reduced-power without downgrading into a surrogate research path.
+Raw `run_backtest(...)` callers in `local_certification` or `trade_ready` mode must now pass `execution_prices` explicitly. Research-only direct calls still allow omission, but the result is labeled with `same_bar_execution_fallback` so close-price execution cannot hide as an intentional assumption.
 Backtest and AutoML summaries now also label futures funding coverage explicitly as `strict`, `fallback`, or `not_applicable`, so missing-event leniency is visible before you read PnL.
 Trade-ready monitoring now also defaults to a finite policy profile instead of leaving freshness, fill-quality, slippage-drift, and signal-decay thresholds at `inf` or `None`.
 Capital-facing summaries now also expose a binding monitoring gate report, so missing telemetry and fallback assumptions surface as explicit admissibility blockers instead of passive warnings.
@@ -39,6 +40,7 @@ The repo now includes:
 - feature admission and retirement governance with venue-specific tagging, transform/lineage metadata, robustness screens, and ablation-based promotion diagnostics
 - a dedicated regime layer with explicit instrument-state, market-state, and cross-asset-state inputs, provenance reports, and endogenous-vs-context stability ablations
 - a pre-feature data-quality quarantine layer that flags, nulls, drops, or winsorizes suspicious bars and records structured anomaly reports
+- research builders now exclude flagged-only quarantined rows from modeling by default, and the example summaries surface quarantined, dropped, nulled, and modeling-excluded counts before label or backtest output
 - a unified trade-ready data-certification report that consolidates market-bar integrity, quarantine status, context TTL breaches, and configured cross-venue reference validation into one promotion-facing verdict
 - historical universe snapshots that gate cross-symbol studies by listing status, minimum history, and liquidity, plus lifecycle-aware backtest actions for halts and delists
 - explicit cross-stage embargoes between AutoML search, validation, and locked holdout windows so label horizons and execution delays cannot bleed across stage boundaries

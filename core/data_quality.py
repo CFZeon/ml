@@ -13,6 +13,8 @@ class DataQualityResult:
     clean_frame: pd.DataFrame
     quarantine_mask: pd.Series
     report: dict
+    row_disposition: pd.Series
+    modeling_exclusion_mask: pd.Series
 
 
 def _rolling_mad(series, window):
@@ -106,6 +108,9 @@ def check_data_quality(frame, config=None):
     config = dict(config or {})
     actions = dict(config.get("actions", {}) or {})
     block_on_quarantine = bool(config.get("block_on_quarantine", False))
+    exclude_flagged_quarantine_rows_from_modeling = bool(
+        config.get("exclude_flagged_quarantine_rows_from_modeling", False)
+    )
     frame = pd.DataFrame(frame).copy()
     window = max(5, int(config.get("rolling_window", 24)))
     return_spike_threshold = float(config.get("return_spike_threshold", 8.0))
@@ -139,6 +144,9 @@ def check_data_quality(frame, config=None):
     clean = frame.copy()
     quarantine_mask = pd.Series(False, index=frame.index, dtype=bool)
     drop_mask = pd.Series(False, index=frame.index, dtype=bool)
+    null_mask = pd.Series(False, index=frame.index, dtype=bool)
+    winsorize_mask = pd.Series(False, index=frame.index, dtype=bool)
+    flag_mask = pd.Series(False, index=frame.index, dtype=bool)
     action_counts = {}
     anomaly_report = {}
 
@@ -152,45 +160,85 @@ def check_data_quality(frame, config=None):
         action_counts[action] = action_counts.get(action, 0) + int(mask.sum())
 
         if action == "null" and mask.any():
+            null_mask |= mask
             quality_columns = [column for column in ["open", "high", "low", "close", "volume", "quote_volume", "trades"] if column in clean.columns]
             clean.loc[mask, quality_columns] = np.nan
         elif action == "drop":
             drop_mask |= mask
         elif action == "winsorize" and mask.any():
+            winsorize_mask |= mask
             winsorize_columns = [column for column in ["open", "high", "low", "close", "volume", "quote_volume", "trades"] if column in clean.columns]
             clean = _winsorize_rows(clean, mask, winsorize_columns, window=window, z_threshold=winsorize_z_threshold)
+        elif action == "flag":
+            flag_mask |= mask
 
         anomaly_report[anomaly_name] = {
             "count": int(mask.sum()),
             "action": action,
         }
 
+    nulled_mask = null_mask & ~drop_mask
+    winsorized_mask = winsorize_mask & ~drop_mask & ~nulled_mask
+    flagged_only_mask = flag_mask & ~drop_mask & ~nulled_mask & ~winsorized_mask
+    modeling_exclusion_mask = flagged_only_mask & exclude_flagged_quarantine_rows_from_modeling
+    row_disposition = pd.Series("clean", index=frame.index, dtype=object)
+    row_disposition.loc[winsorized_mask] = "winsorized"
+    row_disposition.loc[flagged_only_mask] = "flagged_only"
+    row_disposition.loc[nulled_mask] = "nulled"
+    row_disposition.loc[drop_mask] = "dropped"
+
     if drop_mask.any():
         clean = clean.loc[~drop_mask].copy()
+    if modeling_exclusion_mask.any():
+        clean = clean.loc[~modeling_exclusion_mask.reindex(clean.index).fillna(False)].copy()
 
     quarantined_rows = int(quarantine_mask.sum())
     status = "pass" if quarantined_rows == 0 else "quarantine"
     blocking = bool(block_on_quarantine and quarantined_rows > 0)
+    if blocking:
+        quarantine_severity = "flag_blocking"
+    elif flagged_only_mask.any():
+        quarantine_severity = "flag_advisory"
+    elif drop_mask.any() or nulled_mask.any() or winsorized_mask.any():
+        quarantine_severity = "remediated"
+    else:
+        quarantine_severity = "clean"
 
     report = {
         "status": status,
         "blocking": blocking,
+        "quarantine_severity": quarantine_severity,
+        "action_counts": dict(action_counts),
         "summary": {
             "rows_input": int(len(frame)),
             "rows_output": int(len(clean)),
             "quarantined_rows": quarantined_rows,
             "dropped_rows": int(drop_mask.sum()),
+            "nulled_rows": int(nulled_mask.sum()),
+            "winsorized_rows": int(winsorized_mask.sum()),
+            "flagged_only_rows": int(flagged_only_mask.sum()),
+            "modeling_excluded_rows": int(modeling_exclusion_mask.sum()),
+            "exclude_flagged_quarantine_rows_from_modeling": exclude_flagged_quarantine_rows_from_modeling,
             "anomaly_counts": {name: details["count"] for name, details in anomaly_report.items()},
-            "action_counts": action_counts,
+            "action_counts": dict(action_counts),
+            "quarantine_disposition_counts": {
+                "dropped": int(drop_mask.sum()),
+                "nulled": int(nulled_mask.sum()),
+                "winsorized": int(winsorized_mask.sum()),
+                "flagged_only": int(flagged_only_mask.sum()),
+            },
         },
         "anomalies": anomaly_report,
     }
     clean.attrs["data_quality_report"] = report
     clean.attrs["data_quality_quarantine_mask"] = quarantine_mask.reindex(clean.index).fillna(False)
+    clean.attrs["data_quality_row_disposition"] = row_disposition.reindex(clean.index).fillna("clean")
     return DataQualityResult(
         clean_frame=clean,
         quarantine_mask=quarantine_mask,
         report=report,
+        row_disposition=row_disposition,
+        modeling_exclusion_mask=modeling_exclusion_mask,
     )
 
 

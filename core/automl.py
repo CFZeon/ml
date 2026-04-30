@@ -1673,7 +1673,8 @@ def _resolve_replication_config(base_config, automl_config=None, base_pipeline=N
             "min_passed_supporting_cohorts": int(portability_contract.get("min_passed_supporting_cohorts", 1)),
             "require_frozen_universe": bool(portability_contract.get("require_frozen_universe", False)),
             "frozen_universe_available": bool(
-                universe_snapshot_meta.get("snapshot_timestamp") is not None and universe_snapshot_source != "exchange_info"
+                universe_snapshot_meta.get("snapshot_timestamp") is not None
+                and universe_snapshot_source not in {"exchange_info", "synthetic_example_snapshot"}
             ),
             "universe_snapshot_source": universe_snapshot_meta.get("source"),
         },
@@ -1741,6 +1742,12 @@ def _finalize_portability_contract(report, primary_score=None):
         and not bool(contract.get("frozen_universe_available", False))
     ):
         reasons.append("portability_requires_frozen_universe_snapshot")
+    if (
+        bool(report.get("include_symbol_cohorts", False))
+        and "symbol" in accepted_kinds
+        and str(contract.get("universe_snapshot_source") or "").strip().lower() == "synthetic_example_snapshot"
+    ):
+        reasons.append("synthetic_universe_snapshot_not_allowed")
     if int(len(supporting_rows)) < int(contract.get("min_supporting_cohorts", 1)):
         reasons.append("portability_supporting_cohort_missing")
     if int(len(supporting_passed)) < int(contract.get("min_passed_supporting_cohorts", 1)):
@@ -2323,9 +2330,91 @@ def _first_failure_reason(payload, fallback):
     return fallback
 
 
-def _gs(name, passed, measured, threshold, failure_reason, details):
-    return {"name": name, "passed": passed, "measured": measured,
-            "threshold": threshold, "reason": None if passed else failure_reason, "details": details}
+def _resolve_evidence_gate(gate_name, report, *, selection_policy=None, failure_reason=None, missing_reason=None):
+    details = dict(report or {})
+    failure_reason = failure_reason or f"{gate_name}_failed"
+    missing_reason = missing_reason or f"{gate_name}_evidence_missing"
+    if not details:
+        return {
+            "details": {},
+            "status": "unknown",
+            "passed": False,
+            "mode": resolve_promotion_gate_mode(selection_policy, gate_name),
+            "reason": missing_reason,
+        }
+
+    status = str(details.get("status") or "").strip().lower()
+    if status not in {"passed", "failed", "unknown"}:
+        if "promotion_pass" in details:
+            status = "passed" if bool(details.get("promotion_pass", False)) else "failed"
+        else:
+            status = "unknown"
+
+    reasons = list(details.get("reasons") or [])
+    if status == "unknown" and not reasons:
+        reasons = [missing_reason]
+    elif status == "failed" and not reasons:
+        reasons = [failure_reason]
+
+    normalized_details = dict(details)
+    normalized_details["status"] = status
+    normalized_details["reasons"] = reasons
+    return {
+        "details": normalized_details,
+        "status": status,
+        "passed": status == "passed",
+        "mode": str(details.get("gate_mode") or resolve_promotion_gate_mode(selection_policy, gate_name)).lower(),
+        "reason": None if status == "passed" else (reasons[0] if reasons else failure_reason),
+    }
+
+
+def _resolve_lookahead_guard_gate(training_summary):
+    lookahead_guard = dict((training_summary or {}).get("lookahead_guard") or {})
+    if not lookahead_guard:
+        return {
+            "details": {},
+            "passed": False,
+            "reason": "lookahead_guard_missing",
+        }
+
+    status = str(lookahead_guard.get("status") or "").strip().lower()
+    if status == "disabled":
+        return {
+            "details": lookahead_guard,
+            "passed": False,
+            "reason": "lookahead_guard_disabled",
+        }
+    if status == "skipped":
+        return {
+            "details": lookahead_guard,
+            "passed": False,
+            "reason": "lookahead_guard_skipped",
+        }
+    if not bool(lookahead_guard.get("enabled", False)):
+        return {
+            "details": lookahead_guard,
+            "passed": False,
+            "reason": "lookahead_guard_disabled",
+        }
+
+    passed = bool(lookahead_guard.get("promotion_pass", False))
+    return {
+        "details": lookahead_guard,
+        "passed": passed,
+        "reason": None if passed else _first_failure_reason(lookahead_guard, "lookahead_guard_failed"),
+    }
+
+
+def _gs(name, passed, measured, threshold, failure_reason, details, mode=None):
+    return {
+        "name": name,
+        "passed": passed,
+        "measured": measured,
+        "threshold": threshold,
+        "reason": None if passed else failure_reason,
+        "details": details,
+        "mode": mode,
+    }
 
 
 def _update_selection_policy_report(policy_report, promotion_eligibility_report, *, include_post_selection=False):
@@ -3185,13 +3274,50 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         signal_decay = dict(training_summary.get("signal_decay") or {})
         regime_ablation_summary = dict((training_summary.get("regime") or {}).get("ablation_summary") or {})
         operational_monitoring = dict(training_summary.get("operational_monitoring") or {})
-        feature_portability_pass = bool(promotion_gates.get("feature_portability", True))
-        feature_admission_pass = bool(promotion_gates.get("feature_admission", True))
-        regime_stability_pass = bool(promotion_gates.get("regime_stability", True))
+        feature_portability_gate = _resolve_evidence_gate(
+            "feature_portability",
+            feature_portability_diagnostics,
+            selection_policy=selection_policy,
+            failure_reason="feature_portability_failed",
+        )
+        feature_admission_gate = _resolve_evidence_gate(
+            "feature_admission",
+            feature_admission_summary,
+            selection_policy=selection_policy,
+            failure_reason="feature_admission_failed",
+        )
+        regime_stability_gate = _resolve_evidence_gate(
+            "regime_stability",
+            regime_ablation_summary,
+            selection_policy=selection_policy,
+            failure_reason="regime_stability_failed",
+            missing_reason="regime_ablation_evidence_missing",
+        )
         operational_health_pass = bool(promotion_gates.get("operational_health", True))
-        cross_venue_integrity_pass = bool(promotion_gates.get("cross_venue_integrity", True))
-        data_certification_pass = bool(promotion_gates.get("data_certification", data_certification.get("promotion_pass", True)))
-        signal_decay_pass = bool(promotion_gates.get("signal_decay", signal_decay.get("promotion_pass", True)))
+        cross_venue_integrity_gate = _resolve_evidence_gate(
+            "cross_venue_integrity",
+            cross_venue_integrity,
+            selection_policy=selection_policy,
+            failure_reason="cross_venue_integrity_failed",
+        )
+        data_certification_gate = _resolve_evidence_gate(
+            "data_certification",
+            data_certification,
+            selection_policy=selection_policy,
+            failure_reason="data_certification_failed",
+        )
+        signal_decay_gate = _resolve_evidence_gate(
+            "signal_decay",
+            signal_decay,
+            selection_policy=selection_policy,
+            failure_reason="signal_decay_failed",
+        )
+        feature_portability_pass = feature_portability_gate["passed"]
+        feature_admission_pass = feature_admission_gate["passed"]
+        regime_stability_pass = regime_stability_gate["passed"]
+        cross_venue_integrity_pass = cross_venue_integrity_gate["passed"]
+        data_certification_pass = data_certification_gate["passed"]
+        signal_decay_pass = signal_decay_gate["passed"]
 
         eligibility_checks = {
             "minimum_dsr": bool(meets_minimum_dsr_threshold or not dsr_gate_applies),
@@ -3266,25 +3392,25 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                     "model_family_trial_count_above_limit", {"model_family": model_family, "trial_count": model_family_counts.get(model_family, 0)}),
                 _gs("feature_portability", ec["feature_portability"],
                     feature_portability_diagnostics.get("venue_specific_importance_share"), feature_portability_diagnostics.get("config"),
-                    _first_failure_reason(feature_portability_diagnostics, "feature_portability_failed"), feature_portability_diagnostics),
+                    feature_portability_gate["reason"], feature_portability_gate["details"], mode=feature_portability_gate["mode"]),
                 _gs("feature_admission", ec["feature_admission"],
                     feature_admission_summary.get("promotion_pass"), True,
-                    _first_failure_reason(feature_admission_summary, "feature_admission_failed"), feature_admission_summary),
+                    feature_admission_gate["reason"], feature_admission_gate["details"], mode=feature_admission_gate["mode"]),
                 _gs("regime_stability", ec["regime_stability"],
                     regime_ablation_summary.get("stability_improvement"), True,
-                    _first_failure_reason(regime_ablation_summary, "regime_stability_failed"), regime_ablation_summary),
+                    regime_stability_gate["reason"], regime_stability_gate["details"], mode=regime_stability_gate["mode"]),
                 _gs("operational_health", ec["operational_health"],
                     operational_monitoring.get("healthy"), True,
                     _first_failure_reason(operational_monitoring, "operational_monitoring_failed"), operational_monitoring),
                 _gs("cross_venue_integrity", ec["cross_venue_integrity"],
                     cross_venue_integrity.get("promotion_pass"), True,
-                    _first_failure_reason(cross_venue_integrity, "cross_venue_integrity_failed"), cross_venue_integrity),
+                    cross_venue_integrity_gate["reason"], cross_venue_integrity_gate["details"], mode=cross_venue_integrity_gate["mode"]),
                 _gs("data_certification", ec["data_certification"],
                     data_certification.get("promotion_pass"), True,
-                    _first_failure_reason(data_certification, "data_certification_failed"), data_certification),
+                    data_certification_gate["reason"], data_certification_gate["details"], mode=data_certification_gate["mode"]),
                 _gs("signal_decay", ec["signal_decay"],
                     signal_decay.get("net_edge_at_effective_delay"), signal_decay.get("policy"),
-                    _first_failure_reason(signal_decay, "signal_decay_failed"), signal_decay),
+                    signal_decay_gate["reason"], signal_decay_gate["details"], mode=signal_decay_gate["mode"]),
                 _gs("fold_stability", ec["fold_stability"],
                     fold_stability_gate["summary"].get("persistence"), True,
                     "fold_stability_failed", fold_stability_gate["summary"]),
@@ -3295,7 +3421,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                     group="selection",
                     name=gate["name"],
                     passed=gate["passed"],
-                    mode=resolve_promotion_gate_mode(selection_policy, gate["name"]),
+                    mode=gate.get("mode") or resolve_promotion_gate_mode(selection_policy, gate["name"]),
                     measured=gate["measured"],
                     threshold=gate["threshold"],
                     reason=gate["reason"],
@@ -4675,15 +4801,16 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         reason=stress_realism.get("reason"),
         details=stress_realism,
     )
-    lookahead_guard = dict((best_trial_report.get("training") or {}).get("lookahead_guard") or {})
+    lookahead_guard_gate = _resolve_lookahead_guard_gate(best_trial_report.get("training") or {})
+    lookahead_guard = dict(lookahead_guard_gate["details"] or {})
     best_trial_report["selection_policy"]["eligibility_checks"]["lookahead_guard"] = bool(
-        lookahead_guard.get("promotion_pass", True)
+        lookahead_guard_gate["passed"]
     )
     promotion_eligibility_report = upsert_promotion_gate(
         promotion_eligibility_report,
         group="post_selection",
         name="lookahead_guard",
-        passed=bool(lookahead_guard.get("promotion_pass", True)),
+        passed=bool(lookahead_guard_gate["passed"]),
         mode=resolve_promotion_gate_mode(selection_policy, "lookahead_guard"),
         measured=lookahead_guard.get("checked_timestamps"),
         threshold={
@@ -4691,7 +4818,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             "min_prefix_rows": lookahead_guard.get("min_prefix_rows"),
             "decision_sample_size": lookahead_guard.get("decision_sample_size"),
         },
-        reason=None if lookahead_guard.get("promotion_pass", True) else _first_failure_reason(lookahead_guard, "lookahead_guard_failed"),
+        reason=lookahead_guard_gate["reason"],
         details=lookahead_guard,
     )
     best_trial_report["selection_policy"] = _update_selection_policy_report(

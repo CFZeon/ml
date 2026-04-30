@@ -312,7 +312,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
                 ],
             )
 
-    def test_exact_match_defaults_change_when_event_time_availability_is_assumed(self):
+    def test_exact_match_requires_explicit_opt_in(self):
         index = pd.date_range("2026-03-10", periods=1, freq="1h", tz="UTC")
         base = pd.DataFrame(
             {"close": [100.0]},
@@ -351,13 +351,32 @@ class DataBacktestAdapterTest(unittest.TestCase):
                 }
             ],
         )
+        opted_in_joined, opted_in_report = join_custom_data(
+            base,
+            [
+                {
+                    "name": "opted_in_feed",
+                    "frame": custom_frame.assign(available_at=custom_frame["timestamp"]),
+                    "timestamp_column": "timestamp",
+                    "availability_column": "available_at",
+                    "value_columns": ["sentiment"],
+                    "prefix": "opted_in",
+                    "allow_exact_matches": True,
+                }
+            ],
+        )
 
         self.assertTrue(pd.isna(assumed_joined.loc[index[0], "assumed_sentiment"]))
         self.assertFalse(assumed_report[0]["allow_exact_matches"])
         self.assertTrue(assumed_report[0]["fallback_assumption_used"])
-        self.assertAlmostEqual(float(explicit_joined.loc[index[0], "explicit_sentiment"]), 0.25, places=6)
-        self.assertTrue(explicit_report[0]["allow_exact_matches"])
+        self.assertEqual(int(assumed_report[0]["exact_match_count"]), 0)
+        self.assertTrue(pd.isna(explicit_joined.loc[index[0], "explicit_sentiment"]))
+        self.assertFalse(explicit_report[0]["allow_exact_matches"])
         self.assertFalse(explicit_report[0]["fallback_assumption_used"])
+        self.assertEqual(int(explicit_report[0]["exact_match_count"]), 0)
+        self.assertAlmostEqual(float(opted_in_joined.loc[index[0], "opted_in_sentiment"]), 0.25, places=6)
+        self.assertTrue(opted_in_report[0]["allow_exact_matches"])
+        self.assertEqual(int(opted_in_report[0]["exact_match_count"]), 1)
 
     def test_vectorbt_backtest_adapter_supports_futures_execution_inputs(self):
         index = pd.date_range("2026-03-12", periods=6, freq="1h", tz="UTC")
@@ -644,6 +663,44 @@ class DataBacktestAdapterTest(unittest.TestCase):
                 execution_prices=execution_prices,
                 execution_price_policy="strict",
             )
+
+    def test_capital_facing_backtest_requires_explicit_execution_prices(self):
+        index = pd.date_range("2026-03-12", periods=4, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 101.0, 102.0, 103.0], index=index)
+        signals = pd.Series([0.0, 1.0, 0.0, 0.0], index=index)
+
+        with self.assertRaisesRegex(ValueError, "require explicit execution_prices"):
+            run_backtest(
+                close=close,
+                signals=signals,
+                equity=10_000.0,
+                fee_rate=0.0,
+                slippage_rate=0.0,
+                signal_delay_bars=0,
+                engine="pandas",
+                evaluation_mode="local_certification",
+            )
+
+    def test_research_backtest_surfaces_same_bar_close_fallback_warning(self):
+        index = pd.date_range("2026-03-12", periods=4, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 101.0, 102.0, 103.0], index=index)
+        signals = pd.Series([0.0, 1.0, 0.0, 0.0], index=index)
+
+        result = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            signal_delay_bars=0,
+            engine="pandas",
+            evaluation_mode="research_only",
+        )
+
+        self.assertEqual(result["execution_price_source"], "close_fallback")
+        self.assertTrue(result["same_bar_execution_fallback"])
+        self.assertEqual(result["execution_price_warning"], "same_bar_execution_fallback")
+        self.assertIn("same_bar_execution_fallback", result["backtest_warnings"])
 
     def test_execution_prices_can_only_forward_fill_causally_when_enabled(self):
         index = pd.date_range("2026-03-12", periods=5, freq="1h", tz="UTC")

@@ -224,6 +224,10 @@ def evaluate_feature_portability(feature_metadata, top_features=None, family_dia
     max_ablation_f1_drop = float(config.get("max_endogenous_f1_drop", 0.02))
 
     reasons = []
+    status = "passed"
+    if not top_features or total_importance <= 0.0:
+        reasons.append("feature_portability_evidence_missing")
+        status = "unknown"
     if venue_specific_importance_share > max_importance_share:
         reasons.append("venue_specific_importance_dominates")
     if venue_specific_top_feature_share > max_top_feature_share:
@@ -233,9 +237,12 @@ def evaluate_feature_portability(feature_metadata, top_features=None, family_dia
         or endogenous_replication_gap["f1_drop"] > max_ablation_f1_drop
     ):
         reasons.append("endogenous_ablation_failed")
+    if status != "unknown":
+        status = "failed" if reasons else "passed"
 
-    promotion_pass = not reasons
+    promotion_pass = status == "passed"
     return {
+        "status": status,
         "promotion_pass": promotion_pass,
         "reasons": reasons,
         "summary": summary,
@@ -544,16 +551,34 @@ def summarize_feature_admission_reports(reports):
             "avg_admitted_features": 0.0,
             "avg_rejected_features": 0.0,
             "retired_features": [],
-            "promotion_pass": True,
+            "status": "unknown",
+            "promotion_pass": False,
+            "reasons": ["feature_admission_evidence_missing"],
         }
 
     retired = sorted({column for row in rows for column in row.get("retired_columns", [])})
+    statuses = []
+    reasons = []
+    for row in rows:
+        row_status = str(row.get("status") or "").strip().lower()
+        if row_status not in {"passed", "failed", "unknown"}:
+            row_status = "passed" if bool(row.get("promotion_pass", False)) else "failed"
+        statuses.append(row_status)
+        reasons.extend(list(row.get("reasons") or []))
+    if "failed" in statuses:
+        status = "failed"
+    elif "unknown" in statuses:
+        status = "unknown"
+    else:
+        status = "passed"
     return {
         "fold_count": int(len(rows)),
         "avg_admitted_features": float(np.mean([row.get("summary", {}).get("admitted_features", 0) for row in rows])),
         "avg_rejected_features": float(np.mean([row.get("summary", {}).get("rejected_features", 0) for row in rows])),
         "retired_features": retired,
-        "promotion_pass": all(bool(row.get("promotion_pass", True)) for row in rows),
+        "status": status,
+        "promotion_pass": status == "passed",
+        "reasons": list(dict.fromkeys(reasons)),
     }
 
 

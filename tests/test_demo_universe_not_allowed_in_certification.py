@@ -127,6 +127,74 @@ class DemoUniverseNotAllowedInCertificationTest(unittest.TestCase):
         self.assertIn("portability_requires_frozen_universe_snapshot", report["reasons"])
         self.assertEqual(report["portability_contract"]["universe_snapshot_source"], "exchange_info")
 
+    def test_symbol_portability_blocks_synthetic_example_snapshot(self):
+        raw = _build_market_frame(120, start=100.0)
+        eth = _build_market_frame(120, start=50.0)
+        full_state_bundle = {
+            "raw_data": raw,
+            "data": raw.copy(),
+            "indicator_run": None,
+            "futures_context": None,
+            "cross_asset_context": {"ETHUSDT": eth},
+            "data_lineage": {},
+            "symbol_filters": {},
+            "symbol_lifecycle": None,
+            "universe_policy": {},
+            "universe_snapshot": None,
+            "universe_snapshot_meta": {"snapshot_timestamp": raw.index[0], "source": "synthetic_example_snapshot"},
+            "eligible_symbols": ["BTCUSDT", "ETHUSDT"],
+            "universe_report": {},
+        }
+        base_pipeline = SimpleNamespace(
+            state={
+                "cross_asset_context": {"ETHUSDT": eth},
+                "eligible_symbols": ["BTCUSDT", "ETHUSDT"],
+                "universe_snapshot_meta": {"snapshot_timestamp": raw.index[0], "source": "synthetic_example_snapshot"},
+            }
+        )
+        base_config = {
+            "data": {"symbol": "BTCUSDT", "interval": "1h"},
+            "automl": {
+                "objective": "risk_adjusted_after_costs",
+                "replication": {
+                    "enabled": True,
+                    "include_symbol_cohorts": True,
+                    "include_window_cohorts": False,
+                    "min_coverage": 1,
+                    "min_pass_rate": 1.0,
+                    "min_score": 0.0,
+                    "min_rows": 24,
+                },
+                "portability_contract": {
+                    "enabled": True,
+                    "accepted_kinds": ["symbol"],
+                    "min_supporting_cohorts": 1,
+                    "min_passed_supporting_cohorts": 1,
+                    "require_frozen_universe": False,
+                },
+            },
+        }
+
+        with mock.patch(
+            "core.automl._execute_trial_candidate",
+            side_effect=lambda *_args, **_kwargs: _make_training_backtest(full_state_bundle, [0.01, 0.012, 0.011, 0.013]),
+        ):
+            report = automl_module._evaluate_replication_cohorts(
+                base_config=base_config,
+                best_overrides={"model": {"type": "gbm"}},
+                pipeline_class=object,
+                trial_step_classes=[],
+                full_state_bundle=full_state_bundle,
+                holdout_plan={},
+                base_pipeline=base_pipeline,
+                primary_score=0.02,
+            )
+
+        self.assertFalse(report["promotion_pass"])
+        self.assertFalse(report["portability_contract"]["passed"])
+        self.assertIn("synthetic_universe_snapshot_not_allowed", report["reasons"])
+        self.assertEqual(report["portability_contract"]["universe_snapshot_source"], "synthetic_example_snapshot")
+
 
 if __name__ == "__main__":
     unittest.main()

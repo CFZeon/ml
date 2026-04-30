@@ -106,6 +106,61 @@ class DataQualityQuarantineTest(unittest.TestCase):
         self.assertEqual(result.report["anomalies"]["quote_volume_inconsistency"]["action"], "flag")
         self.assertGreaterEqual(int(result.report["summary"]["action_counts"]["flag"]), 1)
         self.assertGreaterEqual(int(result.report["summary"]["action_counts"]["null"]), 1)
+        self.assertIn("quarantine_disposition_counts", result.report["summary"])
+
+    def test_flagged_rows_can_be_excluded_from_modeling_without_blocking(self):
+        index = pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC")
+        frame = pd.DataFrame(
+            {
+                "open": [100.0, 100.2, 130.0, 100.4, 100.6, 100.8],
+                "high": [100.5, 100.7, 130.5, 100.9, 101.1, 101.3],
+                "low": [99.5, 99.7, 129.5, 99.9, 100.1, 100.3],
+                "close": [100.1, 100.3, 130.2, 100.5, 100.7, 100.9],
+                "volume": [10.0, 10.5, 11.0, 11.5, 12.0, 12.5],
+                "quote_volume": [1001.0, 1053.15, 1432.2, 1155.75, 1208.4, 1261.25],
+                "trades": [100, 101, 102, 103, 104, 105],
+                "taker_buy_base_vol": [4.0, 4.1, 4.2, 4.3, 4.4, 4.5],
+                "taker_buy_quote_vol": [400.0, 410.0, 420.0, 430.0, 440.0, 450.0],
+            },
+            index=index,
+        )
+        report = {"status": "complete", "missing_rows": 0, "periods": []}
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h", "start": "2024-01-01", "end": "2024-01-01 06:00:00"},
+                "data_quality": {
+                    "exclude_flagged_quarantine_rows_from_modeling": True,
+                    "rolling_window": 5,
+                    "return_spike_threshold": 2.0,
+                    "actions": {"return_spike": "flag"},
+                },
+                "labels": {"kind": "fixed_horizon", "horizon": 1, "threshold": 0.0},
+            }
+        )
+
+        with mock.patch("core.pipeline.fetch_binance_bars", return_value=(frame, report)), mock.patch("core.pipeline.fetch_binance_symbol_filters", return_value={}):
+            pipeline.fetch_data()
+            pipeline.check_data_quality()
+            pipeline.run_indicators()
+            pipeline.build_features()
+            pipeline.build_labels()
+
+        spike_timestamp = index[2]
+        self.assertNotIn(spike_timestamp, pipeline.state["raw_data"].index)
+        self.assertNotIn(spike_timestamp, pipeline.state["data"].index)
+        self.assertNotIn(spike_timestamp, pipeline.state["features"].index)
+        self.assertNotIn(spike_timestamp, pipeline.state["labels"].index)
+        summary = pipeline.state["data_quality_report"]["summary"]
+        self.assertGreaterEqual(int(summary["modeling_excluded_rows"]), 1)
+        self.assertEqual(
+            int(summary["modeling_excluded_rows"]),
+            int(summary["flagged_only_rows"]),
+        )
+        self.assertFalse(bool(pipeline.state["data_quality_report"]["blocking"]))
+        self.assertEqual(
+            pipeline.state["data_quality_report"]["quarantine_severity"],
+            "flag_advisory",
+        )
 
     def test_quarantine_can_block_run_when_configured(self):
         index = pd.date_range("2024-01-01", periods=3, freq="h", tz="UTC")

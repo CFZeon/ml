@@ -38,6 +38,7 @@ def build_custom_data_entry(
     value_columns,
     timestamp_column="timestamp",
     availability_column="available_at",
+    allow_exact_matches=None,
     prefix=None,
     max_feature_age=None,
     extra_fields=None,
@@ -51,6 +52,8 @@ def build_custom_data_entry(
         "availability_column": str(availability_column),
         "value_columns": list(value_columns),
     }
+    if allow_exact_matches is not None:
+        entry["allow_exact_matches"] = bool(allow_exact_matches)
     if prefix is not None:
         entry["prefix"] = str(prefix)
     if max_feature_age is not None:
@@ -117,6 +120,19 @@ def build_spot_research_config(
         },
         "feature_selection": {"enabled": True, "max_features": 96, "min_mi_threshold": 0.0005},
         "regime": {"method": "hmm"},
+        "data_quality": {
+            "exclude_flagged_quarantine_rows_from_modeling": True,
+            "actions": {
+                "ohlc_inconsistency": "drop",
+                "duplicate_timestamp": "drop",
+                "retrograde_timestamp": "drop",
+                "nonpositive_volume": "drop",
+                "return_spike": "null",
+                "range_spike": "null",
+                "quote_volume_inconsistency": "null",
+                "trade_count_anomaly": "null",
+            },
+        },
         "labels": {
             "kind": "triple_barrier",
             "pt_sl": (2.0, 2.0),
@@ -214,6 +230,19 @@ def build_futures_research_config(
         },
         "feature_selection": {"enabled": True, "max_features": 64, "min_mi_threshold": 0.0},
         "regime": {"method": "hmm"},
+        "data_quality": {
+            "exclude_flagged_quarantine_rows_from_modeling": True,
+            "actions": {
+                "ohlc_inconsistency": "drop",
+                "duplicate_timestamp": "drop",
+                "retrograde_timestamp": "drop",
+                "nonpositive_volume": "drop",
+                "return_spike": "null",
+                "range_spike": "null",
+                "quote_volume_inconsistency": "null",
+                "trade_count_anomaly": "null",
+            },
+        },
         "labels": {
             "kind": "triple_barrier",
             "pt_sl": (1.5, 1.5),
@@ -311,6 +340,7 @@ def build_trade_ready_runtime_overrides(*, market="spot"):
         },
         "data_quality": {
             "block_on_quarantine": True,
+            "exclude_flagged_quarantine_rows_from_modeling": True,
         },
         "signals": {
             "require_paper_verification_for_kelly": True,
@@ -335,7 +365,7 @@ def build_research_demo_runtime_overrides(*, market="spot"):
             {
                 "apply_funding": True,
                 "funding_missing_policy": {
-                    "mode": "zero_fill",
+                    "mode": "zero_fill_debug",
                     "expected_interval": "8h",
                     "max_gap_multiplier": 1.5,
                 },
@@ -452,6 +482,20 @@ def prepare_example_runtime_config(
     """Optionally promote a research example into the strict local-certification runtime profile."""
 
     resolved = clone_config_with_overrides(config)
+    universe_config = dict(resolved.get("universe") or {})
+    universe_source = str(universe_config.get("source") or "").strip().lower()
+    if universe_source == "synthetic_example_snapshot":
+        runtime = dict(resolved.get("example_runtime") or {})
+        runtime.setdefault("mode", "research_only")
+        runtime.setdefault("risk_level", "research_only")
+        synthetic_note = (
+            "synthetic universe snapshot is enabled; cross-symbol eligibility, listing age, and liquidity "
+            "are example assumptions rather than survivorship-safe historical evidence."
+        )
+        existing_note = str(runtime.get("note") or "").strip()
+        if synthetic_note not in existing_note:
+            runtime["note"] = synthetic_note if not existing_note else f"{existing_note} {synthetic_note}"
+        resolved["example_runtime"] = runtime
     if not local_certification:
         return resolved
 
@@ -946,10 +990,14 @@ def build_example_universe_config(
 
     return {
         "market": market,
+        "source": "synthetic_example_snapshot",
+        "survivorship_safe": False,
+        "liquidity_source": "fabricated",
         "snapshots": [
             {
                 "snapshot_timestamp": resolved_snapshot.isoformat().replace("+00:00", "Z"),
                 "market": market,
+                "source": "synthetic_example_snapshot",
                 "symbols": snapshot_symbols,
             }
         ],
@@ -993,6 +1041,22 @@ def print_regime_summary(regimes):
 
 def print_label_summary(labels):
     print(f"  label rows   : {len(labels)}")
+    integrity_report = dict(getattr(labels, "attrs", {}).get("integrity_report") or {})
+    if integrity_report:
+        print(
+            "  dropped bad  : "
+            f"{integrity_report.get('dropped_incomplete_future_windows', 0)}"
+        )
+    data_quality_report = dict(getattr(labels, "attrs", {}).get("data_quality_report") or {})
+    data_quality_summary = dict(data_quality_report.get("summary") or {})
+    if data_quality_summary:
+        print(
+            "  quarantine   : "
+            f"rows={data_quality_summary.get('quarantined_rows', 0)}  "
+            f"dropped={data_quality_summary.get('dropped_rows', 0)}  "
+            f"nulled={data_quality_summary.get('nulled_rows', 0)}  "
+            f"excluded={data_quality_summary.get('modeling_excluded_rows', 0)}"
+        )
     if "label" in labels.columns:
         print(f"  distribution : {labels['label'].value_counts().to_dict()}")
     if "barrier" in labels.columns:
@@ -1320,6 +1384,20 @@ def print_backtest_summary(backtest):
             f"max={_format_metric(backtest.get('max_realized_leverage'), digits=6)}  "
             f"capped={backtest.get('leverage_cap_adjustments')}"
         )
+    funding_coverage = backtest.get("funding_coverage_report") or {}
+    if funding_coverage:
+        print(
+            "  funding cov  : "
+            f"status={backtest.get('funding_coverage_status', funding_coverage.get('coverage_status'))}  "
+            f"missing={funding_coverage.get('missing_event_count', 0)}  "
+            f"pass={bool(funding_coverage.get('promotion_pass', True))}"
+        )
+        funding_reasons = []
+        if funding_coverage.get("coverage_reason"):
+            funding_reasons.append(funding_coverage.get("coverage_reason"))
+        if funding_coverage.get("fallback_assumption"):
+            funding_reasons.append(funding_coverage.get("fallback_assumption"))
+        print(f"  funding why  : {funding_reasons if funding_reasons else 'none'}")
     metric_ranges = backtest.get("metric_ranges") or {}
     if metric_ranges:
         for key, label in [("net_profit_pct", "net range"), ("sharpe_ratio", "sharpe rng"), ("max_drawdown", "mdd range")]:

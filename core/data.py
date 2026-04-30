@@ -75,7 +75,7 @@ class CustomDataset:
     availability_column: str
     source_path: str | None = None
     availability_is_assumed: bool = False
-    default_allow_exact_matches: bool = True
+    default_allow_exact_matches: bool = False
     max_feature_age: pd.Timedelta | None = None
     value_columns: tuple[str, ...] = ()
     dataset_manifest: dict = field(default_factory=dict)
@@ -876,7 +876,7 @@ def load_custom_dataset(path=None, frame=None, name=None, file_format=None,
         availability_column="available_at",
         source_path=str(path) if path is not None else None,
         availability_is_assumed=availability_is_assumed,
-        default_allow_exact_matches=not availability_is_assumed,
+        default_allow_exact_matches=False,
         max_feature_age=_parse_optional_tolerance(max_feature_age),
         value_columns=tuple(selected_value_columns),
         dataset_manifest=dataset_manifest,
@@ -922,6 +922,8 @@ def _custom_join_report_defaults(dataset, joined_columns, allow_exact_matches):
         "fallback_assumption_rows": 0,
         "fallback_assumption_rate": 0.0,
         "allow_exact_matches": bool(allow_exact_matches),
+        "exact_match_count": 0,
+        "exact_match_rate": 0.0,
         "dataset_manifest": dict(dataset.dataset_manifest or {}),
         "contract_hash": dict(dataset.dataset_manifest or {}).get("contract", {}).get("contract_hash"),
     }
@@ -975,6 +977,7 @@ def join_custom_dataset(base_frame, dataset, tolerance=None, allow_exact_matches
 
     matched_after_ttl_mask = matched_mask & ~stale_mask
     matched_feature_age = feature_age.loc[matched_after_ttl_mask] if matched_after_ttl_mask.any() else pd.Series(dtype="timedelta64[ns]")
+    exact_match_mask = matched_after_ttl_mask & feature_age.eq(pd.Timedelta(0))
 
     joined = joined.set_index("decision_time")
     joined.index.name = base.index.name
@@ -998,6 +1001,8 @@ def join_custom_dataset(base_frame, dataset, tolerance=None, allow_exact_matches
         "fallback_assumption_rows": fallback_rows,
         "fallback_assumption_rate": (fallback_rows / len(base)) if len(base) > 0 else 0.0,
         "allow_exact_matches": bool(allow_exact_matches),
+        "exact_match_count": int(exact_match_mask.sum()),
+        "exact_match_rate": float(exact_match_mask.mean()) if len(exact_match_mask) > 0 else 0.0,
         "dataset_manifest": dict(dataset.dataset_manifest or {}),
         "contract_hash": dict(dataset.dataset_manifest or {}).get("contract", {}).get("contract_hash"),
     }

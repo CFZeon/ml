@@ -142,6 +142,8 @@ def main():
         print(f"  runtime note  : {example_runtime.get('note')}")
     print(f"  joined cols   : {custom_report['joined_columns']}")
     print(f"  join coverage : {custom_report['coverage']:.2%}")
+    print(f"  exact matches : {custom_report['exact_match_count']}")
+    print(f"  exact allowed : {custom_report['allow_exact_matches']}")
     print(f"  stale hits    : {custom_report['stale_hit_count']}")
     print(f"  median age    : {custom_report['median_feature_age']}")
     print(f"  max age       : {custom_report['max_feature_age_observed']}")

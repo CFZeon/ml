@@ -11,7 +11,8 @@ import pandas as pd
 def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.0),
                           max_holding=10, min_return=0.0, cost_rate=0.0,
                           barrier_tie_break="sl",
-                          entry_prices=None, start_offset=0):
+                          entry_prices=None, start_offset=0,
+                          missing_future_policy="drop"):
     """Apply triple-barrier labeling.
 
     Three concurrent barriers decide the label per bar:
@@ -41,10 +42,14 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
     """
     pt_m, sl_m = pt_sl
     start_offset = max(0, int(start_offset))
+    missing_future_policy = str(missing_future_policy or "drop").strip().lower()
+    if missing_future_policy != "drop":
+        raise ValueError(f"Unsupported missing_future_policy={missing_future_policy!r}")
     high = close if high is None else high.reindex(close.index)
     low = close if low is None else low.reindex(close.index)
     _entry_series = entry_prices if entry_prices is not None else close
     rows = []
+    dropped_incomplete_future_windows = 0
 
     # Ensure we never index beyond the close series
     for i in range(len(close) - max_holding - start_offset):
@@ -62,6 +67,16 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
         future_close = close.iloc[i + start_offset: i + start_offset + max_holding]
         future_high = high.iloc[i + start_offset: i + start_offset + max_holding]
         future_low = low.iloc[i + start_offset: i + start_offset + max_holding]
+        if (
+            len(future_close) < max_holding
+            or len(future_high) < max_holding
+            or len(future_low) < max_holding
+            or future_close.isna().any()
+            or future_high.isna().any()
+            or future_low.isna().any()
+        ):
+            dropped_incomplete_future_windows += 1
+            continue
 
         label = None
         barrier = None
@@ -113,7 +128,28 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
             }
         )
 
-    return pd.DataFrame(rows).set_index("t0")
+    result = pd.DataFrame(rows)
+    if result.empty:
+        result = pd.DataFrame(
+            columns=[
+                "t1",
+                "label",
+                "barrier",
+                "entry_price",
+                "exit_price",
+                "gross_return",
+                "cost_rate",
+            ]
+        )
+        result.index.name = "t0"
+    else:
+        result = result.set_index("t0")
+    result.attrs["integrity_report"] = {
+        "missing_future_policy": missing_future_policy,
+        "dropped_incomplete_future_windows": int(dropped_incomplete_future_windows),
+        "retained_label_rows": int(len(result)),
+    }
+    return result
 
 
 def fixed_horizon_labels(close, horizon=5, threshold=0.0, cost_rate=0.0,

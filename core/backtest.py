@@ -57,26 +57,77 @@ def _build_default_funding_coverage_report(*, enabled=False, coverage_status="no
     }
 
 
-def _normalize_runtime_funding_rates(funding_rates, index, *, evaluation_mode="research_only"):
+def _resolve_runtime_funding_policy(*, evaluation_mode="research_only", funding_missing_policy=None):
+    resolved_mode = resolve_evaluation_mode({"evaluation_mode": evaluation_mode})
+    policy = {
+        "mode": "strict" if resolved_mode.is_capital_facing else "preserve_missing",
+    }
+    if isinstance(funding_missing_policy, str):
+        policy["mode"] = funding_missing_policy
+    elif isinstance(funding_missing_policy, dict):
+        policy.update(dict(funding_missing_policy))
+    policy["mode"] = str(policy.get("mode", "preserve_missing")).strip().lower()
+    if policy["mode"] == "preserve":
+        policy["mode"] = "preserve_missing"
+    if resolved_mode.is_capital_facing:
+        policy["mode"] = "strict"
+    return policy
+
+
+def _resolve_execution_price_input(close, execution_prices, *, evaluation_mode="research_only"):
+    resolved_mode = resolve_evaluation_mode({"evaluation_mode": evaluation_mode})
+    if execution_prices is None:
+        if resolved_mode.is_capital_facing:
+            mode_label = "Trade-ready" if resolved_mode.effective_mode == "trade_ready" else "Local certification"
+            raise ValueError(
+                f"{mode_label} backtests require explicit execution_prices; implicit close execution is not allowed"
+            )
+        return close, {
+            "source": "close_fallback",
+            "used_fallback": True,
+            "warning": "same_bar_execution_fallback",
+            "warnings": ["same_bar_execution_fallback"],
+        }
+    return execution_prices, {
+        "source": "explicit",
+        "used_fallback": False,
+        "warning": None,
+        "warnings": [],
+    }
+
+
+def _normalize_runtime_funding_rates(funding_rates, index, *, evaluation_mode="research_only", funding_missing_policy=None):
     if funding_rates is None:
         return None, _build_default_funding_coverage_report(enabled=False, coverage_status="not_applicable")
 
     resolved_mode = resolve_evaluation_mode({"evaluation_mode": evaluation_mode})
+    policy = _resolve_runtime_funding_policy(
+        evaluation_mode=evaluation_mode,
+        funding_missing_policy=funding_missing_policy,
+    )
     aligned = pd.Series(funding_rates, copy=False).reindex(index)
     missing_event_count = int(aligned.isna().sum())
-    coverage_status = "strict" if resolved_mode.is_capital_facing else "fallback"
+    mode = str(policy.get("mode") or "strict").strip().lower()
+    if mode in {"zero_fill", "zero_fill_debug"}:
+        coverage_status = "debug_fallback" if missing_event_count > 0 else "strict"
+    elif mode in {"preserve", "preserve_missing"}:
+        coverage_status = "incomplete" if missing_event_count > 0 else "strict"
+    else:
+        coverage_status = "strict"
     report = {
         "enabled": True,
         "coverage_status": coverage_status,
         "missing_event_count": missing_event_count,
         "coverage_reason": "missing_funding_events" if missing_event_count > 0 else None,
-        "promotion_pass": bool(not resolved_mode.is_capital_facing or missing_event_count == 0),
+        "promotion_pass": bool(missing_event_count == 0),
     }
-    if not resolved_mode.is_capital_facing:
+    if mode in {"zero_fill", "zero_fill_debug"}:
         report["fallback_assumption"] = "zero_fill_missing_funding_events"
         return aligned.fillna(0.0).astype(float), report
     if missing_event_count > 0:
-        raise RuntimeError("Funding coverage breach: missing_funding_events")
+        if resolved_mode.is_capital_facing or mode == "strict":
+            raise RuntimeError("Funding coverage breach: missing_funding_events")
+        return None, report
     return aligned.astype(float), report
 
 
@@ -1995,6 +2046,14 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
         "equity_curve": equity_curve,
     }
     if execution_report is not None:
+        execution_price_report = dict(execution_report.get("execution_price_report") or {})
+        scenario_report = dict(execution_report.get("scenario_report") or {})
+        backtest_warnings = list(
+            dict.fromkeys(
+                [str(value) for value in (execution_report.get("warnings") or []) if str(value)]
+                + [str(value) for value in (scenario_report.get("warnings") or []) if str(value)]
+            )
+        )
         summary.update(
             {
                 "blocked_orders": int(execution_report.get("blocked_orders", 0)),
@@ -2021,8 +2080,13 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
                 "order_ledger": execution_report.get("order_ledger", pd.DataFrame()),
                 "price_fill_actions": execution_report.get("price_fill_actions", {}),
                 "liquidity_report": execution_report.get("liquidity_report", {}),
-                "scenario_report": execution_report.get("scenario_report", {}),
+                "scenario_report": scenario_report,
                 "symbol_lifecycle_report": execution_report.get("symbol_lifecycle_report", {}),
+                "execution_price_report": execution_price_report,
+                "execution_price_source": execution_price_report.get("source"),
+                "same_bar_execution_fallback": bool(execution_price_report.get("used_fallback", False)),
+                "execution_price_warning": execution_price_report.get("warning"),
+                "backtest_warnings": backtest_warnings,
             }
         )
     if futures_account_report is not None:
@@ -2250,6 +2314,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  execution_prices=None, signal_delay_bars=1, engine="vectorbt",
                  market="spot", leverage=1.0, allow_short=None, symbol_filters=None,
                  funding_rates=None, significance=None, benchmark_returns=None,
+                 funding_missing_policy=None,
                  benchmark_sharpe=None, volume=None, slippage_model=None,
                  orderbook_depth=None, execution_price_policy="strict",
                  execution_price_fill_limit=None, valuation_price_policy="drop_rows",
@@ -2312,6 +2377,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
             "allow_short": allow_short,
             "symbol_filters": symbol_filters,
             "funding_rates": funding_rates,
+            "funding_missing_policy": funding_missing_policy,
             "significance": significance,
             "benchmark_returns": benchmark_returns,
             "benchmark_sharpe": benchmark_sharpe,
@@ -2351,6 +2417,11 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     allow_short = (market or "spot") != "spot" if allow_short is None else bool(allow_short)
     symbol_filters = dict(symbol_filters or {})
     tick_size = symbol_filters.get("tick_size")
+    execution_input, execution_price_report = _resolve_execution_price_input(
+        close,
+        execution_prices,
+        evaluation_mode=evaluation_mode,
+    )
 
     valuation_series, valuation_fill_actions = _normalize_price_series(
         close,
@@ -2360,7 +2431,6 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         return_diagnostics=True,
         series_name="valuation",
     )
-    execution_input = execution_prices if execution_prices is not None else close
     execution_series, execution_fill_actions = _normalize_price_series(
         execution_input,
         tick_size=tick_size,
@@ -2442,6 +2512,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         "execution": execution_fill_actions,
         "valuation": valuation_fill_actions,
     }
+    execution_report["execution_price_report"] = execution_price_report
+    execution_report["warnings"] = list(dict.fromkeys([str(value) for value in (execution_price_report.get("warnings") or []) if str(value)]))
     execution_report["liquidity_report"] = liquidity_inputs["diagnostics"]
     execution_report = apply_execution_scenarios(
         execution_report,
@@ -2513,6 +2585,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         funding_rates,
         executable_position.index,
         evaluation_mode=evaluation_mode,
+        funding_missing_policy=funding_missing_policy,
     )
 
     resolved_futures_account = _normalize_futures_account_config(

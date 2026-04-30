@@ -80,7 +80,6 @@ def _build_trade_ready_example_config(*, automl_storage, power_profile):
                 "features": {
                     "schema_version": "indicator_aware_v7_trade_ready_profile",
                     "lookahead_guard": {
-                            "enabled": False,
                         "mode": "blocking",
                         "decision_sample_size": 16,
                         "min_prefix_rows": 160,

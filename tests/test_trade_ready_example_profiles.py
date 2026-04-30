@@ -27,6 +27,7 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
         features = config["features"]
         data = config["data"]
         backtest = config["backtest"]
+        data_quality = config["data_quality"]
         self.assertEqual(data["duplicate_policy"], "fail")
         self.assertEqual(data["futures_context"]["recent_stats_availability_lag"], "period_close")
         self.assertEqual(features["context_missing_policy"]["mode"], "preserve_missing")
@@ -34,6 +35,8 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
         self.assertEqual(float(features["futures_context_ttl"]["max_unknown_rate"]), 0.0)
         self.assertEqual(features["cross_asset_context_ttl"]["max_age"], "2h")
         self.assertEqual(backtest["evaluation_mode"], "research_only")
+        self.assertTrue(data_quality["exclude_flagged_quarantine_rows_from_modeling"])
+        self.assertEqual(data_quality["actions"]["return_spike"], "null")
 
     def test_futures_builder_enables_strict_context_and_funding_guardrails(self):
         config = build_futures_research_config(
@@ -48,6 +51,7 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
         features = config["features"]
         data = config["data"]
         backtest = config["backtest"]
+        data_quality = config["data_quality"]
         self.assertEqual(data["duplicate_policy"], "fail")
         self.assertEqual(data["futures_context"]["recent_stats_availability_lag"], "period_close")
         self.assertEqual(features["context_missing_policy"]["mode"], "preserve_missing")
@@ -56,6 +60,8 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
         self.assertEqual(backtest["evaluation_mode"], "research_only")
         self.assertEqual(backtest["funding_missing_policy"]["mode"], "strict")
         self.assertEqual(backtest["funding_missing_policy"]["expected_interval"], "8h")
+        self.assertTrue(data_quality["exclude_flagged_quarantine_rows_from_modeling"])
+        self.assertEqual(data_quality["actions"]["quote_volume_inconsistency"], "null")
 
     def test_trade_ready_automl_profile_enables_binding_controls(self):
         overrides = build_trade_ready_automl_overrides(
@@ -124,6 +130,7 @@ class TradeReadyExampleProfileTests(unittest.TestCase):
         self.assertEqual(overrides["data"]["gap_policy"], "fail")
         self.assertEqual(overrides["data"]["duplicate_policy"], "fail")
         self.assertTrue(overrides["data_quality"]["block_on_quarantine"])
+        self.assertTrue(overrides["data_quality"]["exclude_flagged_quarantine_rows_from_modeling"])
         self.assertTrue(overrides["signals"]["require_paper_verification_for_kelly"])
         self.assertTrue(overrides["signals"]["require_live_calibration_for_kelly"])
         self.assertAlmostEqual(float(overrides["signals"]["uncalibrated_kelly_fraction_cap"]), 0.25, places=12)

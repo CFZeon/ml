@@ -964,6 +964,7 @@ def _run_pipeline_lookahead_guard(pipeline):
     guard_config = _resolve_lookahead_guard_config(pipeline)
     report = {
         **guard_config,
+        "status": "pending",
         "has_bias": False,
         "promotion_pass": True,
         "reasons": [],
@@ -976,6 +977,9 @@ def _run_pipeline_lookahead_guard(pipeline):
         "artifact_reports": {},
     }
     if not guard_config["enabled"]:
+        report["status"] = "disabled"
+        report["promotion_pass"] = False
+        report["reasons"] = ["lookahead_guard_disabled"]
         pipeline.state["lookahead_guard_report"] = report
         return report
 
@@ -998,6 +1002,9 @@ def _run_pipeline_lookahead_guard(pipeline):
         ]
     if not available_step_names:
         report["audit_skipped"] = True
+        report["status"] = "skipped"
+        report["promotion_pass"] = False
+        report["reasons"] = ["lookahead_guard_skipped"]
         pipeline.state["lookahead_guard_report"] = report
         return report
 
@@ -1030,6 +1037,7 @@ def _run_pipeline_lookahead_guard(pipeline):
 
     report.update(
         {
+            "status": "failed" if bool(audit.get("has_bias", False)) else "passed",
             "has_bias": bool(audit.get("has_bias", False)),
             "promotion_pass": not bool(audit.get("has_bias", False)),
             "reasons": failure_reasons,
@@ -1062,8 +1070,9 @@ def _run_pipeline_lookahead_guard(pipeline):
 def _resolve_backtest_funding_missing_policy(backtest_config):
     evaluation_mode = resolve_evaluation_mode(backtest_config)
     configured = backtest_config.get("funding_missing_policy")
+    allow_missing_configured = isinstance(configured, dict) and "allow_missing_events" in configured
     policy = {
-        "mode": "strict" if evaluation_mode.is_capital_facing else "zero_fill",
+        "mode": "strict" if evaluation_mode.is_capital_facing else "preserve_missing",
         "expected_interval": "8h",
         "max_gap_multiplier": 1.25 if evaluation_mode.is_capital_facing else 1.5,
         "allow_missing_events": not evaluation_mode.is_capital_facing,
@@ -1075,10 +1084,17 @@ def _resolve_backtest_funding_missing_policy(backtest_config):
     if evaluation_mode.is_capital_facing:
         policy["mode"] = "strict"
         policy["allow_missing_events"] = False
-    policy["mode"] = str(policy.get("mode", "zero_fill")).strip().lower()
+    policy["mode"] = str(policy.get("mode", "preserve_missing")).strip().lower()
+    if policy["mode"] == "preserve":
+        policy["mode"] = "preserve_missing"
     policy["expected_interval"] = pd.Timedelta(policy.get("expected_interval", "8h"))
     policy["max_gap_multiplier"] = float(policy.get("max_gap_multiplier", 1.5))
-    policy["allow_missing_events"] = bool(policy.get("allow_missing_events", policy["mode"] not in {"strict", "preserve", "preserve_missing"}))
+    if evaluation_mode.is_capital_facing:
+        policy["allow_missing_events"] = False
+    elif allow_missing_configured:
+        policy["allow_missing_events"] = bool(policy.get("allow_missing_events"))
+    else:
+        policy["allow_missing_events"] = bool(policy["mode"] not in {"strict", "preserve", "preserve_missing"})
     return policy
 
 
@@ -1098,6 +1114,7 @@ def _resolve_pipeline_data_quality_config(pipeline):
     evaluation_mode = resolve_evaluation_mode(backtest_config)
     if evaluation_mode.is_capital_facing:
         config.setdefault("block_on_quarantine", True)
+        config.setdefault("exclude_flagged_quarantine_rows_from_modeling", True)
     return config
 
 
@@ -1107,6 +1124,15 @@ def _store_backtest_funding_report(pipeline, report):
     context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
     context_ttl_report["backtest_funding"] = report
     pipeline.state["context_ttl_report"] = context_ttl_report
+
+
+def _resolve_funding_coverage_status(policy, *, has_missing):
+    mode = str((policy or {}).get("mode") or "strict").strip().lower()
+    if mode in {"zero_fill", "zero_fill_debug"}:
+        return "debug_fallback" if has_missing else "strict"
+    if mode in {"preserve", "preserve_missing"}:
+        return "incomplete" if has_missing else "strict"
+    return "strict"
 
 
 def _append_unique_reason(reasons, value):
@@ -1325,14 +1351,14 @@ def _align_backtest_funding_rates(funding_rates, index, policy):
                 "max_gap_multiplier": float(policy["max_gap_multiplier"]),
                 "allow_missing_events": bool(policy.get("allow_missing_events", False)),
             },
-            "coverage_status": "fallback" if bool(policy.get("allow_missing_events", False)) else "strict",
+            "coverage_status": _resolve_funding_coverage_status(policy, has_missing=True),
             "expected_timestamps": [],
             "observed_timestamps": [],
             "missing_event_count": 0,
             "max_consecutive_gap": str(pd.Timedelta(0)),
             "coverage_ratio": 0.0,
             "coverage_reason": "funding_unavailable",
-            "promotion_pass": bool(policy.get("allow_missing_events", False)),
+            "promotion_pass": False,
         }
 
     aligned_index = pd.DatetimeIndex(index)
@@ -1362,15 +1388,17 @@ def _align_backtest_funding_rates(funding_rates, index, policy):
                 "max_gap_multiplier": float(policy["max_gap_multiplier"]),
                 "allow_missing_events": bool(policy.get("allow_missing_events", False)),
             },
-            "coverage_status": "fallback" if bool(policy.get("allow_missing_events", False)) else "strict",
+            "coverage_status": _resolve_funding_coverage_status(policy, has_missing=len(expected_timestamps) > 0),
             "expected_timestamps": [_json_ready(timestamp) for timestamp in expected_timestamps],
             "observed_timestamps": [],
             "missing_event_count": int(len(expected_timestamps)),
             "max_consecutive_gap": str(max_allowed_gap if len(expected_timestamps) > 0 else pd.Timedelta(0)),
             "coverage_ratio": 0.0,
             "coverage_reason": "no_observed_funding_events",
-            "promotion_pass": bool(policy.get("allow_missing_events", False)),
+            "promotion_pass": False,
         }
+        if str(policy.get("mode") or "").strip().lower() in {"zero_fill", "zero_fill_debug"} and len(expected_timestamps) > 0:
+            report["fallback_assumption"] = "zero_fill_missing_funding_events"
         return aligned, report
 
     observed_index = pd.DatetimeIndex(observed.index)
@@ -1402,7 +1430,7 @@ def _align_backtest_funding_rates(funding_rates, index, policy):
             "max_gap_multiplier": float(policy["max_gap_multiplier"]),
             "allow_missing_events": bool(policy.get("allow_missing_events", False)),
         },
-        "coverage_status": "fallback" if bool(policy.get("allow_missing_events", False)) else "strict",
+        "coverage_status": _resolve_funding_coverage_status(policy, has_missing=bool(breach_reasons)),
         "expected_timestamps": [_json_ready(timestamp) for timestamp in expected_timestamps],
         "observed_timestamps": [_json_ready(timestamp) for timestamp in observed_index],
         "missing_event_count": int(len(missing_expected_timestamps)),
@@ -1417,6 +1445,8 @@ def _align_backtest_funding_rates(funding_rates, index, policy):
         "coverage_reason": None if not breach_reasons else ",".join(breach_reasons),
         "promotion_pass": len(breach_reasons) == 0,
     }
+    if str(policy.get("mode") or "").strip().lower() in {"zero_fill", "zero_fill_debug"} and breach_reasons:
+        report["fallback_assumption"] = "zero_fill_missing_funding_events"
     return aligned, report
 
 
@@ -1448,7 +1478,7 @@ def _resolve_backtest_funding_rates(pipeline, index):
         return None
 
     funding_policy = _resolve_backtest_funding_missing_policy(backtest_config)
-    strict_funding_policy = funding_policy["mode"] in {"strict", "preserve", "preserve_missing"}
+    strict_funding_policy = funding_policy["mode"] == "strict"
     futures_context = pipeline.state.get("futures_context") or {}
     funding_frame = futures_context.get("funding")
     if funding_frame is None or funding_frame.empty or "funding_rate" not in funding_frame.columns:
@@ -1461,15 +1491,17 @@ def _resolve_backtest_funding_rates(pipeline, index):
                 "max_gap_multiplier": float(funding_policy["max_gap_multiplier"]),
                 "allow_missing_events": bool(funding_policy.get("allow_missing_events", False)),
             },
-            "coverage_status": "fallback" if bool(funding_policy.get("allow_missing_events", False)) else "strict",
+            "coverage_status": _resolve_funding_coverage_status(funding_policy, has_missing=True),
             "expected_timestamps": [],
             "observed_timestamps": [],
             "missing_event_count": 0,
             "max_consecutive_gap": str(pd.Timedelta(0)),
             "coverage_ratio": 0.0,
             "coverage_reason": "funding_frame_missing",
-            "promotion_pass": not strict_funding_policy,
+            "promotion_pass": False,
         }
+        if funding_policy["mode"] in {"zero_fill", "zero_fill_debug"}:
+            report["fallback_assumption"] = "zero_fill_missing_funding_events"
         _store_backtest_funding_report(pipeline, report)
         if strict_funding_policy:
             raise RuntimeError("Funding coverage gate failed: funding_frame_missing")
@@ -1522,6 +1554,7 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
     backtest_config = pipeline.section("backtest")
     market = _resolve_backtest_market(pipeline)
     raw_data = pipeline.require("raw_data")
+    funding_missing_policy = _resolve_backtest_funding_missing_policy(backtest_config)
     allow_short = backtest_config.get("allow_short")
     if allow_short is None:
         allow_short = market != "spot"
@@ -1553,6 +1586,7 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "allow_short": bool(allow_short),
         "symbol_filters": pipeline.state.get("symbol_filters"),
         "funding_rates": _resolve_backtest_funding_rates(pipeline, index),
+        "funding_missing_policy": funding_missing_policy,
         "volume": raw_data["volume"].reindex(index).fillna(0.0) if "volume" in raw_data.columns else None,
         "liquidity_lag_bars": _resolve_backtest_liquidity_lag_bars(pipeline),
         "execution_policy": _resolve_backtest_execution_policy(pipeline),
@@ -3230,9 +3264,20 @@ class FetchDataStep(PipelineStep):
                 "snapshot_timestamp": universe_snapshot.snapshot_timestamp,
                 "market": universe_snapshot.market,
                 "source": universe_snapshot.source,
+                "survivorship_safe": bool(
+                    universe_config.get("survivorship_safe", universe_snapshot.source != "synthetic_example_snapshot")
+                ),
+                "liquidity_source": universe_config.get("liquidity_source"),
             }
             pipeline.state["eligible_symbols"] = list(universe_report.get("eligible_symbols", []))
             pipeline.state["universe_report"] = universe_report
+
+            evaluation_mode = resolve_evaluation_mode(pipeline.section("backtest"))
+            if (
+                evaluation_mode.is_capital_facing
+                and str(universe_snapshot.source or "").strip().lower() == "synthetic_example_snapshot"
+            ):
+                raise ValueError("Synthetic example universe snapshot is not allowed in capital-facing modes")
 
         market_data, integrity_report = fetch_binance_bars(**config, return_report=True)
         data = market_data.copy()
@@ -3356,6 +3401,7 @@ class DataQualityStep(PipelineStep):
         pipeline.state["raw_data"] = clean_raw
         pipeline.state["data"] = data.reindex(clean_index).copy()
         pipeline.state["data_quality_mask"] = result.quarantine_mask
+        pipeline.state["data_quality_disposition"] = result.row_disposition
         pipeline.state["data_quality_report"] = result.report
         _refresh_active_dataset_manifests(pipeline, data_quality_report=result.report)
         if result.report.get("blocking"):
@@ -3694,6 +3740,7 @@ class LabelsStep(PipelineStep):
                 barrier_tie_break=config.get("barrier_tie_break", "sl"),
                 entry_prices=entry_prices,
                 start_offset=start_offset,
+                missing_future_policy=config.get("missing_future_policy", "drop"),
             )
         elif label_kind == "fixed_horizon":
             labels = fixed_horizon_labels(
@@ -3720,6 +3767,9 @@ class LabelsStep(PipelineStep):
         else:
             raise ValueError(f"Unsupported label kind={label_kind!r}")
 
+        data_quality_report = pipeline.state.get("data_quality_report")
+        if data_quality_report:
+            labels.attrs["data_quality_report"] = data_quality_report
         pipeline.state["labels"] = labels
         return labels
 
@@ -4770,13 +4820,13 @@ class TrainModelsStep(PipelineStep):
             "operational_monitoring": operational_monitoring,
             "context_ttl_report": context_ttl_report,
             "promotion_gates": {
-                "feature_portability": bool(feature_portability_diagnostics.get("promotion_pass", True)),
-                "feature_admission": bool(feature_admission_summary.get("promotion_pass", True)),
-                "regime_stability": bool(regime_ablation_summary.get("promotion_pass", True)),
+                "feature_portability": bool(feature_portability_diagnostics and feature_portability_diagnostics.get("promotion_pass", False)),
+                "feature_admission": bool(feature_admission_summary and feature_admission_summary.get("promotion_pass", False)),
+                "regime_stability": bool(regime_ablation_summary and regime_ablation_summary.get("promotion_pass", False)),
                 "operational_health": bool(operational_monitoring.get("healthy", True)),
-                "cross_venue_integrity": bool(reference_integrity_report.get("promotion_pass", True)),
-                "data_certification": bool(data_certification_report.get("promotion_pass", True)),
-                "signal_decay": bool(signal_decay.get("promotion_pass", True)),
+                "cross_venue_integrity": bool(reference_integrity_report and reference_integrity_report.get("promotion_pass", False)),
+                "data_certification": bool(data_certification_report and data_certification_report.get("promotion_pass", False)),
+                "signal_decay": bool(signal_decay and signal_decay.get("promotion_pass", False)),
                 "lookahead_guard": bool(lookahead_guard_report.get("promotion_pass", True)),
             },
             "regime": {

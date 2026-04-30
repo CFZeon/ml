@@ -1,7 +1,9 @@
 import unittest
+from pathlib import Path
 
 from core import ResearchPipeline
 from core.pipeline import _resolve_lookahead_guard_config
+from example_trade_ready_automl import build_trade_ready_example_config
 
 
 class GlobalLookaheadGuardDefaultTest(unittest.TestCase):
@@ -22,6 +24,18 @@ class GlobalLookaheadGuardDefaultTest(unittest.TestCase):
         self.assertEqual(guard["mode"], "advisory")
         self.assertFalse(guard["trade_ready_mode"])
         self.assertFalse(guard["automl_enabled"])
+
+    def test_trade_ready_example_keeps_lookahead_guard_enabled(self):
+        config = build_trade_ready_example_config(
+            automl_storage=Path(".cache") / "test_trade_ready_lookahead_guard.db"
+        )
+
+        pipeline = ResearchPipeline(config)
+        guard = _resolve_lookahead_guard_config(pipeline)
+
+        self.assertTrue(guard["enabled"])
+        self.assertEqual(guard["mode"], "blocking")
+        self.assertTrue(guard["trade_ready_mode"])
 
 
 if __name__ == "__main__":

@@ -448,6 +448,7 @@ def build_signal_decay_report(
             "effective_delay_bars": int(effective_delay_bars),
             "holding_bars": int(holding_bars),
             "policy": policy,
+            "status": "unknown",
             "promotion_pass": True,
             "gate_mode": "disabled",
             "reasons": [],
@@ -522,6 +523,7 @@ def build_signal_decay_report(
 
     if low_sample_advisory:
         warnings.append("insufficient_realized_decay_trade_count")
+        reasons.append("signal_decay_evidence_insufficient")
         gate_mode = "advisory"
     else:
         if net_edge_at_effective_delay is None or not np.isfinite(float(net_edge_at_effective_delay)) or float(net_edge_at_effective_delay) <= 0.0:
@@ -531,7 +533,8 @@ def build_signal_decay_report(
 
         if half_life_bars is None or float(half_life_bars) < float(required_half_life_bars):
             reasons.append("signal_half_life_below_requirement")
-        promotion_pass = not reasons
+    status = "unknown" if low_sample_advisory else ("failed" if reasons else "passed")
+    promotion_pass = status == "passed"
 
     report = {
         "enabled": True,
@@ -543,6 +546,7 @@ def build_signal_decay_report(
         "holding_bars": int(holding_bars),
         "policy": policy,
         "required_half_life_bars": float(required_half_life_bars),
+        "status": status,
         "promotion_pass": bool(promotion_pass),
         "gate_mode": gate_mode,
         "reasons": reasons,

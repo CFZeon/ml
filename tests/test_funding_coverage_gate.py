@@ -21,6 +21,12 @@ class FundingCoverageGateTest(unittest.TestCase):
         self.assertTrue(mode.is_research_only)
         self.assertFalse(mode.is_capital_facing)
 
+    def test_research_defaults_to_preserve_missing_funding_policy(self):
+        policy = _resolve_backtest_funding_missing_policy({"evaluation_mode": "research_only"})
+
+        self.assertEqual(policy["mode"], "preserve_missing")
+        self.assertFalse(policy["allow_missing_events"])
+
     def test_trade_ready_defaults_to_strict_funding_policy(self):
         policy = _resolve_backtest_funding_missing_policy({"evaluation_mode": "trade_ready"})
 
@@ -57,6 +63,7 @@ class FundingCoverageGateTest(unittest.TestCase):
         self.assertEqual(data_config["gap_policy"], "fail")
         self.assertEqual(data_config["duplicate_policy"], "fail")
         self.assertTrue(data_quality_config["block_on_quarantine"])
+        self.assertTrue(data_quality_config["exclude_flagged_quarantine_rows_from_modeling"])
 
     def test_trade_ready_blocks_missing_funding_even_when_zero_fill_is_requested(self):
         index = pd.date_range("2026-02-01", periods=24, freq="1h", tz="UTC")
@@ -74,6 +81,27 @@ class FundingCoverageGateTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "Funding coverage gate failed: funding_frame_missing"):
             _resolve_backtest_funding_rates(pipeline, index)
+
+    def test_research_preserve_missing_marks_funding_frame_as_incomplete(self):
+        index = pd.date_range("2026-02-01", periods=24, freq="1h", tz="UTC")
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h", "market": "um_futures"},
+                "backtest": {
+                    "evaluation_mode": "research_only",
+                    "apply_funding": True,
+                },
+            }
+        )
+        pipeline.state["futures_context"] = {}
+
+        funding = _resolve_backtest_funding_rates(pipeline, index)
+
+        self.assertIsNone(funding)
+        report = pipeline.state["context_ttl_report"]["backtest_funding"]
+        self.assertEqual(report["coverage_status"], "incomplete")
+        self.assertFalse(report["promotion_pass"])
+        self.assertEqual(report["coverage_reason"], "funding_frame_missing")
 
 
 if __name__ == "__main__":

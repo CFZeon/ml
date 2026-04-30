@@ -614,6 +614,16 @@ def summarize_regime_ablation_reports(reports):
         if row.get("full_provenance", {}).get("contextual_share") is not None
     ]
 
+    if not required_rows:
+        status = "unknown"
+        reasons = ["regime_ablation_evidence_missing"]
+    elif failed_rows:
+        status = "failed"
+        reasons = ["regime_stability_failed"]
+    else:
+        status = "passed"
+        reasons = []
+
     return {
         "fold_count": int(len(rows)),
         "required_fold_count": int(len(required_rows)),
@@ -621,7 +631,9 @@ def summarize_regime_ablation_reports(reports):
         "avg_contextual_share": float(np.mean(contextual_shares)) if contextual_shares else 0.0,
         "avg_agreement_rate": float(np.mean(agreement_rates)) if agreement_rates else None,
         "avg_persistence_improvement": float(np.mean(improvements)) if improvements else None,
-        "promotion_pass": not failed_rows,
+        "status": status,
+        "promotion_pass": status == "passed",
+        "reasons": reasons,
     }
 
 

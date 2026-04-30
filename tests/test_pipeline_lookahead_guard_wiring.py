@@ -1,6 +1,6 @@
 import unittest
 
-from core.automl import _resolve_selection_policy
+from core.automl import _resolve_lookahead_guard_gate, _resolve_selection_policy
 from core.promotion import (
     create_promotion_eligibility_report,
     finalize_promotion_eligibility_report,
@@ -10,6 +10,20 @@ from core.promotion import (
 
 
 class PipelineLookaheadGuardWiringTest(unittest.TestCase):
+    def test_missing_lookahead_guard_is_not_treated_as_pass(self):
+        outcome = _resolve_lookahead_guard_gate({})
+
+        self.assertFalse(outcome["passed"])
+        self.assertEqual(outcome["reason"], "lookahead_guard_missing")
+
+    def test_disabled_lookahead_guard_is_not_treated_as_pass(self):
+        outcome = _resolve_lookahead_guard_gate(
+            {"lookahead_guard": {"enabled": False, "status": "disabled"}}
+        )
+
+        self.assertFalse(outcome["passed"])
+        self.assertEqual(outcome["reason"], "lookahead_guard_disabled")
+
     def test_lookahead_guard_failure_is_blocking_under_default_selection_policy(self):
         selection_policy = _resolve_selection_policy({})
         lookahead_guard = {

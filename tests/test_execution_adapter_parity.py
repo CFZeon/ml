@@ -41,6 +41,7 @@ class ExecutionAdapterParityTest(unittest.TestCase):
         result = run_backtest(
             close,
             signals,
+            execution_prices=close,
             engine="pandas",
             signal_delay_bars=0,
             volume=pd.Series(10_000.0, index=index),
