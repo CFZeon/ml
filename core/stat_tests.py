@@ -18,6 +18,34 @@ def _coerce_return_frame(return_frame, selected_columns=None):
     return frame.dropna(axis=1, how="all")
 
 
+def _safe_abs_correlation(overlap_frame, variance_floor=1e-12):
+    overlap = pd.DataFrame(overlap_frame, copy=False)
+    if overlap.shape[1] < 2 or overlap.empty:
+        return None
+
+    values = overlap.to_numpy(dtype=float)
+    left = values[:, 0]
+    right = values[:, 1]
+    if len(left) < 2:
+        return None
+
+    left_std = float(np.std(left, ddof=1))
+    right_std = float(np.std(right, ddof=1))
+    if not np.isfinite(left_std) or not np.isfinite(right_std):
+        return None
+    if left_std <= float(variance_floor) or right_std <= float(variance_floor):
+        return 1.0 if np.allclose(left, right, atol=variance_floor, rtol=0.0) else 0.0
+
+    left_centered = left - float(np.mean(left))
+    right_centered = right - float(np.mean(right))
+    denominator = float(np.linalg.norm(left_centered) * np.linalg.norm(right_centered))
+    if denominator <= float(variance_floor):
+        return 0.0
+
+    correlation = float(np.dot(left_centered, right_centered) / denominator)
+    return float(abs(np.clip(correlation, -1.0, 1.0)))
+
+
 def _summarize_pairwise_overlap(coverage_frame, min_overlap_fraction=0.0, min_overlap_observations=0):
     coverage = pd.DataFrame(coverage_frame, copy=False).fillna(False).astype(bool)
     overlap_counts = []
@@ -90,7 +118,7 @@ def select_post_selection_candidates(
             overlap = pd.concat([candidate_series, frame[kept_trial]], axis=1).dropna()
             if len(overlap) < int(min_overlap_observations):
                 continue
-            correlation = float(abs(overlap.iloc[:, 0].corr(overlap.iloc[:, 1])))
+            correlation = _safe_abs_correlation(overlap)
             if np.isfinite(correlation) and correlation >= float(correlation_threshold):
                 correlated_with = {
                     "correlated_with_trial_number": int(kept_trial),

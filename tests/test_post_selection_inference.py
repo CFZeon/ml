@@ -1,4 +1,5 @@
 import unittest
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -136,6 +137,32 @@ class PostSelectionInferenceTest(unittest.TestCase):
         self.assertLessEqual(report["selected_candidate_count"], 3)
         self.assertIn(0, report["selected_trial_numbers"])
         self.assertTrue(any(item["discarded_trial_number"] == 1 for item in report["discarded_due_to_correlation"]))
+
+    def test_candidate_selection_handles_constant_series_without_runtime_warning(self):
+        index = pd.date_range("2026-07-01", periods=64, freq="1h", tz="UTC")
+        frame = pd.DataFrame(
+            {
+                0: np.full(len(index), 0.001, dtype=float),
+                1: np.full(len(index), 0.001, dtype=float),
+                2: np.full(len(index), -0.001, dtype=float),
+            },
+            index=index,
+        )
+        trial_reports = [{"number": 0}, {"number": 1}, {"number": 2}]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            report = select_post_selection_candidates(
+                trial_reports,
+                frame,
+                max_candidates=3,
+                correlation_threshold=0.95,
+                min_overlap_observations=20,
+            )
+
+        self.assertIn(0, report["selected_trial_numbers"])
+        self.assertTrue(any(item["discarded_trial_number"] == 1 for item in report["discarded_due_to_correlation"]))
+
 
     def test_automl_selection_report_includes_post_selection_results_and_gate(self):
         matrix = self._make_return_matrix(seed=4, rows=260, cols=3)

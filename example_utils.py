@@ -1520,6 +1520,19 @@ def print_automl_summary(automl):
     if automl.get("best_value_raw") is not None:
         print(f"  raw value    : {_format_metric(automl.get('best_value_raw'))}")
     print(f"  best params  : {automl.get('best_params')}")
+    if automl.get("best_params") is None:
+        top_trials = list(automl.get("top_trials") or [])
+        if top_trials:
+            rejected = top_trials[0]
+            print(
+                "  best reject  : "
+                f"raw={_format_metric(rejected.get('raw_value'))}  "
+                f"selection={_format_metric(rejected.get('value'))}"
+            )
+            rejection_reasons = list((automl.get("selection_outcome") or {}).get("top_rejection_reasons") or [])
+            if not rejection_reasons:
+                rejection_reasons = list(((rejected.get("selection_policy") or {}).get("eligibility_reasons") or []))
+            print(f"  reject why   : {rejection_reasons if rejection_reasons else 'none'}")
     validation_sources = automl.get("validation_sources") or {}
     if validation_sources:
         print(

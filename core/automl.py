@@ -2219,13 +2219,17 @@ def _build_evaluation_record(training, backtest, objective_name, automl_config, 
         backtest_summary,
         automl_config,
     )
-    raw_objective_value = float(objective_diagnostics["final_score"])
+    raw_objective_value = _coerce_float(objective_diagnostics.get("raw_score"))
+    if raw_objective_value is None:
+        raw_objective_value = float(objective_diagnostics["final_score"])
+    gated_objective_value = float(objective_diagnostics["final_score"])
     record = {
         "training": training_summary,
         "backtest": backtest_summary,
         "returns": returns,
         "period_sharpe": period_sharpe,
         "raw_objective_value": float(raw_objective_value),
+        "gated_objective_value": float(gated_objective_value),
         "objective_diagnostics": objective_diagnostics,
     }
     if split is not None:

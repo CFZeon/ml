@@ -247,6 +247,8 @@ Run the local certification AutoML example:
 python example_local_certification_automl.py
 ```
 
+When strict local-certification gates reject every completed trial, the summary now prints `best reject` with the candidate's finite raw objective plus the gated rejection reasons instead of collapsing the entire study into opaque `-inf` trial output. The same path now also handles constant post-selection return vectors without NumPy divide warnings.
+
 Run the drift retraining example:
 
 ```bash
