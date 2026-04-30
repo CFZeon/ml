@@ -3,6 +3,7 @@ import unittest
 import pandas as pd
 
 from core import ResearchPipeline
+from core.evaluation_modes import resolve_evaluation_mode
 from core.pipeline import (
     _resolve_backtest_funding_missing_policy,
     _resolve_backtest_funding_rates,
@@ -12,6 +13,14 @@ from core.pipeline import (
 
 
 class FundingCoverageGateTest(unittest.TestCase):
+    def test_research_demo_alias_resolves_to_research_only_profile(self):
+        mode = resolve_evaluation_mode({"evaluation_mode": "research_demo"})
+
+        self.assertEqual(mode.requested_mode, "research_only")
+        self.assertEqual(mode.effective_mode, "research_demo")
+        self.assertTrue(mode.is_research_only)
+        self.assertFalse(mode.is_capital_facing)
+
     def test_trade_ready_defaults_to_strict_funding_policy(self):
         policy = _resolve_backtest_funding_missing_policy({"evaluation_mode": "trade_ready"})
 

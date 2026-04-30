@@ -160,6 +160,30 @@ class DerivativesContextPipelineTest(unittest.TestCase):
         self.assertEqual(frame.attrs["availability_policy"]["mode"], "period_close")
         self.assertEqual(frame.attrs["availability_policy"]["index"], "publication_time")
 
+    def test_futures_context_zscore_is_prefix_invariant(self):
+        index = pd.date_range("2026-02-01", periods=80, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        futures_context = _make_futures_context(index, raw_data["close"].to_numpy())
+        cutoff = index[39]
+
+        full = build_futures_context_feature_block(raw_data, futures_context, rolling_window=20).frame
+        prefix = build_futures_context_feature_block(
+            raw_data.loc[:cutoff],
+            {name: frame.loc[:cutoff] for name, frame in futures_context.items()},
+            rolling_window=20,
+        ).frame
+
+        self.assertAlmostEqual(
+            float(full.loc[cutoff, "fut_mark_spread_z"]),
+            float(prefix.loc[cutoff, "fut_mark_spread_z"]),
+            places=12,
+        )
+        self.assertAlmostEqual(
+            float(full.loc[cutoff, "fut_premium_z"]),
+            float(prefix.loc[cutoff, "fut_premium_z"]),
+            places=12,
+        )
+
     def test_trend_scanning_labels_capture_non_zero_events(self):
         index = pd.date_range("2026-01-01", periods=180, freq="1h", tz="UTC")
         prices = pd.Series(100.0 + np.linspace(0.0, 10.0, len(index)) + 2.0 * np.sin(np.linspace(0.0, 6.0 * np.pi, len(index))), index=index)

@@ -244,6 +244,7 @@ class LocalRegistryStore:
             "version_id",
             "symbol",
             "created_at",
+            "promoted_at",
             "initial_status",
             "current_status",
             "version_dir",
@@ -392,6 +393,7 @@ class LocalRegistryStore:
             current_status=status,
             version_dir=version_dir,
         )
+        row["promoted_at"] = None
         if index.empty:
             index = pd.DataFrame([row])
         else:
@@ -519,6 +521,8 @@ class LocalRegistryStore:
 
         target_mask = index["version_id"].astype(str) == str(version_id)
         index.loc[target_mask, "current_status"] = stage
+        if stage == "champion":
+            index.loc[target_mask, "promoted_at"] = pd.Timestamp.now(tz="UTC").isoformat()
         self._write_index(index)
         if decision is not None:
             self.record_promotion_decision(version_id, decision, symbol=symbol)
@@ -539,7 +543,9 @@ class LocalRegistryStore:
         if not current_champion.empty:
             current_id = str(current_champion.iloc[0]["version_id"])
             index.loc[index["version_id"].astype(str) == current_id, "current_status"] = "archived"
-        index.loc[index["version_id"].astype(str) == target_version_id, "current_status"] = "champion"
+        target_mask = index["version_id"].astype(str) == target_version_id
+        index.loc[target_mask, "current_status"] = "champion"
+        index.loc[target_mask, "promoted_at"] = pd.Timestamp.now(tz="UTC").isoformat()
         self._write_index(index)
         return self._find_row(target_version_id, symbol=symbol)
 

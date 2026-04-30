@@ -7,6 +7,7 @@ import pandas as pd
 from core import (
     LocalRegistryStore,
     ResearchPipeline,
+    build_operational_limits_report,
     build_model,
     create_promotion_eligibility_report,
     finalize_promotion_eligibility_report,
@@ -66,6 +67,17 @@ def _make_drift_inputs(current_periods=240):
         np.r_[np.full(len(current_index) // 2, 0.6), np.full(len(current_index) - (len(current_index) // 2), -0.4)],
         index=current_index,
     )
+    return reference_features, current_features, reference_predictions, current_predictions, performance
+
+
+def _make_stable_drift_inputs(current_periods=240):
+    reference_index = pd.date_range("2026-10-01", periods=300, freq="1h", tz="UTC")
+    current_index = pd.date_range("2026-11-01", periods=current_periods, freq="1h", tz="UTC")
+    reference_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=reference_index)
+    current_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=current_index)
+    reference_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=reference_index)
+    current_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=current_index)
+    performance = pd.Series(np.zeros(len(current_index)), index=current_index)
     return reference_features, current_features, reference_predictions, current_predictions, performance
 
 
@@ -164,6 +176,34 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             self.assertIn("cooldown_active", result["drift_guardrails"]["reasons"])
             self.assertEqual(build_calls, [])
 
+    def test_model_ttl_expiry_can_promote_challenger_without_drift_signals(self):
+        reference_features, current_features, reference_predictions, current_predictions, performance = _make_stable_drift_inputs()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            champion_id = _register_champion(store, "BTCUSDT", 0.12)
+
+            result = run_drift_retraining_cycle(
+                store=store,
+                symbol="BTCUSDT",
+                reference_features=reference_features,
+                current_features=current_features,
+                reference_predictions=reference_predictions,
+                current_predictions=current_predictions,
+                current_performance=performance,
+                bars_since_last_retrain=800,
+                scheduled_window_open=True,
+                train_challenger=lambda: _make_challenger_payload(0.18),
+                drift_config={"min_samples": 200, "min_drift_signals": 2, "max_bars_between_retrain": 672},
+            )
+
+            self.assertTrue(result["drift_report"]["model_ttl_expired"])
+            self.assertIn("model_ttl_expired", result["drift_guardrails"]["reasons"])
+            self.assertEqual(result["retrain_status"], "promoted")
+            self.assertTrue(result["promotion_decision"]["approved"])
+            self.assertNotEqual(result["candidate_version_id"], champion_id)
+            self.assertEqual(store.get_champion("BTCUSDT")["version_id"], result["candidate_version_id"])
+
     def test_scheduled_drift_retrain_promotes_approved_challenger(self):
         reference_features, current_features, reference_predictions, current_predictions, performance = _make_drift_inputs()
 
@@ -246,6 +286,42 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             self.assertEqual(result["retrain_status"], "promoted")
             self.assertTrue(result["promotion_decision"]["approved"])
             self.assertEqual(pipeline.state["drift_cycle"]["candidate_version_id"], result["candidate_version_id"])
+
+    def test_drawdown_breach_can_trigger_default_hybrid_rollback(self):
+        reference_features, current_features, reference_predictions, current_predictions, performance = _make_drift_inputs()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            previous_champion = _register_champion(store, "BTCUSDT", 0.10)
+            _register_champion(store, "BTCUSDT", 0.14)
+
+            operational_limits = build_operational_limits_report(
+                operational_limits={"healthy": True, "kill_switch_ready": True},
+                equity_curve=pd.Series([1.0, 1.12, 1.05, 0.94], dtype=float),
+            )
+
+            result = run_drift_retraining_cycle(
+                store=store,
+                symbol="BTCUSDT",
+                reference_features=reference_features,
+                current_features=current_features,
+                reference_predictions=reference_predictions,
+                current_predictions=current_predictions,
+                current_performance=performance,
+                bars_since_last_retrain=800,
+                scheduled_window_open=True,
+                train_challenger=lambda: _make_challenger_payload(0.08),
+                current_monitoring_report={"healthy": True, "reasons": []},
+                operational_limits=operational_limits,
+                rollback_policy={"mode": "hybrid"},
+            )
+
+            self.assertEqual(result["retrain_status"], "challenger_rejected")
+            self.assertTrue(result["rollback"]["recommended"])
+            self.assertTrue(result["rollback"]["executed"])
+            self.assertIn("drawdown_limit_breached", result["rollback"]["reasons"])
+            self.assertIn("kill_switch_triggered", result["rollback"]["reasons"])
+            self.assertEqual(result["rollback"]["restored_version_id"], previous_champion)
 
 
 if __name__ == "__main__":

@@ -155,6 +155,40 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
             self.assertIn("backend_unavailable", report["reasons"])
             self.assertIn("rollback_unavailable", report["reasons"])
 
+    def test_deployment_readiness_blocks_on_expired_model_freshness(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.10)
+            current_champion = _register_champion(store, "BTCUSDT", 0.14)
+
+            champion_record = store.get_champion("BTCUSDT")
+            freshness_anchor = pd.Timestamp(champion_record["promoted_at"] or champion_record["created_at"])
+            report = build_deployment_readiness_report(
+                store=store,
+                symbol="BTCUSDT",
+                monitoring_report={"healthy": True, "reasons": []},
+                drift_cycle={
+                    "drift_guardrails": {"approved": False, "reasons": []},
+                    "retrain_status": "not_recommended",
+                },
+                backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+                paper_report=_make_paper_report(),
+                policy={
+                    "max_model_age_days": 28,
+                    "warn_model_age_days": 21,
+                    "as_of_timestamp": freshness_anchor + pd.Timedelta(days=35),
+                },
+            )
+
+            self.assertFalse(report["ready"])
+            self.assertEqual(report["version_id"], current_champion)
+            self.assertEqual(report["capital_release_stage"], "paper_verified")
+            self.assertEqual(report["operator_action"], "hold")
+            self.assertIn("model_freshness", report["summary"]["failed_components"])
+            self.assertIn("model_expired", report["reasons"])
+            self.assertFalse(report["components"]["model_freshness"]["passed"])
+            self.assertTrue(report["components"]["model_freshness"]["expired"])
+
     def test_pipeline_wrapper_reuses_state_for_deployment_readiness(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = LocalRegistryStore(root_dir=temp_dir)
@@ -179,6 +213,99 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
             self.assertEqual(report["capital_release_stage"], "paper_verified")
             self.assertEqual(report["version_id"], current_champion)
             self.assertEqual(pipeline.state["deployment_readiness"]["operator_action"], "paper")
+
+    def test_pipeline_can_build_and_attach_paper_calibration_from_observations(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.10)
+            current_champion = _register_champion(store, "BTCUSDT", 0.14)
+
+            observations = pd.DataFrame(
+                {
+                    "timestamp": pd.date_range("2026-12-01", periods=35, freq="D", tz="UTC"),
+                    "mode": "paper",
+                    "trade_count": 12,
+                    "modeled_slippage_bps": 1.8,
+                    "realized_slippage_bps": 1.9,
+                    "modeled_fill_ratio": 0.94,
+                    "realized_fill_ratio": 0.91,
+                    "data_breach": 0,
+                    "funding_breach": 0,
+                    "kill_switch_trigger": 0,
+                }
+            )
+
+            pipeline = ResearchPipeline({"data": {"symbol": "BTCUSDT", "interval": "1h"}})
+            paper_report = pipeline.inspect_paper_trading_calibration(
+                certified_expectations={"modeled_slippage_bps": 1.8, "modeled_fill_ratio": 0.94},
+                paper_observations=observations,
+            )
+            self.assertTrue(paper_report["passed"])
+            self.assertEqual(pipeline.state["paper_calibration"]["mode"], "paper")
+
+            store.attach_paper_report(current_champion, paper_report, symbol="BTCUSDT")
+            pipeline.state.pop("paper_calibration", None)
+            pipeline.state["operational_monitoring"] = {"healthy": True, "reasons": []}
+            pipeline.state["drift_cycle"] = {
+                "drift_guardrails": {"approved": False, "reasons": []},
+                "retrain_status": "not_recommended",
+            }
+
+            readiness = pipeline.inspect_deployment_readiness(
+                store=store,
+                backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+            )
+
+            self.assertTrue(readiness["ready"])
+            self.assertEqual(readiness["capital_release_stage"], "paper_verified")
+            self.assertTrue(readiness["components"]["paper_calibration"]["passed"])
+
+    def test_pipeline_operational_limits_refresh_when_equity_curve_changes(self):
+        pipeline = ResearchPipeline({"data": {"symbol": "BTCUSDT", "interval": "1h"}})
+
+        green = pipeline.inspect_operational_limits(
+            operational_limits={"healthy": True, "kill_switch_ready": True},
+            equity_curve=pd.Series([1.0, 1.10, 1.056], dtype=float),
+        )
+        breached = pipeline.inspect_operational_limits(
+            operational_limits={"healthy": True, "kill_switch_ready": True},
+            equity_curve=pd.Series([1.0, 1.10, 0.94], dtype=float),
+        )
+
+        self.assertFalse(green["drawdown_breached"])
+        self.assertTrue(breached["drawdown_breached"])
+        self.assertTrue(breached["kill_switch_triggered"])
+        self.assertAlmostEqual(breached["current_drawdown"], 0.94 / 1.10 - 1.0, places=6)
+
+    def test_promoted_drift_cycle_does_not_block_micro_capital_release(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.10)
+            current_champion = _register_champion(store, "BTCUSDT", 0.14)
+
+            pipeline = ResearchPipeline({"data": {"symbol": "BTCUSDT", "interval": "1h"}})
+            pipeline.state["operational_monitoring"] = {"healthy": True, "reasons": []}
+            pipeline.state["drift_cycle"] = {
+                "drift_guardrails": {"approved": True, "reasons": ["approved", "model_ttl_expired"]},
+                "retrain_status": "promoted",
+            }
+            pipeline.inspect_operational_limits(
+                operational_limits={"healthy": True, "kill_switch_ready": True},
+                equity_curve=pd.Series([1.0, 1.10, 1.06], dtype=float),
+            )
+
+            store.attach_paper_report(current_champion, _make_paper_report(), symbol="BTCUSDT")
+            report = pipeline.inspect_deployment_readiness(
+                store=store,
+                backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+                release_request={"requested_stage": "micro_capital", "manual_acknowledged": True},
+            )
+
+            self.assertEqual(report["capital_release_stage"], "micro_capital")
+            self.assertTrue(report["capital_release_eligible"])
+            self.assertEqual(report["operator_action"], "deploy")
+            self.assertNotIn("approved", report["release_blockers"])
+            self.assertNotIn("model_ttl_expired", report["reasons"])
 
 
 if __name__ == "__main__":

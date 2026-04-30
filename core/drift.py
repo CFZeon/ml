@@ -141,6 +141,7 @@ class DriftMonitor:
             "ks_significance": 0.05,
             "prediction_kl_threshold": 0.1,
             "cooldown_bars": 500,
+            "max_bars_between_retrain": 24 * 28,
             "min_samples": 200,
             "min_drift_signals": 2,
             "adwin_delta": 0.002,
@@ -188,21 +189,34 @@ class DriftMonitor:
             performance_updates.append(update)
             performance_drift = performance_drift or bool(update.get("drift_detected", False))
 
+        max_bars_between_retrain = self.config.get("max_bars_between_retrain")
+        if max_bars_between_retrain is not None:
+            max_bars_between_retrain = int(max_bars_between_retrain)
+            if max_bars_between_retrain <= 0:
+                max_bars_between_retrain = None
+        model_ttl_expired = bool(
+            max_bars_between_retrain is not None
+            and bars_since_last_retrain is not None
+            and int(bars_since_last_retrain) >= max_bars_between_retrain
+        )
         cooldown_active = (
             bars_since_last_retrain is not None
             and int(bars_since_last_retrain) < int(self.config["cooldown_bars"])
+            and not model_ttl_expired
         )
         enough_samples = sample_count >= int(self.config["min_samples"])
         evidence_count = int(feature_drift) + int(prediction_drift) + int(performance_drift)
         sufficient_evidence = evidence_count >= int(self.config["min_drift_signals"])
-        should_retrain = bool(enough_samples and not cooldown_active and sufficient_evidence)
+        should_retrain = bool(enough_samples and not cooldown_active and (sufficient_evidence or model_ttl_expired))
 
         reasons = []
+        if model_ttl_expired:
+            reasons.append("model_ttl_expired")
         if not enough_samples:
             reasons.append("minimum_samples_not_met")
         if cooldown_active:
             reasons.append("cooldown_active")
-        if enough_samples and not sufficient_evidence:
+        if enough_samples and not sufficient_evidence and not model_ttl_expired:
             reasons.append("insufficient_drift_evidence")
         if should_retrain:
             reasons.append("retrain_recommended")
@@ -217,6 +231,8 @@ class DriftMonitor:
             "prediction_drift": prediction_drift,
             "performance_updates": performance_updates,
             "performance_drift": performance_drift,
+            "model_ttl_expired": model_ttl_expired,
+            "max_bars_between_retrain": max_bars_between_retrain,
             "cooldown_active": cooldown_active,
             "minimum_samples_met": enough_samples,
             "evidence_count": evidence_count,
@@ -224,6 +240,8 @@ class DriftMonitor:
                 "should_retrain": should_retrain,
                 "reasons": reasons,
                 "bars_since_last_retrain": bars_since_last_retrain,
+                "max_bars_between_retrain": max_bars_between_retrain,
+                "model_ttl_expired": model_ttl_expired,
             },
         }
 
@@ -237,17 +255,21 @@ def evaluate_drift_guardrails(drift_report, policy=None):
     sample_count = int(report.get("sample_count") or 0)
     evidence_count = int(report.get("evidence_count") or 0)
     bars_since_last_retrain = report.get("recommendation", {}).get("bars_since_last_retrain")
-    cooldown_active = bars_since_last_retrain is not None and int(bars_since_last_retrain) < cooldown_bars
+    model_ttl_expired = bool(report.get("model_ttl_expired", False))
+    max_bars_between_retrain = int(policy.get("max_bars_between_retrain", report.get("max_bars_between_retrain") or (24 * 28)))
+    cooldown_active = bars_since_last_retrain is not None and int(bars_since_last_retrain) < cooldown_bars and not model_ttl_expired
     approved = bool(
         sample_count >= minimum_samples
-        and evidence_count >= minimum_signal_count
+        and (evidence_count >= minimum_signal_count or model_ttl_expired)
         and not cooldown_active
         and bool(report.get("recommendation", {}).get("should_retrain", False))
     )
     reasons = []
+    if model_ttl_expired:
+        reasons.append("model_ttl_expired")
     if sample_count < minimum_samples:
         reasons.append("minimum_samples_not_met")
-    if evidence_count < minimum_signal_count:
+    if evidence_count < minimum_signal_count and not model_ttl_expired:
         reasons.append("insufficient_drift_evidence")
     if cooldown_active:
         reasons.append("cooldown_active")
@@ -258,6 +280,8 @@ def evaluate_drift_guardrails(drift_report, policy=None):
         "reasons": reasons,
         "sample_count": sample_count,
         "evidence_count": evidence_count,
+        "model_ttl_expired": model_ttl_expired,
+        "max_bars_between_retrain": max_bars_between_retrain,
     }
 
 

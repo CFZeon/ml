@@ -7,6 +7,7 @@ from core import (
     LocalRegistryStore,
     build_deployment_readiness_report,
     build_live_calibration_report,
+    build_operational_limits_report,
     build_model,
     create_promotion_eligibility_report,
     finalize_promotion_eligibility_report,
@@ -123,6 +124,37 @@ class ReleaseStageTransitionsTest(unittest.TestCase):
             )
             self.assertEqual(scaled["capital_release_stage"], "scaled_capital")
             self.assertTrue(scaled["capital_release_eligible"])
+
+    def test_release_stage_stays_paper_verified_when_drawdown_limit_is_breached(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.12)
+            _register_champion(store, "BTCUSDT", 0.16)
+
+            operational_limits = build_operational_limits_report(
+                operational_limits={"healthy": True, "kill_switch_ready": True},
+                equity_curve=pd.Series([1.0, 1.08, 1.02, 0.95], dtype=float),
+            )
+
+            report = build_deployment_readiness_report(
+                store=store,
+                symbol="BTCUSDT",
+                monitoring_report={"healthy": True, "reasons": []},
+                drift_cycle={
+                    "drift_guardrails": {"approved": False, "reasons": []},
+                    "retrain_status": "not_recommended",
+                },
+                backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+                paper_report=_make_paper_report(),
+                operational_limits=operational_limits,
+                release_request={"requested_stage": "micro_capital", "manual_acknowledged": True},
+            )
+
+            self.assertEqual(report["capital_release_stage"], "paper_verified")
+            self.assertFalse(report["capital_release_eligible"])
+            self.assertIn("operational_limits", report["summary"]["failed_components"])
+            self.assertIn("drawdown_limit_breached", report["release_blockers"])
+            self.assertIn("kill_switch_triggered", report["release_blockers"])
 
 
 if __name__ == "__main__":

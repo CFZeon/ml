@@ -47,6 +47,40 @@ class DriftMonitoringTest(unittest.TestCase):
         self.assertIn("minimum_samples_not_met", report["recommendation"]["reasons"])
         self.assertFalse(guardrails["approved"])
 
+    def test_model_ttl_expiry_can_force_retrain_without_drift_signals(self):
+        reference_index = pd.date_range("2026-10-01", periods=300, freq="1h", tz="UTC")
+        current_index = pd.date_range("2026-11-01", periods=240, freq="1h", tz="UTC")
+        reference_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=reference_index)
+        current_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=current_index)
+        reference_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=reference_index)
+        current_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=current_index)
+        performance = pd.Series(np.zeros(len(current_index)), index=current_index)
+
+        monitor = DriftMonitor(
+            reference_features,
+            reference_predictions,
+            config={"min_samples": 200, "min_drift_signals": 2, "max_bars_between_retrain": 672},
+        )
+        report = monitor.check(
+            current_features,
+            current_predictions=current_predictions,
+            current_performance=performance,
+            bars_since_last_retrain=800,
+        )
+        guardrails = evaluate_drift_guardrails(
+            report,
+            {"min_samples": 200, "min_drift_signals": 2, "max_bars_between_retrain": 672},
+        )
+
+        self.assertFalse(report["feature_drift"])
+        self.assertFalse(report["prediction_drift"])
+        self.assertFalse(report["performance_drift"])
+        self.assertTrue(report["model_ttl_expired"])
+        self.assertTrue(report["recommendation"]["should_retrain"])
+        self.assertIn("model_ttl_expired", report["recommendation"]["reasons"])
+        self.assertTrue(guardrails["approved"])
+        self.assertIn("model_ttl_expired", guardrails["reasons"])
+
     def test_adwin_detector_or_fallback_flags_abrupt_mean_shift(self):
         detector = ADWINDetector(delta=0.002, fallback_window=20)
         updates = []

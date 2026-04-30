@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pandas as pd
+
 from .storage import payload_sha256, read_json, write_json
 
 
 _ACTION_HINTS = {
     "promotion_status": "Promote an approved champion before deployment.",
+    "model_freshness": "Retrain, validate, and promote a fresh champion before deployment.",
     "paper_calibration": "Attach a green paper or shadow-live calibration report before capital release.",
     "operational_monitoring": "Refresh operational monitoring and resolve any health breaches before deployment.",
     "drift_status": "Resolve the active drift recommendation before deployment.",
@@ -24,6 +27,8 @@ _CAPITAL_RELEASE_STAGES = (
     "micro_capital",
     "scaled_capital",
 )
+
+_NON_BLOCKING_REASONS = {"approved"}
 
 
 def _dedupe_reasons(values):
@@ -46,6 +51,20 @@ def _find_target_record(store, symbol, version_id=None):
         if str(row.get("version_id")) == str(version_id):
             return row
     return None
+
+
+def _coerce_timestamp(value):
+    if value is None or value == "":
+        return None
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(timestamp):
+        return None
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("UTC")
 
 
 def _evaluate_promotion_status(record):
@@ -71,6 +90,73 @@ def _evaluate_promotion_status(record):
         "version_id": record.get("version_id"),
         "current_status": current_status,
         "promotion_approved": approved,
+        "reasons": reasons,
+    }
+
+
+def _evaluate_model_freshness(record, policy=None):
+    config = dict(policy or {})
+    require_model_freshness = bool(config.get("require_model_freshness", True))
+    if not require_model_freshness:
+        return {
+            "passed": True,
+            "available": False,
+            "expired": False,
+            "refresh_due": False,
+            "reasons": [],
+        }
+
+    if record is None:
+        return {
+            "passed": False,
+            "available": False,
+            "expired": None,
+            "refresh_due": None,
+            "reasons": ["model_freshness_unavailable"],
+        }
+
+    promoted_at = _coerce_timestamp(record.get("promoted_at"))
+    created_at = _coerce_timestamp(record.get("created_at"))
+    anchor_timestamp = promoted_at or created_at
+    if anchor_timestamp is None:
+        return {
+            "passed": False,
+            "available": False,
+            "expired": None,
+            "refresh_due": None,
+            "reasons": ["model_freshness_unavailable"],
+        }
+
+    max_model_age_days = _coerce_float(config.get("max_model_age_days"))
+    if max_model_age_days is None:
+        max_model_age_days = 28.0
+    if max_model_age_days <= 0.0:
+        raise ValueError("max_model_age_days must be positive")
+
+    warn_model_age_days = _coerce_float(config.get("warn_model_age_days"))
+    if warn_model_age_days is None:
+        warn_model_age_days = min(21.0, max_model_age_days)
+    warn_model_age_days = min(max(0.0, warn_model_age_days), max_model_age_days)
+
+    as_of_timestamp = _coerce_timestamp(config.get("as_of_timestamp")) or pd.Timestamp.now(tz="UTC")
+    age_days = max(0.0, (as_of_timestamp - anchor_timestamp).total_seconds() / (24.0 * 60.0 * 60.0))
+    expires_at = anchor_timestamp + pd.Timedelta(days=max_model_age_days)
+    expired = bool(as_of_timestamp >= expires_at)
+    refresh_due = bool(age_days >= warn_model_age_days)
+    reasons = ["model_expired"] if expired else []
+
+    return {
+        "passed": not expired,
+        "available": True,
+        "anchor_field": "promoted_at" if promoted_at is not None else "created_at",
+        "anchor_timestamp": anchor_timestamp.isoformat(),
+        "as_of_timestamp": as_of_timestamp.isoformat(),
+        "age_days": float(age_days),
+        "warn_model_age_days": float(warn_model_age_days),
+        "max_model_age_days": float(max_model_age_days),
+        "expires_at": expires_at.isoformat(),
+        "expired": expired,
+        "refresh_due": refresh_due,
         "reasons": reasons,
     }
 
@@ -103,7 +189,11 @@ def _evaluate_drift_status(record, drift_cycle=None):
         guardrails = dict(cycle.get("drift_guardrails") or {})
         approved = bool(guardrails.get("approved", False))
         retrain_status = str(cycle.get("retrain_status") or "")
-        reasons = _dedupe_reasons(guardrails.get("reasons") or [])
+        reasons = _dedupe_reasons(
+            reason for reason in (guardrails.get("reasons") or []) if str(reason or "").strip() not in _NON_BLOCKING_REASONS
+        )
+        if approved and retrain_status == "promoted":
+            reasons = []
         if approved and retrain_status != "promoted":
             reasons = _dedupe_reasons(reasons + ["drift_retraining_recommended"])
             if retrain_status == "scheduled_window_pending":
@@ -194,34 +284,160 @@ def _normalize_release_request(release_request=None, policy=None):
     }
 
 
-def _evaluate_operational_limits(operational_limits=None, release_request=None):
+def _coerce_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_equity_curve(equity_curve):
+    if isinstance(equity_curve, pd.Series):
+        series = pd.to_numeric(equity_curve, errors="coerce")
+    elif equity_curve is None:
+        return pd.Series(dtype=float)
+    else:
+        series = pd.to_numeric(pd.Series(equity_curve, copy=False), errors="coerce")
+    return pd.Series(series, copy=False).dropna().astype(float)
+
+
+def _resolve_drawdown_limit(policy, status):
+    for key in ("max_drawdown_limit", "max_drawdown_pct", "drawdown_limit", "max_loss_pct"):
+        value = _coerce_float(policy.get(key))
+        if value is not None:
+            return abs(value)
+    for key in ("max_drawdown_limit", "max_drawdown_pct", "drawdown_limit", "max_loss_pct"):
+        value = _coerce_float(status.get(key))
+        if value is not None:
+            return abs(value)
+    return 0.10
+
+
+def build_operational_limits_report(
+    *,
+    operational_limits=None,
+    equity_curve=None,
+    current_equity=None,
+    peak_equity=None,
+    policy=None,
+):
     status = dict(operational_limits or {})
+    resolved_policy = dict(policy or {})
+    series = _coerce_equity_curve(equity_curve if equity_curve is not None else status.get("equity_curve"))
+    available = bool(status) or not series.empty or current_equity is not None or peak_equity is not None
+    drawdown_limit = _resolve_drawdown_limit(resolved_policy, status)
+    if not available:
+        return {
+            "passed": False,
+            "available": False,
+            "healthy": None,
+            "kill_switch_ready": None,
+            "kill_switch_triggered": None,
+            "drawdown_breached": None,
+            "current_drawdown": None,
+            "current_equity": None,
+            "peak_equity": None,
+            "max_drawdown_limit": float(drawdown_limit),
+            "enforced_action": "unavailable",
+            "reasons": ["operational_limits_unavailable"],
+        }
+
+    resolved_current_equity = _coerce_float(current_equity)
+    if resolved_current_equity is None:
+        resolved_current_equity = _coerce_float(status.get("current_equity"))
+    resolved_peak_equity = _coerce_float(peak_equity)
+    if resolved_peak_equity is None:
+        resolved_peak_equity = _coerce_float(status.get("peak_equity"))
+
+    if not series.empty:
+        if resolved_current_equity is None:
+            resolved_current_equity = float(series.iloc[-1])
+        if resolved_peak_equity is None:
+            resolved_peak_equity = float(series.cummax().iloc[-1])
+
+    current_drawdown = None
+    explicit_equity_inputs = equity_curve is not None or current_equity is not None or peak_equity is not None
+    if explicit_equity_inputs and resolved_current_equity is not None and resolved_peak_equity and resolved_peak_equity > 0:
+        current_drawdown = float(resolved_current_equity / resolved_peak_equity - 1.0)
+    if current_drawdown is None:
+        for key in ("current_drawdown", "current_drawdown_pct", "drawdown"):
+            current_drawdown = _coerce_float(status.get(key))
+            if current_drawdown is not None:
+                break
+    if current_drawdown is None and resolved_current_equity is not None and resolved_peak_equity and resolved_peak_equity > 0:
+        current_drawdown = float(resolved_current_equity / resolved_peak_equity - 1.0)
+
+    drawdown_breached = bool(current_drawdown is not None and current_drawdown <= -float(drawdown_limit))
+    kill_switch_ready = bool(status.get("kill_switch_ready", status.get("kill_switch_enabled", False)))
+    kill_switch_triggered = bool(status.get("kill_switch_triggered", status.get("triggered", False)) or drawdown_breached)
+
+    healthy_flag = status.get("healthy")
+    if healthy_flag is None:
+        healthy = True
+    else:
+        healthy = bool(healthy_flag)
+    healthy = bool(healthy and not drawdown_breached and not kill_switch_triggered)
+
+    reasons = list(status.get("reasons") or [])
+    if drawdown_breached:
+        reasons.append("drawdown_limit_breached")
+    if kill_switch_triggered:
+        reasons.append("kill_switch_triggered")
+    if not healthy and not reasons:
+        reasons.append("operational_limits_not_healthy")
+    if not kill_switch_ready:
+        reasons.append("kill_switch_not_ready")
+
+    return {
+        "passed": bool(healthy and kill_switch_ready and not kill_switch_triggered and not drawdown_breached),
+        "available": True,
+        "healthy": healthy,
+        "kill_switch_ready": kill_switch_ready,
+        "kill_switch_triggered": kill_switch_triggered,
+        "drawdown_breached": drawdown_breached,
+        "current_drawdown": current_drawdown,
+        "current_equity": resolved_current_equity,
+        "peak_equity": resolved_peak_equity,
+        "max_drawdown_limit": float(drawdown_limit),
+        "enforced_action": "flatten_and_hold" if kill_switch_triggered else "monitor",
+        "reasons": _dedupe_reasons(reasons),
+    }
+
+
+def _evaluate_operational_limits(operational_limits=None, release_request=None):
     request = dict(release_request or {})
     requested_stage = str(request.get("requested_stage") or "research_certified")
     requires_limits = requested_stage in {"micro_capital", "scaled_capital"}
 
-    if not status:
+    status = build_operational_limits_report(operational_limits=operational_limits)
+    if not status.get("available", False):
         return {
             "passed": not requires_limits,
             "available": False,
             "healthy": None,
             "kill_switch_ready": None,
-            "reasons": [] if not requires_limits else ["operational_limits_unavailable"],
+            "kill_switch_triggered": None,
+            "drawdown_breached": None,
+            "current_drawdown": None,
+            "max_drawdown_limit": status.get("max_drawdown_limit"),
+            "reasons": [] if not requires_limits else list(status.get("reasons") or ["operational_limits_unavailable"]),
         }
 
-    healthy = bool(status.get("healthy", False))
-    kill_switch_ready = bool(status.get("kill_switch_ready", status.get("kill_switch_enabled", False)))
-    reasons = []
-    if not healthy:
-        reasons.extend(status.get("reasons") or ["operational_limits_not_healthy"])
-    if not kill_switch_ready:
-        reasons.append("kill_switch_not_ready")
+    active_breach = bool(status.get("drawdown_breached", False) or status.get("kill_switch_triggered", False))
+    passed = bool(status.get("passed", False)) if (requires_limits or active_breach) else True
     return {
-        "passed": bool(healthy and kill_switch_ready),
+        "passed": passed,
         "available": True,
-        "healthy": healthy,
-        "kill_switch_ready": kill_switch_ready,
-        "reasons": _dedupe_reasons(reasons),
+        "healthy": bool(status.get("healthy", False)),
+        "kill_switch_ready": bool(status.get("kill_switch_ready", False)),
+        "kill_switch_triggered": bool(status.get("kill_switch_triggered", False)),
+        "drawdown_breached": bool(status.get("drawdown_breached", False)),
+        "current_drawdown": status.get("current_drawdown"),
+        "max_drawdown_limit": status.get("max_drawdown_limit"),
+        "enforced_action": status.get("enforced_action"),
+        "reasons": list(status.get("reasons") or []),
         "status": status,
     }
 
@@ -299,6 +515,159 @@ def persist_deployment_candidate_artifacts(
         "fill_quality": str(candidate_dir / "fill_quality.json") if fill_quality is not None else None,
         "readiness": str(candidate_dir / "readiness.json") if readiness is not None else None,
     }
+
+
+def _coerce_paper_observation_frame(paper_observations=None):
+    if isinstance(paper_observations, pd.DataFrame):
+        return paper_observations.copy()
+    if paper_observations is None:
+        return pd.DataFrame()
+    return pd.DataFrame(list(paper_observations))
+
+
+def _resolve_observation_timestamps(frame):
+    if "timestamp" in frame.columns:
+        return pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    if "observed_at" in frame.columns:
+        return pd.to_datetime(frame["observed_at"], utc=True, errors="coerce")
+    if isinstance(frame.index, pd.DatetimeIndex):
+        return pd.Series(pd.to_datetime(frame.index, utc=True, errors="coerce"), index=frame.index)
+    return pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns, UTC]")
+
+
+def _resolve_observation_counts(frame, *column_names):
+    for column_name in column_names:
+        if column_name in frame.columns:
+            return pd.to_numeric(frame[column_name], errors="coerce").fillna(0.0).clip(lower=0.0)
+    return pd.Series(0.0, index=frame.index, dtype=float)
+
+
+def _weighted_observation_average(frame, weights, column_name):
+    if column_name not in frame.columns:
+        return None
+
+    values = pd.to_numeric(frame[column_name], errors="coerce")
+    valid = values.notna() & weights.notna() & (weights > 0)
+    if not valid.any():
+        return None
+    aligned_weights = weights.loc[valid]
+    return float((values.loc[valid] * aligned_weights).sum() / aligned_weights.sum())
+
+
+def _sum_observation_flags(frame, *column_names):
+    counts = _resolve_observation_counts(frame, *column_names)
+    if counts.empty:
+        return 0
+    return int(counts.sum())
+
+
+def _resolve_observation_duration_days(frame, timestamps):
+    explicit_duration = _resolve_observation_counts(frame, "duration_days")
+    if explicit_duration.sum() > 0:
+        return float(explicit_duration.sum())
+
+    valid_timestamps = timestamps.dropna().sort_values()
+    if len(valid_timestamps) >= 2:
+        deltas = valid_timestamps.diff().dropna()
+        inferred_step = deltas.median() if not deltas.empty else pd.Timedelta(0)
+        coverage = valid_timestamps.iloc[-1] - valid_timestamps.iloc[0]
+        if inferred_step > pd.Timedelta(0):
+            coverage += inferred_step
+        return float(coverage.total_seconds() / (24.0 * 60.0 * 60.0))
+    if len(valid_timestamps) == 1:
+        return 1.0
+    return 0.0
+
+
+def build_paper_trading_report(*, certified_expectations=None, paper_observations=None, policy=None):
+    expectations = dict(certified_expectations or {})
+    policy = dict(policy or {})
+    frame = _coerce_paper_observation_frame(paper_observations)
+    if frame.empty:
+        return {
+            "mode": str(policy.get("mode", "paper")),
+            "passed": False,
+            "reasons": ["paper_observations_unavailable"],
+            "duration_days": 0.0,
+            "data_breaches": 0,
+            "funding_breaches": 0,
+            "kill_switch_triggers": 0,
+            "certified_expectations": expectations,
+            "paper_metrics": {
+                "mode": str(policy.get("mode", "paper")),
+                "duration_days": 0.0,
+                "data_breaches": 0,
+                "funding_breaches": 0,
+                "kill_switch_triggers": 0,
+                "observation_count": 0,
+                "weighted_trade_count": 0.0,
+                "start_timestamp": None,
+                "end_timestamp": None,
+            },
+            "observation_summary": {
+                "observation_count": 0,
+                "weighted_trade_count": 0.0,
+                "start_timestamp": None,
+                "end_timestamp": None,
+            },
+            "policy": {
+                "min_duration_days": float(policy.get("min_duration_days", 28.0)),
+                "max_slippage_error": float(policy.get("max_slippage_error", 0.25)),
+                "max_fill_ratio_degradation": float(policy.get("max_fill_ratio_degradation", 0.15)),
+            },
+        }
+
+    timestamps = _resolve_observation_timestamps(frame)
+    valid_timestamps = timestamps.notna()
+    if valid_timestamps.any():
+        frame = frame.loc[valid_timestamps].copy()
+        timestamps = timestamps.loc[valid_timestamps]
+        frame["_timestamp"] = timestamps
+        frame = frame.sort_values("_timestamp")
+        timestamps = frame["_timestamp"]
+
+    weights = _resolve_observation_counts(frame, "trade_count", "fill_count", "order_count")
+    if float(weights.sum()) <= 0.0:
+        weights = pd.Series(1.0, index=frame.index, dtype=float)
+
+    mode = str(
+        policy.get("mode")
+        or frame.get("mode", pd.Series(dtype=str)).dropna().astype(str).iloc[0]
+        if "mode" in frame.columns and not frame.get("mode", pd.Series(dtype=str)).dropna().empty
+        else "paper"
+    )
+
+    paper_metrics = {
+        "mode": mode,
+        "duration_days": _resolve_observation_duration_days(frame, timestamps),
+        "modeled_slippage_bps": _weighted_observation_average(frame, weights, "modeled_slippage_bps"),
+        "realized_slippage_bps": _weighted_observation_average(frame, weights, "realized_slippage_bps"),
+        "modeled_fill_ratio": _weighted_observation_average(frame, weights, "modeled_fill_ratio"),
+        "realized_fill_ratio": _weighted_observation_average(frame, weights, "realized_fill_ratio"),
+        "data_breaches": _sum_observation_flags(frame, "data_breach", "data_breaches"),
+        "funding_breaches": _sum_observation_flags(frame, "funding_breach", "funding_breaches"),
+        "kill_switch_triggers": _sum_observation_flags(frame, "kill_switch_trigger", "kill_switch_triggers"),
+        "observation_count": int(len(frame)),
+        "weighted_trade_count": float(weights.sum()),
+        "start_timestamp": None if timestamps.dropna().empty else timestamps.dropna().iloc[0].isoformat(),
+        "end_timestamp": None if timestamps.dropna().empty else timestamps.dropna().iloc[-1].isoformat(),
+    }
+    for expectation_key in ("modeled_slippage_bps", "modeled_fill_ratio"):
+        if paper_metrics.get(expectation_key) is None and expectations.get(expectation_key) is not None:
+            paper_metrics[expectation_key] = float(expectations[expectation_key])
+
+    report = build_live_calibration_report(
+        certified_expectations=expectations,
+        paper_metrics=paper_metrics,
+        policy=policy,
+    )
+    report["observation_summary"] = {
+        "observation_count": int(paper_metrics["observation_count"]),
+        "weighted_trade_count": float(paper_metrics["weighted_trade_count"]),
+        "start_timestamp": paper_metrics["start_timestamp"],
+        "end_timestamp": paper_metrics["end_timestamp"],
+    }
+    return report
 
 
 def build_live_calibration_report(*, certified_expectations=None, paper_metrics=None, policy=None):
@@ -425,13 +794,14 @@ def build_deployment_readiness_report(
     """Build one operator-facing deployment readiness verdict.
 
     The report fails closed unless promotion status, operational monitoring,
-    drift state, backend availability, and rollback readiness all pass.
+    model freshness, drift state, backend availability, and rollback readiness all pass.
     """
 
     record = _find_target_record(store, symbol, version_id=version_id)
     normalized_release_request = _normalize_release_request(release_request=release_request, policy=policy)
     components = {
         "promotion_status": _evaluate_promotion_status(record),
+        "model_freshness": _evaluate_model_freshness(record, policy=policy),
         "paper_calibration": _evaluate_paper_calibration(record, paper_report=paper_report, policy=policy),
         "operational_monitoring": _evaluate_operational_monitoring(record, monitoring_report=monitoring_report),
         "drift_status": _evaluate_drift_status(record, drift_cycle=drift_cycle),
@@ -448,6 +818,7 @@ def build_deployment_readiness_report(
         reason
         for component in components.values()
         for reason in component.get("reasons") or []
+        if str(reason or "").strip() not in _NON_BLOCKING_REASONS
     )
     release_blockers = _dedupe_reasons(list(reasons) + list(stage_resolution.get("blockers") or []))
     recommended_actions = [_ACTION_HINTS[name] for name in failed_components if name in _ACTION_HINTS]
@@ -459,7 +830,7 @@ def build_deployment_readiness_report(
         operator_action = "deploy"
     elif ready and stage_resolution.get("stage") == "paper_verified":
         operator_action = "paper"
-    elif bool((components.get("promotion_status") or {}).get("passed", False)):
+    elif ready and stage_resolution.get("stage") == "research_certified":
         operator_action = "certify"
     else:
         operator_action = "hold"
@@ -489,5 +860,7 @@ __all__ = [
     "build_deployment_candidate_id",
     "build_deployment_readiness_report",
     "build_live_calibration_report",
+    "build_operational_limits_report",
+    "build_paper_trading_report",
     "persist_deployment_candidate_artifacts",
 ]

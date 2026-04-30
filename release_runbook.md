@@ -22,6 +22,7 @@ This runbook describes how deployment readiness progresses from research certifi
    - paper verification is green
    - operational limits are healthy
    - kill switch is ready
+   - current drawdown remains above the configured kill-switch threshold
    - an operator has manually acknowledged the micro-capital release
 
 5. `scaled_capital`
@@ -32,11 +33,14 @@ This runbook describes how deployment readiness progresses from research certifi
 
 Advance from `research_certified` to `paper_verified` only after a green paper or shadow-live calibration report is attached.
 
+No stage should advance when the current champion is past its freshness TTL. By default, deployment readiness expires a promoted champion after 28 days and surfaces `model_expired` until a fresh version is retrained, validated, and promoted.
+
 Advance from `paper_verified` to `micro_capital` only when all of the following are true:
 
 - deployment readiness is otherwise healthy
 - operational limits report `healthy=True`
 - operational limits report `kill_switch_ready=True`
+- operational limits report `drawdown_breached=False`
 - the release request includes `manual_acknowledged=True`
 
 Advance from `micro_capital` to `scaled_capital` only when all micro-capital controls remain green and the release request includes `scaled_capital_approved=True`.
@@ -48,6 +52,9 @@ Advance from `micro_capital` to `scaled_capital` only when all micro-capital con
 - `paper_report` for paper or shadow-live verification
 - `operational_limits` for kill-switch and risk-limit readiness
 - `release_request` containing the requested stage and any manual approvals
+- `policy` when you need to override the default 28-day champion TTL through `max_model_age_days`, `warn_model_age_days`, or `as_of_timestamp`
+
+`build_operational_limits_report(...)` can be used to normalize kill-switch readiness plus current equity drawdown into the `operational_limits` payload. The default drawdown ceiling is 10% unless a stricter policy overrides it.
 
 ## Blocking Signals
 
@@ -57,8 +64,11 @@ Common blockers include:
 
 - `paper_verification_required`
 - `manual_ack_required_for_micro_capital`
+- `model_expired`
 - `operational_limits_unavailable`
 - `kill_switch_not_ready`
+- `drawdown_limit_breached`
+- `kill_switch_triggered`
 - `scaled_capital_approval_required`
 - backend, monitoring, drift, or rollback failures propagated from the readiness components
 

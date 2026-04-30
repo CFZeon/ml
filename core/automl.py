@@ -590,6 +590,8 @@ _TEMPORAL_STATE_KEYS = [
 _DEEP_COPY_STATE_KEYS = [
     "data_lineage", "symbol_filters", "universe_policy",
     "universe_snapshot_meta", "eligible_symbols",
+    "custom_data_report", "data_integrity_report", "data_quality_mask",
+    "data_quality_report", "reference_integrity_report",
 ]
 
 

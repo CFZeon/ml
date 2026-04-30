@@ -3,14 +3,47 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pandas as pd
+
 from core import (
     build_deployment_candidate_id,
     build_live_calibration_report,
+    build_paper_trading_report,
     persist_deployment_candidate_artifacts,
 )
 
 
 class LiveCalibrationReportTest(unittest.TestCase):
+    def test_paper_trading_report_aggregates_observations_before_calibration(self):
+        timestamps = pd.date_range("2026-01-01", periods=35, freq="D", tz="UTC")
+        observations = [
+            {
+                "timestamp": timestamp.isoformat(),
+                "mode": "shadow_live",
+                "trade_count": 10 + day,
+                "modeled_slippage_bps": 2.0,
+                "realized_slippage_bps": 2.05,
+                "modeled_fill_ratio": 0.95,
+                "realized_fill_ratio": 0.91,
+                "data_breach": 0,
+                "funding_breach": 0,
+                "kill_switch_trigger": 0,
+            }
+            for day, timestamp in enumerate(timestamps, start=1)
+        ]
+
+        report = build_paper_trading_report(
+            certified_expectations={"modeled_slippage_bps": 2.0, "modeled_fill_ratio": 0.95},
+            paper_observations=observations,
+        )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["mode"], "shadow_live")
+        self.assertGreaterEqual(report["duration_days"], 35.0)
+        self.assertEqual(report["observation_summary"]["observation_count"], 35)
+        self.assertGreater(report["observation_summary"]["weighted_trade_count"], 35.0)
+        self.assertAlmostEqual(report["paper_metrics"]["realized_slippage_bps"], 2.05, places=6)
+
     def test_live_calibration_report_passes_when_metrics_are_within_tolerance(self):
         report = build_live_calibration_report(
             certified_expectations={"modeled_slippage_bps": 2.0, "modeled_fill_ratio": 0.95},

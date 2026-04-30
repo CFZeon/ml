@@ -11,9 +11,11 @@ from .registry.store import evaluate_challenger_promotion
 _DEFAULT_CRITICAL_ROLLBACK_REASONS = {
     "context_ttl_breached",
     "custom_data_ttl",
+    "drawdown_limit_breached",
     "feature_schema",
     "feature_schema_drift",
     "inference",
+    "kill_switch_triggered",
     "l2_snapshot_age",
     "raw_data_freshness",
 }
@@ -88,13 +90,17 @@ def _build_challenger_summary(payload):
     return summary
 
 
-def _evaluate_rollback_action(store, symbol, *, current_monitoring_report=None, rollback_policy=None):
+def _evaluate_rollback_action(store, symbol, *, current_monitoring_report=None, operational_limits=None, rollback_policy=None):
     monitoring_report = dict(current_monitoring_report or {})
+    limits_report = dict(operational_limits or {})
     policy = dict(rollback_policy or {})
     mode = str(policy.get("mode", "hybrid") or "hybrid").lower()
     critical_reasons = set(policy.get("critical_reasons") or _DEFAULT_CRITICAL_ROLLBACK_REASONS)
     monitoring_reasons = set(monitoring_report.get("reasons") or [])
-    recommended = bool(monitoring_report) and not bool(monitoring_report.get("healthy", True))
+    monitoring_reasons.update(limits_report.get("reasons") or [])
+    monitoring_healthy = bool(monitoring_report.get("healthy", True)) if monitoring_report else True
+    limits_healthy = bool(limits_report.get("healthy", True)) if limits_report else True
+    recommended = bool(monitoring_report or limits_report) and not (monitoring_healthy and limits_healthy)
     critical = bool(monitoring_reasons & critical_reasons)
     rollback = {
         "recommended": recommended,
@@ -143,6 +149,7 @@ def run_drift_retraining_cycle(
     drift_config=None,
     promotion_policy=None,
     current_monitoring_report=None,
+    operational_limits=None,
     rollback_policy=None,
 ):
     champion = store.get_champion(symbol)
@@ -237,6 +244,7 @@ def run_drift_retraining_cycle(
         store,
         symbol,
         current_monitoring_report=current_monitoring_report,
+        operational_limits=operational_limits,
         rollback_policy=rollback_policy,
     )
     return result

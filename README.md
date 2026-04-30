@@ -102,16 +102,16 @@ The rest of the examples serve different purposes:
 - `example_trend_breakout_futures.py`: futures example focused on ADX plus Donchian trend-breakout context layered onto the existing futures pipeline; add `--local-certification` to promote the same scenario into the strict local certification runtime
 - `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain; add `--local-certification` when you want the same scenario to run under strict local certification runtime defaults
 - `example_synthetic_derivatives.py`: offline synthetic derivatives/integration example; may also abstain depending on the generated regime path
-- `example_local_certification_automl.py`: strict local certification path with locked holdout, replication, fail-closed data handling, an explicit `local_certification` monitoring profile, and a hard local Nautilus requirement; intended for paper or pre-capital certification on consumer hardware
-- `example_trade_ready_automl.py`: hardened AutoML certification profile with locked holdout, replication cohorts, DSR/PBO diagnostics, blocking pre-training feature-surface lookahead certification, and promotion-readiness reporting; the default run still fails closed if Nautilus is unavailable, while `--smoke` keeps a visibly reduced-power profile but still requires Nautilus. The printed summary now surfaces `oos_evidence.class`, `execution_evidence.class`, `funding_coverage_status`, and `capital_evidence_contract` before backtest metrics. Use `example_automl.py` for the explicit research-only surrogate path
-- `example_drift_retraining_cycle.py`: deterministic registry and drift example showing scheduled retraining, challenger promotion, rollback, and the final operator deploy/hold decision
-- `example_automl.py`: constrained AutoML smoke/demo path kept for short runtime feedback; any post-selection rebuild is explicitly labeled as a research refit artifact, not untouched OOS evidence
+- `example_local_certification_automl.py`: strict local certification path with locked holdout, replication, fail-closed data handling, an explicit `local_certification` monitoring profile, and an explicit `local_certification_surrogate` fallback when Nautilus is unavailable; intended for paper or pre-capital certification on consumer hardware, not live-capital release
+- `example_trade_ready_automl.py`: hardened AutoML certification profile with locked holdout, replication cohorts, DSR/PBO diagnostics, blocking pre-training feature-surface lookahead certification, and promotion-readiness reporting; the default run still fails closed if Nautilus is unavailable, while `--smoke` keeps a visibly reduced-power profile but still requires Nautilus. The printed summary now surfaces `oos_evidence.class`, `execution_evidence.class`, `funding_coverage_status`, and `capital_evidence_contract` before backtest metrics. Use `example_automl.py` for the safer research-only surrogate path, or `example_automl.py --research-demo` for the old fast unsafe smoke mode.
+- `example_drift_retraining_cycle.py`: deterministic registry and drift example showing scheduled retraining, a first-class paper-validation loop, a micro-capital kill-switch gate, challenger promotion, rollback, and the final operator deploy/hold decision
+- `example_automl.py`: research-only AutoML example that now keeps locked holdout separation, a lightweight holdout-focused selection policy, SPA-based post-selection inference, and a minimum statistical-power floor enabled by default while still using surrogate execution; any post-selection rebuild is explicitly labeled as a research refit artifact, not untouched OOS evidence. Pass `--research-demo` when you intentionally want the old fast unsafe smoke path with no holdout or selection gates.
 
 The end-to-end remediation program for making the repo trade-ready is tracked in `TRADE_READY_REMEDIATION_PLAN.md`.
 
 The user-facing entry points are now intentionally separated:
 
-- `example_automl.py`: research-only demo
+- `example_automl.py`: research-only surrogate example with locked holdout separation, SPA-based post-selection inference, and a significance / confidence-bound floor by default; add `--research-demo` for the old unsafe smoke path
 - `example_local_certification_automl.py`: strict local certification on consumer hardware
 - `example_trade_ready_automl.py`: stricter operator-facing certification and promotion path
 
@@ -127,9 +127,9 @@ For the builder-based real-data demos, local certification is also available as 
 - `example_fvg.py`
 - `example_test_case_template.py`
 
-That switch applies the strict local-certification runtime profile, requires a local Nautilus installation, and fails closed rather than silently downgrading to research mode.
+That switch applies the strict local-certification runtime profile. It uses a real Nautilus backend when available and otherwise resolves to an explicit `local_certification_surrogate` runtime that preserves fail-closed certification gates without silently downgrading to research mode. The surrogate path remains non-event-driven and is not eligible for live-capital release.
 
-The operator path is now distinct from the certification path: certify a candidate with `example_local_certification_automl.py` or `example_trade_ready_automl.py`, then hand off the promoted champion to `example_drift_retraining_cycle.py` or `ResearchPipeline.inspect_deployment_readiness(...)` for the final deploy-versus-hold decision.
+The operator path is now distinct from the certification path: certify a candidate with `example_local_certification_automl.py` or `example_trade_ready_automl.py`, then hand off the promoted champion to `example_drift_retraining_cycle.py` or `ResearchPipeline.inspect_paper_trading_calibration(...)`, `ResearchPipeline.inspect_operational_limits(...)`, and `ResearchPipeline.inspect_deployment_readiness(...)` for the final deploy-versus-hold decision.
 The hardened trade-ready path now also auto-applies the `trade_ready` monitoring profile, which binds finite thresholds for freshness, custom-data fallback, fill quality, slippage drift, and signal-decay deterioration.
 `example_utils.py` now also exposes `build_trade_ready_runtime_overrides(...)`, which centralizes the fail-closed trade-ready defaults for market-data gaps, duplicate-bar handling, quarantine blocking, and futures funding coverage.
 Trade-ready runs now also inherit a binding significance floor: the runtime enables significance by default, requires a minimum observation count for statistical-significance payloads, and the trade-ready AutoML profile reports explicit underpowered-evidence reasons instead of silently treating missing confidence bounds as a generic gate failure.
@@ -137,6 +137,8 @@ Trade-ready runs now also inherit a binding significance floor: the runtime enab
 The shared example builders in `example_utils.py` now enable strict context-missing and futures-funding coverage policies by default. If a cross-asset leader goes stale, a futures context feed ages out, or an expected funding event is missing, the example path stops with an explicit gate failure instead of treating that unknown state as a tradable zero.
 They also set `data.duplicate_policy = "fail"`, so conflicting duplicate bars or restated timestamp collisions stop the run instead of being silently collapsed.
 They also set `data.futures_context.recent_stats_availability_lag = "period_close"`, so Binance recent-stat context is aligned to publication-safe timestamps rather than the raw interval it summarizes.
+Those context z-scores are also trailing and prefix-invariant at cutoffs, so the normalized derivatives context does not read future rows.
+They also default public research examples to `backtest.slippage_rate = 0.0002` with `backtest.slippage_model = "sqrt_impact"`, so the accessible path no longer prices fills at zero slippage.
 They also default to `backtest.evaluation_mode = "research_only"`. Only the hardened trade-ready AutoML path opts into `trade_ready` evaluation with event-style execution and an explicit stress matrix.
 When you do opt into `local_certification` or `trade_ready`, the shared runtime now defaults `data.gap_policy = "fail"`, keeps `data.duplicate_policy = "fail"`, blocks on any quarantined rows, and upgrades futures funding coverage to strict mode. If you want a surrogate study, switch the config back to `backtest.evaluation_mode = "research_only"` instead of mixing capital-facing modes with `backtest.research_only_override`; the resulting summary will label futures funding as `fallback` when missing events are zero-filled.
 The shared runtime now also binds monitoring to the evaluation mode: `local_certification` gets its own finite local-certification profile, `trade_ready` keeps the stricter operator-facing profile, and both emit a blocking `monitoring_gate_report` when required telemetry is missing or fallback assumptions appear.
@@ -149,7 +151,9 @@ The OOS contract is now explicit: CPCV or purged temporal search, search-stage e
 Execution realism is now explicit in the same summary: `execution_evidence.class == "event_driven_certification"` is required for certification language, while `research_surrogate` remains a research-only evidence class even when the rest of the metrics look strong.
 Funding completeness is explicit in the same summary too: `funding_coverage_status == "strict"` is the certification-capable futures path, `fallback` means missing events were zero-filled for research only, and `not_applicable` means no futures funding was in scope.
 Operational admissibility is explicit there as well: the summary now prints the monitoring envelope verdict, missing metrics, and blocking reasons before promotion language.
-Surrogate execution remains research-only. `example_trade_ready_automl.py` still exits early whenever Nautilus is unavailable, including `--smoke`; use `example_automl.py` or a config with `backtest.evaluation_mode = "research_only"` for surrogate studies.
+Event-driven execution remains mandatory for `trade_ready`. `example_trade_ready_automl.py` still exits early whenever Nautilus is unavailable, including `--smoke`. For an explicit pre-capital certification path on consumer hardware, use `example_local_certification_automl.py` or a builder-based example with `--local-certification`; those paths may resolve to `local_certification_surrogate`, but the resulting execution evidence stays non-event-driven and is never capital-release eligible. Use `example_automl.py` for the safer research-only surrogate study path, `example_automl.py --research-demo` for the old unsafe smoke path, or a config with `backtest.evaluation_mode = "research_only"` when you are building your own pure research surrogate workflow.
+
+The default `example_automl.py` entrypoint now follows the standard institutional split discipline described in nested-CV and holdout-selection literature: search is separated from a contiguous validation replay, the final locked holdout is only consulted after the selection freeze, and SPA-based post-selection inference is applied to the surviving candidate pool. That script is still research-only because execution remains surrogate and replication is not yet part of the public path, but it no longer defaults to tuning and evaluating on the same effective window or reporting the winner without a data-snooping correction.
 
 ## Installation
 
@@ -248,6 +252,10 @@ Run the drift retraining example:
 ```bash
 python example_drift_retraining_cycle.py
 ```
+
+That example now includes the missing paper-trading validation loop, a finite champion TTL, and the live-capital kill switch: it aggregates paper observations into a calibration report, attaches that report to the current champion artifact, computes an operational-limits report with a default 10% drawdown threshold, and then evaluates deployment readiness with a default 28-day freshness ceiling on the promoted champion.
+
+The same operator path now also treats retrain cadence as bounded instead of open-ended: drift monitoring defaults `max_bars_between_retrain` to 672 bars, so an hourly model is forced back into review after roughly four weeks even when new drift evidence is quiet.
 
 ## Futures Margin Model
 

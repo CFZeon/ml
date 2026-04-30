@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 
 
 VALID_EVALUATION_MODES = {"research_only", "local_certification", "trade_ready"}
+_EVALUATION_MODE_ALIASES = {"research_demo": "research_only"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +22,7 @@ class EvaluationModeResolution:
 def resolve_evaluation_mode(backtest_config=None) -> EvaluationModeResolution:
     config = dict(backtest_config or {})
     requested_mode = str(config.get("evaluation_mode", "research_only")).strip().lower() or "research_only"
+    requested_mode = _EVALUATION_MODE_ALIASES.get(requested_mode, requested_mode)
     if requested_mode not in VALID_EVALUATION_MODES:
         allowed = ", ".join(sorted(VALID_EVALUATION_MODES))
         raise ValueError(

@@ -20,7 +20,12 @@ from core import (
     resolve_canonical_promotion_score,
     upsert_promotion_gate,
 )
-from example_utils import print_deployment_readiness_summary, print_section
+from example_utils import (
+    print_deployment_readiness_summary,
+    print_operational_limits_summary,
+    print_paper_calibration_summary,
+    print_section,
+)
 
 
 def _fit_logistic_model():
@@ -106,6 +111,32 @@ def _make_challenger_payload(score_value, *, monitoring_report=None):
     }
 
 
+def _make_paper_observations(*, periods=35, mode="paper"):
+    index = pd.date_range("2026-12-01", periods=periods, freq="1D", tz="UTC")
+    return pd.DataFrame(
+        {
+            "timestamp": index,
+            "mode": mode,
+            "trade_count": np.full(periods, 12.0),
+            "modeled_slippage_bps": np.full(periods, 1.8),
+            "realized_slippage_bps": np.linspace(1.86, 1.92, periods),
+            "modeled_fill_ratio": np.full(periods, 0.94),
+            "realized_fill_ratio": np.linspace(0.915, 0.905, periods),
+            "data_breach": np.zeros(periods, dtype=int),
+            "funding_breach": np.zeros(periods, dtype=int),
+            "kill_switch_trigger": np.zeros(periods, dtype=int),
+        }
+    )
+
+
+def _make_runtime_equity_curve(*, periods=24, final_drawdown=0.04):
+    index = pd.date_range("2027-01-01", periods=periods, freq="1h", tz="UTC")
+    peak_segment = np.linspace(1.0, 1.12, periods // 2, endpoint=True)
+    trough_segment = np.linspace(1.12, 1.12 * (1.0 - final_drawdown), periods - len(peak_segment), endpoint=True)
+    values = np.r_[peak_segment, trough_segment]
+    return pd.Series(values, index=index, dtype=float)
+
+
 def main():
     sep = "=" * 60
     symbol = "BTCUSDT"
@@ -139,35 +170,78 @@ def main():
     print(f"  new champion      : {store.get_champion(symbol)['version_id']}")
     print(f"  promotion reasons : {promoted['promotion_decision'].get('reasons')}")
 
-    print_section(sep, 2, "Operator deployment readiness")
+    print_section(sep, 2, "Paper validation loop")
+    paper_report = pipeline.inspect_paper_trading_calibration(
+        certified_expectations={"modeled_slippage_bps": 1.8, "modeled_fill_ratio": 0.94},
+        paper_observations=_make_paper_observations(),
+    )
+    print_paper_calibration_summary(paper_report)
+    current_champion = store.get_champion(symbol)["version_id"]
+    paper_path = store.attach_paper_report(current_champion, paper_report, symbol=symbol)
+    pipeline.state.pop("paper_calibration", None)
+    print(f"  attached to  : {current_champion}")
+    print(f"  report path  : {paper_path}")
+
+    print_section(sep, 3, "Micro-capital release gate")
+    green_limits = pipeline.inspect_operational_limits(
+        operational_limits={"healthy": True, "kill_switch_ready": True},
+        equity_curve=_make_runtime_equity_curve(final_drawdown=0.04),
+    )
+    print_operational_limits_summary(green_limits)
     readiness = pipeline.inspect_deployment_readiness(
         store=store,
         backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+        release_request={"requested_stage": "micro_capital", "manual_acknowledged": True},
     )
     print_deployment_readiness_summary(readiness)
 
-    print_section(sep, 3, "Rejecting a challenger and rolling back")
-    pipeline.state["operational_monitoring"] = {"healthy": False, "reasons": ["feature_schema"]}
+    print_section(sep, 4, "Model TTL expiry hold")
+    current_champion_row = store.get_champion(symbol)
+    freshness_anchor = (
+        pd.Timestamp(current_champion_row.get("promoted_at"))
+        if pd.notna(current_champion_row.get("promoted_at"))
+        else pd.Timestamp(current_champion_row.get("created_at"))
+    )
+    stale_readiness = pipeline.inspect_deployment_readiness(
+        store=store,
+        backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+        release_request={"requested_stage": "micro_capital", "manual_acknowledged": True},
+        policy={
+            "max_model_age_days": 28,
+            "warn_model_age_days": 21,
+            "as_of_timestamp": freshness_anchor + pd.Timedelta(days=35),
+        },
+    )
+    print_deployment_readiness_summary(stale_readiness)
+
+    print_section(sep, 5, "Kill switch breach and rollback")
+    breached_limits = pipeline.inspect_operational_limits(
+        operational_limits={"healthy": True, "kill_switch_ready": True},
+        equity_curve=_make_runtime_equity_curve(final_drawdown=0.14),
+    )
+    print_operational_limits_summary(breached_limits)
+    pipeline.state["operational_monitoring"] = {"healthy": True, "reasons": []}
     rollback_result = pipeline.run_drift_retraining_cycle(
         store=store,
         reference_features=reference_features,
         reference_predictions=reference_predictions,
         bars_since_last_retrain=900,
         scheduled_window_open=True,
-        train_challenger=lambda: _make_challenger_payload(0.08, monitoring_report={"healthy": False, "reasons": ["feature_schema"]}),
-        current_monitoring_report=pipeline.state["operational_monitoring"],
-        rollback_policy={"mode": "hybrid", "critical_reasons": ["feature_schema"]},
+        train_challenger=lambda: _make_challenger_payload(0.08),
+        rollback_policy={"mode": "hybrid"},
     )
     print(f"  retrain status    : {rollback_result['retrain_status']}")
     print(f"  candidate version : {rollback_result['candidate_version_id']}")
     print(f"  rollback status   : {rollback_result['rollback'].get('status')}")
+    print(f"  rollback reasons  : {rollback_result['rollback'].get('reasons')}")
     print(f"  restored champion : {rollback_result['rollback'].get('restored_version_id')}")
     print(f"  current champion  : {store.get_champion(symbol)['version_id']}")
 
-    print_section(sep, 4, "Operator hold decision after rollback")
+    print_section(sep, 6, "Operator hold decision after rollback")
     blocked_readiness = pipeline.inspect_deployment_readiness(
         store=store,
         backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+        release_request={"requested_stage": "micro_capital", "manual_acknowledged": True},
     )
     print_deployment_readiness_summary(blocked_readiness)
 

@@ -400,6 +400,31 @@ def build_local_certification_runtime_overrides(*, market="spot"):
         },
     )
 
+
+def build_local_certification_surrogate_runtime_overrides(*, market="spot"):
+    """Build the explicit surrogate-backed local certification profile.
+
+    This keeps the stricter local-certification data, validation, and monitoring
+    controls, but makes the execution evidence class explicit when Nautilus is
+    unavailable on consumer hardware.
+    """
+
+    return clone_config_with_overrides(
+        build_local_certification_runtime_overrides(market=market),
+        {
+            "backtest": {
+                "execution_profile": "local_surrogate_certification",
+                "execution_policy": {
+                    "adapter": "bar_surrogate",
+                    "time_in_force": "IOC",
+                    "participation_cap": 0.05,
+                    "min_fill_ratio": 0.25,
+                    "force_simulation": False,
+                },
+            },
+        },
+    )
+
 def parse_local_certification_args(description):
     """Parse the shared --local-certification flag used by builder-based examples."""
 
@@ -409,7 +434,8 @@ def parse_local_certification_args(description):
         action="store_true",
         help=(
             "Run this example with the strict local-certification runtime profile. "
-            "Requires a local Nautilus installation and is intended for paper or pre-capital checks."
+            "Uses a real local Nautilus backend when available, otherwise falls back to an explicit surrogate "
+            "certification mode that remains paper or pre-capital only."
         ),
     )
     return parser.parse_args()
@@ -430,10 +456,21 @@ def prepare_example_runtime_config(
         return resolved
 
     if not nautilus_available:
-        raise RuntimeError(
-            "Local certification requires a local Nautilus installation. "
-            f"Install/configure NautilusTrader and rerun {example_name} --local-certification, "
-            "or rerun without --local-certification for the research-only path."
+        return clone_config_with_overrides(
+            resolved,
+            clone_config_with_overrides(
+                build_local_certification_surrogate_runtime_overrides(market=market),
+                {
+                    "example_runtime": {
+                        "mode": "local_certification_surrogate",
+                        "risk_level": "paper_or_pre_capital_only",
+                        "note": (
+                            "explicit local-certification surrogate is enabled because Nautilus is unavailable; "
+                            "execution evidence stays non-event-driven and cannot support live-capital release."
+                        ),
+                    }
+                },
+            ),
         )
 
     return clone_config_with_overrides(
@@ -1402,9 +1439,65 @@ def print_deployment_readiness_summary(report, *, label="deploy ready"):
     reasons = list(report.get("reasons") or [])
     print(f"  deploy why  : {reasons if reasons else 'none'}")
 
+    freshness = dict(components.get("model_freshness") or {})
+    if freshness.get("available"):
+        print(
+            "  model age   : "
+            f"age={_format_metric(freshness.get('age_days'), digits=1)}d  "
+            f"ttl={_format_metric(freshness.get('max_model_age_days'), digits=1)}d  "
+            f"expires={freshness.get('expires_at')}  "
+            f"stale={bool(freshness.get('expired', False))}"
+        )
+
     actions = list(report.get("recommended_actions") or [])
     if actions:
         print(f"  next actions : {actions}")
+
+
+def print_paper_calibration_summary(report, *, label="paper calib"):
+    report = dict(report or {})
+    if not report:
+        print(f"  {label:<12}: unavailable")
+        return
+
+    print(
+        f"  {label:<12}: "
+        f"passed={bool(report.get('passed', False))}  "
+        f"mode={report.get('mode')}  "
+        f"days={_format_metric(report.get('duration_days'), digits=1)}"
+    )
+    reasons = list(report.get("reasons") or [])
+    print(f"  paper why   : {reasons if reasons else 'none'}")
+    observation_summary = dict(report.get("observation_summary") or {})
+    if observation_summary:
+        print(
+            "  paper obs   : "
+            f"rows={observation_summary.get('observation_count')}  "
+            f"trades={_format_metric(observation_summary.get('weighted_trade_count'), digits=0)}  "
+            f"range={observation_summary.get('start_timestamp')} -> {observation_summary.get('end_timestamp')}"
+        )
+
+
+def print_operational_limits_summary(report, *, label="risk limits"):
+    report = dict(report or {})
+    if not report:
+        print(f"  {label:<12}: unavailable")
+        return
+
+    print(
+        f"  {label:<12}: "
+        f"passed={bool(report.get('passed', False))}  "
+        f"kill_switch={bool(report.get('kill_switch_ready', False))}  "
+        f"triggered={bool(report.get('kill_switch_triggered', False))}"
+    )
+    print(
+        "  drawdown    : "
+        f"current={_format_metric(report.get('current_drawdown'), digits=4)}  "
+        f"limit={_format_metric(report.get('max_drawdown_limit'), digits=4)}  "
+        f"action={report.get('enforced_action')}"
+    )
+    reasons = list(report.get("reasons") or [])
+    print(f"  limits why  : {reasons if reasons else 'none'}")
 
 
 def print_automl_summary(automl):
@@ -1456,6 +1549,26 @@ def print_automl_summary(automl):
         )
         capital_reasons = list(capital_evidence.get("blocking_reasons") or [])
         print(f"  capital why  : {capital_reasons if capital_reasons else 'none'}")
+
+    post_selection = (automl.get("overfitting_diagnostics") or {}).get("post_selection") or {}
+    if post_selection:
+        print(
+            "  post select  : "
+            f"enabled={bool(post_selection.get('enabled', False))}  "
+            f"passed={bool(post_selection.get('passed', True))}  "
+            f"rule={post_selection.get('pass_rule')}"
+        )
+        white_report = post_selection.get("white_reality_check") or {}
+        spa_report = post_selection.get("hansen_spa") or {}
+        parts = []
+        if white_report.get("enabled"):
+            parts.append(f"white_rc_p={_format_metric(white_report.get('p_value'))}")
+        if spa_report.get("enabled"):
+            parts.append(f"spa_p={_format_metric(spa_report.get('p_value'))}")
+        if parts:
+            print(f"  post select p: {'  '.join(parts)}")
+        if post_selection.get("reason"):
+            print(f"  post select r: {post_selection.get('reason')}")
 
     best_training = automl.get("best_training", {})
     if best_training:
