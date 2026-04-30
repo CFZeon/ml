@@ -78,7 +78,7 @@ from .models import (
 )
 from .monitoring import build_monitoring_report, write_monitoring_artifacts
 from .orchestration import run_drift_retraining_cycle as orchestrate_drift_retraining_cycle
-from .readiness import build_deployment_readiness_report, build_operational_limits_report, build_paper_trading_report
+from .readiness import build_deployment_readiness_report
 from .regime import (
     build_default_regime_feature_set,
     build_regime_ablation_report,
@@ -911,8 +911,8 @@ def _resolve_backtest_execution_policy(pipeline):
     )
     policy = resolve_execution_policy(policy_config)
 
-    if evaluation_mode.effective_mode == "trade_ready" and (policy.adapter != "nautilus" or policy.force_simulation):
-        mode_label = "Trade-ready"
+    if evaluation_mode.is_capital_facing and (policy.adapter != "nautilus" or policy.force_simulation):
+        mode_label = "Trade-ready" if evaluation_mode.effective_mode == "trade_ready" else "Local certification"
         raise RuntimeError(
             f"{mode_label} evaluation requires a Nautilus execution adapter "
             "with force_simulation=false. Use backtest.evaluation_mode='research_only' for explicit research-only studies."
@@ -1695,22 +1695,6 @@ def _build_pipeline_operational_monitoring(
             run_id=f"{scope}_{symbol}_{timestamp}",
         )
     return report
-
-
-def _attach_context_ttl_to_operational_monitoring(operational_monitoring, context_ttl_report):
-    monitoring = dict(operational_monitoring or {})
-    ttl_report = dict(context_ttl_report or {})
-    if not ttl_report:
-        return monitoring
-
-    monitoring["context_ttl"] = ttl_report
-    if not all(bool(report.get("promotion_pass", True)) for report in ttl_report.values()):
-        monitoring["healthy"] = False
-        reasons = list(monitoring.get("reasons", []))
-        if "context_ttl_breached" not in reasons:
-            reasons.append("context_ttl_breached")
-        monitoring["reasons"] = reasons
-    return monitoring
 
 
 def _timed_inference_call(latency_store, func, *args, **kwargs):
@@ -5303,7 +5287,6 @@ class ResearchPipeline:
         drift_config=None,
         promotion_policy=None,
         current_monitoring_report=None,
-        operational_limits=None,
         rollback_policy=None,
     ):
         resolved_symbol = symbol or self.section("data").get("symbol")
@@ -5332,8 +5315,6 @@ class ResearchPipeline:
                 or (self.state.get("backtest") or {}).get("operational_monitoring")
                 or training.get("operational_monitoring")
             )
-        if operational_limits is None:
-            operational_limits = self.state.get("operational_limits")
 
         result = orchestrate_drift_retraining_cycle(
             store=store,
@@ -5349,7 +5330,6 @@ class ResearchPipeline:
             drift_config=drift_config,
             promotion_policy=promotion_policy,
             current_monitoring_report=current_monitoring_report,
-            operational_limits=operational_limits,
             rollback_policy=rollback_policy,
         )
         self.state["drift_cycle"] = result
@@ -5402,80 +5382,6 @@ class ResearchPipeline:
             policy=policy,
         )
         self.state["deployment_readiness"] = report
-        return report
-
-    def inspect_paper_trading_calibration(
-        self,
-        *,
-        certified_expectations=None,
-        paper_observations=None,
-        policy=None,
-    ):
-        if paper_observations is None:
-            paper_observations = self.state.get("paper_trading_observations") or self.state.get("paper_observations")
-        else:
-            if isinstance(paper_observations, pd.DataFrame):
-                self.state["paper_trading_observations"] = paper_observations.copy()
-            else:
-                self.state["paper_trading_observations"] = copy.deepcopy(list(paper_observations))
-
-        if certified_expectations is None:
-            certified_expectations = copy.deepcopy(self.state.get("paper_certified_expectations") or {})
-        else:
-            self.state["paper_certified_expectations"] = copy.deepcopy(certified_expectations)
-
-        report = build_paper_trading_report(
-            certified_expectations=certified_expectations,
-            paper_observations=paper_observations,
-            policy=policy,
-        )
-        self.state["paper_calibration"] = report
-        return report
-
-    def inspect_operational_limits(
-        self,
-        *,
-        operational_limits=None,
-        equity_curve=None,
-        current_equity=None,
-        peak_equity=None,
-        policy=None,
-    ):
-        if equity_curve is None:
-            equity_curve = self.state.get("operational_limits_equity_curve")
-        else:
-            if isinstance(equity_curve, pd.Series):
-                self.state["operational_limits_equity_curve"] = equity_curve.copy()
-            else:
-                self.state["operational_limits_equity_curve"] = copy.deepcopy(list(equity_curve))
-
-        derived_fields = {
-            "passed",
-            "available",
-            "kill_switch_triggered",
-            "drawdown_breached",
-            "current_drawdown",
-            "current_equity",
-            "peak_equity",
-            "max_drawdown_limit",
-            "enforced_action",
-        }
-        base_limits = {
-            key: value
-            for key, value in dict(self.state.get("operational_limits") or {}).items()
-            if key not in derived_fields
-        }
-        if operational_limits is not None:
-            base_limits.update(dict(operational_limits or {}))
-
-        report = build_operational_limits_report(
-            operational_limits=base_limits,
-            equity_curve=equity_curve,
-            current_equity=current_equity,
-            peak_equity=peak_equity,
-            policy=policy,
-        )
-        self.state["operational_limits"] = report
         return report
 
     def run(self):
