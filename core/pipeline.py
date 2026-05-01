@@ -5326,10 +5326,12 @@ class ResearchPipeline:
         *,
         store,
         reference_features,
+        reference_regimes=None,
         symbol=None,
         current_features=None,
         reference_predictions=None,
         current_predictions=None,
+        current_regimes=None,
         current_performance=None,
         bars_since_last_retrain=None,
         scheduled_window_open=False,
@@ -5352,6 +5354,9 @@ class ResearchPipeline:
             raise ValueError("run_drift_retraining_cycle requires current_features or populated pipeline state")
 
         training = dict(self.state.get("training") or {})
+        resolved_current_regimes = current_regimes
+        if resolved_current_regimes is None:
+            resolved_current_regimes = self.state.get("regimes")
         if current_predictions is None:
             current_predictions = training.get("oos_probabilities")
         if current_performance is None:
@@ -5373,6 +5378,8 @@ class ResearchPipeline:
             current_features=resolved_current_features,
             reference_predictions=reference_predictions,
             current_predictions=current_predictions,
+            reference_regimes=reference_regimes,
+            current_regimes=resolved_current_regimes,
             current_performance=current_performance,
             bars_since_last_retrain=bars_since_last_retrain,
             scheduled_window_open=scheduled_window_open,

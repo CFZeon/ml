@@ -28,6 +28,17 @@ def _safe_frame(value):
     return pd.DataFrame(value).copy()
 
 
+def _coerce_regime_label_series(value):
+    if value is None:
+        return pd.Series(dtype=float)
+    if isinstance(value, pd.DataFrame):
+        if value.empty:
+            return pd.Series(dtype=float)
+        column = "regime" if "regime" in value.columns else value.columns[0]
+        return pd.Series(value[column], copy=False)
+    return _safe_series(value)
+
+
 def _population_stability_index(reference, current, bins=10, epsilon=1e-6):
     reference_series = _safe_series(reference).dropna().astype(float)
     current_series = _safe_series(current).dropna().astype(float)
@@ -82,6 +93,65 @@ def _kl_divergence(reference, current, epsilon=1e-6):
     return float(np.sum(cur * np.log(cur / ref)))
 
 
+def _distribution_total_variation(reference_distribution, current_distribution):
+    if not reference_distribution or not current_distribution:
+        return None
+    keys = set(reference_distribution) | set(current_distribution)
+    if not keys:
+        return None
+    return float(
+        0.5 * sum(abs(float(reference_distribution.get(key, 0.0)) - float(current_distribution.get(key, 0.0))) for key in keys)
+    )
+
+
+def _categorical_distribution_shift(reference, current, epsilon=1e-6):
+    reference_series = _coerce_regime_label_series(reference).dropna()
+    current_series = _coerce_regime_label_series(current).dropna()
+    if reference_series.empty or current_series.empty:
+        return None
+
+    categories = sorted(set(reference_series.tolist()) | set(current_series.tolist()))
+    if not categories:
+        return None
+
+    reference_distribution = {}
+    current_distribution = {}
+    for category in categories:
+        reference_distribution[str(category)] = float((reference_series == category).mean())
+        current_distribution[str(category)] = float((current_series == category).mean())
+
+    psi = float(
+        sum(
+            (max(current_distribution[key], epsilon) - max(reference_distribution[key], epsilon))
+            * math.log(max(current_distribution[key], epsilon) / max(reference_distribution[key], epsilon))
+            for key in reference_distribution
+        )
+    )
+    total_variation = _distribution_total_variation(reference_distribution, current_distribution)
+    return {
+        "psi": psi,
+        "total_variation": total_variation,
+        "reference_distribution": reference_distribution,
+        "current_distribution": current_distribution,
+    }
+
+
+def _categorical_transition_distribution(series):
+    labels = _coerce_regime_label_series(series).dropna().tolist()
+    if len(labels) < 2:
+        return {}
+
+    transitions = {}
+    total = 0
+    for left, right in zip(labels[:-1], labels[1:]):
+        key = f"{left}->{right}"
+        transitions[key] = transitions.get(key, 0) + 1
+        total += 1
+    if total <= 0:
+        return {}
+    return {key: float(count / total) for key, count in transitions.items()}
+
+
 class ADWINDetector:
     """Streaming mean-shift detector with a River ADWIN hook and fallback path."""
 
@@ -132,14 +202,18 @@ class ADWINDetector:
 
 
 class DriftMonitor:
-    def __init__(self, reference_features, reference_predictions=None, config=None):
+    def __init__(self, reference_features, reference_predictions=None, reference_regimes=None, config=None):
         self.reference_features = _safe_frame(reference_features)
         self.reference_predictions = _safe_frame(reference_predictions)
+        self.reference_regimes = _coerce_regime_label_series(reference_regimes)
         self.config = {
             "psi_threshold": 0.2,
             "psi_feature_share_threshold": 0.3,
             "ks_significance": 0.05,
             "prediction_kl_threshold": 0.1,
+            "regime_psi_threshold": 0.2,
+            "regime_total_variation_threshold": 0.25,
+            "regime_transition_threshold": 0.2,
             "cooldown_bars": 500,
             "max_bars_between_retrain": 24 * 28,
             "min_samples": 200,
@@ -149,10 +223,23 @@ class DriftMonitor:
         self.config.update(dict(config or {}))
         self.performance_detector = ADWINDetector(delta=self.config["adwin_delta"])
 
-    def check(self, current_features, current_predictions=None, current_performance=None, bars_since_last_retrain=None):
+    def check(self, current_features, current_predictions=None, current_performance=None,
+              current_regimes=None, bars_since_last_retrain=None):
         current_features = _safe_frame(current_features)
         current_predictions = _safe_frame(current_predictions)
-        sample_count = int(len(current_features) or len(current_predictions) or len(_safe_series(current_performance)))
+        inferred_reference_regimes = self.reference_regimes
+        if inferred_reference_regimes.empty and "regime" in self.reference_features.columns:
+            inferred_reference_regimes = _coerce_regime_label_series(self.reference_features["regime"])
+        inferred_current_regimes = _coerce_regime_label_series(current_regimes)
+        if inferred_current_regimes.empty and "regime" in current_features.columns:
+            inferred_current_regimes = _coerce_regime_label_series(current_features["regime"])
+
+        sample_count = int(
+            len(current_features)
+            or len(current_predictions)
+            or len(inferred_current_regimes)
+            or len(_safe_series(current_performance))
+        )
 
         feature_reports = {}
         feature_alerts = []
@@ -182,6 +269,19 @@ class DriftMonitor:
         prediction_kl = _kl_divergence(self.reference_predictions, current_predictions)
         prediction_drift = bool(prediction_kl is not None and prediction_kl >= float(self.config["prediction_kl_threshold"]))
 
+        regime_distribution = _categorical_distribution_shift(inferred_reference_regimes, inferred_current_regimes)
+        reference_transition = _categorical_transition_distribution(inferred_reference_regimes)
+        current_transition = _categorical_transition_distribution(inferred_current_regimes)
+        regime_transition_tv = _distribution_total_variation(reference_transition, current_transition)
+        regime_drift = bool(
+            regime_distribution is not None
+            and (
+                float(regime_distribution.get("psi") or 0.0) >= float(self.config["regime_psi_threshold"])
+                or float(regime_distribution.get("total_variation") or 0.0) >= float(self.config["regime_total_variation_threshold"])
+                or float(regime_transition_tv or 0.0) >= float(self.config["regime_transition_threshold"])
+            )
+        )
+
         performance_updates = []
         performance_drift = False
         for value in _safe_series(current_performance).dropna().tolist():
@@ -205,7 +305,7 @@ class DriftMonitor:
             and not model_ttl_expired
         )
         enough_samples = sample_count >= int(self.config["min_samples"])
-        evidence_count = int(feature_drift) + int(prediction_drift) + int(performance_drift)
+        evidence_count = int(feature_drift) + int(prediction_drift) + int(regime_drift) + int(performance_drift)
         sufficient_evidence = evidence_count >= int(self.config["min_drift_signals"])
         should_retrain = bool(enough_samples and not cooldown_active and (sufficient_evidence or model_ttl_expired))
 
@@ -229,6 +329,13 @@ class DriftMonitor:
             "feature_drift": feature_drift,
             "prediction_kl_divergence": prediction_kl,
             "prediction_drift": prediction_drift,
+            "regime_report": {
+                "distribution": regime_distribution,
+                "reference_transition_distribution": reference_transition,
+                "current_transition_distribution": current_transition,
+                "transition_total_variation": regime_transition_tv,
+            },
+            "regime_drift": regime_drift,
             "performance_updates": performance_updates,
             "performance_drift": performance_drift,
             "model_ttl_expired": model_ttl_expired,

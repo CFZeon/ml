@@ -97,6 +97,14 @@ from .regime import (
     summarize_regime_ablation_reports,
     summarize_regime_provenance,
 )
+from .regime_training import (
+    RegimeAwareFeatureFrame,
+    RegimeAwareModelBundle,
+    build_regime_aware_feature_frame,
+    summarize_regime_coverage,
+    train_regime_aware_model,
+    train_regime_aware_walk_forward,
+)
 from .scenarios import (
     ScenarioEvent,
     apply_execution_scenarios,

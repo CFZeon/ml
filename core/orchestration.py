@@ -48,6 +48,8 @@ def _augment_drift_report(
     current_features,
     reference_predictions=None,
     current_predictions=None,
+    reference_regimes=None,
+    current_regimes=None,
     current_performance=None,
 ):
     report = dict(drift_report or {})
@@ -55,6 +57,8 @@ def _augment_drift_report(
     report["current_window"] = _window_summary(current_features)
     report["reference_prediction_window"] = _window_summary(reference_predictions)
     report["current_prediction_window"] = _window_summary(current_predictions)
+    report["reference_regime_window"] = _window_summary(reference_regimes)
+    report["current_regime_window"] = _window_summary(current_regimes)
     report["performance_window"] = _window_summary(current_performance)
     return report
 
@@ -142,6 +146,8 @@ def run_drift_retraining_cycle(
     current_features,
     reference_predictions=None,
     current_predictions=None,
+    reference_regimes=None,
+    current_regimes=None,
     current_performance=None,
     bars_since_last_retrain=None,
     scheduled_window_open=False,
@@ -153,10 +159,16 @@ def run_drift_retraining_cycle(
     rollback_policy=None,
 ):
     champion = store.get_champion(symbol)
-    monitor = DriftMonitor(reference_features, reference_predictions, config=drift_config)
+    monitor = DriftMonitor(
+        reference_features,
+        reference_predictions,
+        reference_regimes=reference_regimes,
+        config=drift_config,
+    )
     drift_report = monitor.check(
         current_features,
         current_predictions=current_predictions,
+        current_regimes=current_regimes,
         current_performance=current_performance,
         bars_since_last_retrain=bars_since_last_retrain,
     )
@@ -166,6 +178,8 @@ def run_drift_retraining_cycle(
         current_features=current_features,
         reference_predictions=reference_predictions,
         current_predictions=current_predictions,
+        reference_regimes=reference_regimes,
+        current_regimes=current_regimes,
         current_performance=current_performance,
     )
     drift_guardrails = evaluate_drift_guardrails(drift_report, policy=drift_config)

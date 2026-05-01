@@ -127,6 +127,21 @@ def _join_state_frame(base_frame, addition, source_name, source_map):
     return joined, source_map
 
 
+def _resolve_regime_min_periods(window, floor=5):
+    return int(max(floor, int(window) // 2))
+
+
+def _online_cusum_score(series, window):
+    values = pd.Series(series, copy=False).astype(float)
+    min_periods = _resolve_regime_min_periods(window)
+    rolling_mean = values.rolling(window, min_periods=min_periods).mean()
+    rolling_std = values.rolling(window, min_periods=min_periods).std().replace(0, np.nan)
+    standardized = ((values - rolling_mean) / rolling_std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    positive_cusum = standardized.clip(lower=0.0).rolling(window, min_periods=min_periods).sum()
+    negative_cusum = (-standardized.clip(upper=0.0)).rolling(window, min_periods=min_periods).sum()
+    return pd.concat([positive_cusum, negative_cusum], axis=1).max(axis=1)
+
+
 def build_instrument_regime_state(base_data, rolling_window=20, base_interval="1h", context_timeframes=None):
     data = pd.DataFrame(base_data).copy()
     if data.empty:
@@ -134,6 +149,19 @@ def build_instrument_regime_state(base_data, rolling_window=20, base_interval="1
 
     close = data["close"].astype(float)
     returns = close.pct_change()
+    min_periods = _resolve_regime_min_periods(rolling_window)
+    long_window = int(max(rolling_window * 3, rolling_window + 12))
+    long_min_periods = _resolve_regime_min_periods(long_window, floor=min_periods)
+    short_vol = returns.ewm(span=rolling_window, adjust=False, min_periods=min_periods).std()
+    long_vol = returns.ewm(span=long_window, adjust=False, min_periods=long_min_periods).std()
+    rolling_mean = close.rolling(rolling_window, min_periods=min_periods).mean()
+    rolling_std = close.rolling(rolling_window, min_periods=min_periods).std().replace(0, np.nan)
+    long_mean = close.rolling(long_window, min_periods=long_min_periods).mean()
+    long_std = close.rolling(long_window, min_periods=long_min_periods).std().replace(0, np.nan)
+    standardized_returns = (
+        (returns - returns.rolling(rolling_window, min_periods=min_periods).mean())
+        / returns.rolling(rolling_window, min_periods=min_periods).std().replace(0, np.nan)
+    )
     quote_volume = (
         data["quote_volume"].astype(float)
         if "quote_volume" in data.columns
@@ -143,11 +171,24 @@ def build_instrument_regime_state(base_data, rolling_window=20, base_interval="1
 
     frame = pd.DataFrame(
         {
+            "ret_1": returns,
+            "ret_6": close.pct_change(6),
             "trend_20": close.pct_change(20),
             "trend_60": close.pct_change(60),
             "vol_20": returns.rolling(20, min_periods=10).std(),
             "vol_60": returns.rolling(60, min_periods=20).std(),
+            "ewm_vol_20": short_vol,
+            "ewm_vol_60": long_vol,
+            "vol_cluster_ratio_20_60": short_vol / long_vol.replace(0, np.nan),
+            "vol_of_vol_20": short_vol.rolling(rolling_window, min_periods=min_periods).std(),
             "range_20": ((data["high"] - data["low"]) / close).rolling(20, min_periods=10).mean(),
+            "trend_z_20": close.diff(rolling_window) / (rolling_std * np.sqrt(max(1, rolling_window))),
+            "trend_z_60": close.diff(long_window) / (long_std * np.sqrt(max(1, long_window))),
+            "mean_reversion_gap_20": (close - rolling_mean) / rolling_std,
+            "mean_reversion_gap_60": (close - long_mean) / long_std,
+            "drawdown_60": close / close.rolling(long_window, min_periods=long_min_periods).max() - 1.0,
+            "break_score_20": _online_cusum_score(standardized_returns, rolling_window),
+            "shock_score_20": standardized_returns.abs().ewm(span=rolling_window, adjust=False, min_periods=min_periods).mean(),
             "liquidity_20": np.log1p(quote_volume).rolling(20, min_periods=10).mean(),
             "illiquidity_20": illiquidity.rolling(20, min_periods=10).mean(),
             "trades_20": (
@@ -273,6 +314,34 @@ def _coalesce_regime_signal(features, include_terms, exclude_terms=None,
     return standardized.mean(axis=1).fillna(0.0)
 
 
+def _coalesce_online_regime_signal(features, include_terms, exclude_terms=None,
+                                   fallback_column=None, lookback=None, min_periods=20):
+    exclude_terms = tuple(exclude_terms or ())
+    selected_columns = []
+    for column in features.columns:
+        normalized = column.lower()
+        if any(term in normalized for term in include_terms) and not any(term in normalized for term in exclude_terms):
+            selected_columns.append(column)
+
+    if not selected_columns and fallback_column is not None and fallback_column in features.columns:
+        selected_columns = [fallback_column]
+
+    if not selected_columns:
+        return pd.Series(0.0, index=features.index, dtype=float)
+
+    selected = features[selected_columns].apply(pd.to_numeric, errors="coerce")
+    history = selected.shift(1)
+    if lookback is not None:
+        history_mean = history.rolling(int(lookback), min_periods=int(min_periods)).mean()
+        history_std = history.rolling(int(lookback), min_periods=int(min_periods)).std()
+    else:
+        history_mean = history.expanding(min_periods=int(min_periods)).mean()
+        history_std = history.expanding(min_periods=int(min_periods)).std()
+    history_std = history_std.replace(0, np.nan)
+    standardized = ((selected - history_mean) / history_std).replace([np.inf, -np.inf], np.nan)
+    return standardized.mean(axis=1).fillna(0.0)
+
+
 def _bucket_regime_signal(series, lower_quantile=0.33, upper_quantile=0.67,
                           invert=False, reference_series=None):
     values = -pd.Series(series, copy=False) if invert else pd.Series(series, copy=False)
@@ -287,6 +356,35 @@ def _bucket_regime_signal(series, lower_quantile=0.33, upper_quantile=0.67,
     bucket[values <= lower] = -1
     bucket[values >= upper] = 1
     return bucket
+
+
+def _online_bucket_regime_signal(series, lower_quantile=0.33, upper_quantile=0.67,
+                                 invert=False, lookback=None, min_periods=20):
+    values = -pd.Series(series, copy=False) if invert else pd.Series(series, copy=False)
+    history = values.shift(1)
+    if lookback is not None:
+        lower = history.rolling(int(lookback), min_periods=int(min_periods)).quantile(lower_quantile)
+        upper = history.rolling(int(lookback), min_periods=int(min_periods)).quantile(upper_quantile)
+    else:
+        lower = history.expanding(min_periods=int(min_periods)).quantile(lower_quantile)
+        upper = history.expanding(min_periods=int(min_periods)).quantile(upper_quantile)
+
+    bucket = pd.Series(0, index=values.index, dtype=int)
+    bucket[values <= lower] = -1
+    bucket[values >= upper] = 1
+    return bucket.fillna(0).astype(int)
+
+
+def _online_upper_tail_regime_signal(series, upper_quantile=0.67, lookback=None, min_periods=20):
+    values = pd.Series(series, copy=False)
+    history = values.shift(1)
+    if lookback is not None:
+        upper = history.rolling(int(lookback), min_periods=int(min_periods)).quantile(upper_quantile)
+    else:
+        upper = history.expanding(min_periods=int(min_periods)).quantile(upper_quantile)
+    regime = pd.Series(0, index=values.index, dtype=int)
+    regime[values >= upper] = 1
+    return regime.fillna(0).astype(int)
 
 
 def _detect_explicit_regime(features, config=None, fit_features=None):
@@ -390,6 +488,131 @@ def _detect_explicit_regime(features, config=None, fit_features=None):
     )
 
 
+def _detect_online_regime(features, config=None, fit_features=None):
+    del fit_features
+    config = dict(config or {})
+    clean = features.dropna(how="all")
+    if clean.empty:
+        return pd.DataFrame(
+            columns=[
+                "trend_regime",
+                "mean_reversion_regime",
+                "volatility_regime",
+                "liquidity_regime",
+                "structural_break_regime",
+                "regime",
+            ]
+        )
+
+    lookback = config.get("online_lookback")
+    min_periods = int(config.get("online_min_periods", max(20, config.get("rolling_window", 20))))
+
+    trend_score = _coalesce_online_regime_signal(
+        clean,
+        include_terms=("trend", "ret_", "return", "momentum", "slope"),
+        exclude_terms=("vol", "volume", "liquid", "reversion", "break", "shock"),
+        lookback=lookback,
+        min_periods=min_periods,
+    )
+    mean_reversion_score = _coalesce_online_regime_signal(
+        clean,
+        include_terms=("reversion", "gap", "zscore", "distance"),
+        exclude_terms=("vol", "volume", "liquid", "break", "shock"),
+        lookback=lookback,
+        min_periods=min_periods,
+    ).abs()
+    volatility_score = _coalesce_online_regime_signal(
+        clean,
+        include_terms=("vol", "range", "atr", "dispersion", "cluster", "drawdown", "shock"),
+        exclude_terms=("volume", "liquid"),
+        lookback=lookback,
+        min_periods=min_periods,
+    )
+    liquidity_score = _coalesce_online_regime_signal(
+        clean,
+        include_terms=("liquid", "volume", "turnover", "trade"),
+        exclude_terms=("illiquid",),
+        lookback=lookback,
+        min_periods=min_periods,
+    )
+    illiquidity_score = _coalesce_online_regime_signal(
+        clean,
+        include_terms=("illiquid", "amihud"),
+        lookback=lookback,
+        min_periods=min_periods,
+    )
+    liquidity_score = liquidity_score - illiquidity_score
+
+    break_score = _coalesce_online_regime_signal(
+        clean,
+        include_terms=("break", "shock", "jump", "crash", "drawdown"),
+        exclude_terms=("volume", "liquid"),
+        lookback=lookback,
+        min_periods=min_periods,
+    )
+    break_score = break_score + volatility_score.diff().abs().fillna(0.0)
+
+    lower_quantile = float(config.get("lower_quantile", 0.33))
+    upper_quantile = float(config.get("upper_quantile", 0.67))
+    liquidity_invert = bool(config.get("liquidity_invert", False))
+
+    trend_regime = _online_bucket_regime_signal(
+        trend_score,
+        lower_quantile=lower_quantile,
+        upper_quantile=upper_quantile,
+        lookback=lookback,
+        min_periods=min_periods,
+    )
+    mean_reversion_regime = _online_bucket_regime_signal(
+        mean_reversion_score,
+        lower_quantile=lower_quantile,
+        upper_quantile=upper_quantile,
+        lookback=lookback,
+        min_periods=min_periods,
+    )
+    volatility_regime = _online_bucket_regime_signal(
+        volatility_score,
+        lower_quantile=lower_quantile,
+        upper_quantile=upper_quantile,
+        lookback=lookback,
+        min_periods=min_periods,
+    )
+    liquidity_regime = _online_bucket_regime_signal(
+        liquidity_score,
+        lower_quantile=lower_quantile,
+        upper_quantile=upper_quantile,
+        invert=liquidity_invert,
+        lookback=lookback,
+        min_periods=min_periods,
+    )
+    structural_break_regime = _online_upper_tail_regime_signal(
+        break_score,
+        upper_quantile=upper_quantile,
+        lookback=lookback,
+        min_periods=min_periods,
+    )
+
+    composite = (
+        (trend_regime + 1) * 54
+        + (mean_reversion_regime + 1) * 18
+        + (volatility_regime + 1) * 6
+        + (liquidity_regime + 1) * 2
+        + structural_break_regime
+    ).astype(int)
+
+    return pd.DataFrame(
+        {
+            "trend_regime": trend_regime.astype(int),
+            "mean_reversion_regime": mean_reversion_regime.astype(int),
+            "volatility_regime": volatility_regime.astype(int),
+            "liquidity_regime": liquidity_regime.astype(int),
+            "structural_break_regime": structural_break_regime.astype(int),
+            "regime": composite,
+        },
+        index=clean.index,
+    )
+
+
 def _detect_hmm_regime(features, n_regimes=2, config=None, fit_features=None):
     try:
         from hmmlearn.hmm import GaussianHMM
@@ -448,11 +671,13 @@ def detect_regime(features, n_regimes=2, method="hmm", config=None, fit_features
     method = (method or "hmm").lower()
     if method == "explicit":
         return _detect_explicit_regime(features, config=config, fit_features=fit_features)
+    if method == "online":
+        return _detect_online_regime(features, config=config, fit_features=fit_features)
     if method == "hmm":
         return _detect_hmm_regime(features, n_regimes=n_regimes, config=config, fit_features=fit_features)
 
     raise ValueError(
-        f"Unknown regime detection method={method!r}. Choose from ['hmm', 'explicit']"
+        f"Unknown regime detection method={method!r}. Choose from ['hmm', 'explicit', 'online']"
     )
 
 

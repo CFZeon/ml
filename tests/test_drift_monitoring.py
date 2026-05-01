@@ -89,6 +89,41 @@ class DriftMonitoringTest(unittest.TestCase):
 
         self.assertTrue(any(update.get("drift_detected", False) for update in updates))
 
+    def test_regime_distribution_shift_is_counted_as_drift_evidence(self):
+        reference_index = pd.date_range("2026-10-01", periods=320, freq="1h", tz="UTC")
+        current_index = pd.date_range("2026-11-01", periods=240, freq="1h", tz="UTC")
+        reference_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=reference_index)
+        current_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=current_index)
+        reference_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=reference_index)
+        current_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=current_index)
+        reference_regimes = pd.Series(np.where(np.arange(len(reference_index)) < 260, 0, 1), index=reference_index)
+        current_regimes = pd.Series(np.where(np.arange(len(current_index)) < 40, 0, 3), index=current_index)
+
+        monitor = DriftMonitor(
+            reference_features,
+            reference_predictions,
+            reference_regimes=reference_regimes,
+            config={
+                "min_samples": 200,
+                "min_drift_signals": 1,
+                "regime_psi_threshold": 0.15,
+                "regime_total_variation_threshold": 0.20,
+                "regime_transition_threshold": 0.15,
+            },
+        )
+        report = monitor.check(
+            current_features,
+            current_predictions=current_predictions,
+            current_regimes=current_regimes,
+            bars_since_last_retrain=900,
+        )
+
+        self.assertTrue(report["regime_drift"])
+        self.assertFalse(report["feature_drift"])
+        self.assertFalse(report["prediction_drift"])
+        self.assertGreater(float(report["regime_report"]["distribution"]["psi"]), 0.15)
+        self.assertTrue(report["recommendation"]["should_retrain"])
+
 
 if __name__ == "__main__":
     unittest.main()
