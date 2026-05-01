@@ -86,6 +86,11 @@ from .regime import (
     normalize_regime_feature_set,
     summarize_regime_ablation_reports,
 )
+from .regime_training import (
+    evaluate_regime_aware_predictions,
+    summarize_regime_coverage,
+    train_regime_aware_model,
+)
 from .slippage import (
     DepthCurveImpactModel,
     FillAwareCostModel,
@@ -3081,7 +3086,186 @@ def _score_signal_state(backtest, signal_config):
     return score
 
 
-def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None, close=None, trade_outcome_builder=None, context_frame=None):
+def _resolve_regime_aware_model_config(model_config):
+    regime_aware_config = dict((model_config or {}).get("regime_aware") or {})
+    regime_aware_config["enabled"] = bool(regime_aware_config.get("enabled", False))
+    regime_aware_config["strategy"] = str(regime_aware_config.get("strategy", "feature")).lower()
+    regime_aware_config["regime_column"] = str(regime_aware_config.get("regime_column", "regime"))
+    regime_aware_config["feature_config"] = dict(regime_aware_config.get("feature_config") or {})
+    regime_aware_config["coverage_config"] = dict(regime_aware_config.get("coverage_config") or {})
+    return regime_aware_config
+
+
+def _resolve_regime_coverage_policy(pipeline, regime_aware_config):
+    selection_policy = dict(((pipeline.section("automl") or {}).get("selection_policy") or {}))
+    coverage_policy = dict(regime_aware_config.get("coverage_config") or {})
+    if "min_distinct_regimes" not in coverage_policy and selection_policy.get("min_distinct_regimes") is not None:
+        coverage_policy["min_distinct_regimes"] = int(selection_policy.get("min_distinct_regimes"))
+    if "max_dominant_share" not in coverage_policy and selection_policy.get("max_dominant_regime_share") is not None:
+        coverage_policy["max_dominant_share"] = float(selection_policy.get("max_dominant_regime_share"))
+    return coverage_policy
+
+
+def _append_regime_coverage_reasons(summary, extra_reasons, *, extra_details=None):
+    updated = dict(summary or {})
+    reasons = list(updated.get("reasons") or [])
+    for reason in extra_reasons:
+        if reason and reason not in reasons:
+            reasons.append(str(reason))
+    updated["reasons"] = reasons
+    if extra_details:
+        for key, value in (extra_details or {}).items():
+            updated[key] = value
+
+    status = str(updated.get("status") or "unknown").lower()
+    if reasons and status == "passed":
+        updated["status"] = "failed"
+        updated["promotion_pass"] = False
+        updated["coverage_ok"] = False
+    return updated
+
+
+def _aggregate_regime_coverage_summary(fold_regime, *, coverage_policy=None, regime_aware_config=None):
+    fold_summaries = []
+    reasons = []
+    fit_observed = []
+    validation_observed = []
+    test_observed = []
+    unseen_regimes = set()
+    fallback_rows = 0
+    specialist_shortfalls = {}
+
+    for row in list(fold_regime or []):
+        coverage = dict(row.get("coverage") or {})
+        if not coverage:
+            continue
+
+        fit_summary = dict(coverage.get("fit") or {})
+        validation_summary = dict(coverage.get("validation") or {}) if coverage.get("validation") is not None else None
+        test_summary = dict(coverage.get("test") or {}) if coverage.get("test") is not None else None
+        fold_summaries.append(
+            {
+                "fold": row.get("fold"),
+                "split_id": row.get("split_id"),
+                "fit": fit_summary,
+                "validation": validation_summary,
+                "test": test_summary,
+                "specialist_shortfalls": dict(coverage.get("specialist_shortfalls") or {}),
+            }
+        )
+
+        if fit_summary:
+            fit_observed.append(fit_summary)
+            reasons.extend(list(fit_summary.get("reasons") or []))
+        if validation_summary is not None:
+            validation_observed.append(validation_summary)
+            reasons.extend(list(validation_summary.get("reasons") or []))
+        if test_summary is not None:
+            test_observed.append(test_summary)
+
+        specialist_shortfalls.update(dict(coverage.get("specialist_shortfalls") or {}))
+        regime_aware = dict(row.get("regime_aware") or {})
+        inference_report = dict(regime_aware.get("inference_report") or {})
+        fallback_rows += int(inference_report.get("fallback_rows") or 0)
+        unseen_regimes.update(str(value) for value in (inference_report.get("unseen_regimes") or []))
+
+    if not fit_observed:
+        return {
+            "status": "unknown",
+            "promotion_pass": False,
+            "reasons": ["regime_coverage_unavailable"],
+            "configured_thresholds": dict(coverage_policy or {}),
+            "folds": fold_summaries,
+            "fit_ok_share": None,
+            "validation_ok_share": None,
+            "test_ok_share": None,
+            "distinct_regimes_min_fit": None,
+            "distinct_regimes_min_validation": None,
+            "distinct_regimes_min_test": None,
+            "max_dominant_share_fit": None,
+            "max_dominant_share_validation": None,
+            "max_dominant_share_test": None,
+            "fallback_rows": int(fallback_rows),
+            "unseen_regimes": sorted(unseen_regimes),
+            "specialist_shortfalls": specialist_shortfalls,
+            "strategy": regime_aware_config.get("strategy") if regime_aware_config else None,
+        }
+
+    pre_selection_statuses = [str(summary.get("status") or "unknown").lower() for summary in fit_observed]
+    pre_selection_statuses.extend(
+        str(summary.get("status") or "unknown").lower()
+        for summary in validation_observed
+    )
+    if any(status == "failed" for status in pre_selection_statuses):
+        status = "failed"
+    elif any(status == "unknown" for status in pre_selection_statuses):
+        status = "unknown"
+    else:
+        status = "passed"
+
+    def _share(observed):
+        if not observed:
+            return None
+        return round(float(np.mean([bool(summary.get("promotion_pass", False)) for summary in observed])), 4)
+
+    def _min_distinct(observed):
+        values = [int(summary.get("distinct_regimes")) for summary in observed if summary.get("distinct_regimes") is not None]
+        return min(values) if values else None
+
+    def _max_dominant_share(observed):
+        values = [float(summary.get("dominant_share")) for summary in observed if summary.get("dominant_share") is not None]
+        return round(max(values), 4) if values else None
+
+    deduped_reasons = []
+    for reason in reasons:
+        if reason and reason not in deduped_reasons:
+            deduped_reasons.append(str(reason))
+
+    return {
+        "status": status,
+        "promotion_pass": status == "passed",
+        "reasons": deduped_reasons,
+        "configured_thresholds": {
+            **dict(coverage_policy or {}),
+            "specialist_min_samples_per_regime": (
+                int(regime_aware_config.get("min_samples_per_regime", 0))
+                if regime_aware_config and regime_aware_config.get("enabled") and regime_aware_config.get("strategy") == "specialist"
+                else None
+            ),
+        },
+        "folds": fold_summaries,
+        "fit_ok_share": _share(fit_observed),
+        "validation_ok_share": _share(validation_observed),
+        "test_ok_share": _share(test_observed),
+        "distinct_regimes_min_fit": _min_distinct(fit_observed),
+        "distinct_regimes_min_validation": _min_distinct(validation_observed),
+        "distinct_regimes_min_test": _min_distinct(test_observed),
+        "max_dominant_share_fit": _max_dominant_share(fit_observed),
+        "max_dominant_share_validation": _max_dominant_share(validation_observed),
+        "max_dominant_share_test": _max_dominant_share(test_observed),
+        "fallback_rows": int(fallback_rows),
+        "unseen_regimes": sorted(unseen_regimes),
+        "specialist_shortfalls": specialist_shortfalls,
+        "strategy": regime_aware_config.get("strategy") if regime_aware_config and regime_aware_config.get("enabled") else None,
+    }
+
+
+def _predict_primary_outputs(model, X, regime_data=None):
+    X_frame = pd.DataFrame(X).copy()
+    if hasattr(model, "predict_with_probability_report"):
+        predictions, probabilities, report = model.predict_with_probability_report(X_frame, regime_data)
+        return pd.Series(predictions, index=X_frame.index), pd.DataFrame(probabilities).reindex(X_frame.index), report
+
+    predictions = pd.Series(model.predict(X_frame), index=X_frame.index)
+    probabilities = predict_probability_frame(model, X_frame)
+    return predictions, probabilities.reindex(X_frame.index), {
+        "strategy": "standard",
+        "fallback_rows": 0,
+        "unseen_regimes": [],
+    }
+
+
+def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None, close=None, trade_outcome_builder=None, context_frame=None, regime_data=None):
     inner_predictions = []
     inner_probabilities = []
     inner_truth = []
@@ -3090,6 +3274,7 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
     min_train_rows = max(50, min(100, len(X_train) // 3))
     min_test_rows = 20
     binary_primary = model_config.get("binary_primary", True)
+    regime_aware_config = _resolve_regime_aware_model_config(model_config)
 
     for inner_train_idx, inner_test_idx in walk_forward_split(
         X_train,
@@ -3104,6 +3289,8 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
         y_inner_train = y_train.iloc[inner_train_idx]
         w_inner_train = sample_weights.iloc[inner_train_idx]
         X_inner_test = X_train.iloc[inner_test_idx]
+        regime_inner_train = regime_data.reindex(X_inner_train.index) if regime_data is not None else None
+        regime_inner_test = regime_data.reindex(X_inner_test.index) if regime_data is not None else None
         inner_labels_train = labels.iloc[inner_train_idx] if labels is not None else None
 
         inner_test_start = X_inner_test.index[0] if len(X_inner_test) > 0 else None
@@ -3114,6 +3301,8 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
             cutoff_timestamp=inner_test_start,
             sample_weights=w_inner_train,
         )
+        if regime_inner_train is not None:
+            regime_inner_train = regime_inner_train.reindex(X_inner_train.index)
         if len(X_inner_train) < min_train_rows:
             continue
 
@@ -3122,6 +3311,8 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
             X_inner_train = X_inner_train.loc[binary_mask]
             y_inner_train = y_inner_train.loc[binary_mask]
             w_inner_train = w_inner_train.loc[binary_mask]
+            if regime_inner_train is not None:
+                regime_inner_train = regime_inner_train.loc[binary_mask]
             if len(X_inner_train) < min_train_rows:
                 continue
         w_inner_train = _combine_class_balance_weights(y_inner_train, w_inner_train)
@@ -3135,18 +3326,40 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
                 model_config,
             )
 
-        inner_model = train_model(
-            X_inner_train,
-            y_inner_train,
-            sample_weight=w_inner_train,
-            model_type=model_config.get("type", "gbm"),
-            model_params=model_config.get("params"),
-            sampling_metadata=sampling_metadata,
-            emit_warnings=False,
-        )
+        if regime_aware_config["enabled"]:
+            if regime_inner_train is None or regime_inner_train.dropna(how="all").empty:
+                raise RuntimeError("Regime-aware meta training requires fold-local regime inputs.")
+            inner_model, _ = train_regime_aware_model(
+                X_inner_train,
+                y_inner_train,
+                regime_inner_train,
+                strategy=regime_aware_config["strategy"],
+                model_type=model_config.get("type", "gbm"),
+                model_params=model_config.get("params"),
+                feature_config=regime_aware_config.get("feature_config"),
+                regime_column=regime_aware_config.get("regime_column", "regime"),
+                min_samples_per_regime=int(regime_aware_config.get("min_samples_per_regime", 40)),
+                sample_weight=w_inner_train,
+                sampling_metadata=sampling_metadata,
+            )
+            inner_pred, inner_prob, _ = _predict_primary_outputs(
+                inner_model,
+                X_inner_test,
+                regime_data=regime_inner_test,
+            )
+        else:
+            inner_model = train_model(
+                X_inner_train,
+                y_inner_train,
+                sample_weight=w_inner_train,
+                model_type=model_config.get("type", "gbm"),
+                model_params=model_config.get("params"),
+                sampling_metadata=sampling_metadata,
+                emit_warnings=False,
+            )
 
-        inner_pred = pd.Series(inner_model.predict(X_inner_test), index=X_inner_test.index)
-        inner_prob = predict_probability_frame(inner_model, X_inner_test)
+            inner_pred = pd.Series(inner_model.predict(X_inner_test), index=X_inner_test.index)
+            inner_prob = predict_probability_frame(inner_model, X_inner_test)
         inner_predictions.append(inner_pred)
         inner_probabilities.append(inner_prob)
         inner_truth.append(y_train.iloc[inner_test_idx])
@@ -3885,6 +4098,8 @@ class TrainModelsStep(PipelineStep):
         feature_blocks = pipeline.state.get("feature_blocks", {})
         stationarity_config = _resolve_stationarity_screening_config(pipeline)
         binary_primary = config.get("binary_primary", True)
+        regime_aware_config = _resolve_regime_aware_model_config(config)
+        regime_coverage_policy = _resolve_regime_coverage_policy(pipeline, regime_aware_config)
         holding_bars = _resolve_signal_holding_bars(pipeline, signal_config)
         default_avg_win = float(signal_config.get("avg_win", 0.02))
         default_avg_loss = float(signal_config.get("avg_loss", 0.02))
@@ -4100,6 +4315,29 @@ class TrainModelsStep(PipelineStep):
             if X_val is not None and X_val.empty:
                 X_val, y_val, labels_val = None, None, None
 
+            fold_regime[-1]["coverage"] = {
+                "fit": summarize_regime_coverage(
+                    regime_frame.reindex(X_fit.index) if not regime_frame.empty else None,
+                    regime_column=regime_aware_config.get("regime_column", "regime"),
+                    config=regime_coverage_policy,
+                ),
+                "validation": (
+                    summarize_regime_coverage(
+                        regime_frame.reindex(X_val.index) if not regime_frame.empty else None,
+                        regime_column=regime_aware_config.get("regime_column", "regime"),
+                        config=regime_coverage_policy,
+                    )
+                    if X_val is not None
+                    else None
+                ),
+                "test": summarize_regime_coverage(
+                    regime_frame.reindex(X_test.index) if not regime_frame.empty else None,
+                    regime_column=regime_aware_config.get("regime_column", "regime"),
+                    config=regime_coverage_policy,
+                ),
+                "specialist_shortfalls": {},
+            }
+
             w_fit = _compute_fold_sample_weights(labels_fit, close_all).reindex(X_fit.index).fillna(1.0)
             w_val = None
             if X_val is not None and labels_val is not None and not labels_val.empty:
@@ -4190,12 +4428,22 @@ class TrainModelsStep(PipelineStep):
             y_train_primary = y_fit
             w_train_primary = w_fit
             labels_train_primary = labels_fit.loc[X_fit_model.index]
+            regime_fit_model = regime_frame.reindex(X_fit_model.index) if not regime_frame.empty else None
+            regime_test_model = regime_frame.reindex(X_test_model.index) if not regime_frame.empty else None
+            regime_val_model = (
+                regime_frame.reindex(X_val_model.index)
+                if X_val_model is not None and not regime_frame.empty
+                else None
+            )
+            regime_train_primary = regime_frame.reindex(X_train_primary.index) if not regime_frame.empty else None
             if binary_primary:
                 binary_mask = y_fit.ne(0)
                 X_train_primary = X_fit_model.loc[binary_mask]
                 y_train_primary = y_fit.loc[binary_mask]
                 w_train_primary = w_fit.loc[binary_mask]
                 labels_train_primary = labels_fit.loc[binary_mask]
+                if regime_train_primary is not None:
+                    regime_train_primary = regime_train_primary.loc[binary_mask]
             w_train_primary = _combine_class_balance_weights(y_train_primary, w_train_primary)
 
             sampling_metadata = _build_training_sampling_metadata(
@@ -4204,15 +4452,44 @@ class TrainModelsStep(PipelineStep):
                 w_fit.loc[X_train_primary.index],
                 config,
             )
-            model, bootstrap_report = train_model(
-                X_train_primary,
-                y_train_primary,
-                sample_weight=w_train_primary,
-                model_type=config.get("type", "gbm"),
-                model_params=config.get("params"),
-                sampling_metadata=sampling_metadata,
-                return_report=True,
-            )
+            regime_training_report = None
+            if regime_aware_config["enabled"]:
+                if regime_train_primary is None or regime_train_primary.dropna(how="all").empty:
+                    raise RuntimeError("Regime-aware training requires fold-local regime inputs.")
+                model, regime_training_report = train_regime_aware_model(
+                    X_train_primary,
+                    y_train_primary,
+                    regime_train_primary,
+                    strategy=regime_aware_config["strategy"],
+                    model_type=config.get("type", "gbm"),
+                    model_params=config.get("params"),
+                    feature_config=regime_aware_config.get("feature_config"),
+                    regime_column=regime_aware_config.get("regime_column", "regime"),
+                    min_samples_per_regime=int(regime_aware_config.get("min_samples_per_regime", 40)),
+                    sample_weight=w_train_primary,
+                    sampling_metadata=sampling_metadata,
+                )
+                bootstrap_report = {
+                    "sequential_bootstrap_enabled": bool(config.get("sequential_bootstrap", False)),
+                    "sequential_bootstrap_used": False,
+                    "warning": (
+                        "regime_aware_sampling_report_not_available"
+                        if config.get("sequential_bootstrap", False)
+                        else None
+                    ),
+                    "path": "regime_aware_primary_model",
+                    "strategy": regime_aware_config["strategy"],
+                }
+            else:
+                model, bootstrap_report = train_model(
+                    X_train_primary,
+                    y_train_primary,
+                    sample_weight=w_train_primary,
+                    model_type=config.get("type", "gbm"),
+                    model_params=config.get("params"),
+                    sampling_metadata=sampling_metadata,
+                    return_report=True,
+                )
             fold_bootstrap.append(
                 {
                     "fold": fold,
@@ -4221,24 +4498,53 @@ class TrainModelsStep(PipelineStep):
                 }
             )
 
-            metrics = evaluate_model(model, X_test_model, y_test)
+            test_primary_preds, test_primary_probs_raw, primary_inference_report = _timed_inference_call(
+                inference_latencies_ms,
+                _predict_primary_outputs,
+                model,
+                X_test_model,
+                regime_data=regime_test_model,
+            )
+            if regime_training_report is not None:
+                metrics = evaluate_regime_aware_predictions(y_test, test_primary_preds, test_primary_probs_raw)
+            else:
+                metrics = evaluate_model(model, X_test_model, y_test)
             metrics["fold"] = fold
             metrics["split_id"] = split_id
             metrics["validation_method"] = validation_method
             if split_meta.get("test_blocks") is not None:
                 metrics["test_blocks"] = split_meta.get("test_blocks")
-
-            test_primary_preds = pd.Series(
-                _timed_inference_call(inference_latencies_ms, model.predict, X_test_model),
-                index=X_test_model.index,
-            )
-            test_primary_probs_raw = _timed_inference_call(
-                inference_latencies_ms,
-                predict_probability_frame,
-                model,
-                X_test_model,
-            )
             test_primary_probs = test_primary_probs_raw.copy()
+
+            if regime_training_report is not None:
+                specialist_shortfalls = dict(regime_training_report.get("skipped_regimes") or {})
+                if specialist_shortfalls:
+                    shortfall_reasons = []
+                    if any(reason == "minimum_samples_not_met" for reason in specialist_shortfalls.values()):
+                        shortfall_reasons.append("specialist_regime_sample_shortfall")
+                    if any(reason == "single_class_regime" for reason in specialist_shortfalls.values()):
+                        shortfall_reasons.append("specialist_regime_single_class")
+                    fold_regime[-1]["coverage"]["fit"] = _append_regime_coverage_reasons(
+                        fold_regime[-1]["coverage"].get("fit"),
+                        shortfall_reasons,
+                        extra_details={"specialist_shortfalls": specialist_shortfalls},
+                    )
+                    fold_regime[-1]["coverage"]["specialist_shortfalls"] = specialist_shortfalls
+                fold_regime[-1]["regime_aware"] = {
+                    "enabled": True,
+                    "strategy": regime_training_report.get("strategy"),
+                    "training_report": regime_training_report,
+                    "inference_report": primary_inference_report,
+                    "coverage": {
+                        "fit": dict((fold_regime[-1].get("coverage") or {}).get("fit") or {}),
+                        "validation": copy.deepcopy((fold_regime[-1].get("coverage") or {}).get("validation")),
+                        "test": summarize_regime_coverage(
+                            regime_test_model,
+                            regime_column=regime_aware_config.get("regime_column", "regime"),
+                            config=regime_coverage_policy,
+                        ),
+                    },
+                }
 
             primary_calibrator = None
             meta_calibrator = None
@@ -4278,10 +4584,14 @@ class TrainModelsStep(PipelineStep):
                     cutoff_timestamp=cutoff_timestamp,
                 ),
                 context_frame=meta_context_frame.reindex(X_fit_model.index) if meta_context_frame is not None else None,
+                regime_data=regime_fit_model,
             )
-            fit_primary_preds = pd.Series(
-                _timed_inference_call(inference_latencies_ms, model.predict, X_fit_model),
-                index=X_fit_model.index,
+            fit_primary_preds, _, _ = _timed_inference_call(
+                inference_latencies_ms,
+                _predict_primary_outputs,
+                model,
+                X_fit_model,
+                regime_data=regime_fit_model,
             )
             fold_avg_win = default_avg_win
             fold_avg_loss = default_avg_loss
@@ -4312,15 +4622,12 @@ class TrainModelsStep(PipelineStep):
             tuned_signal_params = dict(signal_policy_report["params"])
             policy_backtest = None
             if X_val_model is not None and not X_val_model.empty:
-                val_primary_preds = pd.Series(
-                    _timed_inference_call(inference_latencies_ms, model.predict, X_val_model),
-                    index=X_val_model.index,
-                )
-                val_primary_probs_raw = _timed_inference_call(
+                val_primary_preds, val_primary_probs_raw, _ = _timed_inference_call(
                     inference_latencies_ms,
-                    predict_probability_frame,
+                    _predict_primary_outputs,
                     model,
                     X_val_model,
+                    regime_data=regime_val_model,
                 )
                 val_primary_probs, primary_calibrator = _calibrate_primary_probability_frame(
                     val_primary_probs_raw,
@@ -4452,17 +4759,23 @@ class TrainModelsStep(PipelineStep):
 
             test_primary_probs = _apply_primary_probability_calibrator(test_primary_probs_raw, primary_calibrator)
 
-            block_diagnostics = compute_feature_block_diagnostics(
-                model,
-                X_train_primary,
-                X_test_model,
-                y_test,
-                feature_blocks=fold_feature_blocks,
-                baseline_metrics=metrics,
-            )
-            fold_block_diagnostics.append(block_diagnostics)
-            fold_family_diagnostics.append(
-                compute_feature_family_diagnostics(
+            if regime_training_report is not None:
+                block_diagnostics = {
+                    "mode": "regime_aware",
+                    "strategy": regime_training_report.get("strategy"),
+                    "blocks": [],
+                    "top_features": [],
+                }
+                family_diagnostics = {
+                    "mode": "regime_aware",
+                    "strategy": regime_training_report.get("strategy"),
+                    "families": [],
+                    "bundles": [],
+                    "selected_families": [],
+                    "endogenous_only_selected": False,
+                }
+            else:
+                block_diagnostics = compute_feature_block_diagnostics(
                     model,
                     X_train_primary,
                     X_test_model,
@@ -4470,7 +4783,16 @@ class TrainModelsStep(PipelineStep):
                     feature_blocks=fold_feature_blocks,
                     baseline_metrics=metrics,
                 )
-            )
+                family_diagnostics = compute_feature_family_diagnostics(
+                    model,
+                    X_train_primary,
+                    X_test_model,
+                    y_test,
+                    feature_blocks=fold_feature_blocks,
+                    baseline_metrics=metrics,
+                )
+            fold_block_diagnostics.append(block_diagnostics)
+            fold_family_diagnostics.append(family_diagnostics)
 
             X_meta_test = build_meta_feature_frame(
                 test_primary_preds,
@@ -4694,6 +5016,12 @@ class TrainModelsStep(PipelineStep):
         regime_ablation_summary = summarize_regime_ablation_reports(
             [row.get("ablation") for row in fold_regime]
         )
+        regime_aware_folds = [row.get("regime_aware") for row in fold_regime if row.get("regime_aware")]
+        regime_coverage_summary = _aggregate_regime_coverage_summary(
+            fold_regime,
+            coverage_policy=regime_coverage_policy,
+            regime_aware_config=regime_aware_config,
+        )
         signal_decay = _build_signal_decay_report_for_segments(pipeline, signal_decay_segments, holding_bars)
         context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
         data_certification_report = dict(pipeline.state.get("data_certification") or {})
@@ -4834,6 +5162,13 @@ class TrainModelsStep(PipelineStep):
                 "preview_provenance": pipeline.state.get("regime_provenance"),
                 "preview_ablation": pipeline.state.get("regime_ablation"),
                 "ablation_summary": regime_ablation_summary,
+                "coverage_summary": regime_coverage_summary,
+                "regime_aware": {
+                    "enabled": bool(regime_aware_config.get("enabled", False)),
+                    "strategy": regime_aware_config.get("strategy") if regime_aware_config.get("enabled", False) else None,
+                    "folds": regime_aware_folds,
+                    "coverage_summary": regime_coverage_summary,
+                },
                 "folds": fold_regime,
             },
             "stationarity": {

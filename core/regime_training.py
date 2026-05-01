@@ -8,7 +8,12 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score
 
-from .models import predict_probability_frame, train_model, walk_forward_split
+from .models import (
+    _evaluate_directional_probability_quality,
+    predict_probability_frame,
+    train_model,
+    walk_forward_split,
+)
 
 
 def _coerce_regime_frame(regime_data, index=None):
@@ -24,6 +29,21 @@ def _coerce_regime_frame(regime_data, index=None):
     return frame
 
 
+def _subset_sampling_metadata(sampling_metadata, index):
+    metadata = dict(sampling_metadata or {})
+    if not metadata:
+        return None
+
+    subset = dict(metadata)
+    labels = metadata.get("labels")
+    if labels is not None:
+        subset["labels"] = pd.DataFrame(labels).reindex(index)
+    close = metadata.get("close")
+    if close is not None:
+        subset["close"] = pd.Series(close, copy=False)
+    return subset
+
+
 def summarize_regime_coverage(regime_data, regime_column="regime", config=None):
     regime_frame = _coerce_regime_frame(regime_data)
     config = dict(config or {})
@@ -32,6 +52,8 @@ def summarize_regime_coverage(regime_data, regime_column="regime", config=None):
 
     if regime_frame.empty:
         return {
+            "status": "unknown",
+            "promotion_pass": False,
             "available_rows": 0,
             "distinct_regimes": 0,
             "dominant_regime": None,
@@ -45,6 +67,8 @@ def summarize_regime_coverage(regime_data, regime_column="regime", config=None):
     labels = pd.Series(regime_frame[target_column], copy=False).dropna()
     if labels.empty:
         return {
+            "status": "unknown",
+            "promotion_pass": False,
             "available_rows": 0,
             "distinct_regimes": 0,
             "dominant_regime": None,
@@ -63,7 +87,10 @@ def summarize_regime_coverage(regime_data, regime_column="regime", config=None):
         reasons.append("insufficient_regime_diversity")
     if dominant_share > max_dominant_share:
         reasons.append("dominant_regime_exceeds_threshold")
+    status = "passed" if not reasons else "failed"
     return {
+        "status": status,
+        "promotion_pass": status == "passed",
         "available_rows": int(len(labels)),
         "distinct_regimes": distinct_regimes,
         "dominant_regime": dominant_regime,
@@ -155,12 +182,13 @@ def build_regime_aware_feature_frame(X, regime_data, config=None):
     )
 
 
-def _evaluate_regime_aware_predictions(y_true, predictions):
+def evaluate_regime_aware_predictions(y_true, predictions, probability_frame=None):
     y_series = pd.Series(y_true, index=predictions.index if isinstance(predictions, pd.Series) else None)
     pred_series = pd.Series(predictions, index=y_series.index)
     metrics = {
         "accuracy": round(float(accuracy_score(y_series, pred_series)), 4),
         "f1_macro": round(float(f1_score(y_series, pred_series, average="macro", zero_division=0)), 4),
+        "label_abstain_rate": round(float(y_series.eq(0).mean()), 4),
         "prediction_coverage": round(float(pred_series.ne(0).mean()), 4),
     }
     directional_mask = y_series.ne(0)
@@ -169,6 +197,12 @@ def _evaluate_regime_aware_predictions(y_true, predictions):
             float(accuracy_score(y_series.loc[directional_mask], pred_series.loc[directional_mask])),
             4,
         )
+        metrics["directional_f1_macro"] = round(
+            float(f1_score(y_series.loc[directional_mask], pred_series.loc[directional_mask], average="macro", zero_division=0)),
+            4,
+        )
+    if probability_frame is not None:
+        metrics.update(_evaluate_directional_probability_quality(probability_frame, y_series))
     return metrics
 
 
@@ -238,7 +272,7 @@ class RegimeAwareModelBundle:
                 model = self.fallback_model
                 fallback_rows += int(len(row_index))
                 unseen_regimes.append(regime_value)
-            group_X = X_frame.loc[row_index]
+            group_X = X_frame.loc[row_index, self.feature_columns] if self.feature_columns else X_frame.loc[row_index]
             predictions.loc[row_index] = model.predict(group_X)
             probabilities.loc[row_index, :] = predict_probability_frame(
                 model,
@@ -249,11 +283,12 @@ class RegimeAwareModelBundle:
         missing_rows = labels.index[labels.isna()]
         if len(missing_rows) > 0:
             fallback_rows += int(len(missing_rows))
-            fallback_predictions = self.fallback_model.predict(X_frame.loc[missing_rows])
+            fallback_X = X_frame.loc[missing_rows, self.feature_columns] if self.feature_columns else X_frame.loc[missing_rows]
+            fallback_predictions = self.fallback_model.predict(fallback_X)
             predictions.loc[missing_rows] = fallback_predictions
             probabilities.loc[missing_rows, :] = predict_probability_frame(
                 self.fallback_model,
-                X_frame.loc[missing_rows],
+                fallback_X,
                 ordered_classes=self.ordered_classes,
             ).to_numpy()
             unseen_regimes.append("missing")
@@ -278,11 +313,13 @@ def train_regime_aware_model(
     regime_column="regime",
     min_samples_per_regime=40,
     sample_weight=None,
+    sampling_metadata=None,
 ):
     X_frame = pd.DataFrame(X).copy()
     y_series = pd.Series(y, index=X_frame.index)
     regime_frame = _coerce_regime_frame(regime_data, index=X_frame.index)
     strategy = str(strategy).lower()
+    coverage_summary = summarize_regime_coverage(regime_frame, regime_column=regime_column, config=feature_config)
 
     if strategy == "feature":
         feature_result = build_regime_aware_feature_frame(X_frame, regime_frame, config=feature_config)
@@ -292,6 +329,7 @@ def train_regime_aware_model(
             sample_weight=sample_weight,
             model_type=model_type,
             model_params=model_params,
+            sampling_metadata=sampling_metadata,
         )
         bundle = RegimeAwareModelBundle(
             strategy="feature",
@@ -307,6 +345,7 @@ def train_regime_aware_model(
             "normalized_columns": list(feature_result.normalized_columns),
             "interaction_columns": list(feature_result.interaction_columns),
             "regime_alignment": "inference_aligned_input",
+            "coverage_summary": coverage_summary,
         }
         return bundle, report
 
@@ -324,6 +363,7 @@ def train_regime_aware_model(
         sample_weight=sample_weight,
         model_type=model_type,
         model_params=model_params,
+        sampling_metadata=sampling_metadata,
     )
     specialist_models = {}
     specialist_rows = {}
@@ -340,12 +380,14 @@ def train_regime_aware_model(
         regime_weight = None
         if sample_weight is not None:
             regime_weight = pd.Series(sample_weight, index=X_frame.index).loc[row_index]
+        regime_sampling_metadata = _subset_sampling_metadata(sampling_metadata, row_index)
         specialist_models[regime_value] = train_model(
             regime_X,
             regime_y,
             sample_weight=regime_weight,
             model_type=model_type,
             model_params=model_params,
+            sampling_metadata=regime_sampling_metadata,
         )
         specialist_rows[str(regime_value)] = int(len(regime_X))
 
@@ -353,15 +395,18 @@ def train_regime_aware_model(
         strategy="specialist",
         fallback_model=fallback_model,
         specialist_models=specialist_models,
+        feature_columns=list(X_frame.columns),
         regime_column=target_column,
     )
     report = {
         "strategy": "specialist",
+        "feature_columns": list(X_frame.columns),
         "trained_regimes": [str(value) for value in specialist_models],
         "trained_rows_by_regime": specialist_rows,
         "skipped_regimes": skipped_regimes,
         "fallback_enabled": True,
         "regime_alignment": "inference_aligned_input",
+        "coverage_summary": coverage_summary,
     }
     return bundle, report
 
@@ -430,7 +475,7 @@ def train_regime_aware_walk_forward(
             sample_weight=weight_train,
         )
         predictions, probabilities, inference_report = bundle.predict_with_probability_report(X_test, regime_test)
-        metrics = _evaluate_regime_aware_predictions(y_test, predictions)
+        metrics = evaluate_regime_aware_predictions(y_test, predictions, probabilities)
 
         folds.append(
             {
@@ -469,6 +514,7 @@ __all__ = [
     "RegimeAwareFeatureFrame",
     "RegimeAwareModelBundle",
     "build_regime_aware_feature_frame",
+    "evaluate_regime_aware_predictions",
     "summarize_regime_coverage",
     "train_regime_aware_model",
     "train_regime_aware_walk_forward",

@@ -185,6 +185,11 @@ class ExchangeFailureScenariosTest(unittest.TestCase):
         self.assertTrue(result["stress_matrix"]["configured"])
         self.assertEqual(result["stress_matrix"]["scenario_count"], 3)
         self.assertCountEqual(result["stress_matrix"]["scenario_names"], ["downtime", "stale_mark", "halt"])
+        self.assertIn("worst_max_drawdown", result["stress_matrix"])
+        self.assertIn("worst_fill_ratio", result["stress_matrix"])
+        self.assertIn("worst_trade_count", result["stress_matrix"])
+        self.assertIn("venue_failure", result["stress_matrix"]["control_intents"])
+        self.assertIn("control_tags", result["stress_matrix"]["results"]["downtime"])
         self.assertTrue(result["stress_realism_ready"])
 
 

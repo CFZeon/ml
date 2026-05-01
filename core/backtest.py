@@ -2103,25 +2103,89 @@ def _resolve_realized_slippage_paid(cost_report, fallback_total, execution_repor
     return float(fallback_total)
 
 
+def _infer_stress_control_tags(name, scenario_report=None):
+    report = dict(scenario_report or {})
+    tags = [str(tag) for tag in list(report.get("control_tags") or []) if str(tag).strip()]
+    control_intent = report.get("control_intent")
+    if control_intent is not None:
+        tags.append(str(control_intent))
+
+    configured_event_types = [str(value).lower() for value in list(report.get("configured_event_types") or [])]
+    descriptor = " ".join([str(name).lower(), *configured_event_types])
+    inferred = []
+    if any(token in descriptor for token in ("downtime", "halt", "stale_mark", "venue", "outage")):
+        inferred.append("venue_failure")
+    if any(token in descriptor for token in ("liquidity", "drought", "fill")):
+        inferred.append("liquidity_drought")
+    if any(token in descriptor for token in ("crash", "volatility", "spike", "shock")):
+        inferred.append("volatility_spike")
+    if any(token in descriptor for token in ("regime", "transition")):
+        inferred.append("regime_transition")
+    if any(token in descriptor for token in ("fallback", "unseen_regime", "unseen-regime")):
+        inferred.append("unseen_regime_fallback_pressure")
+
+    ordered = []
+    for tag in tags + inferred:
+        if tag and tag not in ordered:
+            ordered.append(tag)
+    return ordered
+
+
 def _summarize_stress_matrix_results(results):
     scenario_names = [str(name) for name in results if str(name) != "base"]
     stressed_results = [results[name] for name in scenario_names if isinstance(results.get(name), dict)]
+    control_intents = set()
+    summarized_results = {}
+    worst_max_drawdown = None
+    worst_fill_ratio = None
+    worst_trade_count = None
+
+    for name in scenario_names:
+        result = results.get(name)
+        if not isinstance(result, dict):
+            continue
+
+        scenario_report = dict(result.get("scenario_report") or {})
+        control_tags = _infer_stress_control_tags(name, scenario_report)
+        control_intents.update(control_tags)
+
+        max_drawdown = result.get("max_drawdown")
+        if max_drawdown is not None:
+            max_drawdown = float(max_drawdown)
+            worst_max_drawdown = max_drawdown if worst_max_drawdown is None else min(worst_max_drawdown, max_drawdown)
+
+        fill_ratio = result.get("fill_ratio")
+        if fill_ratio is not None:
+            fill_ratio = float(fill_ratio)
+            worst_fill_ratio = fill_ratio if worst_fill_ratio is None else min(worst_fill_ratio, fill_ratio)
+
+        trade_count = result.get("total_trades")
+        if trade_count is not None:
+            trade_count = int(trade_count)
+            worst_trade_count = trade_count if worst_trade_count is None else min(worst_trade_count, trade_count)
+
+        summarized_results[name] = {
+            "net_profit_pct": result.get("net_profit_pct"),
+            "sharpe_ratio": result.get("sharpe_ratio"),
+            "max_drawdown": result.get("max_drawdown"),
+            "fill_ratio": result.get("fill_ratio"),
+            "total_trades": result.get("total_trades"),
+            "scenario_report": scenario_report,
+            "control_intent": scenario_report.get("control_intent"),
+            "control_tags": control_tags,
+        }
+
     return {
         "configured": bool(scenario_names),
         "scenario_count": int(len(scenario_names)),
         "scenario_names": scenario_names,
         "worst_net_profit_pct": min((float(result.get("net_profit_pct", 0.0)) for result in stressed_results), default=None),
         "worst_sharpe_ratio": min((float(result.get("sharpe_ratio", 0.0)) for result in stressed_results), default=None),
-        "results": {
-            name: {
-                "net_profit_pct": results[name].get("net_profit_pct"),
-                "sharpe_ratio": results[name].get("sharpe_ratio"),
-                "max_drawdown": results[name].get("max_drawdown"),
-                "scenario_report": results[name].get("scenario_report", {}),
-            }
-            for name in scenario_names
-            if isinstance(results.get(name), dict)
-        },
+        "worst_max_drawdown": worst_max_drawdown,
+        "worst_fill_ratio": worst_fill_ratio,
+        "worst_trade_count": worst_trade_count,
+        "control_intents": sorted(control_intents),
+        "results": summarized_results,
     }
 
 

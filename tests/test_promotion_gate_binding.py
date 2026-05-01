@@ -115,6 +115,9 @@ class PromotionGateBindingTest(unittest.TestCase):
                 "stress_matrix": {
                     "configured": True,
                     "scenario_names": ["downtime", "stale_mark", "halt"],
+                    "worst_max_drawdown": -0.05,
+                    "worst_fill_ratio": 0.95,
+                    "worst_trade_count": 3,
                 },
                 "required_stress_scenarios": ["downtime", "stale_mark", "halt"],
             }
@@ -122,6 +125,81 @@ class PromotionGateBindingTest(unittest.TestCase):
 
         self.assertTrue(stress_realism["passed"])
         self.assertFalse(stress_realism["research_only"])
+
+    def test_stress_realism_blocks_unacceptable_drawdown_even_when_scenarios_exist(self):
+        stress_realism = evaluate_stress_realism_gate(
+            {
+                "evaluation_mode": "trade_ready",
+                "stress_matrix": {
+                    "configured": True,
+                    "scenario_names": ["downtime", "stale_mark", "halt"],
+                    "worst_max_drawdown": -0.32,
+                    "worst_fill_ratio": 0.9,
+                    "worst_trade_count": 4,
+                },
+                "required_stress_scenarios": ["downtime", "stale_mark", "halt"],
+            },
+            policy={"max_stress_drawdown": 0.10},
+        )
+
+        self.assertFalse(stress_realism["passed"])
+        self.assertEqual(stress_realism["failure_class"], "stressed_outcome_unacceptable")
+        self.assertEqual(stress_realism["reason"], "stress_drawdown_above_limit")
+
+    def test_stress_realism_blocks_low_fill_ratio_drought(self):
+        stress_realism = evaluate_stress_realism_gate(
+            {
+                "evaluation_mode": "trade_ready",
+                "stress_matrix": {
+                    "configured": True,
+                    "scenario_names": ["liquidity_drought"],
+                    "control_intents": ["liquidity_drought"],
+                    "worst_max_drawdown": -0.04,
+                    "worst_fill_ratio": 0.18,
+                    "worst_trade_count": 2,
+                },
+            },
+            policy={
+                "required_stress_scenarios": ["liquidity_drought"],
+                "required_stress_control_intents": ["liquidity_drought"],
+                "min_stress_fill_ratio": 0.75,
+            },
+        )
+
+        self.assertFalse(stress_realism["passed"])
+        self.assertEqual(stress_realism["reason"], "stress_fill_ratio_below_minimum")
+
+    def test_stress_realism_blocks_unseen_regime_fallback_breach(self):
+        stress_realism = evaluate_stress_realism_gate(
+            {
+                "evaluation_mode": "trade_ready",
+                "stress_matrix": {
+                    "configured": True,
+                    "scenario_names": ["unseen_regime_fallback"],
+                    "control_intents": ["unseen_regime_fallback_pressure"],
+                    "worst_max_drawdown": -0.06,
+                    "worst_fill_ratio": 0.92,
+                    "worst_trade_count": 3,
+                },
+            },
+            policy={
+                "required_stress_scenarios": ["unseen_regime_fallback"],
+                "required_stress_control_intents": ["unseen_regime_fallback_pressure"],
+                "require_unseen_regime_fallback_bound": True,
+                "max_unseen_regime_fallback_share": 0.20,
+            },
+            regime_aware_summary={
+                "enabled": True,
+                "strategy": "specialist",
+                "fallback_rows": 25,
+                "fallback_evidence_rows": 100,
+                "unseen_regimes": ["2"],
+            },
+        )
+
+        self.assertFalse(stress_realism["passed"])
+        self.assertEqual(stress_realism["reason"], "unseen_regime_fallback_share_above_limit")
+        self.assertEqual(stress_realism["failure_class"], "stressed_outcome_unacceptable")
 
     def test_default_profile_locked_holdout_failure_blocks_promotion(self):
         selection_policy = _resolve_selection_policy({})

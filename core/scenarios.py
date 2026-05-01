@@ -17,6 +17,8 @@ class ScenarioEvent:
     start: pd.Timestamp
     end: pd.Timestamp | None = None
     value: float | None = None
+    control_intent: str | None = None
+    control_tags: tuple[str, ...] | None = None
 
 
 def _coerce_scenario_frame(index, scenario_schedule=None):
@@ -257,7 +259,23 @@ def run_scenario_matrix(run_backtest_fn, base_kwargs, scenario_matrix):
         kwargs = dict(base_kwargs)
         kwargs["scenario_schedule"] = payload.get("events") or payload.get("scenario_schedule")
         kwargs["scenario_policy"] = payload.get("policy") or {}
-        results[str(name)] = run_backtest_fn(**kwargs)
+        scenario_result = run_backtest_fn(**kwargs)
+        if isinstance(scenario_result, dict):
+            control_intent = payload.get("control_intent")
+            control_tags = [
+                str(tag)
+                for tag in list(payload.get("control_tags") or ([] if control_intent is None else [control_intent]))
+                if str(tag).strip()
+            ]
+            scenario_report = dict(scenario_result.get("scenario_report") or {})
+            scenario_report["scenario_name"] = str(name)
+            if control_intent is not None:
+                scenario_report["control_intent"] = str(control_intent)
+            if control_tags:
+                scenario_report["control_tags"] = control_tags
+            scenario_result = dict(scenario_result)
+            scenario_result["scenario_report"] = scenario_report
+        results[str(name)] = scenario_result
     return results
 
 

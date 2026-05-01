@@ -15,6 +15,7 @@ class SelectionPolicyDefaultsTest(unittest.TestCase):
         self.assertEqual(policy["gate_modes"]["replication"], "blocking")
         self.assertEqual(policy["gate_modes"]["execution_realism"], "blocking")
         self.assertEqual(policy["gate_modes"]["stress_realism"], "blocking")
+        self.assertEqual(policy["gate_modes"]["regime_coverage"], "blocking")
         self.assertEqual(policy["gate_modes"]["param_fragility"], "blocking")
         self.assertEqual(policy["gate_modes"]["lookahead_guard"], "blocking")
 

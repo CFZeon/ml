@@ -68,6 +68,11 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
         "gap": {"type": "categorical", "choices": [12, 24, 48]},
         "validation_fraction": {"type": "categorical", "choices": [0.15, 0.2, 0.25, 0.3]},
         "meta_n_splits": {"type": "categorical", "choices": [2, 3]},
+        "regime_aware": {
+            "enabled": {"type": "categorical", "choices": [False]},
+            "strategy": {"type": "categorical", "choices": ["feature", "specialist"]},
+            "min_samples_per_regime": {"type": "categorical", "choices": [24, 40, 64]},
+        },
         "calibration_params": {
             "c": {"type": "float", "low": 0.1, "high": 10.0, "log": True},
         },
@@ -1206,6 +1211,24 @@ def _summarize_training(training):
     feature_selection = training.get("feature_selection") or {}
     bootstrap = training.get("bootstrap") or {}
     feature_governance = training.get("feature_governance") or {}
+    regime = training.get("regime") or {}
+    regime_aware = regime.get("regime_aware") or {}
+    regime_aware_folds = list(regime_aware.get("folds") or [])
+    regime_coverage_summary = regime.get("coverage_summary") or regime_aware.get("coverage_summary") or {}
+    fallback_rows = int(
+        regime_aware.get("fallback_rows")
+        or sum(int((fold.get("inference_report") or {}).get("fallback_rows", 0)) for fold in regime_aware_folds)
+    )
+    fallback_evidence_rows = int(
+        regime_aware.get("fallback_evidence_rows")
+        or sum(
+            int(((fold.get("test") or {}).get("available_rows") or 0))
+            for fold in list(regime_coverage_summary.get("folds") or [])
+        )
+    )
+    fallback_share = regime_aware.get("fallback_share")
+    if fallback_share is None and fallback_evidence_rows > 0:
+        fallback_share = float(fallback_rows) / float(fallback_evidence_rows)
     operational_monitoring = training.get("operational_monitoring") or {}
     cross_venue_integrity = training.get("cross_venue_integrity") or {}
     data_certification = training.get("data_certification") or {}
@@ -1240,6 +1263,38 @@ def _summarize_training(training):
         "feature_governance": {
             "retirement": feature_governance.get("retirement", {}),
             "admission_summary": feature_governance.get("admission_summary", {}),
+        },
+        "regime": {
+            "ablation_summary": regime.get("ablation_summary", {}),
+            "coverage_summary": regime_coverage_summary,
+            "regime_aware": {
+                "enabled": bool(regime_aware.get("enabled", False)),
+                "strategy": regime_aware.get("strategy"),
+                "coverage_summary": regime_aware.get("coverage_summary", regime_coverage_summary),
+                "fallback_rows": fallback_rows,
+                "fallback_evidence_rows": fallback_evidence_rows,
+                "fallback_share": fallback_share,
+                "unseen_regimes": sorted(
+                    {
+                        *[str(value) for value in list(regime_aware.get("unseen_regimes") or [])],
+                        *[
+                            str(value)
+                            for fold in regime_aware_folds
+                            for value in ((fold.get("inference_report") or {}).get("unseen_regimes") or [])
+                        ],
+                    }
+                ),
+                "trained_regimes": sorted(
+                    {
+                        *[str(value) for value in list(regime_aware.get("trained_regimes") or [])],
+                        *[
+                            str(value)
+                            for fold in regime_aware_folds
+                            for value in ((fold.get("training_report") or {}).get("trained_regimes") or [])
+                        ],
+                    }
+                ),
+            },
         },
         "operational_monitoring": {
             "healthy": bool(operational_monitoring.get("healthy", True)),
@@ -1290,6 +1345,11 @@ def _summarize_backtest(backtest, *, evidence_class=None):
         "average_action_delay_bars",
         "average_fill_delay_bars",
         "max_fill_delay_bars",
+        "evaluation_mode",
+        "promotion_execution_ready",
+        "execution_mode",
+        "execution_adapter",
+        "execution_backend",
     ]
     summary = {key: backtest.get(key) for key in keys}
     equity_curve = backtest.get("equity_curve")
@@ -1298,6 +1358,14 @@ def _summarize_backtest(backtest, *, evidence_class=None):
         summary["statistical_significance"] = backtest.get("statistical_significance")
     if backtest.get("signal_decay") is not None:
         summary["signal_decay"] = backtest.get("signal_decay")
+    if backtest.get("stress_matrix") is not None:
+        summary["stress_matrix"] = backtest.get("stress_matrix")
+    if backtest.get("required_stress_scenarios") is not None:
+        summary["required_stress_scenarios"] = list(backtest.get("required_stress_scenarios") or [])
+    if backtest.get("required_stress_control_intents") is not None:
+        summary["required_stress_control_intents"] = list(backtest.get("required_stress_control_intents") or [])
+    if backtest.get("execution_limitations") is not None:
+        summary["execution_limitations"] = list(backtest.get("execution_limitations") or [])
     summary["evidence_class"] = str(evidence_class or backtest.get("evidence_class") or "backtest_payload")
     return summary
 
@@ -2167,6 +2235,7 @@ _HARDENED_DEFAULT_SELECTION_GATE_MODES = {
     "replication": "blocking",
     "execution_realism": "blocking",
     "stress_realism": "blocking",
+    "regime_coverage": "blocking",
     "data_certification": "blocking",
     "param_fragility": "blocking",
     "lookahead_guard": "blocking",
@@ -2288,6 +2357,15 @@ def _resolve_selection_policy(automl_config=None):
             "max_trials_per_model_family": int(1e9),
             "local_perturbation_limit": 0,
             "require_fold_stability_pass": False,
+            "min_distinct_regimes": int(policy.get("min_distinct_regimes", 2)),
+            "max_dominant_regime_share": float(policy.get("max_dominant_regime_share", 0.80)),
+            "min_samples_per_regime": int(policy.get("min_samples_per_regime", 0)),
+            "required_stress_control_intents": list(policy.get("required_stress_control_intents", [])),
+            "max_stress_drawdown": _coerce_float(policy.get("max_stress_drawdown")),
+            "min_stress_fill_ratio": _coerce_float(policy.get("min_stress_fill_ratio")),
+            "min_stress_trade_count": int(policy.get("min_stress_trade_count", 0)),
+            "require_unseen_regime_fallback_bound": bool(policy.get("require_unseen_regime_fallback_bound", False)),
+            "max_unseen_regime_fallback_share": _coerce_float(policy.get("max_unseen_regime_fallback_share")),
         }
     gate_modes = {} if legacy_profile else copy.deepcopy(_HARDENED_DEFAULT_SELECTION_GATE_MODES)
     gate_modes.update(copy.deepcopy(policy.get("gate_modes") or {}))
@@ -2307,6 +2385,15 @@ def _resolve_selection_policy(automl_config=None):
         "max_trials_per_model_family": int(policy.get("max_trials_per_model_family", 64)),
         "local_perturbation_limit": int(policy.get("local_perturbation_limit", 8)),
         "require_fold_stability_pass": bool(policy.get("require_fold_stability_pass", True)),
+        "min_distinct_regimes": int(policy.get("min_distinct_regimes", 2)),
+        "max_dominant_regime_share": float(policy.get("max_dominant_regime_share", 0.80)),
+        "min_samples_per_regime": int(policy.get("min_samples_per_regime", 0)),
+        "required_stress_control_intents": list(policy.get("required_stress_control_intents", [])),
+        "max_stress_drawdown": _coerce_float(policy.get("max_stress_drawdown")),
+        "min_stress_fill_ratio": _coerce_float(policy.get("min_stress_fill_ratio")),
+        "min_stress_trade_count": int(policy.get("min_stress_trade_count", 0)),
+        "require_unseen_regime_fallback_bound": bool(policy.get("require_unseen_regime_fallback_bound", False)),
+        "max_unseen_regime_fallback_share": _coerce_float(policy.get("max_unseen_regime_fallback_share")),
     }
 
 
@@ -2334,12 +2421,19 @@ def _resolve_evidence_gate(gate_name, report, *, selection_policy=None, failure_
     details = dict(report or {})
     failure_reason = failure_reason or f"{gate_name}_failed"
     missing_reason = missing_reason or f"{gate_name}_evidence_missing"
+    explicit_gate_modes = dict((selection_policy or {}).get("gate_modes") or {})
+    resolved_mode = resolve_promotion_gate_mode(selection_policy, gate_name)
+    if (
+        str((selection_policy or {}).get("policy_profile") or "").lower() == "legacy_permissive"
+        and gate_name not in explicit_gate_modes
+    ):
+        resolved_mode = "disabled"
     if not details:
         return {
             "details": {},
             "status": "unknown",
             "passed": False,
-            "mode": resolve_promotion_gate_mode(selection_policy, gate_name),
+            "mode": resolved_mode,
             "reason": missing_reason,
         }
 
@@ -2363,7 +2457,7 @@ def _resolve_evidence_gate(gate_name, report, *, selection_policy=None, failure_
         "details": normalized_details,
         "status": status,
         "passed": status == "passed",
-        "mode": str(details.get("gate_mode") or resolve_promotion_gate_mode(selection_policy, gate_name)).lower(),
+        "mode": str(details.get("gate_mode") or resolved_mode).lower(),
         "reason": None if status == "passed" else (reasons[0] if reasons else failure_reason),
     }
 
@@ -3273,6 +3367,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         data_certification = dict(training_summary.get("data_certification") or {})
         signal_decay = dict(training_summary.get("signal_decay") or {})
         regime_ablation_summary = dict((training_summary.get("regime") or {}).get("ablation_summary") or {})
+        regime_coverage_summary = dict((training_summary.get("regime") or {}).get("coverage_summary") or {})
         operational_monitoring = dict(training_summary.get("operational_monitoring") or {})
         feature_portability_gate = _resolve_evidence_gate(
             "feature_portability",
@@ -3292,6 +3387,13 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             selection_policy=selection_policy,
             failure_reason="regime_stability_failed",
             missing_reason="regime_ablation_evidence_missing",
+        )
+        regime_coverage_gate = _resolve_evidence_gate(
+            "regime_coverage",
+            regime_coverage_summary,
+            selection_policy=selection_policy,
+            failure_reason="regime_coverage_failed",
+            missing_reason="regime_coverage_evidence_missing",
         )
         operational_health_pass = bool(promotion_gates.get("operational_health", True))
         cross_venue_integrity_gate = _resolve_evidence_gate(
@@ -3315,6 +3417,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         feature_portability_pass = feature_portability_gate["passed"]
         feature_admission_pass = feature_admission_gate["passed"]
         regime_stability_pass = regime_stability_gate["passed"]
+        regime_coverage_pass = regime_coverage_gate["passed"]
         cross_venue_integrity_pass = cross_venue_integrity_gate["passed"]
         data_certification_pass = data_certification_gate["passed"]
         signal_decay_pass = signal_decay_gate["passed"]
@@ -3343,6 +3446,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "feature_portability": feature_portability_pass,
             "feature_admission": feature_admission_pass,
             "regime_stability": regime_stability_pass,
+            "regime_coverage": regime_coverage_pass,
             "operational_health": operational_health_pass,
             "cross_venue_integrity": cross_venue_integrity_pass,
             "data_certification": data_certification_pass,
@@ -3399,6 +3503,9 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 _gs("regime_stability", ec["regime_stability"],
                     regime_ablation_summary.get("stability_improvement"), True,
                     regime_stability_gate["reason"], regime_stability_gate["details"], mode=regime_stability_gate["mode"]),
+                _gs("regime_coverage", ec["regime_coverage"],
+                    regime_coverage_summary.get("max_dominant_share_fit"), regime_coverage_summary.get("configured_thresholds"),
+                    regime_coverage_gate["reason"], regime_coverage_gate["details"], mode=regime_coverage_gate["mode"]),
                 _gs("operational_health", ec["operational_health"],
                     operational_monitoring.get("healthy"), True,
                     _first_failure_reason(operational_monitoring, "operational_monitoring_failed"), operational_monitoring),
@@ -4141,6 +4248,30 @@ def _sample_trial_overrides(trial, search_space):
         for key in ["validation_fraction", "meta_n_splits"]:
             if key in model_space:
                 model_overrides[key] = _sample_from_spec(trial, f"model.{key}", model_space[key])
+        regime_aware_space = model_space.get("regime_aware", {})
+        if regime_aware_space:
+            regime_aware_overrides = {}
+            enabled_spec = regime_aware_space.get("enabled")
+            if enabled_spec is not None:
+                regime_aware_overrides["enabled"] = bool(
+                    _sample_from_spec(trial, "model.regime_aware.enabled", enabled_spec)
+                )
+            elif regime_aware_space:
+                regime_aware_overrides["enabled"] = True
+            if regime_aware_overrides.get("enabled"):
+                for key in ["strategy", "min_samples_per_regime", "regime_column"]:
+                    if key in regime_aware_space:
+                        regime_aware_overrides[key] = _sample_from_spec(
+                            trial,
+                            f"model.regime_aware.{key}",
+                            regime_aware_space[key],
+                        )
+                for key in ["feature_config", "coverage_config"]:
+                    params = _sample_param_group(trial, f"model.regime_aware.{key}", regime_aware_space.get(key, {}))
+                    if params:
+                        regime_aware_overrides[key] = params
+            if regime_aware_overrides:
+                model_overrides["regime_aware"] = regime_aware_overrides
         for key, prefix in [
             ("calibration_params", "model.calibration_params"),
             ("meta_params", "model.meta_params"),
@@ -4788,6 +4919,9 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         or best_trial_report.get("backtest")
         or {},
         policy=selection_policy,
+        regime_aware_summary=dict(
+            (((best_trial_report.get("training") or {}).get("regime") or {}).get("regime_aware") or {})
+        ),
     )
     best_trial_report["selection_policy"]["eligibility_checks"]["stress_realism"] = bool(stress_realism["passed"])
     promotion_eligibility_report = upsert_promotion_gate(
@@ -4796,8 +4930,21 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         name="stress_realism",
         passed=bool(stress_realism["passed"]),
         mode=resolve_promotion_gate_mode(selection_policy, "stress_realism"),
-        measured=stress_realism.get("configured_scenarios"),
-        threshold=stress_realism.get("required_scenarios"),
+        measured={
+            "configured_scenarios": stress_realism.get("configured_scenarios"),
+            "configured_control_intents": stress_realism.get("configured_control_intents"),
+            "worst_net_profit_pct": stress_realism.get("worst_net_profit_pct"),
+            "worst_sharpe_ratio": stress_realism.get("worst_sharpe_ratio"),
+            "worst_max_drawdown": stress_realism.get("worst_max_drawdown"),
+            "worst_fill_ratio": stress_realism.get("worst_fill_ratio"),
+            "worst_trade_count": stress_realism.get("worst_trade_count"),
+            "regime_fallback_share": (stress_realism.get("regime_fallback") or {}).get("fallback_share"),
+        },
+        threshold={
+            "required_scenarios": stress_realism.get("required_scenarios"),
+            "required_control_intents": stress_realism.get("required_control_intents"),
+            **dict(stress_realism.get("thresholds") or {}),
+        },
         reason=stress_realism.get("reason"),
         details=stress_realism,
     )
