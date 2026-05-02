@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 
+from .data import _interval_timedelta
 from .evaluation_modes import resolve_evaluation_mode
 from .execution import (
     ExecutionAdapterUnavailableError,
@@ -74,9 +75,20 @@ def _resolve_runtime_funding_policy(*, evaluation_mode="research_only", funding_
     return policy
 
 
-def _resolve_execution_price_input(close, execution_prices, *, evaluation_mode="research_only"):
+def _resolve_execution_price_input(
+    close,
+    execution_prices,
+    *,
+    evaluation_mode="research_only",
+    allow_same_bar_fill_fallback=False,
+):
     resolved_mode = resolve_evaluation_mode({"evaluation_mode": evaluation_mode})
     if execution_prices is None:
+        if not bool(allow_same_bar_fill_fallback):
+            raise ValueError(
+                "execution_prices must be provided. To use same-bar close fallback explicitly, "
+                "set allow_same_bar_fill_fallback=True"
+            )
         if resolved_mode.is_capital_facing:
             mode_label = "Trade-ready" if resolved_mode.effective_mode == "trade_ready" else "Local certification"
             raise ValueError(
@@ -165,7 +177,15 @@ def kelly_fraction(prob_win, avg_win, avg_loss, fraction=0.5):
     return max(0.0, min(k, 1.0)) * fraction
 
 
-def _infer_periods_per_year(index):
+def _infer_periods_per_year(index, interval=None):
+    if interval:
+        try:
+            td = _interval_timedelta(str(interval))
+        except Exception:
+            td = None
+        if td is not None and td.total_seconds() > 0:
+            return _SECONDS_PER_YEAR / td.total_seconds()
+
     if len(index) < 2:
         return 0.0
 
@@ -1586,7 +1606,7 @@ def _run_futures_account_backtest(close, position, equity, fee_rate, slippage_ra
                                   significance=None, benchmark_returns=None,
                                   benchmark_sharpe=None, volume=None,
                                   slippage_model=None, orderbook_depth=None,
-                                  execution_report=None):
+                                  execution_report=None, interval=None):
     valuation_series = pd.Series(close, copy=False).astype(float)
     execution_series = valuation_series if execution_prices is None else pd.Series(
         execution_prices, index=valuation_series.index
@@ -1822,6 +1842,7 @@ def _run_futures_account_backtest(close, position, equity, fee_rate, slippage_ra
         benchmark_sharpe=benchmark_sharpe,
         execution_report=execution_summary,
         futures_account_report=futures_account_report,
+        interval=interval,
     )
 
 
@@ -1931,12 +1952,13 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
                         fees_paid, slippage_paid, signal_delay_bars, trade_ledger,
                         funding_pnl=0.0, engine="pandas", significance=None,
                         benchmark_returns=None, benchmark_sharpe=None,
-                        execution_report=None, futures_account_report=None):
+                        execution_report=None, futures_account_report=None,
+                        interval=None):
     prev_equity = equity_curve.shift(1).fillna(equity)
     pnl = equity_curve - prev_equity
 
     total_ret = equity_curve.iloc[-1] / equity - 1
-    periods_per_year = _infer_periods_per_year(equity_curve.index)
+    periods_per_year = _infer_periods_per_year(equity_curve.index, interval=interval)
     annualization = np.sqrt(periods_per_year) if periods_per_year > 0 else 0.0
     volatility = strat_ret.std()
     sharpe = _annualized_sharpe(strat_ret.to_numpy(dtype=float), annualization)
@@ -2189,7 +2211,7 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
                            significance=None, benchmark_returns=None,
                            benchmark_sharpe=None, volume=None,
                            slippage_model=None, orderbook_depth=None,
-                           execution_report=None):
+                           execution_report=None, interval=None):
     if vbt is None or Direction is None or SizeType is None:
         raise ImportError("vectorbt is not installed")
 
@@ -2248,6 +2270,7 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
         benchmark_returns=benchmark_returns,
         benchmark_sharpe=benchmark_sharpe,
         execution_report=execution_report,
+        interval=interval,
     )
 
 
@@ -2256,7 +2279,7 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
                          significance=None, benchmark_returns=None,
                          benchmark_sharpe=None, volume=None,
                          slippage_model=None, orderbook_depth=None,
-                         execution_report=None):
+                         execution_report=None, interval=None):
     valuation_series = pd.Series(close, copy=False).astype(float)
     execution_series = valuation_series if execution_prices is None else pd.Series(execution_prices, index=valuation_series.index).reindex(valuation_series.index).astype(float)
     returns = valuation_series.pct_change().fillna(0.0)
@@ -2303,6 +2326,7 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
         benchmark_returns=benchmark_returns,
         benchmark_sharpe=benchmark_sharpe,
         execution_report=execution_report,
+        interval=interval,
     )
 
 
@@ -2315,6 +2339,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  market="spot", leverage=1.0, allow_short=None, symbol_filters=None,
                  funding_rates=None, significance=None, benchmark_returns=None,
                  funding_missing_policy=None,
+                 interval=None,
                  benchmark_sharpe=None, volume=None, slippage_model=None,
                  orderbook_depth=None, execution_price_policy="strict",
                  execution_price_fill_limit=None, valuation_price_policy="drop_rows",
@@ -2324,7 +2349,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  symbol_lifecycle=None, symbol_lifecycle_policy=None,
                  scenario_schedule=None, scenario_policy=None,
                  scenario_matrix=None, evaluation_mode="research_only",
-                 required_stress_scenarios=None):
+                 required_stress_scenarios=None,
+                 allow_same_bar_fill_fallback=True):
     """Run a backtest through the configured execution adapter.
 
     Parameters
@@ -2400,6 +2426,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
             "scenario_matrix": None,
             "evaluation_mode": evaluation_mode,
             "required_stress_scenarios": required_stress_scenarios,
+            "allow_same_bar_fill_fallback": allow_same_bar_fill_fallback,
+            "interval": interval,
         }
         results = run_scenario_matrix(run_backtest, base_kwargs, scenario_matrix)
         base_result = dict(results.get("base") or {})
@@ -2421,6 +2449,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         close,
         execution_prices,
         evaluation_mode=evaluation_mode,
+        allow_same_bar_fill_fallback=allow_same_bar_fill_fallback,
     )
 
     valuation_series, valuation_fill_actions = _normalize_price_series(
@@ -2614,6 +2643,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
             slippage_model=slippage_model,
             orderbook_depth=orderbook_depth,
             execution_report=execution_report,
+            interval=interval,
         )
         summary["funding_coverage_report"] = dict(funding_coverage_report)
         return _attach_backtest_evaluation_metadata(
@@ -2643,6 +2673,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                 slippage_model=slippage_model,
                 orderbook_depth=orderbook_depth,
                 execution_report=execution_report,
+                interval=interval,
             )
             summary["funding_coverage_report"] = dict(funding_coverage_report)
             return _attach_backtest_evaluation_metadata(
@@ -2669,6 +2700,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         slippage_model=slippage_model,
         orderbook_depth=orderbook_depth,
         execution_report=execution_report,
+        interval=interval,
     )
     summary["funding_coverage_report"] = dict(funding_coverage_report)
     return _attach_backtest_evaluation_metadata(

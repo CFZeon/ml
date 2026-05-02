@@ -1,5 +1,7 @@
 """Labeling (triple-barrier, fixed-horizon) and sampling (weights, bootstrap)."""
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -12,7 +14,9 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
                           max_holding=10, min_return=0.0, cost_rate=0.0,
                           barrier_tie_break="sl",
                           entry_prices=None, start_offset=0,
-                          missing_future_policy="drop"):
+                          missing_future_policy="drop",
+                          volatility_fit_boundary=None,
+                          volatility_window=None):
     """Apply triple-barrier labeling.
 
     Three concurrent barriers decide the label per bar:
@@ -47,9 +51,27 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
         raise ValueError(f"Unsupported missing_future_policy={missing_future_policy!r}")
     high = close if high is None else high.reindex(close.index)
     low = close if low is None else low.reindex(close.index)
+    if barrier_tie_break not in {"sl", "pt", "conservative"}:
+        raise ValueError("barrier_tie_break must be one of {'sl', 'pt', 'conservative'}")
+    if barrier_tie_break in {"sl", "pt"}:
+        warnings.warn(
+            "barrier_tie_break='sl'/'pt' assumes intrabar execution path that is not observable in kline OHLC data",
+            UserWarning,
+        )
+
+    if volatility_fit_boundary is not None:
+        boundary = max(1, int(volatility_fit_boundary))
+        window = max(2, int(volatility_window or max_holding))
+        train_close = pd.Series(close.iloc[:boundary], copy=False).astype(float)
+        fold_volatility = train_close.pct_change(fill_method=None).rolling(window, min_periods=max(2, window // 2)).std()
+        volatility = fold_volatility.reindex(close.index).ffill()
+    else:
+        volatility = pd.Series(volatility, copy=False).reindex(close.index)
+
     _entry_series = entry_prices if entry_prices is not None else close
     rows = []
     dropped_incomplete_future_windows = 0
+    tie_count = 0
 
     # Ensure we never index beyond the close series
     for i in range(len(close) - max_holding - start_offset):
@@ -91,8 +113,11 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
             hit_pt = bool(high_price >= upper)
             hit_sl = bool(low_price <= lower)
             if hit_pt and hit_sl:
+                tie_count += 1
                 if barrier_tie_break == "pt":
                     label, barrier, exit_price = 1, "pt", upper
+                elif barrier_tie_break == "conservative":
+                    label, barrier, exit_price = 0, "tie", close_price
                 else:
                     label, barrier, exit_price = -1, "sl", lower
                 t1 = timestamp
@@ -148,6 +173,7 @@ def triple_barrier_labels(close, volatility, high=None, low=None, pt_sl=(2.0, 2.
         "missing_future_policy": missing_future_policy,
         "dropped_incomplete_future_windows": int(dropped_incomplete_future_windows),
         "retained_label_rows": int(len(result)),
+        "tie_count": int(tie_count),
     }
     return result
 

@@ -191,12 +191,7 @@ def build_example_automl_config(*, automl_storage, research_demo=False):
                         "min_mi_threshold": {"type": "categorical", "choices": [0.0, 0.0005]},
                     },
                     "labels": {
-                        "pt_mult": {"type": "categorical", "choices": [1.5, 2.0]},
-                        "sl_mult": {"type": "categorical", "choices": [1.5, 2.0]},
-                        "max_holding": {"type": "categorical", "choices": [12, 24]},
                         "min_return": {"type": "categorical", "choices": [0.0005, 0.001]},
-                        "volatility_window": {"type": "categorical", "choices": [24]},
-                        "barrier_tie_break": {"type": "categorical", "choices": ["sl"]},
                     },
                     "regime": {
                         "n_regimes": {"type": "categorical", "choices": [2]},
@@ -204,8 +199,6 @@ def build_example_automl_config(*, automl_storage, research_demo=False):
                     "model": {
                         "type": {"type": "categorical", "choices": ["gbm"]},
                         "gap": {"type": "categorical", "choices": [24]},
-                        "validation_fraction": {"type": "categorical", "choices": [0.2]},
-                        "meta_n_splits": {"type": "categorical", "choices": [2]},
                     },
                 },
             },

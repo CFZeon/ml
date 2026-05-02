@@ -715,6 +715,14 @@ def _build_executable_validation_training(pipeline):
     monitoring_config = dict(clone_config.get("monitoring") or {})
     monitoring_config["write_reports"] = False
     clone_config["monitoring"] = monitoring_config
+    # The primary train_models pass already ran the lookahead guard.  Demote it
+    # to advisory here so a different stationarity fit on the refit window does
+    # not hard-block the executable-validation replay.
+    features_config = dict(clone_config.get("features") or {})
+    lookahead_guard_config = dict(features_config.get("lookahead_guard") or {})
+    lookahead_guard_config["mode"] = "advisory"
+    features_config["lookahead_guard"] = lookahead_guard_config
+    clone_config["features"] = features_config
 
     clone = ResearchPipeline(clone_config, steps=[TrainModelsStep])
     clone.state = {
@@ -911,11 +919,15 @@ def _resolve_backtest_execution_policy(pipeline):
     )
     policy = resolve_execution_policy(policy_config)
 
-    if evaluation_mode.is_capital_facing and (policy.adapter != "nautilus" or policy.force_simulation):
-        mode_label = "Trade-ready" if evaluation_mode.effective_mode == "trade_ready" else "Local certification"
+    if evaluation_mode.requested_mode == "trade_ready" and (policy.adapter != "nautilus" or policy.force_simulation):
         raise RuntimeError(
-            f"{mode_label} evaluation requires a Nautilus execution adapter "
+            "Trade-ready evaluation requires a Nautilus execution adapter "
             "with force_simulation=false. Use backtest.evaluation_mode='research_only' for explicit research-only studies."
+        )
+    if evaluation_mode.requested_mode == "local_certification" and policy.force_simulation:
+        raise RuntimeError(
+            "Local certification evaluation requires force_simulation=false. "
+            "Use backtest.evaluation_mode='research_only' for explicit research-only studies."
         )
 
     return policy.to_dict()

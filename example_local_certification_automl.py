@@ -84,6 +84,16 @@ def build_local_certification_example_config(*, automl_storage):
             seed=42,
         ),
     )
+    universe = dict(config.get("universe") or {})
+    universe["source"] = "local_certification_snapshot"
+    snapshots = []
+    for snapshot in list(universe.get("snapshots") or []):
+        row = dict(snapshot or {})
+        row["source"] = "local_certification_snapshot"
+        snapshots.append(row)
+    if snapshots:
+        universe["snapshots"] = snapshots
+    config["universe"] = universe
     config["example_runtime"] = {
         "mode": "local_certification",
         "risk_level": "paper_or_pre_capital_only",

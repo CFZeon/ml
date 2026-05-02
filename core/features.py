@@ -72,6 +72,13 @@ class FeatureScreeningResult:
     feature_families: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
+class TransformSpec:
+    column: str
+    transform_name: str
+    params: dict = field(default_factory=dict)
+
+
 def resolve_feature_family(block_name):
     normalized = str(block_name or "unknown")
     if normalized in ENDOGENOUS_FEATURE_FAMILIES or normalized in CONTEXT_FEATURE_FAMILIES:
@@ -949,7 +956,173 @@ def _apply_stationarity_transform(series, transform_name, rolling_window, frac_d
     raise ValueError(f"Unsupported stationarity transform {transform_name!r}")
 
 
-def screen_features_for_stationarity(features, feature_blocks=None, config=None, fit_features=None):
+def fit_stationarity_transforms(features, significance=0.05, transform_order=None, feature_blocks=None, config=None, fit_window=None):
+    """Fit fold-local stationarity transforms and return transform specs per column.
+
+    The transform selection logic is executed only on the reference window (optionally
+    truncated by ``fit_window``) so downstream application to test windows remains
+    causal.
+    """
+    config = dict(config or {})
+    transform_order = tuple(transform_order or config.get("transform_order") or DEFAULT_STATIONARITY_TRANSFORM_ORDER)
+    rolling_window = int(config.get("rolling_window", 20))
+    frac_diff_d = config.get("frac_diff_d")
+    frac_diff_threshold = float(config.get("frac_diff_threshold", 1e-5))
+    discrete_max_unique = int(config.get("discrete_max_unique", 6))
+    drop_failed = bool(config.get("drop_failed", True))
+
+    if fit_window is not None:
+        fit_window = max(1, int(fit_window))
+        reference = features.iloc[:fit_window]
+    else:
+        reference = features
+
+    feature_blocks = dict(feature_blocks or {})
+    specs = {}
+    reports = {}
+    dropped_features = []
+
+    for column in features.columns:
+        reference_series = pd.Series(reference[column]).replace([np.inf, -np.inf], np.nan)
+        clean = reference_series.dropna()
+        unique_values = int(clean.nunique())
+        block_name = feature_blocks.get(column, "unknown")
+        report = {
+            "block": block_name,
+            "status": None,
+            "selected_transform": None,
+            "original": None,
+            "final": None,
+            "candidates": [],
+        }
+
+        if unique_values <= 1:
+            report["status"] = "dropped_constant"
+            report["original"] = {
+                "stationary": False,
+                "p_value": 1.0,
+                "adf_stat": 0.0,
+                "observations": int(len(clean)),
+                "unique_values": unique_values,
+                "error": "constant",
+            }
+            report["final"] = report["original"]
+            reports[column] = report
+            dropped_features.append(column)
+            continue
+
+        if unique_values <= discrete_max_unique:
+            report["status"] = "discrete_passthrough"
+            report["selected_transform"] = "passthrough"
+            report["final"] = {
+                "stationary": True,
+                "p_value": 0.0,
+                "adf_stat": 0.0,
+                "observations": int(len(clean)),
+                "unique_values": unique_values,
+                "note": "discrete_passthrough",
+            }
+            reports[column] = report
+            continue
+
+        original = check_stationarity(reference_series, significance=significance)
+        report["original"] = original
+        if original["stationary"]:
+            report["status"] = "stationary"
+            report["selected_transform"] = "passthrough"
+            report["final"] = original
+            reports[column] = report
+            continue
+
+        selected_stats = None
+        selected_transform = None
+        for transform_name in transform_order:
+            transformed = _apply_stationarity_transform(
+                reference_series,
+                transform_name=transform_name,
+                rolling_window=rolling_window,
+                frac_diff_d=frac_diff_d,
+                frac_diff_threshold=frac_diff_threshold,
+            )
+            if transformed is None:
+                report["candidates"].append({"transform": transform_name, "applicable": False})
+                continue
+
+            stats = check_stationarity(transformed, significance=significance)
+            report["candidates"].append(
+                {
+                    "transform": transform_name,
+                    "applicable": True,
+                    "result": stats,
+                }
+            )
+            if stats["stationary"]:
+                selected_stats = stats
+                selected_transform = transform_name
+                break
+
+        if selected_transform is not None:
+            params = {
+                "rolling_window": rolling_window,
+                "frac_diff_d": frac_diff_d,
+                "frac_diff_threshold": frac_diff_threshold,
+            }
+            specs[column] = TransformSpec(
+                column=column,
+                transform_name=selected_transform,
+                params=params,
+            )
+            report["status"] = "transformed"
+            report["selected_transform"] = selected_transform
+            report["final"] = selected_stats
+            reports[column] = report
+            continue
+
+        report["status"] = "failed_kept" if not drop_failed else "dropped_unrepaired"
+        report["final"] = report["candidates"][-1]["result"] if report["candidates"] else original
+        reports[column] = report
+        if drop_failed:
+            dropped_features.append(column)
+
+    return {
+        "specs": specs,
+        "reports": reports,
+        "dropped_features": dropped_features,
+        "fit_window": fit_window,
+    }
+
+
+def apply_stationarity_transforms(features, specs):
+    """Apply pre-fitted stationarity transform specs to an input frame."""
+    columns: dict = {}
+    for column in features.columns:
+        series = pd.Series(features[column]).replace([np.inf, -np.inf], np.nan)
+        spec = (specs or {}).get(column)
+        if isinstance(spec, TransformSpec):
+            spec_dict = {
+                "transform_name": spec.transform_name,
+                **dict(spec.params or {}),
+            }
+        else:
+            spec_dict = dict(spec or {})
+
+        transform_name = spec_dict.get("transform_name")
+        if not transform_name:
+            columns[column] = series
+            continue
+
+        transformed = _apply_stationarity_transform(
+            series,
+            transform_name=transform_name,
+            rolling_window=int(spec_dict.get("rolling_window", 20)),
+            frac_diff_d=spec_dict.get("frac_diff_d"),
+            frac_diff_threshold=float(spec_dict.get("frac_diff_threshold", 1e-5)),
+        )
+        columns[column] = transformed
+    return pd.DataFrame(columns, index=features.index)
+
+
+def screen_features_for_stationarity(features, feature_blocks=None, config=None, fit_features=None, fit_window=None):
     """Screen each feature for stationarity and transform or drop when needed.
 
     When ``fit_features`` is supplied, transform selection is fitted on that
@@ -959,6 +1132,11 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None,
     """
     config = dict(config or {})
     reference_features = features if fit_features is None else fit_features.reindex(columns=features.columns)
+    search_policy = str(config.get("stationarity_search_policy") or "").strip().lower()
+    if fit_window is not None:
+        fit_window = max(1, int(fit_window))
+        reference_features = reference_features.iloc[:fit_window]
+    leakage_risk = bool(fit_window is None and search_policy != "fixed")
     if not config.get("enabled", True):
         blocks = dict(feature_blocks or {})
         family_summary = summarize_feature_families(blocks, columns=features.columns)
@@ -1020,128 +1198,47 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None,
 
     feature_blocks = dict(feature_blocks or {})
 
+    fit_result = fit_stationarity_transforms(
+        features=reference_features,
+        significance=significance,
+        transform_order=transform_order,
+        feature_blocks=feature_blocks,
+        config=config,
+        fit_window=fit_window,
+    )
+    fitted_specs = fit_result.get("specs") or {}
+    reports = dict(fit_result.get("reports") or {})
+    dropped_features = list(fit_result.get("dropped_features") or [])
+
+    transformed_frame = apply_stationarity_transforms(features, fitted_specs)
     for column in features.columns:
-        series = pd.Series(features[column]).replace([np.inf, -np.inf], np.nan)
-        reference_series = pd.Series(reference_features[column]).replace([np.inf, -np.inf], np.nan)
-        clean = reference_series.dropna()
-        unique_values = int(clean.nunique())
-        block_name = feature_blocks.get(column, "unknown")
-        report = {
-            "block": block_name,
-            "status": None,
-            "selected_transform": None,
-            "original": None,
-            "final": None,
-            "candidates": [],
-        }
-
-        if unique_values <= 1:
-            report["status"] = "dropped_constant"
-            report["original"] = {
-                "stationary": False,
-                "p_value": 1.0,
-                "adf_stat": 0.0,
-                "observations": int(len(clean)),
-                "unique_values": unique_values,
-                "error": "constant",
-            }
-            report["final"] = report["original"]
-            reports[column] = report
-            dropped_features.append(column)
+        if column in dropped_features and drop_failed:
+            report = reports.get(column) or {}
+            status = str(report.get("status") or "")
             summary["dropped_features"] += 1
-            summary["dropped_constant"] += 1
+            if status == "dropped_constant":
+                summary["dropped_constant"] += 1
+            else:
+                summary["dropped_unrepaired"] += 1
             continue
 
-        if unique_values <= discrete_max_unique:
-            screened_columns[column] = series
-            kept_blocks[column] = block_name
-            report["status"] = "discrete_passthrough"
-            report["selected_transform"] = "passthrough"
-            report["final"] = {
-                "stationary": True,
-                "p_value": 0.0,
-                "adf_stat": 0.0,
-                "observations": int(len(clean)),
-                "unique_values": unique_values,
-                "note": "discrete_passthrough",
-            }
-            reports[column] = report
-            summary["discrete_passthrough"] += 1
-            continue
+        report = reports.get(column) or {}
+        status = str(report.get("status") or "")
+        selected_transform = report.get("selected_transform")
+        block_name = feature_blocks.get(column, "unknown")
 
-        original = check_stationarity(reference_series, significance=significance)
-        report["original"] = original
-        if original["stationary"]:
-            screened_columns[column] = series
-            kept_blocks[column] = block_name
-            report["status"] = "stationary"
-            report["selected_transform"] = "passthrough"
-            report["final"] = original
-            reports[column] = report
+        screened_columns[column] = transformed_frame[column]
+        kept_blocks[column] = block_name
+
+        if status == "stationary":
             summary["stationary_as_is"] += 1
-            continue
-
-        selected_series = None
-        selected_stats = None
-        selected_transform = None
-
-        for transform_name in transform_order:
-            transformed = _apply_stationarity_transform(
-                reference_series,
-                transform_name=transform_name,
-                rolling_window=rolling_window,
-                frac_diff_d=frac_diff_d,
-                frac_diff_threshold=frac_diff_threshold,
-            )
-            if transformed is None:
-                report["candidates"].append({"transform": transform_name, "applicable": False})
-                continue
-
-            stats = check_stationarity(transformed, significance=significance)
-            report["candidates"].append(
-                {
-                    "transform": transform_name,
-                    "applicable": True,
-                    "result": stats,
-                }
-            )
-            if stats["stationary"]:
-                selected_series = transformed
-                selected_stats = stats
-                selected_transform = transform_name
-                break
-
-        if selected_series is not None:
-            screened_columns[column] = _apply_stationarity_transform(
-                series,
-                transform_name=selected_transform,
-                rolling_window=rolling_window,
-                frac_diff_d=frac_diff_d,
-                frac_diff_threshold=frac_diff_threshold,
-            )
-            kept_blocks[column] = block_name
-            report["status"] = "transformed"
-            report["selected_transform"] = selected_transform
-            report["final"] = selected_stats
-            reports[column] = report
+        elif status == "discrete_passthrough":
+            summary["discrete_passthrough"] += 1
+        elif status == "transformed":
             transformed_features.append(column)
             summary["transformed_features"] += 1
-            transform_usage[selected_transform] = transform_usage.get(selected_transform, 0) + 1
-            continue
-
-        report["status"] = "failed_kept" if not drop_failed else "dropped_unrepaired"
-        report["selected_transform"] = None
-        report["final"] = report["candidates"][-1]["result"] if report["candidates"] else original
-        reports[column] = report
-
-        if drop_failed:
-            dropped_features.append(column)
-            summary["dropped_features"] += 1
-            summary["dropped_unrepaired"] += 1
-            continue
-
-        screened_columns[column] = series
-        kept_blocks[column] = block_name
+            if selected_transform:
+                transform_usage[selected_transform] = transform_usage.get(selected_transform, 0) + 1
 
     screened = pd.DataFrame(screened_columns, index=features.index)
     summary["screened_feature_count"] = int(screened.shape[1])
@@ -1162,6 +1259,15 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None,
         "features": reports,
         "transformed_features": transformed_features,
         "dropped_features": dropped_features,
+        "transform_specs": {
+            column: {
+                "transform_name": spec.transform_name,
+                **dict(spec.params or {}),
+            }
+            for column, spec in fitted_specs.items()
+        },
+        "fit_window": fit_window,
+        "leakage_risk": leakage_risk,
     }
     return FeatureScreeningResult(
         frame=screened,

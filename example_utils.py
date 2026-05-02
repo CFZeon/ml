@@ -443,6 +443,10 @@ def build_local_certification_surrogate_runtime_overrides(*, market="spot"):
         build_local_certification_runtime_overrides(market=market),
         {
             "backtest": {
+                # Keep local-certification mode explicit while using a
+                # deterministic bar-surrogate execution adapter when Nautilus
+                # is unavailable.
+                "evaluation_mode": "local_certification",
                 "execution_profile": "local_surrogate_certification",
                 "execution_policy": {
                     "adapter": "bar_surrogate",
@@ -655,12 +659,8 @@ def build_trade_ready_automl_overrides(
             "min_mi_threshold": {"type": "categorical", "choices": [0.0005, 0.001]},
         },
         "labels": {
-            "pt_mult": {"type": "categorical", "choices": [1.5, 2.0]},
-            "sl_mult": {"type": "categorical", "choices": [1.5, 2.0]},
-            "max_holding": {"type": "categorical", "choices": [12, 24]},
             "min_return": {"type": "categorical", "choices": [0.0005, 0.001]},
-            "volatility_window": {"type": "categorical", "choices": [24]},
-            "barrier_tie_break": {"type": "categorical", "choices": ["sl", "pt"]},
+            "barrier_tie_break": {"type": "categorical", "choices": ["sl", "pt", "conservative"]},
         },
         "regime": {
             "n_regimes": {"type": "categorical", "choices": [2, 3]},
@@ -668,8 +668,6 @@ def build_trade_ready_automl_overrides(
         "model": {
             "type": {"type": "categorical", "choices": ["gbm", "logistic"]},
             "gap": {"type": "categorical", "choices": [24, 48]},
-            "validation_fraction": {"type": "categorical", "choices": [resolved_validation_fraction]},
-            "meta_n_splits": {"type": "categorical", "choices": [2]},
             "params": {
                 "gbm": {
                     "n_estimators": {"type": "categorical", "choices": [100, 200]},
@@ -697,12 +695,8 @@ def build_trade_ready_automl_overrides(
             "min_mi_threshold": {"type": "categorical", "choices": [0.0005]},
         }
         constrained_search_space["labels"] = {
-            "pt_mult": {"type": "categorical", "choices": [1.5]},
-            "sl_mult": {"type": "categorical", "choices": [1.5]},
-            "max_holding": {"type": "categorical", "choices": [24]},
             "min_return": {"type": "categorical", "choices": [0.0005]},
-            "volatility_window": {"type": "categorical", "choices": [24]},
-            "barrier_tie_break": {"type": "categorical", "choices": ["sl"]},
+            "barrier_tie_break": {"type": "categorical", "choices": ["conservative"]},
         }
         constrained_search_space["regime"] = {
             "n_regimes": {"type": "categorical", "choices": [2]},

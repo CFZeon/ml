@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import subprocess
+import warnings
 from itertools import combinations
 from pathlib import Path
 from statistics import NormalDist
@@ -53,12 +54,7 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
         "min_mi_threshold": {"type": "categorical", "choices": [0.0, 0.0005, 0.001, 0.002]},
     },
     "labels": {
-        "pt_mult": {"type": "float", "low": 1.0, "high": 3.0, "step": 0.5},
-        "sl_mult": {"type": "float", "low": 1.0, "high": 3.0, "step": 0.5},
-        "max_holding": {"type": "categorical", "choices": [12, 24, 48]},
         "min_return": {"type": "categorical", "choices": [0.0, 0.0005, 0.001, 0.002]},
-        "volatility_window": {"type": "categorical", "choices": [12, 24, 48]},
-        "barrier_tie_break": {"type": "categorical", "choices": ["sl", "pt"]},
     },
     "regime": {
         "n_regimes": {"type": "categorical", "choices": [2, 3, 4]},
@@ -66,8 +62,6 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
     "model": {
         "type": {"type": "categorical", "choices": ["rf", "gbm", "logistic"]},
         "gap": {"type": "categorical", "choices": [12, 24, 48]},
-        "validation_fraction": {"type": "categorical", "choices": [0.15, 0.2, 0.25, 0.3]},
-        "meta_n_splits": {"type": "categorical", "choices": [2, 3]},
         "calibration_params": {
             "c": {"type": "float", "low": 0.1, "high": 10.0, "log": True},
         },
@@ -127,18 +121,21 @@ _THESIS_SPACE_PATHS = {
     ("feature_selection", "enabled"),
     ("feature_selection", "max_features"),
     ("feature_selection", "min_mi_threshold"),
-    ("labels", "pt_mult"),
-    ("labels", "sl_mult"),
-    ("labels", "max_holding"),
     ("labels", "min_return"),
-    ("labels", "volatility_window"),
     ("labels", "barrier_tie_break"),
     ("regime", "n_regimes"),
     ("model", "gap"),
-    ("model", "validation_fraction"),
 }
 _MODEL_FAMILY_SPACE_PATHS = {
     ("model", "type"),
+}
+_FORBIDDEN_SEARCH_PATHS = {
+    ("model", "validation_fraction"),
+    ("model", "meta_n_splits"),
+    ("labels", "pt_mult"),
+    ("labels", "sl_mult"),
+    ("labels", "max_holding"),
+    ("labels", "volatility_window"),
 }
 
 
@@ -188,6 +185,25 @@ def _find_varying_thesis_paths(search_space_tiers):
             if _spec_allows_variation(spec):
                 violations.append(f"{section_name}.{key}")
     return sorted(violations)
+
+
+def _find_forbidden_search_paths(search_space):
+    violations = []
+    for section_name, section in dict(search_space or {}).items():
+        for key in dict(section or {}).keys():
+            if (section_name, key) in _FORBIDDEN_SEARCH_PATHS:
+                violations.append(f"{section_name}.{key}")
+    return sorted(violations)
+
+
+def _validate_forbidden_search_space_paths(search_space):
+    violations = _find_forbidden_search_paths(search_space)
+    if violations:
+        joined = ", ".join(violations)
+        raise ValueError(
+            "Search space includes forbidden thesis/data-split parameters. Remove these entries: "
+            f"{joined}"
+        )
 
 
 def _validate_trade_ready_search_space(search_space, automl_config):
@@ -1206,6 +1222,8 @@ def _summarize_training(training):
     feature_selection = training.get("feature_selection") or {}
     bootstrap = training.get("bootstrap") or {}
     feature_governance = training.get("feature_governance") or {}
+    feature_portability_diagnostics = training.get("feature_portability_diagnostics") or {}
+    regime = training.get("regime") or {}
     operational_monitoring = training.get("operational_monitoring") or {}
     cross_venue_integrity = training.get("cross_venue_integrity") or {}
     data_certification = training.get("data_certification") or {}
@@ -1247,19 +1265,25 @@ def _summarize_training(training):
             "summary": operational_monitoring.get("summary", {}),
             "artifacts": operational_monitoring.get("artifacts", {}),
         },
-        "cross_venue_integrity": {
-            "kind": cross_venue_integrity.get("kind"),
-            "promotion_pass": bool(cross_venue_integrity.get("promotion_pass", True)),
-            "gate_mode": cross_venue_integrity.get("gate_mode"),
-            "reasons": list(cross_venue_integrity.get("reasons", [])),
-            "warnings": list(cross_venue_integrity.get("warnings", [])),
-            "venues": cross_venue_integrity.get("venues", {}),
-            "self_consistency": cross_venue_integrity.get("self_consistency", {}),
-            "divergence": cross_venue_integrity.get("divergence", {}),
-            "overlay_columns": list(cross_venue_integrity.get("overlay_columns", [])),
-        },
+        "cross_venue_integrity": (
+            {
+                "kind": cross_venue_integrity.get("kind"),
+                "promotion_pass": bool(cross_venue_integrity.get("promotion_pass", False)),
+                "gate_mode": cross_venue_integrity.get("gate_mode"),
+                "reasons": list(cross_venue_integrity.get("reasons", [])),
+                "warnings": list(cross_venue_integrity.get("warnings", [])),
+                "venues": cross_venue_integrity.get("venues", {}),
+                "self_consistency": cross_venue_integrity.get("self_consistency", {}),
+                "divergence": cross_venue_integrity.get("divergence", {}),
+                "overlay_columns": list(cross_venue_integrity.get("overlay_columns", [])),
+            }
+            if cross_venue_integrity
+            else {}
+        ),
         "data_certification": data_certification,
         "signal_decay": signal_decay,
+        "feature_portability_diagnostics": feature_portability_diagnostics,
+        "regime": regime,
         "promotion_gates": training.get("promotion_gates", {}),
         "fold_stability": primary_training.get("fold_stability", training.get("fold_stability")),
         "fold_count": len(primary_training.get("fold_metrics", [])),
@@ -1762,7 +1786,7 @@ def _finalize_portability_contract(report, primary_score=None):
     contract["reasons"] = reasons
     contract["passed"] = not reasons
     report["portability_contract"] = contract
-    report["promotion_pass"] = bool(report.get("promotion_pass", True) and contract["passed"])
+    report["promotion_pass"] = bool(report.get("promotion_pass", False) and contract["passed"])
     return report
 
 
@@ -2266,10 +2290,11 @@ def _build_trial_record(overrides, search_record, validation_record=None):
     }
 
 
-def _resolve_selection_policy(automl_config=None):
+def _resolve_selection_policy(automl_config=None, evaluation_mode=None):
     policy_profile = _resolve_automl_policy_profile(automl_config)
     legacy_profile = policy_profile == "legacy_permissive"
     policy = copy.deepcopy((automl_config or {}).get("selection_policy") or {})
+    is_capital_facing = bool(getattr(evaluation_mode, "is_capital_facing", False))
     enabled = bool(policy.get("enabled", True))
     if not enabled:
         return {
@@ -2289,11 +2314,15 @@ def _resolve_selection_policy(automl_config=None):
             "local_perturbation_limit": 0,
             "require_fold_stability_pass": False,
         }
-    gate_modes = {} if legacy_profile else copy.deepcopy(_HARDENED_DEFAULT_SELECTION_GATE_MODES)
+    default_gate_modes = {}
+    if is_capital_facing and not legacy_profile:
+        default_gate_modes = copy.deepcopy(_HARDENED_DEFAULT_SELECTION_GATE_MODES)
+    gate_modes = default_gate_modes
     gate_modes.update(copy.deepcopy(policy.get("gate_modes") or {}))
     return {
         "enabled": True,
         "policy_profile": policy_profile,
+        "is_capital_facing": is_capital_facing,
         "deprecation_warning": "legacy_permissive_policy_profile_deprecated" if legacy_profile else None,
         "calibration_mode": bool(policy.get("calibration_mode", False)),
         "gate_modes": gate_modes,
@@ -2301,12 +2330,14 @@ def _resolve_selection_policy(automl_config=None):
         "max_param_fragility": float(policy.get("max_param_fragility", 0.30)),
         "max_complexity_score": float(policy.get("max_complexity_score", 18.0)),
         "min_validation_trade_count": int(policy.get("min_validation_trade_count", 10)),
-        "require_locked_holdout_pass": bool(policy.get("require_locked_holdout_pass", not legacy_profile)),
         "min_locked_holdout_score": float(policy.get("min_locked_holdout_score", 0.0)),
         "max_feature_count_ratio": float(policy.get("max_feature_count_ratio", 1.0)),
         "max_trials_per_model_family": int(policy.get("max_trials_per_model_family", 64)),
         "local_perturbation_limit": int(policy.get("local_perturbation_limit", 8)),
-        "require_fold_stability_pass": bool(policy.get("require_fold_stability_pass", True)),
+        "require_locked_holdout_pass": bool(
+            policy.get("require_locked_holdout_pass", bool(is_capital_facing and not legacy_profile))
+        ),
+        "require_fold_stability_pass": bool(policy.get("require_fold_stability_pass", bool(is_capital_facing))),
     }
 
 
@@ -2334,13 +2365,18 @@ def _resolve_evidence_gate(gate_name, report, *, selection_policy=None, failure_
     details = dict(report or {})
     failure_reason = failure_reason or f"{gate_name}_failed"
     missing_reason = missing_reason or f"{gate_name}_evidence_missing"
+    policy_profile = str((selection_policy or {}).get("policy_profile") or "").strip().lower()
+    is_capital_facing = bool((selection_policy or {}).get("is_capital_facing", False))
+    default_mode = "advisory" if policy_profile == "legacy_permissive" else "blocking"
+    gate_mode = resolve_promotion_gate_mode(selection_policy, gate_name, default=default_mode)
     if not details:
+        passed = gate_mode != "blocking" or not is_capital_facing
         return {
             "details": {},
             "status": "unknown",
-            "passed": False,
-            "mode": resolve_promotion_gate_mode(selection_policy, gate_name),
-            "reason": missing_reason,
+            "passed": passed,
+            "mode": gate_mode,
+            "reason": None if passed else missing_reason,
         }
 
     status = str(details.get("status") or "").strip().lower()
@@ -2351,20 +2387,25 @@ def _resolve_evidence_gate(gate_name, report, *, selection_policy=None, failure_
             status = "unknown"
 
     reasons = list(details.get("reasons") or [])
+    canonical_reason_gates = {"feature_portability", "feature_admission", "regime_stability"}
     if status == "unknown" and not reasons:
         reasons = [missing_reason]
-    elif status == "failed" and not reasons:
-        reasons = [failure_reason]
+    elif status == "failed":
+        if not reasons:
+            reasons = [failure_reason]
+        elif gate_name in canonical_reason_gates and failure_reason not in reasons:
+            reasons = [failure_reason] + reasons
 
     normalized_details = dict(details)
     normalized_details["status"] = status
     normalized_details["reasons"] = reasons
+    passed = status == "passed" or (status == "unknown" and (gate_mode != "blocking" or not is_capital_facing))
     return {
         "details": normalized_details,
         "status": status,
-        "passed": status == "passed",
-        "mode": str(details.get("gate_mode") or resolve_promotion_gate_mode(selection_policy, gate_name)).lower(),
-        "reason": None if status == "passed" else (reasons[0] if reasons else failure_reason),
+        "passed": passed,
+        "mode": str(details.get("gate_mode") or gate_mode).lower(),
+        "reason": None if passed else (reasons[0] if reasons else failure_reason),
     }
 
 
@@ -3168,7 +3209,8 @@ def compute_cpcv_pbo(
 
 def _build_trial_selection_report(completed_trials, trial_records, objective_name, automl_config):
     control = _resolve_overfitting_control(automl_config)
-    selection_policy = _resolve_selection_policy(automl_config)
+    evaluation_mode = resolve_evaluation_mode((automl_config or {}).get("backtest") or {})
+    selection_policy = _resolve_selection_policy(automl_config, evaluation_mode=evaluation_mode)
     validation_contract = _resolve_validation_contract({}, automl_config)
     explicit_minimum_dsr_threshold = "minimum_dsr_threshold" in (automl_config or {})
     minimum_dsr_threshold = automl_config.get("minimum_dsr_threshold", 0.3)
@@ -4112,9 +4154,10 @@ def _sample_trial_overrides(trial, search_space):
     label_space = search_space.get("labels", {})
     if label_space:
         label_overrides = {}
-        pt_mult = _sample_from_spec(trial, "labels.pt_mult", label_space["pt_mult"])
-        sl_mult = _sample_from_spec(trial, "labels.sl_mult", label_space["sl_mult"])
-        label_overrides["pt_sl"] = (pt_mult, sl_mult)
+        if "pt_mult" in label_space and "sl_mult" in label_space:
+            pt_mult = _sample_from_spec(trial, "labels.pt_mult", label_space["pt_mult"])
+            sl_mult = _sample_from_spec(trial, "labels.sl_mult", label_space["sl_mult"])
+            label_overrides["pt_sl"] = (pt_mult, sl_mult)
         for key in ["max_holding", "min_return", "volatility_window", "barrier_tie_break"]:
             if key in label_space:
                 label_overrides[key] = _sample_from_spec(trial, f"labels.{key}", label_space[key])
@@ -4138,9 +4181,6 @@ def _sample_trial_overrides(trial, search_space):
         model_overrides = {"type": model_type}
         if "gap" in model_space:
             model_overrides["gap"] = _sample_from_spec(trial, "model.gap", model_space["gap"])
-        for key in ["validation_fraction", "meta_n_splits"]:
-            if key in model_space:
-                model_overrides[key] = _sample_from_spec(trial, f"model.{key}", model_space[key])
         for key, prefix in [
             ("calibration_params", "model.calibration_params"),
             ("meta_params", "model.meta_params"),
@@ -4185,8 +4225,35 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     automl_config = copy.deepcopy(base_config.get("automl", {}))
     search_space = copy.deepcopy(DEFAULT_AUTOML_SEARCH_SPACE)
     _deep_merge(search_space, automl_config.get("search_space", {}))
+    _validate_forbidden_search_space_paths(search_space)
     _validate_signal_policy_search_space(search_space)
     _validate_trade_ready_search_space(search_space, automl_config)
+    tiers = _classify_search_space(search_space)
+    varying_thesis_paths = _find_varying_thesis_paths(tiers)
+    requested_evaluation_mode = (
+        automl_config.get("evaluation_mode")
+        or base_config.get("evaluation_mode")
+        or dict(base_config.get("backtest") or {}).get("evaluation_mode")
+        or "research_only"
+    )
+    resolved_mode = resolve_evaluation_mode(
+        {
+            "evaluation_mode": requested_evaluation_mode,
+        }
+    )
+    automl_config.setdefault("backtest", {})
+    automl_config["backtest"]["evaluation_mode"] = resolved_mode.requested_mode
+    if varying_thesis_paths:
+        joined = ", ".join(varying_thesis_paths)
+        if resolved_mode.requested_mode == "trade_ready":
+            raise ValueError(
+                "Capital-facing/certification AutoML cannot vary thesis parameters. Freeze entries: "
+                f"{joined}"
+            )
+        warnings.warn(
+            f"{resolved_mode.requested_mode} AutoML is varying thesis parameters ({joined}); this weakens locked-holdout guarantees.",
+            UserWarning,
+        )
 
     full_state_bundle = _build_state_bundle(base_pipeline)
     experiment_manifest = _build_experiment_manifest(base_config, automl_config, full_state_bundle, search_space)
@@ -4196,7 +4263,8 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     storage_path.parent.mkdir(parents=True, exist_ok=True)
     storage_url = f"sqlite:///{storage_path.as_posix()}"
     study_name = _resolve_study_name(base_config, automl_config)
-    sampler = TPESampler(seed=automl_config.get("seed", 42))
+    tpe_startup_trials = int(automl_config.get("tpe_startup_trials", 25))
+    sampler = TPESampler(seed=automl_config.get("seed", 42), n_startup_trials=tpe_startup_trials)
     objective_name = _normalize_objective_name(automl_config.get("objective", "risk_adjusted_after_costs"))
 
     experiment_dir = Path(storage_context["experiment_dir"])
@@ -4258,7 +4326,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         study.set_user_attr("search_space_hash", experiment_manifest["search_space_hash"])
         study.set_user_attr("code_revision", experiment_manifest["code_revision"])
     trial_records = {}
-    selection_policy = _resolve_selection_policy(automl_config)
+    selection_policy = _resolve_selection_policy(automl_config, evaluation_mode=resolved_mode)
 
     def objective(trial):
         overrides = _sample_trial_overrides(trial, search_space)
@@ -4382,9 +4450,16 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         trial.set_user_attr("raw_objective_value", value)
         return value
 
+    n_trials = int(automl_config.get("n_trials", 25))
+    if n_trials < tpe_startup_trials:
+        warnings.warn(
+            f"n_trials={n_trials} is below tpe_startup_trials={tpe_startup_trials}; study will remain random-sampling dominated",
+            UserWarning,
+        )
+
     study.optimize(
         objective,
-        n_trials=automl_config.get("n_trials", 25),
+        n_trials=n_trials,
         gc_after_trial=automl_config.get("gc_after_trial", True),
         show_progress_bar=False,
         catch=(ValueError, RuntimeError),
@@ -4447,7 +4522,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         trial_records[trial.number] = _build_trial_record(overrides, search_record, validation_record)
 
     selection_report = _build_trial_selection_report(completed_trials, trial_records, objective_name, automl_config)
-    selection_policy = _resolve_selection_policy(automl_config)
+    selection_policy = _resolve_selection_policy(automl_config, evaluation_mode=resolved_mode)
     best_trial_report = None
     evaluation_split = None
     if holdout_plan["enabled"]:
@@ -4752,7 +4827,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             promotion_eligibility_report,
             group="post_selection",
             name="replication",
-            passed=bool(replication_report.get("promotion_pass", True)),
+            passed=bool(replication_report.get("promotion_pass", False)),
             mode=replication_report.get("gate_mode"),
             measured=replication_report.get("pass_rate"),
             threshold={
@@ -4760,7 +4835,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 "min_pass_rate": replication_report.get("min_pass_rate"),
                 "min_score": replication_report.get("min_score"),
             },
-            reason=None if replication_report.get("promotion_pass", True) else _first_failure_reason(replication_report, "replication_failed"),
+            reason=None if replication_report.get("promotion_pass", False) else _first_failure_reason(replication_report, "replication_failed"),
             details=replication_report,
         )
     execution_realism = evaluate_execution_realism_gate(

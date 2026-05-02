@@ -51,7 +51,7 @@ def _normalize_execution_outcome_funding_rates(funding_rates, index, *, evaluati
 # ───────────────────────────────────────────────────────────────────────────
 
 def walk_forward_split(X, n_splits=3, train_size=None, test_size=None,
-                       gap=0, expanding=False):
+                       gap=0, expanding=False, max_lag=0):
     """Yield (train_idx, test_idx) arrays – never shuffled.
 
     Parameters
@@ -68,10 +68,11 @@ def walk_forward_split(X, n_splits=3, train_size=None, test_size=None,
     if train_size is None:
         train_size = test_size * 2
 
+    effective_gap = max(0, int(gap)) + max(0, int(max_lag))
     for i in range(n_splits):
         test_end = n - (n_splits - i - 1) * test_size
         test_start = test_end - test_size
-        train_end = test_start - gap
+        train_end = test_start - effective_gap
         train_start = 0 if expanding else max(0, train_end - train_size)
 
         if train_start >= train_end or test_start >= test_end:
@@ -81,7 +82,7 @@ def walk_forward_split(X, n_splits=3, train_size=None, test_size=None,
                np.arange(test_start, min(test_end, n)))
 
 
-def cpcv_split(X, n_blocks=4, test_blocks=None, embargo=0):
+def cpcv_split(X, n_blocks=4, test_blocks=None, embargo=0, max_lag=0):
     """Yield CPCV train/test index arrays plus split metadata.
 
     Parameters
@@ -117,6 +118,8 @@ def cpcv_split(X, n_blocks=4, test_blocks=None, embargo=0):
     test_block_count = max(1, min(test_block_count, block_count - 1))
 
     embargo = max(0, int(embargo))
+    lag_extension = max(0, int(max_lag))
+    effective_embargo = embargo + lag_extension
 
     for split_number, test_block_ids in enumerate(combinations(range(block_count), test_block_count)):
         test_parts = [blocks[block_id] for block_id in test_block_ids]
@@ -129,7 +132,7 @@ def cpcv_split(X, n_blocks=4, test_blocks=None, embargo=0):
         for block_id in test_block_ids:
             block = blocks[block_id]
             embargo_start = int(block[-1]) + 1
-            embargo_end = min(n, embargo_start + embargo)
+            embargo_end = min(n, embargo_start + effective_embargo)
             if embargo_start < embargo_end:
                 embargo_mask[embargo_start:embargo_end] = True
 
@@ -149,6 +152,7 @@ def cpcv_split(X, n_blocks=4, test_blocks=None, embargo=0):
                 "train_blocks": tuple(block_id for block_id in range(block_count) if block_id not in test_block_ids),
                 "test_blocks": tuple(test_block_ids),
                 "embargo_rows": int((embargo_mask & ~test_mask).sum()),
+                "lag_embargo_extension": int(lag_extension),
             },
         )
 
@@ -168,7 +172,7 @@ def build_model(model_type="gbm", model_params=None):
             min_samples_leaf=int(model_params.get("min_samples_leaf", 1)),
             class_weight=model_params.get("class_weight", None),
             random_state=int(model_params.get("random_state", 42)),
-            n_jobs=int(model_params.get("n_jobs", -1)),
+            n_jobs=int(model_params.get("n_jobs", 1)),
             bootstrap=bool(model_params.get("bootstrap", True)),
             oob_score=bool(model_params.get("oob_score", False)),
             max_samples=model_params.get("max_samples"),
@@ -273,6 +277,13 @@ def train_model(
 
     X_train = X
     y_train = y
+
+    if pd.DataFrame(X_train).isna().any(axis=1).any():
+        nan_count = int(pd.DataFrame(X_train).isna().any(axis=1).sum())
+        raise ValueError(
+            f"train_model received {nan_count} rows with NaN features. "
+            "Resolve feature warm-up NaNs before training."
+        )
     sw_series = _as_weight_series(sample_weight, X.index)
     fit_model_params = dict(model_params)
 
