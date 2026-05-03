@@ -1,6 +1,7 @@
 """Feature engineering: fractional differentiation, stationarity, derived features."""
 
 from dataclasses import dataclass, field
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -253,7 +254,15 @@ def check_stationarity(series, significance=0.05):
         }
 
     try:
-        result = adfuller(clean, maxlag=min(20, len(clean) // 4))
+        # statsmodels can emit a benign RuntimeWarning from llf math when
+        # residual variance collapses for near-deterministic series.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="divide by zero encountered in log",
+                category=RuntimeWarning,
+            )
+            result = adfuller(clean, maxlag=min(20, len(clean) // 4))
     except Exception as exc:
         return {
             "stationary": False,

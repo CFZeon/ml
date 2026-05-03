@@ -981,8 +981,9 @@ def join_custom_dataset(base_frame, dataset, tolerance=None, allow_exact_matches
 
     joined = joined.set_index("decision_time")
     joined.index.name = base.index.name
-    if dataset.availability_column in joined.columns:
-        joined = joined.drop(columns=[dataset.availability_column])
+    drop_cols = [c for c in [dataset.availability_column, "event_timestamp"] if c in joined.columns]
+    if drop_cols:
+        joined = joined.drop(columns=drop_cols)
 
     coverage = float(joined[feature_columns].notna().all(axis=1).mean()) if feature_columns else 0.0
     fallback_rows = int(matched_after_ttl_mask.sum()) if dataset.availability_is_assumed else 0

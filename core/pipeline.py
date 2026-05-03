@@ -2638,6 +2638,9 @@ def _position_size_from_profitability(probability, avg_win, avg_loss, signal_con
         size = max(0.0, expected_edge) / utility_scale
         size = min(size, 1.0) * fraction
 
+    min_position_size = float(signal_config.get("min_position_size", 0.0))
+    size = max(size, min_position_size)
+
     max_kelly_fraction = signal_config.get("max_kelly_fraction")
     if max_kelly_fraction is not None:
         size = min(float(size), max(0.0, float(max_kelly_fraction)))
