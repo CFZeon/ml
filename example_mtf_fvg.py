@@ -4,6 +4,7 @@ Feature stack
 -------------
   Base indicators (15m)
     - RSI(14), ATR(14)
+        - WaveTrend oscillator (10, 21, 4)
     - FVG with 1 % minimum gap width filter
   
     Optional derivatives indicators (fetched inside indicators, no pipeline changes)
@@ -36,6 +37,8 @@ Usage
 When live open-interest context is enabled, the example automatically switches
 to a recent rolling window because Binance only exposes recent OI history.
 """
+
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -136,9 +139,17 @@ def format_config_timestamp(timestamp: pd.Timestamp) -> str:
 
 def build_indicator_specs(symbol: str):
     """Build indicator instances without changing pipeline registration code."""
-    indicators = [
+    indicators: list[object] = [
         {"kind": "rsi", "params": {"period": 14}},
         {"kind": "atr", "params": {"period": 14}},
+        {
+            "kind": "wavetrend",
+            "params": {
+                "channel_length": 10,
+                "average_length": 21,
+                "signal_length": 4,
+            },
+        },
         {
             "kind": "fvg",
             "params": {
@@ -461,23 +472,23 @@ def main():
     # ── 1. Pre-fetch data for custom feature computation ───────────────────────
     print_section(sep, 1, f"Pre-fetching {SYMBOL} data for custom feature computation")
 
-    base_bars = fetch_binance_bars(
+    base_bars = cast(pd.DataFrame, fetch_binance_bars(
         symbol=SYMBOL,
         interval=BASE_INTERVAL,
         start=model_start,
         end=model_end,
         market="spot",
-    )
+    ))
     print(f"  {BASE_INTERVAL} bars (model window) : {len(base_bars)}")
     print(f"  range                      : {base_bars.index[0]} ... {base_bars.index[-1]}")
 
-    daily_bars = fetch_binance_bars(
+    daily_bars = cast(pd.DataFrame, fetch_binance_bars(
         symbol=SYMBOL,
         interval="1d",
         start=sma_history_start,
         end=model_end,
         market="spot",
-    )
+    ))
     print(f"  1d bars (SMA history)      : {len(daily_bars)}")
     print(f"  range                      : {daily_bars.index[0]} ... {daily_bars.index[-1]}")
 
@@ -657,7 +668,7 @@ def main():
         print(f"  mode  : {example_runtime.get('mode')}")
 
     # ── 7. Indicators ──────────────────────────────────────────────────────────
-    print_section(sep, 7, "Running indicators  (RSI, ATR, FVG, funding, OI, combined)")
+    print_section(sep, 7, "Running indicators  (RSI, ATR, WaveTrend, FVG, funding, OI, combined)")
 
     indicator_run = pipeline.run_indicators()
     fvg_meta = indicator_run.metadata.get("fvg_base", {})

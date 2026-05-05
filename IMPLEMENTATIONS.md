@@ -167,6 +167,28 @@ Key details:
 - Normalizes funding timestamps onto the fetched futures bar grid to absorb Binance funding timestamp millisecond jitter.
 - Uses research-mode funding coverage policy `zero_fill_debug` for this example because CPCV training evaluates funding both on the raw futures bar index and on sparse fold-level research indices. Strict funding coverage is appropriate for capital-facing paths, but it is too brittle for this research-only example once custom-data alignment drops many bars from the modeling matrix.
 
+### 7. WaveTrend Feature Extraction
+
+Implemented dedicated WaveTrend indicator-aware extraction in `core/features.py`.
+
+Current extracted outputs:
+
+- `wt_10_21_4_spread`
+- `wt_10_21_4_cross_up`
+- `wt_10_21_4_cross_down`
+- `wt_10_21_4_level`
+- `wt_10_21_4_slope`
+- `wt_10_21_4_extreme_high`
+- `wt_10_21_4_extreme_low`
+- `wt_10_21_4_reversion_up`
+- `wt_10_21_4_reversion_down`
+- `wt_10_21_4_price_agreement`
+
+Final semantic change:
+
+- WaveTrend no longer falls back to the generic indicator diff/z-score expansion path.
+- The model-facing feature surface now captures oscillator spread, crossover state, zone extremes, mean-reversion exits, and short-horizon agreement with price direction.
+
 ## Validation Strategy And Outcome
 
 ### Focused Local Hypothesis
@@ -185,21 +207,23 @@ Focused synthetic tests were added to verify:
 
 - `pytest tests/test_derivatives_indicator_extensions.py`
 	- passed: `3/3`
+- `pytest tests/test_indicator_feature_expansion.py`
+	- passed: `1/1`
 - `python example_mtf_fvg.py`
-	- completed successfully after the non-level OI migration
+	- completed successfully after the dedicated WaveTrend feature extraction
 - `python example_mtf_fvg_futures.py`
-	- completed successfully after the non-level OI migration
+	- completed successfully after the dedicated WaveTrend feature extraction
 
 Latest validated spot-example outcome:
 
-- end equity: `$9,923.85`
-- net return: `-0.76%`
+- end equity: `$9,916.24`
+- net return: `-0.84%`
 
 Latest validated futures-example outcome:
 
-- end equity: `$10,102.46`
-- net return: `1.02%`
-- funding PnL: `$0.72`
+- end equity: `$9,929.33`
+- net return: `-0.71%`
+- funding PnL: `$0.35`
 - funding coverage: `status=strict  missing=0  pass=True` at final standalone backtest stage
 
 ## Execution Notes
@@ -223,5 +247,7 @@ Latest validated futures-example outcome:
 - [x] Open-interest semantics migrated from first derivatives to non-level change features.
 - [x] Extra futures-base example added in `example_mtf_fvg_futures.py`.
 - [x] Runtime funding attachment normalized at the example layer without changing core pipeline code.
+- [x] WaveTrend indicator added to both MTF FVG examples.
+- [x] Dedicated WaveTrend feature extraction implemented.
 - [x] Lightweight validation tests added.
 - [x] Focused validation executed.

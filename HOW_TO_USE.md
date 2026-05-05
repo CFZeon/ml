@@ -26,6 +26,7 @@ Use this map instead of scanning every example manually.
 | Run drift-governed retraining flow | `example_drift_retraining_cycle.py` | Shows champion/challenger registration, a paper-validation loop, a kill-switch / drawdown gate, scheduled retraining, hybrid rollback, and the final operator deploy/hold decision |
 | Run research-only AutoML with locked holdout separation | `example_automl.py` | Keeps the public surrogate path research-only, but now preserves a contiguous validation replay, a final locked holdout, SPA-based post-selection inference, and a minimum significance floor before any post-selection refit |
 | Run the old unsafe AutoML smoke path | `example_automl.py --research-demo` | Restores the fast demo mode that disables locked holdout and selection gates |
+| Explore MTF FVG plus derivatives context | `example_mtf_fvg.py` and `example_mtf_fvg_futures.py` | Show the shared MTF FVG workflow with WaveTrend, funding, non-level OI features, and custom FVG/SMA regime context |
 | Explore FVG-specific features | `example_fvg.py` | Narrow feature example; useful as a feature smoke test |
 | Explore wider indicator families | `example_trend_volume_spot.py` and `example_trend_breakout_futures.py` | Show how to widen the indicator stack without changing the rest of the pipeline |
 
@@ -38,10 +39,12 @@ The builder-based real-data examples now also accept `--local-certification` whe
 - `example_active_futures.py`
 - `example_trend_volume_spot.py`
 - `example_trend_breakout_futures.py`
-
-Those shared builders also keep execution costs finite by default: the public research examples use `backtest.slippage_rate = 0.0002` and `backtest.slippage_model = "sqrt_impact"` unless you explicitly override them.
+- `example_mtf_fvg.py`
+- `example_mtf_fvg_futures.py`
 - `example_fvg.py`
 - `example_test_case_template.py`
+
+Those shared builders also keep execution costs finite by default: the public research examples use `backtest.slippage_rate = 0.0002` and `backtest.slippage_model = "sqrt_impact"` unless you explicitly override them.
 
 That path keeps the strict local-certification gates and stays explicit about execution evidence. It uses Nautilus when available and otherwise resolves to `local_certification_surrogate` instead of silently downgrading to the research path. The surrogate path is still non-event-driven and remains ineligible for live-capital release.
 
@@ -64,6 +67,8 @@ Start from the shared builders in `example_utils.py`:
 - `seed_offline_pipeline_state(...)`
 
 That gives you one stable base config plus a short diff that contains only your experiment-specific changes.
+
+WaveTrend now has a dedicated indicator-aware feature extractor instead of falling back to generic diffs and z-scores. The built feature surface includes spread, crossover, level, slope, extreme-zone, reversion, and price-agreement features, so adding `WaveTrendOscillator(...)` to an example is now a meaningful model-surface change rather than a cosmetic indicator add.
 
 The shared builders now include strict context and funding integrity guardrails by default. If cross-asset context goes stale or a futures funding event is missing, the pipeline fails closed with an explicit gate error instead of converting that unknown state into zeros.
 They also set `data.duplicate_policy = "fail"`, so conflicting duplicate market bars raise immediately instead of being silently de-duplicated.

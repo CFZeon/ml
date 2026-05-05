@@ -27,8 +27,8 @@ The current codebase is built around these constraints:
 The repo now includes:
 
 - Binance spot and futures data loaders with cacheing, retry/backoff, and integrity reporting
-- modular indicators in `core/indicators/` including RSI, MACD, Bollinger Bands, ATR, Fair Value Gap, ADX, stochastic oscillator, on-balance volume, and Donchian channels
-- feature engineering with fractional differentiation and ADF-based stationarity screening
+- modular indicators in `core/indicators/` including RSI, MACD, Bollinger Bands, ATR, Fair Value Gap, ADX, stochastic oscillator, WaveTrend oscillator, on-balance volume, and Donchian channels
+- feature engineering with fractional differentiation, ADF-based stationarity screening, and indicator-aware oscillator extraction including dedicated WaveTrend spread, crossover, extreme-zone, reversion, and price-agreement features
 - triple-barrier, fixed-horizon, and trend-scanning labels
 - uniqueness weighting and sequential bootstrap support
 - explicit regime detection and context features
@@ -82,6 +82,7 @@ The repo now includes:
 - `core/lookahead.py`: baseline-plus-prefix replay audit for lookahead bias provocation
 - `example_active_spot.py`, `example_active_futures.py`: runnable active-trading demos
 - `example_trend_volume_spot.py`, `example_trend_breakout_futures.py`: runnable expanded-indicator demos
+- `example_mtf_fvg.py`, `example_mtf_fvg_futures.py`: multi-timeframe FVG plus WaveTrend and derivatives-context research demos
 - `example.py`, `example_custom_data.py`, `example_futures.py`, `example_fvg.py`, `example_synthetic_derivatives.py`, `example_automl.py`, `example_local_certification_automl.py`, `example_trade_ready_automl.py`: runnable end-to-end examples and smoke/integration demos
 - `example_drift_retraining_cycle.py`: deterministic champion/challenger drift orchestration example with rollback
 - `tests/`: regression coverage for validation, joins, execution semantics, AutoML governance, and futures behavior
@@ -102,6 +103,8 @@ The rest of the examples serve different purposes:
 - `example_futures.py`: conservative futures example using real Binance data and the liquidation-aware adapter; add `--local-certification` to run it under the strict local certification runtime
 - `example_trend_volume_spot.py`: spot example that blends RSI/MACD/Bollinger/ATR with ADX, stochastic, OBV, and Donchian features; add `--local-certification` to promote the same scenario into the strict local certification runtime
 - `example_trend_breakout_futures.py`: futures example focused on ADX plus Donchian trend-breakout context layered onto the existing futures pipeline; add `--local-certification` to promote the same scenario into the strict local certification runtime
+- `example_mtf_fvg.py`: multi-timeframe spot FVG workflow that now layers RSI, ATR, WaveTrend, derivatives context, and custom FVG/SMA regime features; add `--local-certification` to run the same case under the strict local certification runtime
+- `example_mtf_fvg_futures.py`: futures-base variant of the MTF FVG workflow with WaveTrend, funding, non-level OI features, and the futures execution stack; add `--local-certification` to run the same case under the strict local certification runtime
 - `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain; add `--local-certification` when you want the same scenario to run under strict local certification runtime defaults
 - `example_synthetic_derivatives.py`: offline synthetic derivatives/integration example; may also abstain depending on the generated regime path
 - `example_local_certification_automl.py`: strict local certification path with locked holdout, replication, fail-closed data handling, an explicit `local_certification` monitoring profile, and an explicit `local_certification_surrogate` fallback when Nautilus is unavailable; intended for paper or pre-capital certification on consumer hardware, not live-capital release
@@ -126,6 +129,8 @@ For the builder-based real-data demos, local certification is also available as 
 - `example_active_futures.py`
 - `example_trend_volume_spot.py`
 - `example_trend_breakout_futures.py`
+- `example_mtf_fvg.py`
+- `example_mtf_fvg_futures.py`
 - `example_fvg.py`
 - `example_test_case_template.py`
 

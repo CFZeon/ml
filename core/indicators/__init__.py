@@ -18,6 +18,7 @@ from .stochastic import StochasticOscillator
 from .on_balance_volume import OnBalanceVolume
 from .donchian_channels import DonchianChannels
 from .fair_value_gap import FairValueGap
+from .wavetrend import WaveTrendOscillator
 
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "OnBalanceVolume",
     "RSI",
     "StochasticOscillator",
+    "WaveTrendOscillator",
     "attach_indicators",
     "build_indicator",
     "build_indicators",

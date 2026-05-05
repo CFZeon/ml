@@ -7,6 +7,7 @@ Feature stack
 
   Base indicators (15m)
     - RSI(14), ATR(14)
+        - WaveTrend oscillator (10, 21, 4)
     - FVG with 1 % minimum gap width filter
 
   Optional derivatives indicators (fetched inside indicators, no pipeline changes)
@@ -290,7 +291,7 @@ def main():
         )
     print(f"  runtime funding rows: {len(funding_frame)}")
 
-    print_section(sep, 7, "Running indicators  (RSI, ATR, FVG, funding delta, OI change, combined)")
+    print_section(sep, 7, "Running indicators  (RSI, ATR, WaveTrend, FVG, funding delta, OI change, combined)")
     indicator_run = pipeline.run_indicators()
     fvg_meta = indicator_run.metadata.get("fvg_base", {})
     print(f"  indicator names  : {list(indicator_run.metadata)}")

@@ -64,6 +64,7 @@ from .indicators import (
     INDICATOR_REGISTRY,
     OnBalanceVolume,
     StochasticOscillator,
+    WaveTrendOscillator,
     build_indicator,
     build_indicators,
     run_indicators,

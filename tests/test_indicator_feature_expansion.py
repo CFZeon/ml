@@ -9,6 +9,7 @@ from core import (
     DonchianChannels,
     OnBalanceVolume,
     StochasticOscillator,
+    WaveTrendOscillator,
     build_feature_set,
     run_indicators,
 )
@@ -45,6 +46,7 @@ class IndicatorFeatureExpansionTest(unittest.TestCase):
             [
                 ADX(14),
                 StochasticOscillator(14, 3, 3),
+                WaveTrendOscillator(10, 21, 4),
                 OnBalanceVolume(),
                 DonchianChannels(20),
                 ATR(14),
@@ -62,6 +64,16 @@ class IndicatorFeatureExpansionTest(unittest.TestCase):
             "adx_14_strength",
             "adx_14_di_spread",
             "stoch_14_3_3_spread",
+            "wt_10_21_4_spread",
+            "wt_10_21_4_cross_up",
+            "wt_10_21_4_cross_down",
+            "wt_10_21_4_level",
+            "wt_10_21_4_slope",
+            "wt_10_21_4_extreme_high",
+            "wt_10_21_4_extreme_low",
+            "wt_10_21_4_reversion_up",
+            "wt_10_21_4_reversion_down",
+            "wt_10_21_4_price_agreement",
             "obv_pressure",
             "donchian_20_position",
             "breakout_trend_pressure",
@@ -73,11 +85,14 @@ class IndicatorFeatureExpansionTest(unittest.TestCase):
 
         self.assertEqual(feature_set.feature_blocks["adx_14_strength"], "adx")
         self.assertEqual(feature_set.feature_blocks["stoch_14_3_3_spread"], "stochastic")
+        self.assertEqual(feature_set.feature_blocks["wt_10_21_4_spread"], "wavetrend")
         self.assertEqual(feature_set.feature_blocks["obv_pressure"], "obv")
         self.assertEqual(feature_set.feature_blocks["donchian_20_position"], "donchian")
 
         self.assertNotIn("obv_diff", feature_set.frame.columns)
         self.assertNotIn("adx_14_diff", feature_set.frame.columns)
+        self.assertNotIn("wt_10_21_4_wt1_diff", feature_set.frame.columns)
+        self.assertNotIn("wt_10_21_4_wt1_zscore", feature_set.frame.columns)
 
 
 if __name__ == "__main__":

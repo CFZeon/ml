@@ -20,6 +20,7 @@ _INDICATOR_BLOCKS = frozenset(
         "atr",
         "adx",
         "stochastic",
+        "wavetrend",
         "obv",
         "donchian",
         "fvg",
@@ -660,6 +661,42 @@ def _extract_stochastic_features(result, df, rolling_window=20, **_):
     return _as_feature_block(frame, laggable, block_name=result.kind)
 
 
+def _extract_wavetrend_features(result, df, rolling_window=20, **_):
+    wt1 = df[f"{result.name}_wt1"].astype(float)
+    wt2 = df[f"{result.name}_wt2"].astype(float)
+    close = df["close"].astype(float)
+
+    spread_raw = wt1 - wt2
+    spread = spread_raw / 100.0
+    level = wt1.clip(-100.0, 100.0) / 100.0
+    slope = wt1.diff() / 100.0
+    price_return = close.pct_change(fill_method=None)
+    spread_turn = spread.diff()
+
+    frame = pd.DataFrame(
+        {
+            f"{result.name}_spread": spread,
+            f"{result.name}_cross_up": _cross_up(spread_raw, 0.0),
+            f"{result.name}_cross_down": _cross_down(spread_raw, 0.0),
+            f"{result.name}_level": level,
+            f"{result.name}_slope": slope,
+            f"{result.name}_extreme_high": (wt1 >= 60.0).astype(float),
+            f"{result.name}_extreme_low": (wt1 <= -60.0).astype(float),
+            f"{result.name}_reversion_up": ((wt1 > -60.0) & (wt1.shift(1) <= -60.0)).astype(float),
+            f"{result.name}_reversion_down": ((wt1 < 60.0) & (wt1.shift(1) >= 60.0)).astype(float),
+            f"{result.name}_price_agreement": np.sign(price_return.fillna(0.0)) * np.sign(spread_turn.fillna(0.0)),
+        },
+        index=df.index,
+    )
+    laggable = [
+        f"{result.name}_spread",
+        f"{result.name}_level",
+        f"{result.name}_slope",
+        f"{result.name}_price_agreement",
+    ]
+    return _as_feature_block(frame, laggable, block_name=result.kind)
+
+
 def _extract_obv_features(result, df, rolling_window=20, **_):
     obv = df[result.name].astype(float)
     close = df["close"].astype(float)
@@ -785,7 +822,7 @@ def _extract_fvg_features(result, df, **_):
 
 
 def _extract_generic_indicator_features(result, df, rolling_window=20, **_):
-    frame = pd.DataFrame(index=df.index)
+    columns = {}
     laggable = []
 
     for column in result.metadata.get("output_columns", []):
@@ -795,10 +832,11 @@ def _extract_generic_indicator_features(result, df, rolling_window=20, **_):
         series = df[column].astype(float)
         diff_name = f"{column}_diff"
         zscore_name = f"{column}_zscore"
-        frame[diff_name] = series.diff()
-        frame[zscore_name] = _rolling_zscore(series, rolling_window)
+        columns[diff_name] = series.diff()
+        columns[zscore_name] = _rolling_zscore(series, rolling_window)
         laggable.extend([diff_name, zscore_name])
 
+    frame = pd.DataFrame(columns, index=df.index)
     return _as_feature_block(frame, laggable, block_name=getattr(result, "kind", "generic_indicator"))
 
 
@@ -828,6 +866,7 @@ INDICATOR_FEATURE_EXTRACTORS = {
     "atr": _extract_atr_features,
     "adx": _extract_adx_features,
     "stochastic": _extract_stochastic_features,
+    "wavetrend": _extract_wavetrend_features,
     "obv": _extract_obv_features,
     "donchian": _extract_donchian_features,
     "fvg": _extract_fvg_features,
