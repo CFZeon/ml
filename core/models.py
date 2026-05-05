@@ -772,6 +772,53 @@ def _binary_expected_calibration_error(y_true, positive_probability, n_bins=10):
     return calibration_error
 
 
+def _binary_brier_decomposition(y_true, positive_probability, n_bins=10):
+    """Return Murphy-style Brier decomposition terms for binary probabilities."""
+    truth = np.asarray(y_true, dtype=float).reshape(-1)
+    probability = np.clip(np.asarray(positive_probability, dtype=float).reshape(-1), 0.0, 1.0)
+
+    valid_mask = np.isfinite(truth) & np.isfinite(probability)
+    if not valid_mask.any():
+        return {}
+
+    truth = truth[valid_mask]
+    probability = probability[valid_mask]
+    if len(probability) == 0:
+        return {}
+
+    bins = np.linspace(0.0, 1.0, int(max(2, n_bins)) + 1)
+    assignments = np.digitize(probability, bins[1:-1], right=True)
+    total = float(len(probability))
+    event_rate = float(truth.mean())
+    brier_score = float(brier_score_loss(truth, probability))
+    reliability = 0.0
+    resolution = 0.0
+    occupied_bins = 0
+
+    for bin_idx in range(len(bins) - 1):
+        bin_mask = assignments == bin_idx
+        if not bin_mask.any():
+            continue
+        occupied_bins += 1
+        avg_confidence = float(probability[bin_mask].mean())
+        avg_outcome = float(truth[bin_mask].mean())
+        weight = float(bin_mask.sum()) / total
+        reliability += weight * (avg_confidence - avg_outcome) ** 2
+        resolution += weight * (avg_outcome - event_rate) ** 2
+
+    uncertainty = event_rate * (1.0 - event_rate)
+    residual = brier_score - (reliability - resolution + uncertainty)
+    return {
+        "reliability": reliability,
+        "resolution": resolution,
+        "uncertainty": uncertainty,
+        "residual": residual,
+        "observation_count": int(len(probability)),
+        "positive_rate": event_rate,
+        "bin_count": int(occupied_bins),
+    }
+
+
 def _evaluate_directional_probability_quality(probability_frame, y_true):
     """Score directional probabilities on the non-abstain subset only."""
     y_series = pd.Series(y_true, index=probability_frame.index)
@@ -789,6 +836,9 @@ def _evaluate_directional_probability_quality(probability_frame, y_true):
     directional_truth = y_series.loc[directional_mask].loc[valid_mask]
     binary_truth = directional_truth.eq(1).astype(int)
     positive_probability = directional_frame[1].clip(1e-6, 1.0 - 1e-6)
+    brier_score = float(brier_score_loss(binary_truth, positive_probability.to_numpy()))
+    calibration_error = float(_binary_expected_calibration_error(binary_truth, positive_probability.to_numpy()))
+    brier_decomposition = _binary_brier_decomposition(binary_truth, positive_probability.to_numpy())
 
     metrics = {
         "directional_log_loss": round(
@@ -801,18 +851,39 @@ def _evaluate_directional_probability_quality(probability_frame, y_true):
             ),
             4,
         ),
-        "directional_brier_score": round(
-            float(brier_score_loss(binary_truth, positive_probability.to_numpy())),
-            4,
-        ),
-        "directional_calibration_error": round(
-            float(_binary_expected_calibration_error(binary_truth, positive_probability.to_numpy())),
-            4,
-        ),
+        "directional_brier_score": round(brier_score, 4),
+        "directional_calibration_error": round(calibration_error, 4),
     }
+    if brier_decomposition:
+        rounded_decomposition = {
+            "reliability": round(float(brier_decomposition["reliability"]), 6),
+            "resolution": round(float(brier_decomposition["resolution"]), 6),
+            "uncertainty": round(float(brier_decomposition["uncertainty"]), 6),
+            "residual": round(float(brier_decomposition["residual"]), 6),
+            "observation_count": int(brier_decomposition["observation_count"]),
+            "positive_rate": round(float(brier_decomposition["positive_rate"]), 6),
+            "bin_count": int(brier_decomposition["bin_count"]),
+        }
+        metrics.update(
+            {
+                "directional_probability_observation_count": int(rounded_decomposition["observation_count"]),
+                "directional_brier_reliability": rounded_decomposition["reliability"],
+                "directional_brier_resolution": rounded_decomposition["resolution"],
+                "directional_brier_uncertainty": rounded_decomposition["uncertainty"],
+                "directional_brier_residual": rounded_decomposition["residual"],
+                "directional_brier_decomposition": rounded_decomposition,
+            }
+        )
     metrics["log_loss"] = metrics["directional_log_loss"]
     metrics["brier_score"] = metrics["directional_brier_score"]
     metrics["calibration_error"] = metrics["directional_calibration_error"]
+    if brier_decomposition:
+        metrics["probability_observation_count"] = metrics["directional_probability_observation_count"]
+        metrics["brier_reliability"] = metrics["directional_brier_reliability"]
+        metrics["brier_resolution"] = metrics["directional_brier_resolution"]
+        metrics["brier_uncertainty"] = metrics["directional_brier_uncertainty"]
+        metrics["brier_residual"] = metrics["directional_brier_residual"]
+        metrics["brier_decomposition"] = metrics["directional_brier_decomposition"]
     return metrics
 
 def evaluate_model(model, X, y):

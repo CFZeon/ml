@@ -33,7 +33,25 @@ _DEFAULT_POLICY = {
 }
 
 _POLICY_PROFILES = {
-    "research": {},
+    "research": {
+        "max_data_lag": "24h",
+        "max_custom_ttl_breach_rate": 0.25,
+        "max_fallback_assumption_rate": 0.25,
+        "max_l2_snapshot_age": "1h",
+        "require_l2_snapshots": False,
+        "min_fill_ratio": 0.05,
+        "max_fill_ratio_deterioration": 0.50,
+        "max_slippage_gap_share": 0.90,
+        "max_slippage_drift": 0.01,
+        "max_inference_p95_ms": 2_000.0,
+        "max_queue_backlog": 100,
+        "require_inference_metrics": False,
+        "min_signal_decay_net_edge_at_delay": -0.01,
+        "min_signal_half_life_bars": 0.0,
+        "max_signal_delay_edge_deterioration": 0.10,
+        "max_signal_half_life_deterioration": 10.0,
+        "required_components": [],
+    },
     "local_certification": {
         "max_data_lag": "4h",
         "max_custom_ttl_breach_rate": 0.0,
@@ -275,6 +293,43 @@ def evaluate_fallback_assumptions(custom_data_report=None, backtest_reports=None
                     "source": f"execution:{offset}",
                     "fallback_used": bool(fallback_used),
                     "detail": execution_evidence.get("class") or execution_evidence.get("execution_mode"),
+                }
+            )
+
+        pricing_fallback_used = bool(report.get("same_bar_execution_fallback", False))
+        pricing_source = str(report.get("execution_price_source") or "").strip().lower()
+        pricing_warnings = [str(value) for value in list(report.get("backtest_warnings") or []) if str(value)]
+        if pricing_source or pricing_fallback_used or "same_bar_execution_fallback" in pricing_warnings:
+            fallback_used = bool(
+                pricing_fallback_used
+                or pricing_source == "close_fallback"
+                or "same_bar_execution_fallback" in pricing_warnings
+            )
+            source_count += 1
+            fallback_source_count += int(fallback_used)
+            rows.append(
+                {
+                    "source": f"pricing:{offset}",
+                    "fallback_used": bool(fallback_used),
+                    "detail": report.get("execution_price_source") or "same_bar_execution_fallback",
+                }
+            )
+
+        requested_engine = str(report.get("requested_engine") or "").strip().lower()
+        actual_engine = str(report.get("engine") or "").strip().lower()
+        engine_warnings = [str(value) for value in list(report.get("backtest_warnings") or []) if str(value)]
+        if requested_engine or actual_engine or report.get("engine_fallback_used") is not None:
+            fallback_used = bool(
+                report.get("engine_fallback_used", False)
+                or "engine_fallback_to_pandas" in engine_warnings
+            )
+            source_count += 1
+            fallback_source_count += int(fallback_used)
+            rows.append(
+                {
+                    "source": f"engine:{offset}",
+                    "fallback_used": bool(fallback_used),
+                    "detail": report.get("engine_fallback_reason") or f"{requested_engine or actual_engine}->{actual_engine or requested_engine}",
                 }
             )
 

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 
-from .drift import DriftMonitor, evaluate_drift_guardrails
+from .drift import DriftMonitor, _resolve_drift_policy, evaluate_drift_guardrails
 from .registry.store import evaluate_challenger_promotion
 
 
@@ -19,6 +21,54 @@ _DEFAULT_CRITICAL_ROLLBACK_REASONS = {
     "l2_snapshot_age",
     "raw_data_freshness",
 }
+
+
+def _evaluate_request_weight_guard(config=None):
+    configured = dict((dict(config or {}).get("request_weight_guard") or {}))
+    if not configured:
+        return {
+            "configured": False,
+            "allowed": True,
+            "reasons": [],
+            "limit": None,
+            "used": None,
+            "remaining": None,
+            "reserve_weight": None,
+            "retrain_cost": None,
+            "retry_after_seconds": None,
+        }
+
+    limit = int(max(0, configured.get("limit", 0) or 0))
+    used = int(max(0, configured.get("used", 0) or 0))
+    retrain_cost = int(max(0, configured.get("retrain_cost", 0) or 0))
+    reserve_ratio = float(max(0.0, configured.get("reserve_ratio", 0.1) or 0.0))
+    reserve_weight = int(max(0, configured.get("reserve_weight", 0) or 0))
+    retry_after_seconds = configured.get("retry_after_seconds")
+    if retry_after_seconds is not None:
+        retry_after_seconds = float(max(0.0, retry_after_seconds))
+
+    implied_reserve = int(max(reserve_weight, math.ceil(limit * reserve_ratio))) if limit > 0 else reserve_weight
+    remaining = None if limit <= 0 else max(0, int(limit - used))
+    reasons = []
+    allowed = True
+    if retry_after_seconds is not None and retry_after_seconds > 0.0:
+        allowed = False
+        reasons.append("request_weight_retry_after_active")
+    if limit > 0 and remaining is not None and remaining < int(retrain_cost + implied_reserve):
+        allowed = False
+        reasons.append("request_weight_headroom_insufficient")
+
+    return {
+        "configured": True,
+        "allowed": allowed,
+        "reasons": reasons,
+        "limit": None if limit <= 0 else int(limit),
+        "used": int(used),
+        "remaining": remaining,
+        "reserve_weight": int(implied_reserve),
+        "retrain_cost": int(retrain_cost),
+        "retry_after_seconds": retry_after_seconds,
+    }
 
 
 def _window_summary(data):
@@ -158,12 +208,14 @@ def run_drift_retraining_cycle(
     operational_limits=None,
     rollback_policy=None,
 ):
+    resolved_drift_config = _resolve_drift_policy(drift_config)
+    request_weight_guard = _evaluate_request_weight_guard(drift_config)
     champion = store.get_champion(symbol)
     monitor = DriftMonitor(
         reference_features,
         reference_predictions,
         reference_regimes=reference_regimes,
-        config=drift_config,
+        config=resolved_drift_config,
     )
     drift_report = monitor.check(
         current_features,
@@ -182,7 +234,7 @@ def run_drift_retraining_cycle(
         current_regimes=current_regimes,
         current_performance=current_performance,
     )
-    drift_guardrails = evaluate_drift_guardrails(drift_report, policy=drift_config)
+    drift_guardrails = evaluate_drift_guardrails(drift_report, policy=resolved_drift_config)
 
     if champion is not None:
         store.attach_drift_report(champion["version_id"], drift_report, symbol=symbol)
@@ -194,9 +246,15 @@ def run_drift_retraining_cycle(
         "scheduled_window_open": bool(scheduled_window_open),
         "drift_report": drift_report,
         "drift_guardrails": drift_guardrails,
+        "request_weight_guard": request_weight_guard,
         "retrain_status": "not_recommended",
         "candidate_version_id": None,
         "promotion_decision": None,
+        "post_retrain_warmup": {
+            "required": False,
+            "mode": str(resolved_drift_config.get("post_retrain_warmup_mode", "paper") or "paper").lower(),
+            "completed": False,
+        },
         "rollback": {
             "recommended": False,
             "executed": False,
@@ -212,6 +270,10 @@ def run_drift_retraining_cycle(
 
     if not scheduled_window_open:
         result["retrain_status"] = "scheduled_window_pending"
+        return result
+
+    if not request_weight_guard.get("allowed", True):
+        result["retrain_status"] = "request_weight_deferred"
         return result
 
     if train_challenger is None:
@@ -251,6 +313,11 @@ def run_drift_retraining_cycle(
     if promotion_decision.get("approved", False):
         store.promote(candidate_version_id, "champion", symbol=symbol, decision=promotion_decision)
         result["retrain_status"] = "promoted"
+        result["post_retrain_warmup"] = {
+            "required": bool(resolved_drift_config.get("post_retrain_warmup_required", True)),
+            "mode": str(resolved_drift_config.get("post_retrain_warmup_mode", "paper") or "paper").lower(),
+            "completed": False,
+        }
         return result
 
     result["retrain_status"] = "challenger_rejected"

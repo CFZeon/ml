@@ -55,6 +55,7 @@ class BuiltFeatureSet:
     feature_families: dict[str, str] = field(default_factory=dict)
     feature_lineage: dict[str, dict] = field(default_factory=dict)
     feature_availability: dict[str, dict] = field(default_factory=dict)
+    transform_retention_reports: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -157,6 +158,37 @@ def derive_feature_lineage(feature_blocks, columns=None, feature_availability=No
     return lineage
 
 
+def estimate_feature_lag_reach(feature_lineage, columns=None):
+    lineage = dict(feature_lineage or {})
+    selected_columns = list(columns) if columns is not None else list(lineage)
+    max_lag = 0
+    lagged_features = []
+
+    for column in selected_columns:
+        entry = dict(lineage.get(column) or {})
+        transform_chain = [str(value) for value in list(entry.get("transform_chain") or [])]
+        column_lag = 0
+        for transform in transform_chain:
+            if not transform.startswith("lag:"):
+                continue
+            lag_value = transform.split(":", 1)[1]
+            if lag_value.isdigit():
+                column_lag = max(column_lag, int(lag_value))
+        if column_lag <= 0 and "_lag" in str(column):
+            _, lag_suffix = str(column).rsplit("_lag", 1)
+            if lag_suffix.isdigit():
+                column_lag = max(column_lag, int(lag_suffix))
+        if column_lag > 0:
+            lagged_features.append(str(column))
+            max_lag = max(max_lag, column_lag)
+
+    return {
+        "max_lag": int(max_lag),
+        "lagged_feature_count": int(len(lagged_features)),
+        "lagged_features": sorted(lagged_features),
+    }
+
+
 def summarize_feature_families(feature_blocks, columns=None):
     feature_families = derive_feature_families(feature_blocks, columns=columns)
     counts = pd.Series(list(feature_families.values()), dtype="object")
@@ -188,7 +220,37 @@ def summarize_feature_families(feature_blocks, columns=None):
 # Fractional differentiation
 # ---------------------------------------------------------------------------
 
-def fractional_diff(series, d, threshold=1e-5):
+def _coerce_transform_retention_report(transformed, *, total_rows, transform_name,
+                                       min_retained_ratio=0.25, min_retained_samples=32,
+                                       configured_max_lag=None, applied_max_lag=None,
+                                       truncated_by_max_lag=False):
+    total_rows = max(0, int(total_rows))
+    retained_rows = int(pd.Series(transformed).notna().sum()) if total_rows > 0 else 0
+    retention_ratio = float(retained_rows / total_rows) if total_rows > 0 else 0.0
+    min_retained_ratio = max(0.0, float(0.25 if min_retained_ratio is None else min_retained_ratio))
+    min_retained_samples = max(0, int(32 if min_retained_samples is None else min_retained_samples))
+    reasons = []
+    if retained_rows < min_retained_samples:
+        reasons.append("retained_rows_below_minimum")
+    if retention_ratio < min_retained_ratio:
+        reasons.append("retention_ratio_below_minimum")
+    return {
+        "transform_name": str(transform_name),
+        "total_rows": int(total_rows),
+        "retained_rows": int(retained_rows),
+        "retention_ratio": float(retention_ratio),
+        "min_retained_ratio": float(min_retained_ratio),
+        "min_retained_samples": int(min_retained_samples),
+        "configured_max_lag": None if configured_max_lag is None else int(max(0, int(configured_max_lag))),
+        "applied_max_lag": None if applied_max_lag is None else int(max(0, int(applied_max_lag))),
+        "truncated_by_max_lag": bool(truncated_by_max_lag),
+        "accepted": not reasons,
+        "reasons": reasons,
+    }
+
+
+def fractional_diff(series, d, threshold=1e-5, max_lag=None,
+                    min_retained_ratio=0.25, min_retained_samples=32):
     """Fractionally differentiate *series* by order *d*.
 
     Uses expanding-window weights (cut off at *threshold*) applied as a
@@ -200,7 +262,12 @@ def fractional_diff(series, d, threshold=1e-5):
     """
     weights = [1.0]
     k = 1
+    truncated_by_max_lag = False
+    resolved_max_lag = None if max_lag is None else max(0, int(max_lag))
     while True:
+        if resolved_max_lag is not None and (len(weights) - 1) >= resolved_max_lag:
+            truncated_by_max_lag = True
+            break
         w = -weights[-1] * (d - k + 1) / k
         if abs(w) < threshold:
             break
@@ -215,12 +282,27 @@ def fractional_diff(series, d, threshold=1e-5):
     for i in range(width - 1, len(values)):
         out[i] = weights @ values[i - width + 1: i + 1]
 
+    report = _coerce_transform_retention_report(
+        out,
+        total_rows=len(values),
+        transform_name="frac_diff",
+        min_retained_ratio=min_retained_ratio,
+        min_retained_samples=min_retained_samples,
+        configured_max_lag=resolved_max_lag,
+        applied_max_lag=max(0, width - 1),
+        truncated_by_max_lag=truncated_by_max_lag,
+    )
+    if not report["accepted"]:
+        out[:] = np.nan
+
     series_name = getattr(series, "name", None)
     if series_name:
         output_name = f"{series_name}_fracdiff"
     else:
         output_name = "fracdiff"
-    return pd.Series(out, index=series.index, name=output_name)
+    output = pd.Series(out, index=series.index, name=output_name)
+    output.attrs["transform_retention_report"] = report
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -936,7 +1018,9 @@ def _append_lags(features, laggable_columns, lags, feature_blocks):
     return pd.concat([features, lagged_frame], axis=1), updated_blocks
 
 
-def _apply_stationarity_transform(series, transform_name, rolling_window, frac_diff_d, frac_diff_threshold):
+def _apply_stationarity_transform(series, transform_name, rolling_window, frac_diff_d, frac_diff_threshold,
+                                  frac_diff_max_lag=None, frac_diff_min_retained_ratio=0.25,
+                                  frac_diff_min_retained_samples=32):
     clean = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
     if clean.empty:
         return None
@@ -960,7 +1044,14 @@ def _apply_stationarity_transform(series, transform_name, rolling_window, frac_d
     if transform_name == "frac_diff":
         if frac_diff_d is None:
             return None
-        return fractional_diff(series, d=frac_diff_d, threshold=frac_diff_threshold)
+        return fractional_diff(
+            series,
+            d=frac_diff_d,
+            threshold=frac_diff_threshold,
+            max_lag=frac_diff_max_lag,
+            min_retained_ratio=frac_diff_min_retained_ratio,
+            min_retained_samples=frac_diff_min_retained_samples,
+        )
 
     raise ValueError(f"Unsupported stationarity transform {transform_name!r}")
 
@@ -977,6 +1068,9 @@ def fit_stationarity_transforms(features, significance=0.05, transform_order=Non
     rolling_window = int(config.get("rolling_window", 20))
     frac_diff_d = config.get("frac_diff_d")
     frac_diff_threshold = float(config.get("frac_diff_threshold", 1e-5))
+    frac_diff_max_lag = config.get("frac_diff_max_lag")
+    frac_diff_min_retained_ratio = float(config.get("frac_diff_min_retained_ratio", 0.25))
+    frac_diff_min_retained_samples = int(config.get("frac_diff_min_retained_samples", 32))
     discrete_max_unique = int(config.get("discrete_max_unique", 6))
     drop_failed = bool(config.get("drop_failed", True))
 
@@ -1052,9 +1146,33 @@ def fit_stationarity_transforms(features, significance=0.05, transform_order=Non
                 rolling_window=rolling_window,
                 frac_diff_d=frac_diff_d,
                 frac_diff_threshold=frac_diff_threshold,
+                frac_diff_max_lag=frac_diff_max_lag,
+                frac_diff_min_retained_ratio=frac_diff_min_retained_ratio,
+                frac_diff_min_retained_samples=frac_diff_min_retained_samples,
             )
             if transformed is None:
                 report["candidates"].append({"transform": transform_name, "applicable": False})
+                continue
+
+            retention_report = _coerce_transform_retention_report(
+                transformed,
+                total_rows=len(reference_series),
+                transform_name=transform_name,
+                min_retained_ratio=frac_diff_min_retained_ratio if transform_name == "frac_diff" else 0.0,
+                min_retained_samples=frac_diff_min_retained_samples if transform_name == "frac_diff" else 0,
+                configured_max_lag=(transformed.attrs.get("transform_retention_report") or {}).get("configured_max_lag"),
+                applied_max_lag=(transformed.attrs.get("transform_retention_report") or {}).get("applied_max_lag"),
+                truncated_by_max_lag=bool((transformed.attrs.get("transform_retention_report") or {}).get("truncated_by_max_lag", False)),
+            )
+            if transform_name == "frac_diff" and not bool(retention_report.get("accepted", False)):
+                report["candidates"].append(
+                    {
+                        "transform": transform_name,
+                        "applicable": False,
+                        "retention": retention_report,
+                        "rejection_reason": list(retention_report.get("reasons") or []),
+                    }
+                )
                 continue
 
             stats = check_stationarity(transformed, significance=significance)
@@ -1062,12 +1180,14 @@ def fit_stationarity_transforms(features, significance=0.05, transform_order=Non
                 {
                     "transform": transform_name,
                     "applicable": True,
+                    "retention": retention_report,
                     "result": stats,
                 }
             )
             if stats["stationary"]:
                 selected_stats = stats
                 selected_transform = transform_name
+                report["retention"] = retention_report
                 break
 
         if selected_transform is not None:
@@ -1075,6 +1195,9 @@ def fit_stationarity_transforms(features, significance=0.05, transform_order=Non
                 "rolling_window": rolling_window,
                 "frac_diff_d": frac_diff_d,
                 "frac_diff_threshold": frac_diff_threshold,
+                "frac_diff_max_lag": frac_diff_max_lag,
+                "frac_diff_min_retained_ratio": frac_diff_min_retained_ratio,
+                "frac_diff_min_retained_samples": frac_diff_min_retained_samples,
             }
             specs[column] = TransformSpec(
                 column=column,
@@ -1126,6 +1249,9 @@ def apply_stationarity_transforms(features, specs):
             rolling_window=int(spec_dict.get("rolling_window", 20)),
             frac_diff_d=spec_dict.get("frac_diff_d"),
             frac_diff_threshold=float(spec_dict.get("frac_diff_threshold", 1e-5)),
+            frac_diff_max_lag=spec_dict.get("frac_diff_max_lag"),
+            frac_diff_min_retained_ratio=float(spec_dict.get("frac_diff_min_retained_ratio", 0.25)),
+            frac_diff_min_retained_samples=int(spec_dict.get("frac_diff_min_retained_samples", 32)),
         )
         columns[column] = transformed
     return pd.DataFrame(columns, index=features.index)
@@ -1268,6 +1394,11 @@ def screen_features_for_stationarity(features, feature_blocks=None, config=None,
         "features": reports,
         "transformed_features": transformed_features,
         "dropped_features": dropped_features,
+        "retention_by_feature": {
+            column: dict((reports.get(column) or {}).get("retention") or {})
+            for column in transformed_features
+            if (reports.get(column) or {}).get("retention")
+        },
         "transform_specs": {
             column: {
                 "transform_name": spec.transform_name,
@@ -1401,6 +1532,9 @@ def build_feature_set(
     df,
     lags=None,
     frac_diff_d=None,
+    frac_diff_max_lag=None,
+    frac_diff_min_retained_ratio=0.25,
+    frac_diff_min_retained_samples=32,
     indicator_run=None,
     rolling_window=20,
     squeeze_quantile=0.2,
@@ -1464,6 +1598,7 @@ def build_feature_set(
     feature_blocks = {}
     laggable_columns = []
     block_metadata = {}
+    transform_retention_reports = {}
 
     for block in blocks:
         if block.frame.empty:
@@ -1475,9 +1610,19 @@ def build_feature_set(
             feature_blocks[column] = block.block_name
 
     if frac_diff_d is not None:
-        features["close_fracdiff"] = fractional_diff(df["close"], d=frac_diff_d)
-        laggable_columns.append("close_fracdiff")
-        feature_blocks["close_fracdiff"] = "price_volume"
+        close_fracdiff = fractional_diff(
+            df["close"],
+            d=frac_diff_d,
+            max_lag=frac_diff_max_lag,
+            min_retained_ratio=frac_diff_min_retained_ratio,
+            min_retained_samples=frac_diff_min_retained_samples,
+        )
+        fracdiff_report = dict(close_fracdiff.attrs.get("transform_retention_report") or {})
+        transform_retention_reports["close_fracdiff"] = fracdiff_report
+        if bool(fracdiff_report.get("accepted", False)):
+            features["close_fracdiff"] = close_fracdiff
+            laggable_columns.append("close_fracdiff")
+            feature_blocks["close_fracdiff"] = "price_volume"
 
     features, feature_blocks = _append_lags(
         features,
@@ -1502,6 +1647,7 @@ def build_feature_set(
         feature_families=feature_families,
         feature_lineage=feature_lineage,
         feature_availability=feature_availability,
+        transform_retention_reports=transform_retention_reports,
     )
 
 
@@ -1513,6 +1659,9 @@ def build_features(
     df,
     lags=None,
     frac_diff_d=None,
+    frac_diff_max_lag=None,
+    frac_diff_min_retained_ratio=0.25,
+    frac_diff_min_retained_samples=32,
     indicator_run=None,
     rolling_window=20,
     squeeze_quantile=0.2,
@@ -1548,6 +1697,9 @@ def build_features(
         df,
         lags=lags,
         frac_diff_d=frac_diff_d,
+        frac_diff_max_lag=frac_diff_max_lag,
+        frac_diff_min_retained_ratio=frac_diff_min_retained_ratio,
+        frac_diff_min_retained_samples=frac_diff_min_retained_samples,
         indicator_run=indicator_run,
         rolling_window=rolling_window,
         squeeze_quantile=squeeze_quantile,

@@ -75,6 +75,7 @@ def _make_paper_report():
             "funding_breaches": 0,
             "kill_switch_triggers": 0,
         },
+        symbol_filters={"tick_size": 0.1, "step_size": 0.001, "min_notional": 10.0},
     )
 
 
@@ -124,6 +125,45 @@ class TradeReadyPaperGateTest(unittest.TestCase):
             self.assertEqual(report["capital_release_stage"], "paper_verified")
             self.assertEqual(report["version_id"], current_champion)
             self.assertTrue(report["components"]["paper_calibration"]["passed"])
+
+    def test_paper_verified_stage_requires_venue_constraints(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.14)
+            _register_champion(store, "BTCUSDT", 0.18)
+
+            paper_report = build_live_calibration_report(
+                certified_expectations={"modeled_slippage_bps": 1.8, "modeled_fill_ratio": 0.94},
+                paper_metrics={
+                    "mode": "paper",
+                    "duration_days": 35,
+                    "modeled_slippage_bps": 1.8,
+                    "realized_slippage_bps": 1.9,
+                    "modeled_fill_ratio": 0.94,
+                    "realized_fill_ratio": 0.91,
+                    "data_breaches": 0,
+                    "funding_breaches": 0,
+                    "kill_switch_triggers": 0,
+                },
+            )
+
+            report = build_deployment_readiness_report(
+                store=store,
+                symbol="BTCUSDT",
+                monitoring_report={"healthy": True, "reasons": []},
+                drift_cycle={
+                    "drift_guardrails": {"approved": False, "reasons": []},
+                    "retrain_status": "not_recommended",
+                },
+                backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+                paper_report=paper_report,
+                release_request={"requested_stage": "paper_verified"},
+            )
+
+            self.assertEqual(report["capital_release_stage"], "research_certified")
+            self.assertFalse(report["capital_release_eligible"])
+            self.assertIn("venue_constraints", report["summary"]["failed_components"])
+            self.assertIn("venue_constraints_unavailable", report["reasons"])
 
 
 if __name__ == "__main__":

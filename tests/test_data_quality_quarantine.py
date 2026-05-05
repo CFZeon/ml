@@ -150,6 +150,10 @@ class DataQualityQuarantineTest(unittest.TestCase):
         self.assertNotIn(spike_timestamp, pipeline.state["data"].index)
         self.assertNotIn(spike_timestamp, pipeline.state["features"].index)
         self.assertNotIn(spike_timestamp, pipeline.state["labels"].index)
+        self.assertIn("data_quality_report", pipeline.state["features"].attrs)
+        self.assertIn("data_integrity_report", pipeline.state["features"].attrs)
+        self.assertIn("data_quality_report", pipeline.state["labels"].attrs)
+        self.assertIn("data_integrity_report", pipeline.state["labels"].attrs)
         summary = pipeline.state["data_quality_report"]["summary"]
         self.assertGreaterEqual(int(summary["modeling_excluded_rows"]), 1)
         self.assertEqual(

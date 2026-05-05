@@ -1355,6 +1355,27 @@ def print_backtest_summary(backtest):
             f"{backtest.get('max_drawdown_duration_bars')} bars "
             f"({backtest.get('max_drawdown_duration')})"
         )
+    portfolio_risk = backtest.get("portfolio_risk_summary") or {}
+    if portfolio_risk:
+        print(
+            "  port risk    : "
+            f"bets={portfolio_risk.get('effective_bet_count')}/{portfolio_risk.get('minimum_effective_bets')}  "
+            f"mdd={_format_metric(portfolio_risk.get('max_drawdown'), percent=True)}  "
+            f"calmar={_format_metric(portfolio_risk.get('calmar_ratio'))}  "
+            f"advisory={bool(portfolio_risk.get('low_sample_advisory', False))}"
+        )
+    trade_risk = backtest.get("trade_risk_summary") or {}
+    if trade_risk:
+        print(
+            "  trade risk   : "
+            f"closed={trade_risk.get('closed_trades')}/{trade_risk.get('minimum_closed_trades')}  "
+            f"pf={_format_metric(trade_risk.get('trade_profit_factor'))}  "
+            f"win={_format_metric(trade_risk.get('trade_win_rate'), percent=True)}  "
+            f"advisory={bool(trade_risk.get('low_sample_advisory', False))}"
+        )
+    metric_qualification = backtest.get("metric_qualification") or {}
+    if metric_qualification.get("warnings"):
+        print(f"  sample qual  : {metric_qualification.get('warnings')}")
     if backtest.get("account_model") == "futures_margin":
         print(
             "  futures acct : "

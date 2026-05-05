@@ -92,7 +92,9 @@ class CPCVValidationTest(unittest.TestCase):
         backtest = pipeline.run_backtest()
 
         self.assertEqual(training["validation"]["method"], "cpcv")
+        self.assertEqual(int(training["validation"]["feature_lag_bars"]), 3)
         self.assertEqual(int(training["validation"]["embargo_bars"]), 6)
+        self.assertEqual(int(training["validation"]["effective_embargo_bars"]), 9)
         self.assertGreaterEqual(int(training["validation"]["split_count"]), 1)
         self.assertIsNone(training["oos_predictions"])
         self.assertEqual(len(training["oos_paths"]), int(training["validation"]["split_count"]))
@@ -112,6 +114,23 @@ class CPCVValidationTest(unittest.TestCase):
         self.assertTrue(backtest["statistical_significance"]["enabled"])
         self.assertFalse(backtest["diagnostic_validation"]["summary"]["statistical_significance"]["enabled"])
 
+    def test_walk_forward_rejects_gap_shorter_than_feature_lag(self):
+        raw = _make_raw(n=320, seed=13)
+        pipeline = _make_pipeline(
+            raw,
+            {
+                "type": "gbm",
+                "cv_method": "walk_forward",
+                "n_splits": 2,
+                "gap": 2,
+                "validation_fraction": 0.2,
+                "meta_n_splits": 2,
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "feature_lag_bars=3"):
+            pipeline.train_models()
+
     def test_explicit_walk_forward_preserves_flat_oos_outputs(self):
         raw = _make_raw(n=320, seed=11)
         pipeline = _make_pipeline(
@@ -120,7 +139,7 @@ class CPCVValidationTest(unittest.TestCase):
                 "type": "gbm",
                 "cv_method": "walk_forward",
                 "n_splits": 1,
-                "gap": 0,
+                "gap": 3,
                 "validation_fraction": 0.2,
                 "meta_n_splits": 2,
             },

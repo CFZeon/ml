@@ -84,15 +84,15 @@ def _resolve_execution_price_input(
 ):
     resolved_mode = resolve_evaluation_mode({"evaluation_mode": evaluation_mode})
     if execution_prices is None:
-        if not bool(allow_same_bar_fill_fallback):
-            raise ValueError(
-                "execution_prices must be provided. To use same-bar close fallback explicitly, "
-                "set allow_same_bar_fill_fallback=True"
-            )
         if resolved_mode.is_capital_facing:
             mode_label = "Trade-ready" if resolved_mode.effective_mode == "trade_ready" else "Local certification"
             raise ValueError(
                 f"{mode_label} backtests require explicit execution_prices; implicit close execution is not allowed"
+            )
+        if not bool(allow_same_bar_fill_fallback):
+            raise ValueError(
+                "execution_prices must be provided. To use same-bar close fallback explicitly, "
+                "set allow_same_bar_fill_fallback=True"
             )
         return close, {
             "source": "close_fallback",
@@ -106,6 +106,27 @@ def _resolve_execution_price_input(
         "warning": None,
         "warnings": [],
     }
+
+
+def _annotate_backtest_engine_summary(
+    summary,
+    *,
+    requested_engine,
+    engine_fallback_used=False,
+    engine_fallback_reason=None,
+):
+    payload = dict(summary or {})
+    resolved_requested = str(requested_engine or payload.get("engine") or "unknown").strip().lower()
+    resolved_actual = str(payload.get("engine") or resolved_requested).strip().lower()
+    warnings = [str(value) for value in list(payload.get("backtest_warnings") or []) if str(value)]
+    if engine_fallback_used:
+        warnings.append("engine_fallback_to_pandas")
+    payload["engine"] = resolved_actual
+    payload["requested_engine"] = resolved_requested
+    payload["engine_fallback_used"] = bool(engine_fallback_used)
+    payload["engine_fallback_reason"] = None if engine_fallback_reason is None else str(engine_fallback_reason)
+    payload["backtest_warnings"] = list(dict.fromkeys(warnings))
+    return payload
 
 
 def _normalize_runtime_funding_rates(funding_rates, index, *, evaluation_mode="research_only", funding_missing_policy=None):
@@ -214,6 +235,10 @@ def _safe_ratio(numerator, denominator, default=0.0):
     return numerator / denominator
 
 
+def _has_symbol_filter_evidence(symbol_filters):
+    return bool(dict(symbol_filters or {}))
+
+
 def _build_execution_evidence(
     execution_mode,
     promotion_execution_ready,
@@ -221,23 +246,41 @@ def _build_execution_evidence(
     *,
     execution_adapter=None,
     execution_backend=None,
+    symbol_filters=None,
 ):
     resolved_mode = str(execution_mode or "unknown").strip().lower()
     limitations = [str(value) for value in list(execution_limitations or []) if str(value)]
+    venue_constraints_available = _has_symbol_filter_evidence(symbol_filters)
     blocking_reasons = []
     if resolved_mode != "event_driven":
         blocking_reasons.append("execution_backend_not_event_driven")
     if not bool(promotion_execution_ready):
         blocking_reasons.append("promotion_execution_not_ready")
+    if not venue_constraints_available:
+        blocking_reasons.append("venue_constraints_unavailable")
     for limitation in limitations:
         if limitation not in blocking_reasons:
             blocking_reasons.append(limitation)
+    certification_ready = bool(
+        resolved_mode == "event_driven"
+        and promotion_execution_ready
+        and venue_constraints_available
+    )
     return {
-        "class": "event_driven_certification" if resolved_mode == "event_driven" and bool(promotion_execution_ready) else "research_surrogate",
+        "class": (
+            "event_driven_certification"
+            if certification_ready
+            else (
+                "unknown_execution_constraints"
+                if resolved_mode == "event_driven" and bool(promotion_execution_ready) and not venue_constraints_available
+                else "research_surrogate"
+            )
+        ),
         "execution_mode": resolved_mode,
-        "promotion_execution_ready": bool(promotion_execution_ready),
+        "promotion_execution_ready": certification_ready,
         "execution_adapter": execution_adapter,
         "execution_backend": execution_backend,
+        "venue_constraints_available": venue_constraints_available,
         "blocking_reasons": blocking_reasons,
         "execution_limitations": limitations,
     }
@@ -619,6 +662,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
             report["execution_limitations"],
             execution_adapter=report["execution_adapter"],
             execution_backend=report["execution_backend"],
+            symbol_filters=symbol_filters,
         )
         report["execution_policy"] = policy.to_dict()
         report["partial_fill_orders"] = 0
@@ -1048,6 +1092,7 @@ def _build_execution_contract(close, requested_position, equity, execution_price
             execution_limitations,
             execution_adapter=policy.adapter,
             execution_backend=adapter_boundary.backend if adapter_boundary is not None else policy.adapter,
+            symbol_filters=symbol_filters,
         ),
         "execution_adapter_scenarios": adapter_boundary.describe_scenarios() if adapter_boundary is not None else {},
         "execution_policy": policy.to_dict(),
@@ -1948,6 +1993,101 @@ def _build_trade_ledger(strat_ret, position, execution_series):
     return pd.DataFrame(trades)
 
 
+def _build_sample_qualified_metric(raw_value, observed_count, minimum_count, *, insufficient_reason):
+    entry = {
+        "raw_value": None if raw_value is None else float(raw_value),
+        "reported_value": None if raw_value is None else float(raw_value),
+        "status": "qualified",
+        "observed_count": None if observed_count is None else int(max(0, int(observed_count))),
+        "minimum_count": None if minimum_count is None else int(max(0, int(minimum_count))),
+        "reason": None,
+    }
+    if entry["observed_count"] is None:
+        entry["status"] = "unknown"
+        entry["reported_value"] = None
+        entry["reason"] = "sample_count_unavailable"
+        return entry
+
+    minimum = entry["minimum_count"] or 0
+    if entry["observed_count"] <= 0:
+        entry["status"] = "suppressed"
+        entry["reported_value"] = None
+        entry["reason"] = insufficient_reason
+    elif minimum > 0 and entry["observed_count"] < minimum:
+        entry["status"] = "advisory"
+        entry["reported_value"] = None
+        entry["reason"] = insufficient_reason
+    return entry
+
+
+def _summarize_metric_qualification(*, closed_trades, effective_bet_count, minimum_effective_bets,
+                                    profit_factor, calmar, trade_profit_factor,
+                                    trade_win_rate, avg_trade_return_pct):
+    minimum_effective_bets = max(1, int(minimum_effective_bets))
+    trade_metrics = {
+        "trade_profit_factor": _build_sample_qualified_metric(
+            trade_profit_factor,
+            closed_trades,
+            minimum_effective_bets,
+            insufficient_reason="insufficient_realized_trade_count",
+        ),
+        "trade_win_rate": _build_sample_qualified_metric(
+            trade_win_rate,
+            closed_trades,
+            minimum_effective_bets,
+            insufficient_reason="insufficient_realized_trade_count",
+        ),
+        "avg_trade_return_pct": _build_sample_qualified_metric(
+            avg_trade_return_pct,
+            closed_trades,
+            minimum_effective_bets,
+            insufficient_reason="insufficient_realized_trade_count",
+        ),
+    }
+    portfolio_metrics = {
+        "profit_factor": _build_sample_qualified_metric(
+            profit_factor,
+            effective_bet_count,
+            minimum_effective_bets,
+            insufficient_reason="insufficient_effective_bet_count",
+        ),
+        "calmar_ratio": _build_sample_qualified_metric(
+            calmar,
+            effective_bet_count,
+            minimum_effective_bets,
+            insufficient_reason="insufficient_effective_bet_count",
+        ),
+    }
+    warnings = []
+    if int(closed_trades) < minimum_effective_bets:
+        warnings.append("insufficient_realized_trade_count_for_trade_metrics")
+    if int(effective_bet_count) < minimum_effective_bets:
+        warnings.append("insufficient_effective_bet_count_for_portfolio_metrics")
+
+    qualification = {
+        "enabled": True,
+        "minimum_effective_bets": int(minimum_effective_bets),
+        "trade_level": {
+            "observed_count": int(closed_trades),
+            "minimum_count": int(minimum_effective_bets),
+            "low_sample_advisory": bool(int(closed_trades) < minimum_effective_bets),
+            "metrics": trade_metrics,
+        },
+        "portfolio_level": {
+            "observed_count": int(effective_bet_count),
+            "minimum_count": int(minimum_effective_bets),
+            "low_sample_advisory": bool(int(effective_bet_count) < minimum_effective_bets),
+            "metrics": portfolio_metrics,
+        },
+        "warnings": warnings,
+    }
+    qualified_metrics = {
+        metric_name: metric_payload["reported_value"]
+        for metric_name, metric_payload in {**portfolio_metrics, **trade_metrics}.items()
+    }
+    return qualification, qualified_metrics
+
+
 def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equity,
                         fees_paid, slippage_paid, signal_delay_bars, trade_ledger,
                         funding_pnl=0.0, engine="pandas", significance=None,
@@ -2018,6 +2158,54 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
         benchmark_sharpe=benchmark_sharpe,
         effective_bet_count=effective_bet_count,
     )
+    minimum_effective_bets = int(
+        max(
+            1,
+            significance_metrics.get("min_effective_bets")
+            or significance_metrics.get("min_observations")
+            or 1,
+        )
+    )
+    metric_qualification, sample_qualified_metrics = _summarize_metric_qualification(
+        closed_trades=len(trade_ledger),
+        effective_bet_count=effective_bet_count,
+        minimum_effective_bets=minimum_effective_bets,
+        profit_factor=profit_factor,
+        calmar=calmar,
+        trade_profit_factor=trade_profit_factor,
+        trade_win_rate=trade_win_rate,
+        avg_trade_return_pct=avg_trade_return_pct,
+    )
+    portfolio_risk_summary = {
+        "effective_bet_count": int(effective_bet_count),
+        "minimum_effective_bets": int(minimum_effective_bets),
+        "low_sample_advisory": bool(int(effective_bet_count) < minimum_effective_bets),
+        "max_drawdown": _round_metric(max_dd, 4),
+        "max_drawdown_amount": _round_metric(max_dd_amount, 2),
+        "max_drawdown_duration": max_dd_duration,
+        "max_drawdown_duration_bars": max_dd_bars,
+        "annualized_volatility": _round_metric(volatility * annualization, 4),
+        "calmar_ratio": _round_metric(calmar, 2),
+        "sortino_ratio": _round_metric(sortino, 2),
+        "profit_factor": _round_metric(profit_factor, 2),
+        "exposure_rate": _round_metric(exposure_rate, 4),
+        "total_turnover": _round_metric(total_turnover, 4),
+    }
+    trade_risk_summary = {
+        "total_trades": int(n_trades),
+        "closed_trades": int(len(trade_ledger)),
+        "effective_bet_count": int(effective_bet_count),
+        "minimum_closed_trades": int(minimum_effective_bets),
+        "low_sample_advisory": bool(int(len(trade_ledger)) < minimum_effective_bets),
+        "trade_win_rate": _round_metric(trade_win_rate, 4),
+        "trade_profit_factor": _round_metric(trade_profit_factor, 2),
+        "avg_trade_return_pct": _round_metric(avg_trade_return_pct, 6),
+        "avg_trade_bars": _round_metric(avg_trade_bars, 2),
+        "expectancy": _round_metric(expectancy, 2),
+        "expectancy_pct": _round_metric(expectancy_pct, 6),
+        "avg_win": _round_metric(avg_win, 2),
+        "avg_loss": _round_metric(avg_loss, 2),
+    }
 
     funding_paid = max(-float(funding_pnl), 0.0)
     funding_received = max(float(funding_pnl), 0.0)
@@ -2064,6 +2252,10 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
         "avg_trade_bars": _round_metric(avg_trade_bars, 2),
         "trade_profit_factor": _round_metric(trade_profit_factor, 2),
         "statistical_significance": significance_metrics,
+        "metric_qualification": metric_qualification,
+        "sample_qualified_metrics": sample_qualified_metrics,
+        "portfolio_risk_summary": portfolio_risk_summary,
+        "trade_risk_summary": trade_risk_summary,
         "trade_ledger": trade_ledger,
         "equity_curve": equity_curve,
     }
@@ -2125,25 +2317,93 @@ def _resolve_realized_slippage_paid(cost_report, fallback_total, execution_repor
     return float(fallback_total)
 
 
+def _infer_stress_control_tags(scenario_name, scenario_report):
+    report = dict(scenario_report or {})
+    explicit_tags = [
+        str(tag)
+        for tag in list(report.get("control_tags") or [])
+        if str(tag).strip()
+    ]
+    if explicit_tags:
+        return list(dict.fromkeys(explicit_tags))
+
+    name = str(scenario_name or report.get("scenario_name") or "").strip().lower()
+    derived = []
+    if any(token in name for token in ("downtime", "halt", "stale_mark", "stale")):
+        derived.append("venue_failure")
+    if any(token in name for token in ("liquidity", "fill_drought", "drought")):
+        derived.append("liquidity_drought")
+    if any(token in name for token in ("volatility", "crash", "spike")):
+        derived.append("volatility_spike")
+    if "regime" in name:
+        derived.append("regime_transition")
+    return list(dict.fromkeys(derived))
+
+
 def _summarize_stress_matrix_results(results):
     scenario_names = [str(name) for name in results if str(name) != "base"]
-    stressed_results = [results[name] for name in scenario_names if isinstance(results.get(name), dict)]
+    scenario_rows = {}
+    stressed_net_profit_pct = []
+    stressed_sharpe_ratio = []
+    stressed_max_drawdown = []
+    stressed_fill_ratio = []
+    stressed_trade_count = []
+    control_intents = set()
+    control_tags = set()
+
+    for name in scenario_names:
+        result = results.get(name)
+        if not isinstance(result, dict):
+            continue
+
+        scenario_report = dict(result.get("scenario_report") or {})
+        tags = _infer_stress_control_tags(name, scenario_report)
+        intent = scenario_report.get("control_intent")
+        if intent is None and tags:
+            intent = tags[0]
+        if intent is not None:
+            control_intents.add(str(intent))
+        control_tags.update(tags)
+
+        net_profit_pct = result.get("net_profit_pct")
+        sharpe_ratio = result.get("sharpe_ratio")
+        max_drawdown = result.get("max_drawdown")
+        fill_ratio = result.get("fill_ratio")
+        total_trades = result.get("total_trades")
+        if net_profit_pct is not None:
+            stressed_net_profit_pct.append(float(net_profit_pct))
+        if sharpe_ratio is not None:
+            stressed_sharpe_ratio.append(float(sharpe_ratio))
+        if max_drawdown is not None:
+            stressed_max_drawdown.append(float(max_drawdown))
+        if fill_ratio is not None:
+            stressed_fill_ratio.append(float(fill_ratio))
+        if total_trades is not None:
+            stressed_trade_count.append(int(total_trades))
+
+        scenario_rows[name] = {
+            "net_profit_pct": net_profit_pct,
+            "sharpe_ratio": sharpe_ratio,
+            "max_drawdown": max_drawdown,
+            "fill_ratio": fill_ratio,
+            "total_trades": total_trades,
+            "control_intent": None if intent is None else str(intent),
+            "control_tags": tags,
+            "scenario_report": scenario_report,
+        }
+
     return {
         "configured": bool(scenario_names),
         "scenario_count": int(len(scenario_names)),
         "scenario_names": scenario_names,
-        "worst_net_profit_pct": min((float(result.get("net_profit_pct", 0.0)) for result in stressed_results), default=None),
-        "worst_sharpe_ratio": min((float(result.get("sharpe_ratio", 0.0)) for result in stressed_results), default=None),
-        "results": {
-            name: {
-                "net_profit_pct": results[name].get("net_profit_pct"),
-                "sharpe_ratio": results[name].get("sharpe_ratio"),
-                "max_drawdown": results[name].get("max_drawdown"),
-                "scenario_report": results[name].get("scenario_report", {}),
-            }
-            for name in scenario_names
-            if isinstance(results.get(name), dict)
-        },
+        "control_intents": sorted(control_intents),
+        "control_tags": sorted(control_tags),
+        "worst_net_profit_pct": min(stressed_net_profit_pct, default=None),
+        "worst_sharpe_ratio": min(stressed_sharpe_ratio, default=None),
+        "worst_max_drawdown": min(stressed_max_drawdown, default=None),
+        "worst_fill_ratio": min(stressed_fill_ratio, default=None),
+        "worst_trade_count": min(stressed_trade_count, default=None),
+        "results": scenario_rows,
     }
 
 
@@ -2178,6 +2438,7 @@ def _attach_backtest_evaluation_metadata(summary, *, evaluation_mode="research_o
             payload.get("execution_limitations") or [],
             execution_adapter=payload.get("execution_adapter"),
             execution_backend=payload.get("execution_backend"),
+            symbol_filters=payload.get("symbol_filters"),
         )
     funding_coverage_report = dict(payload.get("funding_coverage_report") or {})
     if not funding_coverage_report:
@@ -2350,7 +2611,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  scenario_schedule=None, scenario_policy=None,
                  scenario_matrix=None, evaluation_mode="research_only",
                  required_stress_scenarios=None,
-                 allow_same_bar_fill_fallback=True):
+                 allow_same_bar_fill_fallback=False,
+                 allow_engine_fallback=False):
     """Run a backtest through the configured execution adapter.
 
     Parameters
@@ -2380,6 +2642,8 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     symbol_lifecycle_policy : dict|None – lifecycle actions such as {"halt_action": "freeze", "delist_action": "liquidate"}
     scenario_schedule : list[dict]|pd.DataFrame|None – venue-state events such as downtime, stale marks, halts, and deleveraging windows
     scenario_policy : dict|None – scenario responses such as {"downtime_action": "freeze", "stale_mark_action": "reject"}
+    allow_same_bar_fill_fallback : bool – permit research-only implicit close execution when explicit execution prices are unavailable
+    allow_engine_fallback : bool – permit research-only vectorbt->pandas fallback when VectorBT is unavailable
 
     execution_price_policy : str – one of {"strict", "ffill", "ffill_with_limit", "drop_rows"}
     execution_price_fill_limit : int|None – max consecutive execution-price fills when using "ffill_with_limit"
@@ -2427,6 +2691,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
             "evaluation_mode": evaluation_mode,
             "required_stress_scenarios": required_stress_scenarios,
             "allow_same_bar_fill_fallback": allow_same_bar_fill_fallback,
+            "allow_engine_fallback": allow_engine_fallback,
             "interval": interval,
         }
         results = run_scenario_matrix(run_backtest, base_kwargs, scenario_matrix)
@@ -2439,6 +2704,10 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         )
 
     close = pd.Series(close, copy=False).astype(float)
+    resolved_mode = resolve_evaluation_mode({"evaluation_mode": evaluation_mode})
+    requested_engine = str(engine or "vectorbt").strip().lower()
+    if requested_engine not in {"vectorbt", "pandas"}:
+        raise ValueError("engine must be one of ['vectorbt', 'pandas']")
     signal_series = pd.Series(signals, index=close.index).reindex(close.index).fillna(0.0).astype(float)
     benchmark_returns = _align_benchmark_returns(benchmark_returns, close.index)
     signal_delay_bars = max(0, int(signal_delay_bars))
@@ -2646,13 +2915,16 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
             interval=interval,
         )
         summary["funding_coverage_report"] = dict(funding_coverage_report)
+        summary = _annotate_backtest_engine_summary(summary, requested_engine=requested_engine)
         return _attach_backtest_evaluation_metadata(
             summary,
             evaluation_mode=evaluation_mode,
             required_stress_scenarios=required_stress_scenarios,
         )
 
-    selected_engine = (engine or "vectorbt").lower()
+    selected_engine = requested_engine
+    engine_fallback_used = False
+    engine_fallback_reason = None
     if selected_engine == "vectorbt":
         try:
             summary = _run_vectorbt_backtest(
@@ -2676,13 +2948,26 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                 interval=interval,
             )
             summary["funding_coverage_report"] = dict(funding_coverage_report)
+            summary = _annotate_backtest_engine_summary(summary, requested_engine=requested_engine)
             return _attach_backtest_evaluation_metadata(
                 summary,
                 evaluation_mode=evaluation_mode,
                 required_stress_scenarios=required_stress_scenarios,
             )
-        except ImportError:
+        except ImportError as exc:
+            if resolved_mode.is_capital_facing:
+                mode_label = "Trade-ready" if resolved_mode.effective_mode == "trade_ready" else "Local certification"
+                raise ImportError(
+                    f"{mode_label} backtests require explicit engine parity; requested engine 'vectorbt' is unavailable"
+                ) from exc
+            if not bool(allow_engine_fallback):
+                raise ImportError(
+                    "vectorbt engine requested but unavailable. To fall back to pandas explicitly, "
+                    "set allow_engine_fallback=True"
+                ) from exc
             selected_engine = "pandas"
+            engine_fallback_used = True
+            engine_fallback_reason = "vectorbt_unavailable"
 
     summary = _run_pandas_backtest(
         close=valuation_series,
@@ -2703,6 +2988,12 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         interval=interval,
     )
     summary["funding_coverage_report"] = dict(funding_coverage_report)
+    summary = _annotate_backtest_engine_summary(
+        summary,
+        requested_engine=requested_engine,
+        engine_fallback_used=engine_fallback_used,
+        engine_fallback_reason=engine_fallback_reason,
+    )
     return _attach_backtest_evaluation_metadata(
         summary,
         evaluation_mode=evaluation_mode,

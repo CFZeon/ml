@@ -13,6 +13,7 @@ _ACTION_HINTS = {
     "promotion_status": "Promote an approved champion before deployment.",
     "model_freshness": "Retrain, validate, and promote a fresh champion before deployment.",
     "paper_calibration": "Attach a green paper or shadow-live calibration report before capital release.",
+    "venue_constraints": "Attach current Binance symbol filters before paper verification or capital release.",
     "operational_monitoring": "Refresh operational monitoring and resolve any health breaches before deployment.",
     "drift_status": "Resolve the active drift recommendation before deployment.",
     "backend": "Restore the required execution backend before deployment.",
@@ -42,6 +43,21 @@ def _dedupe_reasons(values):
 
 def _load_report(path):
     return dict(read_json(path) or {}) if path else {}
+
+
+def _coerce_symbol_filters(symbol_filters):
+    return dict(symbol_filters or {})
+
+
+def _build_venue_constraints_report(symbol_filters=None):
+    filters = _coerce_symbol_filters(symbol_filters)
+    available = bool(filters)
+    return {
+        "available": available,
+        "constraint_count": int(len(filters)),
+        "keys": sorted(filters.keys()),
+        "reasons": [] if available else ["venue_constraints_unavailable"],
+    }
 
 
 def _find_target_record(store, symbol, version_id=None):
@@ -449,7 +465,9 @@ def _resolve_capital_release_stage(components, release_request=None):
 
     if bool((components.get("promotion_status") or {}).get("passed", False)):
         stage = "research_certified"
-    if bool((components.get("paper_calibration") or {}).get("passed", False)):
+    if bool((components.get("paper_calibration") or {}).get("passed", False)) and bool(
+        (components.get("venue_constraints") or {}).get("passed", False)
+    ):
         stage = "paper_verified"
 
     requested_stage = str(request.get("requested_stage") or "research_certified")
@@ -579,7 +597,7 @@ def _resolve_observation_duration_days(frame, timestamps):
     return 0.0
 
 
-def build_paper_trading_report(*, certified_expectations=None, paper_observations=None, policy=None):
+def build_paper_trading_report(*, certified_expectations=None, paper_observations=None, policy=None, symbol_filters=None):
     expectations = dict(certified_expectations or {})
     policy = dict(policy or {})
     frame = _coerce_paper_observation_frame(paper_observations)
@@ -615,6 +633,7 @@ def build_paper_trading_report(*, certified_expectations=None, paper_observation
                 "max_slippage_error": float(policy.get("max_slippage_error", 0.25)),
                 "max_fill_ratio_degradation": float(policy.get("max_fill_ratio_degradation", 0.15)),
             },
+            "venue_constraints": _build_venue_constraints_report(symbol_filters),
         }
 
     timestamps = _resolve_observation_timestamps(frame)
@@ -660,6 +679,7 @@ def build_paper_trading_report(*, certified_expectations=None, paper_observation
         certified_expectations=expectations,
         paper_metrics=paper_metrics,
         policy=policy,
+        symbol_filters=symbol_filters,
     )
     report["observation_summary"] = {
         "observation_count": int(paper_metrics["observation_count"]),
@@ -670,7 +690,7 @@ def build_paper_trading_report(*, certified_expectations=None, paper_observation
     return report
 
 
-def build_live_calibration_report(*, certified_expectations=None, paper_metrics=None, policy=None):
+def build_live_calibration_report(*, certified_expectations=None, paper_metrics=None, policy=None, symbol_filters=None):
     expectations = dict(certified_expectations or {})
     paper = dict(paper_metrics or {})
     policy = dict(policy or {})
@@ -723,17 +743,23 @@ def build_live_calibration_report(*, certified_expectations=None, paper_metrics=
             "max_slippage_error": max_slippage_error,
             "max_fill_ratio_degradation": max_fill_ratio_degradation,
         },
+        "venue_constraints": _build_venue_constraints_report(symbol_filters),
     }
 
 
-def _evaluate_paper_calibration(record, paper_report=None, policy=None):
+def _evaluate_paper_calibration(record, paper_report=None, policy=None, drift_cycle=None):
     policy = dict(policy or {})
     require_paper_calibration = bool(policy.get("require_paper_calibration", True))
+    warmup = dict((drift_cycle or {}).get("post_retrain_warmup") or {})
+    post_retrain_required = bool(warmup.get("required", False))
+    required_mode = str(warmup.get("mode") or "paper").strip().lower() if post_retrain_required else None
     if not require_paper_calibration:
         return {
             "passed": True,
             "available": False,
             "mode": None,
+            "post_retrain_required": post_retrain_required,
+            "required_mode": required_mode,
             "reasons": [],
         }
 
@@ -741,22 +767,68 @@ def _evaluate_paper_calibration(record, paper_report=None, policy=None):
     if not report and record is not None:
         report = _load_report(record.get("latest_paper_report"))
     if not report:
+        reasons = ["paper_calibration_unavailable"]
+        if post_retrain_required:
+            reasons.append("post_retrain_warmup_required")
         return {
             "passed": False,
             "available": False,
             "mode": None,
-            "reasons": ["paper_calibration_unavailable"],
+            "post_retrain_required": post_retrain_required,
+            "required_mode": required_mode,
+            "reasons": reasons,
         }
 
     passed = bool(report.get("passed", False))
     reasons = _dedupe_reasons(report.get("reasons") or ([] if passed else ["paper_calibration_failed"]))
+    report_mode = str(report.get("mode") or "").strip().lower()
+    if post_retrain_required and report_mode != required_mode:
+        passed = False
+        reasons = _dedupe_reasons(reasons + ["post_retrain_warmup_mode_mismatch"])
     return {
         "passed": passed,
         "available": True,
         "mode": report.get("mode"),
         "duration_days": report.get("duration_days"),
+        "post_retrain_required": post_retrain_required,
+        "required_mode": required_mode,
         "reasons": reasons,
         "report": report,
+    }
+
+
+def _evaluate_venue_constraints(record, *, symbol_filters=None, paper_report=None, release_request=None):
+    request = dict(release_request or {})
+    requested_stage = str(request.get("requested_stage") or "research_certified").strip().lower()
+    requires_constraints = requested_stage in {"paper_verified", "micro_capital", "scaled_capital"}
+
+    filters = _coerce_symbol_filters(symbol_filters)
+    if not filters:
+        report = dict(paper_report or {})
+        if not report and record is not None:
+            report = _load_report(record.get("latest_paper_report"))
+        embedded = dict(report.get("venue_constraints") or {}) if report else {}
+        if embedded:
+            available = bool(embedded.get("available", False))
+            reasons = list(embedded.get("reasons") or [])
+            return {
+                "passed": bool(available or not requires_constraints),
+                "available": available,
+                "required": requires_constraints,
+                "constraint_count": int(embedded.get("constraint_count", 0) or 0),
+                "keys": list(embedded.get("keys") or []),
+                "reasons": [] if available or not requires_constraints else (reasons or ["venue_constraints_unavailable"]),
+            }
+
+    constraints = _build_venue_constraints_report(filters)
+    available = bool(constraints.get("available", False))
+    return {
+        "passed": bool(available or not requires_constraints),
+        "available": available,
+        "required": requires_constraints,
+        "constraint_count": int(constraints.get("constraint_count", 0) or 0),
+        "keys": list(constraints.get("keys") or []),
+        "reasons": [] if available or not requires_constraints else list(constraints.get("reasons") or ["venue_constraints_unavailable"]),
     }
 
 
@@ -787,6 +859,7 @@ def build_deployment_readiness_report(
     drift_cycle=None,
     backend_status=None,
     paper_report=None,
+    symbol_filters=None,
     operational_limits=None,
     release_request=None,
     policy=None,
@@ -802,7 +875,18 @@ def build_deployment_readiness_report(
     components = {
         "promotion_status": _evaluate_promotion_status(record),
         "model_freshness": _evaluate_model_freshness(record, policy=policy),
-        "paper_calibration": _evaluate_paper_calibration(record, paper_report=paper_report, policy=policy),
+        "paper_calibration": _evaluate_paper_calibration(
+            record,
+            paper_report=paper_report,
+            policy=policy,
+            drift_cycle=drift_cycle,
+        ),
+        "venue_constraints": _evaluate_venue_constraints(
+            record,
+            symbol_filters=symbol_filters,
+            paper_report=paper_report,
+            release_request=normalized_release_request,
+        ),
         "operational_monitoring": _evaluate_operational_monitoring(record, monitoring_report=monitoring_report),
         "drift_status": _evaluate_drift_status(record, drift_cycle=drift_cycle),
         "backend": _evaluate_backend_status(backend_status=backend_status, policy=policy),

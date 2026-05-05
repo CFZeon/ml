@@ -310,6 +310,7 @@ def train_regime_aware_model(
     model_type="gbm",
     model_params=None,
     feature_config=None,
+    coverage_config=None,
     regime_column="regime",
     min_samples_per_regime=40,
     sample_weight=None,
@@ -319,17 +320,18 @@ def train_regime_aware_model(
     y_series = pd.Series(y, index=X_frame.index)
     regime_frame = _coerce_regime_frame(regime_data, index=X_frame.index)
     strategy = str(strategy).lower()
-    coverage_summary = summarize_regime_coverage(regime_frame, regime_column=regime_column, config=feature_config)
+    coverage_summary = summarize_regime_coverage(regime_frame, regime_column=regime_column, config=coverage_config)
 
     if strategy == "feature":
         feature_result = build_regime_aware_feature_frame(X_frame, regime_frame, config=feature_config)
-        model = train_model(
+        model, sampling_report = train_model(
             feature_result.frame,
             y_series,
             sample_weight=sample_weight,
             model_type=model_type,
             model_params=model_params,
             sampling_metadata=sampling_metadata,
+            return_report=True,
         )
         bundle = RegimeAwareModelBundle(
             strategy="feature",
@@ -346,6 +348,7 @@ def train_regime_aware_model(
             "interaction_columns": list(feature_result.interaction_columns),
             "regime_alignment": "inference_aligned_input",
             "coverage_summary": coverage_summary,
+            "sampling_report": sampling_report,
         }
         return bundle, report
 
@@ -357,17 +360,19 @@ def train_regime_aware_model(
 
     target_column = regime_column if regime_column in regime_frame.columns else regime_frame.columns[0]
     labels = pd.Series(regime_frame[target_column], index=X_frame.index)
-    fallback_model = train_model(
+    fallback_model, fallback_sampling_report = train_model(
         X_frame,
         y_series,
         sample_weight=sample_weight,
         model_type=model_type,
         model_params=model_params,
         sampling_metadata=sampling_metadata,
+        return_report=True,
     )
     specialist_models = {}
     specialist_rows = {}
     skipped_regimes = {}
+    specialist_sampling_reports = {}
     for regime_value, row_index in labels.groupby(labels).groups.items():
         regime_X = X_frame.loc[row_index]
         regime_y = y_series.loc[row_index]
@@ -381,15 +386,18 @@ def train_regime_aware_model(
         if sample_weight is not None:
             regime_weight = pd.Series(sample_weight, index=X_frame.index).loc[row_index]
         regime_sampling_metadata = _subset_sampling_metadata(sampling_metadata, row_index)
-        specialist_models[regime_value] = train_model(
+        specialist_model, specialist_sampling_report = train_model(
             regime_X,
             regime_y,
             sample_weight=regime_weight,
             model_type=model_type,
             model_params=model_params,
             sampling_metadata=regime_sampling_metadata,
+            return_report=True,
         )
+        specialist_models[regime_value] = specialist_model
         specialist_rows[str(regime_value)] = int(len(regime_X))
+        specialist_sampling_reports[str(regime_value)] = specialist_sampling_report
 
     bundle = RegimeAwareModelBundle(
         strategy="specialist",
@@ -407,6 +415,8 @@ def train_regime_aware_model(
         "fallback_enabled": True,
         "regime_alignment": "inference_aligned_input",
         "coverage_summary": coverage_summary,
+        "fallback_sampling_report": fallback_sampling_report,
+        "specialist_sampling_reports": specialist_sampling_reports,
     }
     return bundle, report
 
@@ -470,6 +480,7 @@ def train_regime_aware_walk_forward(
             model_type=model_type,
             model_params=model_params,
             feature_config=feature_config,
+            coverage_config=coverage_config,
             regime_column=regime_column,
             min_samples_per_regime=min_samples_per_regime,
             sample_weight=weight_train,

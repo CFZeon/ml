@@ -77,6 +77,7 @@ def _make_paper_report(*, duration_days=35.0):
             "funding_breaches": 0,
             "kill_switch_triggers": 0,
         },
+        symbol_filters={"tick_size": 0.1, "step_size": 0.001, "min_notional": 10.0},
     )
 
 
@@ -306,6 +307,31 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
             self.assertEqual(report["operator_action"], "deploy")
             self.assertNotIn("approved", report["release_blockers"])
             self.assertNotIn("model_ttl_expired", report["reasons"])
+
+    def test_post_retrain_warmup_mode_mismatch_blocks_capital_release(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.10)
+            current_champion = _register_champion(store, "BTCUSDT", 0.14)
+
+            store.attach_paper_report(current_champion, _make_paper_report(), symbol="BTCUSDT")
+            report = build_deployment_readiness_report(
+                store=store,
+                symbol="BTCUSDT",
+                monitoring_report={"healthy": True, "reasons": []},
+                drift_cycle={
+                    "drift_guardrails": {"approved": True, "reasons": ["approved"]},
+                    "retrain_status": "promoted",
+                    "post_retrain_warmup": {"required": True, "mode": "shadow_live", "completed": False},
+                },
+                operational_limits={"healthy": True, "kill_switch_ready": True},
+                backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+                release_request={"requested_stage": "micro_capital", "manual_acknowledged": True},
+            )
+
+            self.assertFalse(report["capital_release_eligible"])
+            self.assertIn("post_retrain_warmup_mode_mismatch", report["reasons"])
+            self.assertFalse(report["components"]["paper_calibration"]["passed"])
 
 
 if __name__ == "__main__":

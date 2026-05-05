@@ -20,6 +20,7 @@ class EffectiveBetCountSignificanceTest(unittest.TestCase):
             equity=1_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             allow_short=True,
             significance={"enabled": True, "min_observations": 8, "min_effective_bets": 8},
@@ -33,6 +34,25 @@ class EffectiveBetCountSignificanceTest(unittest.TestCase):
         self.assertEqual(int(significance["observation_count"]), len(close))
         self.assertEqual(int(significance["effective_bet_count"]), int(report["effective_bet_count"]))
         self.assertEqual(int(significance["min_effective_bets"]), 8)
+
+        qualification = report["metric_qualification"]
+        self.assertTrue(qualification["trade_level"]["low_sample_advisory"])
+        self.assertTrue(qualification["portfolio_level"]["low_sample_advisory"])
+        self.assertIn(
+            "insufficient_realized_trade_count_for_trade_metrics",
+            qualification["warnings"],
+        )
+        self.assertIn(
+            "insufficient_effective_bet_count_for_portfolio_metrics",
+            qualification["warnings"],
+        )
+        self.assertIsNone(report["sample_qualified_metrics"]["trade_profit_factor"])
+        self.assertIsNone(report["sample_qualified_metrics"]["calmar_ratio"])
+        self.assertLess(report["trade_risk_summary"]["closed_trades"], report["trade_risk_summary"]["minimum_closed_trades"])
+        self.assertLess(
+            report["portfolio_risk_summary"]["effective_bet_count"],
+            report["portfolio_risk_summary"]["minimum_effective_bets"],
+        )
 
 
 if __name__ == "__main__":

@@ -59,6 +59,32 @@ class FallbackAssumptionRateBlocksCapitalModesTest(unittest.TestCase):
         self.assertTrue(report["healthy"])
         self.assertTrue(report["promotion_pass"])
 
+    def test_monitoring_counts_engine_and_pricing_fallback_metadata(self):
+        report = build_monitoring_report(
+            backtest_reports=[
+                {
+                    "engine": "pandas",
+                    "requested_engine": "vectorbt",
+                    "engine_fallback_used": True,
+                    "engine_fallback_reason": "vectorbt_unavailable",
+                    "execution_price_source": "close_fallback",
+                    "same_bar_execution_fallback": True,
+                    "backtest_warnings": ["same_bar_execution_fallback", "engine_fallback_to_pandas"],
+                }
+            ],
+            policy={
+                "policy_profile": "trade_ready",
+                "required_components": ["fallback_assumptions"],
+            },
+        )
+
+        fallback = report["components"]["fallback_assumptions"]
+        self.assertFalse(report["healthy"])
+        self.assertEqual(fallback["source_count"], 2)
+        self.assertEqual(fallback["fallback_source_count"], 2)
+        self.assertEqual(float(fallback["fallback_assumption_rate"]), 1.0)
+        self.assertIn("fallback_assumption_rate_breach", report["monitoring_gate_report"]["blocking_reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -124,6 +124,36 @@ class DriftMonitoringTest(unittest.TestCase):
         self.assertGreater(float(report["regime_report"]["distribution"]["psi"]), 0.15)
         self.assertTrue(report["recommendation"]["should_retrain"])
 
+    def test_interval_and_trade_rate_normalize_cooldown_and_sample_floors(self):
+        reference_index = pd.date_range("2026-10-01", periods=240, freq="4h", tz="UTC")
+        current_index = pd.date_range("2026-11-01", periods=60, freq="4h", tz="UTC")
+        reference_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=reference_index)
+        current_features = pd.DataFrame({"alpha": 3.0, "beta": 3.0}, index=current_index)
+        reference_predictions = pd.DataFrame({"p0": 0.8, "p1": 0.2}, index=reference_index)
+        current_predictions = pd.DataFrame({"p0": 0.2, "p1": 0.8}, index=current_index)
+
+        policy = {
+            "interval": "4h",
+            "expected_trades_per_day": 2.0,
+            "min_expected_trades": 24,
+            "min_drift_signals": 1,
+        }
+        monitor = DriftMonitor(reference_features, reference_predictions, config=policy)
+        report = monitor.check(
+            current_features,
+            current_predictions=current_predictions,
+            bars_since_last_retrain=100,
+        )
+        guardrails = evaluate_drift_guardrails(report, policy)
+
+        self.assertEqual(int(monitor.config["cooldown_bars"]), 126)
+        self.assertEqual(int(monitor.config["max_bars_between_retrain"]), 168)
+        self.assertEqual(int(monitor.config["trade_rate_min_samples"]), 72)
+        self.assertEqual(int(report["min_samples"]), 72)
+        self.assertEqual(int(guardrails["cooldown_bars"]), 126)
+        self.assertFalse(guardrails["approved"])
+        self.assertIn("minimum_samples_not_met", guardrails["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

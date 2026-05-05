@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from core import run_backtest
-from core.automl import _validate_forbidden_search_space_paths
+from core.automl import DEFAULT_AUTOML_SEARCH_SPACE, _validate_forbidden_search_space_paths
 from core.features import fit_stationarity_transforms, screen_features_for_stationarity
 from core.labeling import triple_barrier_labels
 from core.models import build_model, cpcv_split
@@ -97,6 +97,26 @@ class RemediationBatch1Test(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             _validate_forbidden_search_space_paths(bad_space)
+
+    def test_calibration_search_paths_are_forbidden_and_removed_from_defaults(self):
+        self.assertNotIn("calibration_params", DEFAULT_AUTOML_SEARCH_SPACE["model"])
+        self.assertNotIn("meta_calibration_params", DEFAULT_AUTOML_SEARCH_SPACE["model"])
+
+        bad_space = {
+            "model": {
+                "calibration_params": {"c": {"type": "float", "low": 0.1, "high": 1.0}},
+            }
+        }
+        with self.assertRaises(ValueError):
+            _validate_forbidden_search_space_paths(bad_space)
+
+        bad_meta_space = {
+            "model": {
+                "meta_calibration_params": {"c": {"type": "float", "low": 0.1, "high": 1.0}},
+            }
+        }
+        with self.assertRaises(ValueError):
+            _validate_forbidden_search_space_paths(bad_meta_space)
 
     def test_rf_default_n_jobs_is_deterministic_single_worker(self):
         model = build_model("rf", model_params={"random_state": 42})

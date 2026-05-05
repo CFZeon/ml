@@ -8,6 +8,19 @@ from example_local_certification_automl import build_local_certification_example
 
 
 class LocalCertificationMonitoringDefaultsTest(unittest.TestCase):
+    def test_research_profile_uses_finite_advisory_thresholds(self):
+        report = build_monitoring_report(policy={"policy_profile": "research"})
+
+        policy = report["policy"]
+        self.assertEqual(policy["policy_profile"], "research")
+        self.assertEqual(policy["max_data_lag"], "24h")
+        self.assertEqual(policy["max_l2_snapshot_age"], "1h")
+        self.assertEqual(float(policy["max_slippage_drift"]), 0.01)
+        self.assertEqual(float(policy["max_fallback_assumption_rate"]), 0.25)
+        self.assertEqual(float(policy["max_fill_ratio_deterioration"]), 0.5)
+        self.assertEqual(float(policy["max_inference_p95_ms"]), 2000.0)
+        self.assertEqual(int(policy["max_queue_backlog"]), 100)
+
     def test_local_certification_profile_uses_finite_thresholds(self):
         report = build_monitoring_report(policy={"policy_profile": "local_certification"})
 

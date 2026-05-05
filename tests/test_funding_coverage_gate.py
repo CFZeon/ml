@@ -65,6 +65,22 @@ class FundingCoverageGateTest(unittest.TestCase):
         self.assertTrue(data_quality_config["block_on_quarantine"])
         self.assertTrue(data_quality_config["exclude_flagged_quarantine_rows_from_modeling"])
 
+    def test_research_runtime_defaults_drop_gap_windows_and_exclude_flagged_rows(self):
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "backtest": {"evaluation_mode": "research_only"},
+            }
+        )
+
+        data_config = _resolve_pipeline_data_fetch_config(pipeline)
+        data_quality_config = _resolve_pipeline_data_quality_config(pipeline)
+
+        self.assertEqual(data_config["gap_policy"], "drop_windows")
+        self.assertEqual(data_config["duplicate_policy"], "fail")
+        self.assertFalse(data_quality_config["block_on_quarantine"])
+        self.assertTrue(data_quality_config["exclude_flagged_quarantine_rows_from_modeling"])
+
     def test_trade_ready_blocks_missing_funding_even_when_zero_fill_is_requested(self):
         index = pd.date_range("2026-02-01", periods=24, freq="1h", tz="UTC")
         pipeline = ResearchPipeline(

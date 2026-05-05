@@ -48,6 +48,7 @@ from .features import (
     derive_feature_availability,
     derive_feature_families,
     derive_feature_lineage,
+    estimate_feature_lag_reach,
     screen_features_for_stationarity,
     select_features,
     summarize_feature_families,
@@ -86,6 +87,7 @@ from .regime import (
     normalize_regime_feature_set,
     summarize_regime_ablation_reports,
 )
+from .regime_training import evaluate_regime_aware_predictions, summarize_regime_coverage, train_regime_aware_model
 from .slippage import (
     DepthCurveImpactModel,
     FillAwareCostModel,
@@ -331,6 +333,42 @@ def _positive_class_probability(model, X, positive_class=1):
     return probabilities[:, -1]
 
 
+def _is_regime_aware_model(model):
+    return hasattr(model, "predict_with_probability_report")
+
+
+def _resolve_regime_aware_config(model_config):
+    configured = dict((model_config or {}).get("regime_aware") or {})
+    enabled = bool(configured.get("enabled", False))
+    if not enabled:
+        return {}
+
+    strategy = str(configured.get("strategy", "feature")).strip().lower()
+    if strategy not in {"feature", "specialist"}:
+        raise ValueError("model.regime_aware.strategy must be 'feature' or 'specialist'")
+
+    return {
+        **configured,
+        "enabled": True,
+        "strategy": strategy,
+        "regime_column": str(configured.get("regime_column", "regime")),
+        "min_samples_per_regime": int(configured.get("min_samples_per_regime", 40)),
+        "coverage_config": dict(configured.get("coverage_config") or {}),
+    }
+
+
+def _predict_primary_model_outputs(model, X, regime_data=None):
+    if _is_regime_aware_model(model):
+        predictions, probability_frame, inference_report = model.predict_with_probability_report(X, regime_data)
+        prediction_series = pd.Series(predictions, index=X.index, copy=False)
+        probability_frame = pd.DataFrame(probability_frame, index=X.index).copy()
+        return prediction_series, probability_frame, dict(inference_report or {})
+
+    prediction_series = pd.Series(model.predict(X), index=X.index)
+    probability_frame = predict_probability_frame(model, X)
+    return prediction_series, probability_frame, {}
+
+
 def _resolve_signal_holding_bars(pipeline, signal_config):
     configured = signal_config.get("holding_bars")
     if configured is not None:
@@ -532,6 +570,45 @@ def _resolve_cpcv_embargo_bars(pipeline, model_config):
     return max(0, int(model_config.get("gap", 0)))
 
 
+def _resolve_feature_lag_bars(pipeline):
+    report = dict(pipeline.state.get("feature_lag_report") or {})
+    return max(0, int(report.get("max_lag", 0)))
+
+
+def _validate_feature_lag_split_geometry(*, validation_method, feature_lag_bars,
+                                         configured_gap=None, embargo_bars=None,
+                                         explicit_splits=None):
+    feature_lag_bars = max(0, int(feature_lag_bars))
+    if feature_lag_bars <= 0:
+        return
+
+    if explicit_splits is not None:
+        for position, split in enumerate(list(explicit_splits or [])):
+            split_dict = dict(split or {})
+            gap_index = split_dict.get("gap_index", split_dict.get("gap_idx", [])) or []
+            gap_bars = int(split_dict.get("gap_bars", len(gap_index)))
+            if gap_bars < feature_lag_bars:
+                split_id = str(split_dict.get("split_id", f"explicit_{position}"))
+                raise ValueError(
+                    f"Explicit split {split_id} gap_bars={gap_bars} is shorter than feature_lag_bars={feature_lag_bars}"
+                )
+        return
+
+    if str(validation_method) == "cpcv":
+        observed = max(0, int(embargo_bars or 0))
+        if observed < feature_lag_bars:
+            raise ValueError(
+                f"CPCV embargo_bars={observed} is shorter than feature_lag_bars={feature_lag_bars}"
+            )
+        return
+
+    observed = max(0, int(configured_gap or 0))
+    if observed < feature_lag_bars:
+        raise ValueError(
+            f"Validation gap={observed} is shorter than feature_lag_bars={feature_lag_bars}"
+        )
+
+
 def _build_contiguous_test_intervals(index, positions):
     if index is None or len(index) == 0 or positions is None or len(positions) == 0:
         return []
@@ -605,14 +682,28 @@ def _iter_validation_splits(pipeline, X):
     model_config = pipeline.section("model")
     explicit_splits = list(model_config.get("explicit_splits") or [])
     configured_gap = int(model_config.get("gap", 0))
+    feature_lag_bars = _resolve_feature_lag_bars(pipeline)
     if explicit_splits:
+        _validate_feature_lag_split_geometry(
+            validation_method="walk_forward",
+            feature_lag_bars=feature_lag_bars,
+            explicit_splits=explicit_splits,
+        )
         for split_number, split_config in enumerate(explicit_splits):
-            yield _normalize_explicit_split(X, split_number, split_config, configured_gap)
+            normalized_split = _normalize_explicit_split(X, split_number, split_config, configured_gap)
+            normalized_split["metadata"]["feature_lag_bars"] = int(feature_lag_bars)
+            normalized_split["metadata"]["effective_gap_bars"] = int(normalized_split["metadata"].get("gap_bars", 0))
+            yield normalized_split
         return
 
     validation_method = _resolve_validation_method(model_config)
 
     if validation_method == "walk_forward":
+        _validate_feature_lag_split_geometry(
+            validation_method=validation_method,
+            feature_lag_bars=feature_lag_bars,
+            configured_gap=configured_gap,
+        )
         for split_number, (train_idx, test_idx) in enumerate(
             walk_forward_split(
                 X,
@@ -621,6 +712,7 @@ def _iter_validation_splits(pipeline, X):
                 test_size=model_config.get("test_size"),
                 gap=model_config.get("gap", 0),
                 expanding=model_config.get("expanding", False),
+                max_lag=feature_lag_bars,
             )
         ):
             yield {
@@ -632,6 +724,9 @@ def _iter_validation_splits(pipeline, X):
                 "test_intervals": _build_contiguous_test_intervals(X.index, test_idx),
                 "metadata": {
                     "gap": int(model_config.get("gap", 0)),
+                    "configured_gap": int(configured_gap),
+                    "feature_lag_bars": int(feature_lag_bars),
+                    "effective_gap_bars": int(configured_gap + feature_lag_bars),
                     "expanding": bool(model_config.get("expanding", False)),
                 },
             }
@@ -640,6 +735,11 @@ def _iter_validation_splits(pipeline, X):
     n_blocks = _resolve_cpcv_block_count(model_config)
     embargo_bars = _resolve_cpcv_embargo_bars(pipeline, model_config)
     test_blocks = _resolve_cpcv_test_block_count(model_config)
+    _validate_feature_lag_split_geometry(
+        validation_method=validation_method,
+        feature_lag_bars=feature_lag_bars,
+        embargo_bars=embargo_bars,
+    )
 
     for split_number, (train_idx, test_idx, metadata) in enumerate(
         cpcv_split(
@@ -647,10 +747,13 @@ def _iter_validation_splits(pipeline, X):
             n_blocks=n_blocks,
             test_blocks=test_blocks,
             embargo=embargo_bars,
+            max_lag=feature_lag_bars,
         )
     ):
         split_metadata = dict(metadata)
         split_metadata["embargo_bars"] = int(embargo_bars)
+        split_metadata["feature_lag_bars"] = int(feature_lag_bars)
+        split_metadata["effective_embargo_bars"] = int(embargo_bars + feature_lag_bars)
         yield {
             "fold": split_number,
             "split_id": split_metadata.get("split_id", f"cpcv_{split_number}"),
@@ -1117,6 +1220,9 @@ def _resolve_pipeline_data_fetch_config(pipeline):
     if evaluation_mode.is_capital_facing:
         config.setdefault("gap_policy", "fail")
         config.setdefault("duplicate_policy", "fail")
+    else:
+        config.setdefault("gap_policy", "drop_windows")
+        config.setdefault("duplicate_policy", "fail")
     return config
 
 
@@ -1126,6 +1232,9 @@ def _resolve_pipeline_data_quality_config(pipeline):
     evaluation_mode = resolve_evaluation_mode(backtest_config)
     if evaluation_mode.is_capital_facing:
         config.setdefault("block_on_quarantine", True)
+        config.setdefault("exclude_flagged_quarantine_rows_from_modeling", True)
+    else:
+        config.setdefault("block_on_quarantine", False)
         config.setdefault("exclude_flagged_quarantine_rows_from_modeling", True)
     return config
 
@@ -2182,6 +2291,9 @@ def _resolve_stationarity_screening_config(pipeline):
     screening_config.setdefault("enabled", True)
     screening_config.setdefault("rolling_window", features_config.get("rolling_window", 20))
     screening_config.setdefault("frac_diff_d", features_config.get("frac_diff_d"))
+    screening_config.setdefault("frac_diff_max_lag", features_config.get("frac_diff_max_lag"))
+    screening_config.setdefault("frac_diff_min_retained_ratio", features_config.get("frac_diff_min_retained_ratio", 0.25))
+    screening_config.setdefault("frac_diff_min_retained_samples", features_config.get("frac_diff_min_retained_samples", 32))
     return screening_config
 
 
@@ -2486,6 +2598,37 @@ def _average_fold_metric(fold_metrics, key):
     if not values:
         return None
     return round(float(np.mean(values)), 4)
+
+
+def _summarize_probability_quality(fold_metrics):
+    fold_metrics = list(fold_metrics or [])
+    observation_counts = [
+        int(metric["probability_observation_count"])
+        for metric in fold_metrics
+        if metric.get("probability_observation_count") is not None
+    ]
+    decomposition = {}
+    for key, label in [
+        ("brier_reliability", "reliability"),
+        ("brier_resolution", "resolution"),
+        ("brier_uncertainty", "uncertainty"),
+        ("brier_residual", "residual"),
+    ]:
+        value = _average_fold_metric(fold_metrics, key)
+        if value is not None:
+            decomposition[label] = value
+
+    if not observation_counts and not decomposition:
+        return {}
+
+    summary = {}
+    if observation_counts:
+        summary["avg_observation_count"] = round(float(np.mean(observation_counts)), 2)
+        summary["min_observation_count"] = int(min(observation_counts))
+        summary["max_observation_count"] = int(max(observation_counts))
+    if decomposition:
+        summary["brier_decomposition"] = decomposition
+    return summary
 
 
 def _resolve_validation_stability_policy(pipeline):
@@ -2807,15 +2950,19 @@ def _resolve_kelly_calibration_guard(signal_config):
     trade_ready_mode = bool(signal_config.get("trade_ready_mode", False))
     require_paper = bool(signal_config.get("require_paper_verification_for_kelly", trade_ready_mode))
     require_calibration = bool(signal_config.get("require_live_calibration_for_kelly", trade_ready_mode))
+    require_venue_constraints = bool(signal_config.get("require_venue_constraints_for_kelly", trade_ready_mode))
     configured_cap = float(signal_config.get("max_kelly_fraction", 0.5))
     fallback_cap = float(signal_config.get("uncalibrated_kelly_fraction_cap", min(configured_cap, 0.25)))
     calibration_error = signal_config.get("live_calibration_error")
     if calibration_error is None:
         calibration_error = signal_config.get("calibration_error")
     max_live_calibration_error = float(signal_config.get("max_live_calibration_error", 0.25))
+    venue_constraints_available = bool(signal_config.get("venue_constraints_available", False))
 
     reasons = []
     if sizing_mode == "kelly":
+        if require_venue_constraints and not venue_constraints_available:
+            reasons.append("venue_constraints_required")
         if require_paper and not bool(signal_config.get("paper_verified", False)):
             reasons.append("paper_verification_required")
         if require_calibration:
@@ -2832,6 +2979,7 @@ def _resolve_kelly_calibration_guard(signal_config):
         "configured_max_kelly_fraction": configured_cap,
         "effective_max_kelly_fraction": effective_cap,
         "paper_verified": bool(signal_config.get("paper_verified", False)),
+        "venue_constraints_available": venue_constraints_available,
         "live_calibration_error": calibration_error,
         "max_live_calibration_error": max_live_calibration_error,
     }
@@ -2879,9 +3027,11 @@ class SignalPolicyBuilder:
         params.setdefault("trade_ready_mode", trade_ready_mode)
         params.setdefault("require_paper_verification_for_kelly", trade_ready_mode)
         params.setdefault("require_live_calibration_for_kelly", trade_ready_mode)
+        params.setdefault("require_venue_constraints_for_kelly", trade_ready_mode)
+        params.setdefault("venue_constraints_available", bool(self.signal_config.get("venue_constraints_available", False)))
         params.setdefault("uncalibrated_kelly_fraction_cap", min(float(params.get("max_kelly_fraction", 0.5)), 0.25))
         params.setdefault("max_live_calibration_error", float(self.signal_config.get("max_live_calibration_error", 0.25)))
-        for key in ("paper_verified", "live_calibration_error", "calibration_error"):
+        for key in ("paper_verified", "live_calibration_error", "calibration_error", "venue_constraints_available"):
             if key in calibration_context:
                 params[key] = calibration_context.get(key)
         break_even_prob = float(avg_loss) / max(float(avg_win) + float(avg_loss), 1e-12)
@@ -3044,6 +3194,120 @@ def _build_empty_signal_state(index, signal_config, avg_win, avg_loss, holding_b
     )
 
 
+def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None):
+    configured_thresholds = dict(coverage_config or {})
+    if not folds:
+        return {
+            "status": "unknown",
+            "promotion_pass": False,
+            "reasons": ["regime_coverage_unavailable"],
+            "configured_thresholds": configured_thresholds,
+            "folds": [],
+            "fit_ok_share": None,
+            "validation_ok_share": None,
+            "test_ok_share": None,
+            "distinct_regimes_min_fit": None,
+            "distinct_regimes_min_validation": None,
+            "distinct_regimes_min_test": None,
+            "max_dominant_share_fit": None,
+            "max_dominant_share_validation": None,
+            "max_dominant_share_test": None,
+            "fallback_rows": 0,
+            "unseen_regimes": [],
+            "specialist_shortfalls": {},
+            "strategy": strategy,
+        }
+
+    def _stage_rows(stage_name):
+        return [dict(fold.get(stage_name) or {}) for fold in folds]
+
+    def _stage_ok_share(stage_name):
+        values = [
+            bool(stage.get("coverage_ok", stage.get("promotion_pass", False)))
+            for stage in _stage_rows(stage_name)
+            if stage and stage.get("status") != "unknown"
+        ]
+        if not values:
+            return None
+        return round(float(np.mean(values)), 4)
+
+    def _stage_min_distinct(stage_name):
+        values = [
+            int(stage.get("distinct_regimes"))
+            for stage in _stage_rows(stage_name)
+            if stage and stage.get("distinct_regimes") is not None
+        ]
+        if not values:
+            return None
+        return int(min(values))
+
+    def _stage_max_dominant(stage_name):
+        values = [
+            float(stage.get("dominant_share"))
+            for stage in _stage_rows(stage_name)
+            if stage and stage.get("dominant_share") is not None
+        ]
+        if not values:
+            return None
+        return round(float(max(values)), 6)
+
+    stages = []
+    reasons = []
+    unseen_regimes = set()
+    specialist_shortfalls = {}
+    fallback_rows = 0
+    for fold in folds:
+        for stage_name in ("fit", "validation", "test"):
+            stage = dict(fold.get(stage_name) or {})
+            if stage:
+                stages.append(str(stage.get("status") or "unknown"))
+                reasons.extend(list(stage.get("reasons") or []))
+        inference_report = dict(fold.get("inference_report") or {})
+        fallback_rows += int(inference_report.get("fallback_rows", 0) or 0)
+        unseen_regimes.update(str(value) for value in inference_report.get("unseen_regimes", []) if value is not None)
+        training_report = dict(fold.get("training_report") or {})
+        for regime_name, reason in dict(training_report.get("skipped_regimes") or {}).items():
+            specialist_shortfalls[str(regime_name)] = reason
+
+    if "failed" in stages:
+        status = "failed"
+    elif "unknown" in stages:
+        status = "unknown"
+    else:
+        status = "passed"
+
+    return {
+        "status": status,
+        "promotion_pass": status == "passed",
+        "reasons": list(dict.fromkeys(reasons)),
+        "configured_thresholds": configured_thresholds,
+        "folds": [
+            {
+                "fold": int(fold.get("fold", position)),
+                "split_id": fold.get("split_id"),
+                "fit": dict(fold.get("fit") or {}),
+                "validation": dict(fold.get("validation") or {}),
+                "test": dict(fold.get("test") or {}),
+                "specialist_shortfalls": dict((fold.get("training_report") or {}).get("skipped_regimes") or {}),
+            }
+            for position, fold in enumerate(folds)
+        ],
+        "fit_ok_share": _stage_ok_share("fit"),
+        "validation_ok_share": _stage_ok_share("validation"),
+        "test_ok_share": _stage_ok_share("test"),
+        "distinct_regimes_min_fit": _stage_min_distinct("fit"),
+        "distinct_regimes_min_validation": _stage_min_distinct("validation"),
+        "distinct_regimes_min_test": _stage_min_distinct("test"),
+        "max_dominant_share_fit": _stage_max_dominant("fit"),
+        "max_dominant_share_validation": _stage_max_dominant("validation"),
+        "max_dominant_share_test": _stage_max_dominant("test"),
+        "fallback_rows": int(fallback_rows),
+        "unseen_regimes": sorted(unseen_regimes),
+        "specialist_shortfalls": specialist_shortfalls,
+        "strategy": strategy,
+    }
+
+
 def _resolve_fallback_signal_frame(X, training):
     fallback_scope = dict(training.get("fallback_inference") or {})
     fallback_scope.setdefault("mode", "unrestricted")
@@ -3096,7 +3360,19 @@ def _score_signal_state(backtest, signal_config):
     return score
 
 
-def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labels=None, close=None, trade_outcome_builder=None, context_frame=None):
+def _train_inner_meta_model(
+    X_train,
+    y_train,
+    sample_weights,
+    model_config,
+    labels=None,
+    close=None,
+    trade_outcome_builder=None,
+    context_frame=None,
+    regime_data=None,
+    regime_aware_config=None,
+    feature_lag_bars=0,
+):
     inner_predictions = []
     inner_probabilities = []
     inner_truth = []
@@ -3105,12 +3381,17 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
     min_train_rows = max(50, min(100, len(X_train) // 3))
     min_test_rows = 20
     binary_primary = model_config.get("binary_primary", True)
+    resolved_regime_aware = _resolve_regime_aware_config(
+        {"regime_aware": regime_aware_config or model_config.get("regime_aware")}
+    )
+    regime_frame = pd.DataFrame(regime_data).reindex(X_train.index) if regime_data is not None else None
 
     for inner_train_idx, inner_test_idx in walk_forward_split(
         X_train,
         n_splits=model_config.get("meta_n_splits", max(2, min(3, model_config.get("n_splits", 3)))),
         gap=model_config.get("gap", 0),
         expanding=model_config.get("expanding", False),
+        max_lag=feature_lag_bars,
     ):
         if len(inner_train_idx) < min_train_rows or len(inner_test_idx) < min_test_rows:
             continue
@@ -3120,6 +3401,8 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
         w_inner_train = sample_weights.iloc[inner_train_idx]
         X_inner_test = X_train.iloc[inner_test_idx]
         inner_labels_train = labels.iloc[inner_train_idx] if labels is not None else None
+        inner_regime_train = regime_frame.iloc[inner_train_idx] if regime_frame is not None else None
+        inner_regime_test = regime_frame.iloc[inner_test_idx] if regime_frame is not None else None
 
         inner_test_start = X_inner_test.index[0] if len(X_inner_test) > 0 else None
         X_inner_train, y_inner_train, inner_labels_train, w_inner_train, _ = _purge_overlapping_training_rows(
@@ -3137,6 +3420,8 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
             X_inner_train = X_inner_train.loc[binary_mask]
             y_inner_train = y_inner_train.loc[binary_mask]
             w_inner_train = w_inner_train.loc[binary_mask]
+            if inner_regime_train is not None:
+                inner_regime_train = inner_regime_train.reindex(X_inner_train.index)
             if len(X_inner_train) < min_train_rows:
                 continue
         w_inner_train = _combine_class_balance_weights(y_inner_train, w_inner_train)
@@ -3150,18 +3435,37 @@ def _train_inner_meta_model(X_train, y_train, sample_weights, model_config, labe
                 model_config,
             )
 
-        inner_model = train_model(
-            X_inner_train,
-            y_inner_train,
-            sample_weight=w_inner_train,
-            model_type=model_config.get("type", "gbm"),
-            model_params=model_config.get("params"),
-            sampling_metadata=sampling_metadata,
-            emit_warnings=False,
-        )
-
-        inner_pred = pd.Series(inner_model.predict(X_inner_test), index=X_inner_test.index)
-        inner_prob = predict_probability_frame(inner_model, X_inner_test)
+        if resolved_regime_aware.get("enabled"):
+            inner_model, _ = train_regime_aware_model(
+                X_inner_train,
+                y_inner_train,
+                inner_regime_train,
+                strategy=resolved_regime_aware.get("strategy", "feature"),
+                model_type=model_config.get("type", "gbm"),
+                model_params=model_config.get("params"),
+                feature_config=resolved_regime_aware,
+                coverage_config=resolved_regime_aware.get("coverage_config"),
+                regime_column=resolved_regime_aware.get("regime_column", "regime"),
+                min_samples_per_regime=resolved_regime_aware.get("min_samples_per_regime", 40),
+                sample_weight=w_inner_train,
+                sampling_metadata=sampling_metadata,
+            )
+            inner_pred, inner_prob, _ = _predict_primary_model_outputs(
+                inner_model,
+                X_inner_test,
+                regime_data=inner_regime_test,
+            )
+        else:
+            inner_model = train_model(
+                X_inner_train,
+                y_inner_train,
+                sample_weight=w_inner_train,
+                model_type=model_config.get("type", "gbm"),
+                model_params=model_config.get("params"),
+                sampling_metadata=sampling_metadata,
+                emit_warnings=False,
+            )
+            inner_pred, inner_prob, _ = _predict_primary_model_outputs(inner_model, X_inner_test)
         inner_predictions.append(inner_pred)
         inner_probabilities.append(inner_prob)
         inner_truth.append(y_train.iloc[inner_test_idx])
@@ -3476,6 +3780,9 @@ class FeaturesStep(PipelineStep):
             data,
             lags=config.get("lags"),
             frac_diff_d=config.get("frac_diff_d"),
+            frac_diff_max_lag=config.get("frac_diff_max_lag"),
+            frac_diff_min_retained_ratio=config.get("frac_diff_min_retained_ratio", 0.25),
+            frac_diff_min_retained_samples=config.get("frac_diff_min_retained_samples", 32),
             indicator_run=indicator_run,
             rolling_window=config.get("rolling_window", 20),
             squeeze_quantile=config.get("squeeze_quantile", 0.2),
@@ -3485,6 +3792,7 @@ class FeaturesStep(PipelineStep):
         feature_families = dict(feature_set.feature_families)
         feature_availability = dict(getattr(feature_set, "feature_availability", {}) or {})
         feature_lineage = dict(getattr(feature_set, "feature_lineage", {}) or {})
+        transform_retention_reports = dict(getattr(feature_set, "transform_retention_reports", {}) or {})
 
         futures_context_block = build_futures_context_feature_block(
             raw_data,
@@ -3605,6 +3913,7 @@ class FeaturesStep(PipelineStep):
             columns=features.columns,
             feature_availability=feature_availability,
         )
+        feature_lag_report = estimate_feature_lag_reach(feature_lineage, columns=features.columns)
 
         screening_result = screen_features_for_stationarity(
             features,
@@ -3614,6 +3923,8 @@ class FeaturesStep(PipelineStep):
         screening_report = copy.deepcopy(screening_result.report)
         screening_report["mode"] = "global_preview_only"
         screening_report.setdefault("summary", {})["mode"] = "global_preview_only"
+        if transform_retention_reports:
+            screening_report["preview_transform_retention"] = transform_retention_reports
         feature_metadata = derive_feature_metadata(
             feature_blocks=feature_blocks,
             feature_families=feature_families,
@@ -3634,8 +3945,18 @@ class FeaturesStep(PipelineStep):
         pipeline.state["feature_families"] = feature_families
         pipeline.state["feature_availability"] = feature_availability
         pipeline.state["feature_lineage"] = feature_lineage
+        pipeline.state["feature_lag_report"] = feature_lag_report
+        pipeline.state["feature_retention_report"] = transform_retention_reports
         pipeline.state["feature_metadata"] = feature_metadata
         pipeline.state["feature_family_summary"] = summarize_feature_families(feature_blocks, columns=features.columns)
+        if transform_retention_reports:
+            features.attrs["transform_retention_report"] = transform_retention_reports
+        integrity_report = pipeline.state.get("data_integrity_report")
+        if integrity_report:
+            features.attrs["data_integrity_report"] = integrity_report
+        data_quality_report = pipeline.state.get("data_quality_report")
+        if data_quality_report:
+            features.attrs["data_quality_report"] = data_quality_report
         pipeline.state["features"] = features
         data_certification = _build_data_certification_report(pipeline)
         if data_certification.get("enabled") and data_certification.get("mode") == "blocking" and not data_certification.get("promotion_pass", True):
@@ -3785,6 +4106,9 @@ class LabelsStep(PipelineStep):
         data_quality_report = pipeline.state.get("data_quality_report")
         if data_quality_report:
             labels.attrs["data_quality_report"] = data_quality_report
+        data_integrity_report = pipeline.state.get("data_integrity_report")
+        if data_integrity_report:
+            labels.attrs["data_integrity_report"] = data_integrity_report
         pipeline.state["labels"] = labels
         return labels
 
@@ -3894,9 +4218,11 @@ class TrainModelsStep(PipelineStep):
         raw_data = pipeline.require("raw_data")
         config = pipeline.section("model")
         selection_config = pipeline.section("feature_selection")
-        signal_config = pipeline.section("signals")
+        signal_config = dict(pipeline.section("signals"))
+        signal_config.setdefault("venue_constraints_available", bool(pipeline.state.get("symbol_filters")))
         backtest_config = pipeline.section("backtest")
         signal_policy_builder = SignalPolicyBuilder(signal_config, backtest_config)
+        regime_aware_config = _resolve_regime_aware_config(config)
         feature_blocks = pipeline.state.get("feature_blocks", {})
         stationarity_config = _resolve_stationarity_screening_config(pipeline)
         binary_primary = config.get("binary_primary", True)
@@ -3911,13 +4237,15 @@ class TrainModelsStep(PipelineStep):
                 "source": "static_defaults",
                 "calibration_rows": 0,
                 "kelly_trade_count": 0,
+                "venue_constraints_available": bool(pipeline.state.get("symbol_filters")),
             },
         )
         close_all = raw_data["close"]
         explicit_splits = list(config.get("explicit_splits") or [])
         validation_method = "walk_forward" if explicit_splits else _resolve_validation_method(config)
         stability_policy = _resolve_validation_stability_policy(pipeline)
-        validation_details = {"method": validation_method}
+        feature_lag_bars = _resolve_feature_lag_bars(pipeline)
+        validation_details = {"method": validation_method, "feature_lag_bars": int(feature_lag_bars)}
         if explicit_splits:
             validation_details.update(
                 {
@@ -3930,6 +4258,7 @@ class TrainModelsStep(PipelineStep):
                             "source": str(split.get("source", "explicit_split")),
                             "gap_rows": int(len(split.get("gap_index", split.get("gap_idx", [])) or [])),
                             "gap_bars": int(split.get("gap_bars", len(split.get("gap_index", split.get("gap_idx", [])) or []))),
+                            "feature_lag_bars": int(feature_lag_bars),
                             "timestamp_bounds": dict(split.get("timestamp_bounds") or {}),
                             "configured_gap": int(config.get("gap", 0)),
                         }
@@ -3943,12 +4272,14 @@ class TrainModelsStep(PipelineStep):
                     "n_blocks": _resolve_cpcv_block_count(config),
                     "test_blocks": _resolve_cpcv_test_block_count(config),
                     "embargo_bars": _resolve_cpcv_embargo_bars(pipeline, config),
+                    "effective_embargo_bars": int(_resolve_cpcv_embargo_bars(pipeline, config) + feature_lag_bars),
                 }
             )
         else:
             validation_details.update(
                 {
                     "gap": int(config.get("gap", 0)),
+                    "effective_gap_bars": int(config.get("gap", 0)) + int(feature_lag_bars),
                     "n_splits": int(config.get("n_splits", 3)),
                 }
             )
@@ -3963,6 +4294,7 @@ class TrainModelsStep(PipelineStep):
         fold_stationarity = []
         fold_purging = []
         fold_regime = []
+        fold_regime_aware = []
         fold_bootstrap = []
         fold_backtest_reports = []
         inference_latencies_ms = []
@@ -4155,6 +4487,13 @@ class TrainModelsStep(PipelineStep):
             X_fit_model = X_fit.loc[:, selected_columns]
             X_test_model = X_test.loc[:, selected_columns]
             X_val_model = X_val.loc[:, selected_columns] if X_val is not None else None
+            fit_regime_view = regime_frame.reindex(X_fit_model.index) if not regime_frame.empty else pd.DataFrame(index=X_fit_model.index)
+            val_regime_view = (
+                regime_frame.reindex(X_val_model.index)
+                if X_val_model is not None and not regime_frame.empty
+                else pd.DataFrame(index=X_val_model.index if X_val_model is not None else pd.Index([], dtype=object))
+            )
+            test_regime_view = regime_frame.reindex(X_test_model.index) if not regime_frame.empty else pd.DataFrame(index=X_test_model.index)
 
             fold_feature_metadata = filter_feature_metadata(
                 pipeline.state.get("feature_metadata") or derive_feature_metadata(fold_feature_blocks, columns=selected_columns),
@@ -4212,6 +4551,7 @@ class TrainModelsStep(PipelineStep):
                 w_train_primary = w_fit.loc[binary_mask]
                 labels_train_primary = labels_fit.loc[binary_mask]
             w_train_primary = _combine_class_balance_weights(y_train_primary, w_train_primary)
+            train_regime_view = fit_regime_view.reindex(X_train_primary.index) if not fit_regime_view.empty else pd.DataFrame(index=X_train_primary.index)
 
             sampling_metadata = _build_training_sampling_metadata(
                 labels_train_primary,
@@ -4219,15 +4559,47 @@ class TrainModelsStep(PipelineStep):
                 w_fit.loc[X_train_primary.index],
                 config,
             )
-            model, bootstrap_report = train_model(
-                X_train_primary,
-                y_train_primary,
-                sample_weight=w_train_primary,
-                model_type=config.get("type", "gbm"),
-                model_params=config.get("params"),
-                sampling_metadata=sampling_metadata,
-                return_report=True,
-            )
+            regime_training_report = None
+            if regime_aware_config.get("enabled"):
+                model, regime_training_report = train_regime_aware_model(
+                    X_train_primary,
+                    y_train_primary,
+                    train_regime_view,
+                    strategy=regime_aware_config.get("strategy", "feature"),
+                    model_type=config.get("type", "gbm"),
+                    model_params=config.get("params"),
+                    feature_config=regime_aware_config,
+                    coverage_config=regime_aware_config.get("coverage_config"),
+                    regime_column=regime_aware_config.get("regime_column", "regime"),
+                    min_samples_per_regime=regime_aware_config.get("min_samples_per_regime", 40),
+                    sample_weight=w_train_primary,
+                    sampling_metadata=sampling_metadata,
+                )
+                bootstrap_report = (
+                    regime_training_report.get("sampling_report")
+                    or regime_training_report.get("fallback_sampling_report")
+                    or {
+                        "sequential_bootstrap_enabled": False,
+                        "sequential_bootstrap_used": False,
+                        "reason": "regime_aware_training_bundle",
+                        "warning": None,
+                        "mean_uniqueness": None,
+                        "uniqueness_threshold": None,
+                        "high_concurrency": False,
+                        "random_state": (config.get("params") or {}).get("random_state", 42),
+                        "bootstrap_sample_size": None,
+                    }
+                )
+            else:
+                model, bootstrap_report = train_model(
+                    X_train_primary,
+                    y_train_primary,
+                    sample_weight=w_train_primary,
+                    model_type=config.get("type", "gbm"),
+                    model_params=config.get("params"),
+                    sampling_metadata=sampling_metadata,
+                    return_report=True,
+                )
             fold_bootstrap.append(
                 {
                     "fold": fold,
@@ -4236,23 +4608,51 @@ class TrainModelsStep(PipelineStep):
                 }
             )
 
-            metrics = evaluate_model(model, X_test_model, y_test)
+            if regime_aware_config.get("enabled"):
+                test_primary_preds, test_primary_probs_raw, regime_inference_report = _timed_inference_call(
+                    inference_latencies_ms,
+                    _predict_primary_model_outputs,
+                    model,
+                    X_test_model,
+                    regime_data=test_regime_view,
+                )
+                metrics = evaluate_regime_aware_predictions(y_test, test_primary_preds, test_primary_probs_raw)
+                fold_regime_aware.append(
+                    {
+                        "fold": fold,
+                        "split_id": split_id,
+                        "fit": summarize_regime_coverage(
+                            fit_regime_view,
+                            regime_column=regime_aware_config.get("regime_column", "regime"),
+                            config=regime_aware_config.get("coverage_config"),
+                        ),
+                        "validation": summarize_regime_coverage(
+                            val_regime_view,
+                            regime_column=regime_aware_config.get("regime_column", "regime"),
+                            config=regime_aware_config.get("coverage_config"),
+                        ),
+                        "test": summarize_regime_coverage(
+                            test_regime_view,
+                            regime_column=regime_aware_config.get("regime_column", "regime"),
+                            config=regime_aware_config.get("coverage_config"),
+                        ),
+                        "training_report": regime_training_report or {},
+                        "inference_report": regime_inference_report,
+                    }
+                )
+            else:
+                metrics = evaluate_model(model, X_test_model, y_test)
+                test_primary_preds, test_primary_probs_raw, regime_inference_report = _timed_inference_call(
+                    inference_latencies_ms,
+                    _predict_primary_model_outputs,
+                    model,
+                    X_test_model,
+                )
             metrics["fold"] = fold
             metrics["split_id"] = split_id
             metrics["validation_method"] = validation_method
             if split_meta.get("test_blocks") is not None:
                 metrics["test_blocks"] = split_meta.get("test_blocks")
-
-            test_primary_preds = pd.Series(
-                _timed_inference_call(inference_latencies_ms, model.predict, X_test_model),
-                index=X_test_model.index,
-            )
-            test_primary_probs_raw = _timed_inference_call(
-                inference_latencies_ms,
-                predict_probability_frame,
-                model,
-                X_test_model,
-            )
             test_primary_probs = test_primary_probs_raw.copy()
 
             primary_calibrator = None
@@ -4293,10 +4693,9 @@ class TrainModelsStep(PipelineStep):
                     cutoff_timestamp=cutoff_timestamp,
                 ),
                 context_frame=meta_context_frame.reindex(X_fit_model.index) if meta_context_frame is not None else None,
-            )
-            fit_primary_preds = pd.Series(
-                _timed_inference_call(inference_latencies_ms, model.predict, X_fit_model),
-                index=X_fit_model.index,
+                regime_data=fit_regime_view if not fit_regime_view.empty else None,
+                regime_aware_config=regime_aware_config,
+                feature_lag_bars=feature_lag_bars,
             )
             fold_avg_win = default_avg_win
             fold_avg_loss = default_avg_loss
@@ -4327,15 +4726,12 @@ class TrainModelsStep(PipelineStep):
             tuned_signal_params = dict(signal_policy_report["params"])
             policy_backtest = None
             if X_val_model is not None and not X_val_model.empty:
-                val_primary_preds = pd.Series(
-                    _timed_inference_call(inference_latencies_ms, model.predict, X_val_model),
-                    index=X_val_model.index,
-                )
-                val_primary_probs_raw = _timed_inference_call(
+                val_primary_preds, val_primary_probs_raw, _ = _timed_inference_call(
                     inference_latencies_ms,
-                    predict_probability_frame,
+                    _predict_primary_model_outputs,
                     model,
                     X_val_model,
+                    regime_data=val_regime_view if regime_aware_config.get("enabled") else None,
                 )
                 val_primary_probs, primary_calibrator = _calibrate_primary_probability_frame(
                     val_primary_probs_raw,
@@ -4467,17 +4863,27 @@ class TrainModelsStep(PipelineStep):
 
             test_primary_probs = _apply_primary_probability_calibrator(test_primary_probs_raw, primary_calibrator)
 
-            block_diagnostics = compute_feature_block_diagnostics(
-                model,
-                X_train_primary,
-                X_test_model,
-                y_test,
-                feature_blocks=fold_feature_blocks,
-                baseline_metrics=metrics,
-            )
-            fold_block_diagnostics.append(block_diagnostics)
-            fold_family_diagnostics.append(
-                compute_feature_family_diagnostics(
+            if regime_aware_config.get("enabled"):
+                fold_block_diagnostics.append(
+                    {
+                        "baseline_metrics": metrics,
+                        "blocks": [],
+                        "top_features": [],
+                        "reason": "regime_aware_model_bundle",
+                    }
+                )
+                fold_family_diagnostics.append(
+                    {
+                        "baseline_metrics": metrics,
+                        "families": [],
+                        "bundles": [],
+                        "selected_families": [],
+                        "endogenous_only_selected": False,
+                        "reason": "regime_aware_model_bundle",
+                    }
+                )
+            else:
+                block_diagnostics = compute_feature_block_diagnostics(
                     model,
                     X_train_primary,
                     X_test_model,
@@ -4485,7 +4891,17 @@ class TrainModelsStep(PipelineStep):
                     feature_blocks=fold_feature_blocks,
                     baseline_metrics=metrics,
                 )
-            )
+                fold_block_diagnostics.append(block_diagnostics)
+                fold_family_diagnostics.append(
+                    compute_feature_family_diagnostics(
+                        model,
+                        X_train_primary,
+                        X_test_model,
+                        y_test,
+                        feature_blocks=fold_feature_blocks,
+                        baseline_metrics=metrics,
+                    )
+                )
 
             X_meta_test = build_meta_feature_frame(
                 test_primary_preds,
@@ -4667,6 +5083,11 @@ class TrainModelsStep(PipelineStep):
         avg_log_loss = _average_fold_metric(fold_metrics, "log_loss")
         avg_brier_score = _average_fold_metric(fold_metrics, "brier_score")
         avg_calibration_error = _average_fold_metric(fold_metrics, "calibration_error")
+        avg_brier_reliability = _average_fold_metric(fold_metrics, "brier_reliability")
+        avg_brier_resolution = _average_fold_metric(fold_metrics, "brier_resolution")
+        avg_brier_uncertainty = _average_fold_metric(fold_metrics, "brier_uncertainty")
+        avg_brier_residual = _average_fold_metric(fold_metrics, "brier_residual")
+        probability_quality_summary = _summarize_probability_quality(fold_metrics)
         last_fold_train_end = last_regime_fit_index[-1] if len(last_regime_fit_index) > 0 else None
         aligned_safe_index = X.index[X.index > last_fold_train_end] if last_fold_train_end is not None else X.index[:0]
         if validation_method == "walk_forward":
@@ -4709,6 +5130,39 @@ class TrainModelsStep(PipelineStep):
         regime_ablation_summary = summarize_regime_ablation_reports(
             [row.get("ablation") for row in fold_regime]
         )
+        regime_coverage_summary = _summarize_regime_coverage_folds(
+            fold_regime_aware,
+            coverage_config=regime_aware_config.get("coverage_config"),
+            strategy=regime_aware_config.get("strategy"),
+        ) if regime_aware_config.get("enabled") else None
+        regime_aware_summary = {
+            "enabled": bool(regime_aware_config.get("enabled", False)),
+            "strategy": regime_aware_config.get("strategy"),
+            "folds": fold_regime_aware,
+        }
+        if regime_aware_config.get("enabled"):
+            trained_regimes = set()
+            trained_rows_by_regime = {}
+            fallback_evidence_rows = 0
+            for fold_report in fold_regime_aware:
+                training_report = dict(fold_report.get("training_report") or {})
+                for regime_name in list(training_report.get("trained_regimes") or []):
+                    trained_regimes.add(str(regime_name))
+                for regime_name, row_count in dict(training_report.get("trained_rows_by_regime") or {}).items():
+                    trained_rows_by_regime[str(regime_name)] = trained_rows_by_regime.get(str(regime_name), 0) + int(row_count)
+                test_report = dict(fold_report.get("test") or {})
+                if test_report.get("available_rows") is not None:
+                    fallback_evidence_rows += int(test_report.get("available_rows") or 0)
+
+            regime_aware_summary.update(
+                {
+                    "fallback_rows": int((regime_coverage_summary or {}).get("fallback_rows", 0) or 0),
+                    "fallback_evidence_rows": int(fallback_evidence_rows),
+                    "unseen_regimes": list((regime_coverage_summary or {}).get("unseen_regimes") or []),
+                    "trained_regimes": sorted(trained_regimes),
+                    "trained_rows_by_regime": trained_rows_by_regime,
+                }
+            )
         signal_decay = _build_signal_decay_report_for_segments(pipeline, signal_decay_segments, holding_bars)
         context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
         data_certification_report = dict(pipeline.state.get("data_certification") or {})
@@ -4769,6 +5223,10 @@ class TrainModelsStep(PipelineStep):
             "avg_log_loss": avg_log_loss,
             "avg_brier_score": avg_brier_score,
             "avg_calibration_error": avg_calibration_error,
+            "avg_brier_reliability": avg_brier_reliability,
+            "avg_brier_resolution": avg_brier_resolution,
+            "avg_brier_uncertainty": avg_brier_uncertainty,
+            "avg_brier_residual": avg_brier_residual,
             "validation": validation_details,
             "fold_backtests": fold_backtests,
             "fold_stability": fold_stability,
@@ -4777,7 +5235,9 @@ class TrainModelsStep(PipelineStep):
                 "log_loss": avg_log_loss,
                 "brier_score": avg_brier_score,
                 "calibration_error": avg_calibration_error,
+                "brier_decomposition": dict(probability_quality_summary.get("brier_decomposition") or {}),
             },
+            "probability_quality_summary": probability_quality_summary,
             "last_model": last_model,
             "last_meta": last_meta,
             "last_primary_calibrator": last_primary_calibrator,
@@ -4850,6 +5310,8 @@ class TrainModelsStep(PipelineStep):
                 "preview_ablation": pipeline.state.get("regime_ablation"),
                 "ablation_summary": regime_ablation_summary,
                 "folds": fold_regime,
+                "regime_aware": regime_aware_summary,
+                "coverage_summary": regime_coverage_summary,
             },
             "stationarity": {
                 "mode": "fold_local",
@@ -4898,7 +5360,8 @@ class SignalsStep(PipelineStep):
 
     def run(self, pipeline):
         training = pipeline.require("training")
-        config = pipeline.section("signals")
+        config = dict(pipeline.section("signals"))
+        config.setdefault("venue_constraints_available", bool(pipeline.state.get("symbol_filters")))
         fallback_scope = training.get("fallback_inference")
         validation_method = training.get("validation", {}).get("method", "walk_forward")
         executable_validation = training.get("executable_validation") or {}
@@ -4987,19 +5450,23 @@ class SignalsStep(PipelineStep):
 
             selected_columns = training.get("last_selected_columns") or list(X.columns)
             missing_columns = [column for column in selected_columns if column not in X.columns]
-            if missing_columns:
+            model = training["last_model"]
+            regime_frame = None
+            if missing_columns or _is_regime_aware_model(model):
                 regime_frame, _ = _build_fold_local_regime_frame(
                     pipeline,
                     X.index,
                     fit_index=training.get("last_regime_fit_index"),
                 )
-                if not regime_frame.empty:
+                if missing_columns and regime_frame is not None and not regime_frame.empty:
                     X = X.join(regime_frame)
             X_model = X.loc[:, selected_columns]
-            model = training["last_model"]
             meta_model = training["last_meta"]
-            predictions = pd.Series(model.predict(X_model), index=X_model.index)
-            probability_frame_raw = predict_probability_frame(model, X_model)
+            predictions, probability_frame_raw, _ = _predict_primary_model_outputs(
+                model,
+                X_model,
+                regime_data=(regime_frame.reindex(X_model.index) if regime_frame is not None and not regime_frame.empty else None),
+            )
             probability_frame = _apply_primary_probability_calibrator(
                 probability_frame_raw,
                 training.get("last_primary_calibrator"),
@@ -5410,6 +5877,7 @@ class ResearchPipeline:
         drift_cycle=None,
         backend_status=None,
         paper_report=None,
+        symbol_filters=None,
         operational_limits=None,
         release_request=None,
         policy=None,
@@ -5429,6 +5897,8 @@ class ResearchPipeline:
             drift_cycle = self.state.get("drift_cycle")
         if paper_report is None:
             paper_report = self.state.get("paper_calibration")
+        if symbol_filters is None:
+            symbol_filters = self.state.get("symbol_filters")
         if operational_limits is None:
             operational_limits = self.state.get("operational_limits")
         if release_request is None:
@@ -5442,6 +5912,7 @@ class ResearchPipeline:
             drift_cycle=drift_cycle,
             backend_status=backend_status,
             paper_report=paper_report,
+            symbol_filters=symbol_filters,
             operational_limits=operational_limits,
             release_request=release_request,
             policy=policy,

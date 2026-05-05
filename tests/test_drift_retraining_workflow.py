@@ -201,6 +201,8 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             self.assertIn("model_ttl_expired", result["drift_guardrails"]["reasons"])
             self.assertEqual(result["retrain_status"], "promoted")
             self.assertTrue(result["promotion_decision"]["approved"])
+            self.assertTrue(result["post_retrain_warmup"]["required"])
+            self.assertEqual(result["post_retrain_warmup"]["mode"], "paper")
             self.assertNotEqual(result["candidate_version_id"], champion_id)
             self.assertEqual(store.get_champion("BTCUSDT")["version_id"], result["candidate_version_id"])
 
@@ -322,6 +324,42 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             self.assertIn("drawdown_limit_breached", result["rollback"]["reasons"])
             self.assertIn("kill_switch_triggered", result["rollback"]["reasons"])
             self.assertEqual(result["rollback"]["restored_version_id"], previous_champion)
+
+    def test_request_weight_guard_defers_drift_retraining_before_training(self):
+        reference_features, current_features, reference_predictions, current_predictions, performance = _make_drift_inputs()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.12)
+            build_calls = []
+
+            result = run_drift_retraining_cycle(
+                store=store,
+                symbol="BTCUSDT",
+                reference_features=reference_features,
+                current_features=current_features,
+                reference_predictions=reference_predictions,
+                current_predictions=current_predictions,
+                current_performance=performance,
+                bars_since_last_retrain=800,
+                scheduled_window_open=True,
+                train_challenger=lambda: build_calls.append("called"),
+                drift_config={
+                    "request_weight_guard": {
+                        "limit": 6000,
+                        "used": 5900,
+                        "retrain_cost": 200,
+                        "reserve_ratio": 0.05,
+                    }
+                },
+            )
+
+            self.assertEqual(result["retrain_status"], "request_weight_deferred")
+            self.assertEqual(build_calls, [])
+            self.assertTrue(result["drift_guardrails"]["approved"])
+            self.assertTrue(result["request_weight_guard"]["configured"])
+            self.assertFalse(result["request_weight_guard"]["allowed"])
+            self.assertIn("request_weight_headroom_insufficient", result["request_weight_guard"]["reasons"])
 
 
 if __name__ == "__main__":

@@ -76,6 +76,7 @@ def _make_paper_report():
             "funding_breaches": 0,
             "kill_switch_triggers": 0,
         },
+        symbol_filters={"tick_size": 0.1, "step_size": 0.001, "min_notional": 10.0},
     )
 
 

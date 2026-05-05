@@ -174,6 +174,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=10_000.0,
             fee_rate=0.001,
             slippage_rate=0.0005,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="pandas",
             volume=volume,
@@ -184,6 +185,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=10_000.0,
             fee_rate=0.001,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="pandas",
             volume=volume,
@@ -207,6 +209,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
                 equity=10_000.0,
                 fee_rate=0.0,
                 slippage_rate=0.0,
+                execution_prices=close,
                 signal_delay_bars=0,
                 engine="pandas",
                 volume=volume,
@@ -419,6 +422,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=10_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="pandas",
             market="um_futures",
@@ -484,6 +488,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=10_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="pandas",
             market="um_futures",
@@ -497,6 +502,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=10_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="pandas",
             market="um_futures",
@@ -522,6 +528,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=1_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="pandas",
             symbol_filters=filters,
@@ -532,6 +539,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=1_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="vectorbt",
             symbol_filters=filters,
@@ -557,6 +565,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=10_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="pandas",
             allow_short=True,
@@ -567,6 +576,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=10_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="vectorbt",
             allow_short=True,
@@ -587,8 +597,8 @@ class DataBacktestAdapterTest(unittest.TestCase):
             "weighted_average_price": 100.0,
         }
 
-        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="pandas", symbol_filters=filters)
-        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="vectorbt", symbol_filters=filters)
+        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, execution_prices=close, signal_delay_bars=0, engine="pandas", symbol_filters=filters)
+        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, execution_prices=close, signal_delay_bars=0, engine="vectorbt", symbol_filters=filters)
 
         self.assertEqual(pandas_result["order_rejection_reasons"], {"percent_price": 1})
         self.assertEqual(vectorbt_result["order_rejection_reasons"], {"percent_price": 1})
@@ -603,8 +613,8 @@ class DataBacktestAdapterTest(unittest.TestCase):
         signals = pd.Series([0.0, 0.67, 0.0, 0.0], index=index)
         filters = {"market_min_qty": 1.0, "market_max_qty": 5.0, "market_step_size": 1.0}
 
-        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="pandas", symbol_filters=filters)
-        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="vectorbt", symbol_filters=filters)
+        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, execution_prices=close, signal_delay_bars=0, engine="pandas", symbol_filters=filters)
+        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, execution_prices=close, signal_delay_bars=0, engine="vectorbt", symbol_filters=filters)
 
         self.assertEqual(int(pandas_result["adjusted_orders"]), 1)
         self.assertEqual(int(vectorbt_result["adjusted_orders"]), 1)
@@ -619,8 +629,8 @@ class DataBacktestAdapterTest(unittest.TestCase):
         signals = pd.Series([0.0, 1.0, 0.0, 0.0], index=index)
         filters = {"max_notional": 500.0, "notional_apply_max_to_market": True}
 
-        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="pandas", symbol_filters=filters)
-        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="vectorbt", symbol_filters=filters)
+        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, execution_prices=close, signal_delay_bars=0, engine="pandas", symbol_filters=filters)
+        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, execution_prices=close, signal_delay_bars=0, engine="vectorbt", symbol_filters=filters)
 
         self.assertEqual(int(pandas_result["adjusted_orders"]), 1)
         self.assertEqual(int(vectorbt_result["adjusted_orders"]), 1)
@@ -635,8 +645,8 @@ class DataBacktestAdapterTest(unittest.TestCase):
         signals = pd.Series([0.0, 1.0, 1.0, 0.0, 0.0], index=index)
         filters = {"max_position": 4.0, "step_size": 1.0, "max_qty": 10.0}
 
-        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="pandas", market="spot", symbol_filters=filters)
-        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, signal_delay_bars=0, engine="vectorbt", market="spot", symbol_filters=filters)
+        pandas_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, execution_prices=close, signal_delay_bars=0, engine="pandas", market="spot", symbol_filters=filters)
+        vectorbt_result = run_backtest(close=close, signals=signals, equity=1_000.0, fee_rate=0.0, slippage_rate=0.0, execution_prices=close, signal_delay_bars=0, engine="vectorbt", market="spot", symbol_filters=filters)
 
         self.assertAlmostEqual(float(pandas_result["order_ledger"].iloc[0]["executed_position"]), 0.4, places=6)
         self.assertAlmostEqual(float(vectorbt_result["order_ledger"].iloc[0]["executed_position"]), 0.4, places=6)
@@ -681,6 +691,23 @@ class DataBacktestAdapterTest(unittest.TestCase):
                 evaluation_mode="local_certification",
             )
 
+    def test_research_backtest_requires_explicit_same_bar_opt_in(self):
+        index = pd.date_range("2026-03-12", periods=4, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 101.0, 102.0, 103.0], index=index)
+        signals = pd.Series([0.0, 1.0, 0.0, 0.0], index=index)
+
+        with self.assertRaisesRegex(ValueError, "allow_same_bar_fill_fallback=True"):
+            run_backtest(
+                close=close,
+                signals=signals,
+                equity=10_000.0,
+                fee_rate=0.0,
+                slippage_rate=0.0,
+                signal_delay_bars=0,
+                engine="pandas",
+                evaluation_mode="research_only",
+            )
+
     def test_research_backtest_surfaces_same_bar_close_fallback_warning(self):
         index = pd.date_range("2026-03-12", periods=4, freq="1h", tz="UTC")
         close = pd.Series([100.0, 101.0, 102.0, 103.0], index=index)
@@ -695,6 +722,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             signal_delay_bars=0,
             engine="pandas",
             evaluation_mode="research_only",
+            allow_same_bar_fill_fallback=True,
         )
 
         self.assertEqual(result["execution_price_source"], "close_fallback")
@@ -729,7 +757,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
         index = pd.date_range("2026-03-13", periods=10, freq="1h", tz="UTC")
         close = pd.Series([100.0, 103.0, 99.0, 104.0, 98.0, 105.0, 97.0, 106.0, 96.0, 107.0], index=index)
         signals = pd.Series([0.0, 1.0, 1.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0, 0.0], index=index)
-        volume = pd.Series(5.0, index=index)
+        volume = pd.Series(500.0, index=index)
 
         baseline = run_backtest(
             close=close,
@@ -737,6 +765,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=10_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="vectorbt",
             volume=volume,
@@ -747,6 +776,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=10_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="vectorbt",
             volume=volume,
@@ -776,9 +806,10 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=10_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="pandas",
-            significance={"bootstrap_samples": 96, "mean_block_length": 4, "random_state": 7},
+            significance={"bootstrap_samples": 96, "mean_block_length": 4, "random_state": 7, "min_effective_bets": 1},
             benchmark_returns=benchmark_close.pct_change().fillna(0.0),
         )
 
@@ -815,6 +846,7 @@ class DataBacktestAdapterTest(unittest.TestCase):
             equity=10_000.0,
             fee_rate=0.0,
             slippage_rate=0.0,
+            execution_prices=close,
             signal_delay_bars=0,
             engine="pandas",
         )

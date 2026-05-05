@@ -62,14 +62,8 @@ DEFAULT_AUTOML_SEARCH_SPACE = {
     "model": {
         "type": {"type": "categorical", "choices": ["rf", "gbm", "logistic"]},
         "gap": {"type": "categorical", "choices": [12, 24, 48]},
-        "calibration_params": {
-            "c": {"type": "float", "low": 0.1, "high": 10.0, "log": True},
-        },
         "meta_params": {
             "c": {"type": "float", "low": 0.05, "high": 5.0, "log": True},
-        },
-        "meta_calibration_params": {
-            "c": {"type": "float", "low": 0.1, "high": 10.0, "log": True},
         },
         "params": {
             "rf": {
@@ -132,6 +126,8 @@ _MODEL_FAMILY_SPACE_PATHS = {
 _FORBIDDEN_SEARCH_PATHS = {
     ("model", "validation_fraction"),
     ("model", "meta_n_splits"),
+    ("model", "calibration_params"),
+    ("model", "meta_calibration_params"),
     ("labels", "pt_mult"),
     ("labels", "sl_mult"),
     ("labels", "max_holding"),
@@ -1018,10 +1014,15 @@ def _sample_from_spec(trial, name, spec):
 
 
 def _sample_param_group(trial, prefix, group_space):
-    return {
-        key: _sample_from_spec(trial, f"{prefix}.{key}", spec)
-        for key, spec in (group_space or {}).items()
-    }
+    sampled = {}
+    for key, spec in (group_space or {}).items():
+        if isinstance(spec, dict) and "type" not in spec:
+            nested = _sample_param_group(trial, f"{prefix}.{key}", spec)
+            if nested:
+                sampled[key] = nested
+            continue
+        sampled[key] = _sample_from_spec(trial, f"{prefix}.{key}", spec)
+    return sampled
 
 
 def _build_study_storage_path(base_config, automl_config):
@@ -1237,7 +1238,12 @@ def _summarize_training(training):
         "avg_log_loss": primary_training.get("avg_log_loss"),
         "avg_brier_score": primary_training.get("avg_brier_score"),
         "avg_calibration_error": primary_training.get("avg_calibration_error"),
+        "avg_brier_reliability": primary_training.get("avg_brier_reliability"),
+        "avg_brier_resolution": primary_training.get("avg_brier_resolution"),
+        "avg_brier_uncertainty": primary_training.get("avg_brier_uncertainty"),
+        "avg_brier_residual": primary_training.get("avg_brier_residual"),
         "headline_metrics": primary_training.get("headline_metrics", {}),
+        "probability_quality_summary": primary_training.get("probability_quality_summary", {}),
         "selection_metrics_source": primary_source,
         "selection_metric_source": validation_sources.get("selection_metric_source", primary_source),
         "diagnostic_metric_source": validation_sources.get("diagnostic_metric_source"),
@@ -1308,12 +1314,29 @@ def _summarize_backtest(backtest, *, evidence_class=None):
         "total_trades",
         "win_rate",
         "ending_equity",
+        "portfolio_risk_summary",
+        "trade_risk_summary",
+        "metric_qualification",
+        "sample_qualified_metrics",
         "fill_ratio",
         "cancelled_orders",
         "unfilled_notional",
         "average_action_delay_bars",
         "average_fill_delay_bars",
         "max_fill_delay_bars",
+        "evaluation_mode",
+        "required_stress_scenarios",
+        "required_stress_control_intents",
+        "stress_matrix",
+        "stress_realism_ready",
+        "trade_ready_evaluation",
+        "evaluation_limitations",
+        "research_only",
+        "execution_mode",
+        "promotion_execution_ready",
+        "execution_adapter",
+        "execution_backend",
+        "execution_limitations",
     ]
     summary = {key: backtest.get(key) for key in keys}
     equity_curve = backtest.get("equity_curve")
@@ -2192,6 +2215,7 @@ _HARDENED_DEFAULT_SELECTION_GATE_MODES = {
     "execution_realism": "blocking",
     "stress_realism": "blocking",
     "data_certification": "blocking",
+    "regime_coverage": "blocking",
     "param_fragility": "blocking",
     "lookahead_guard": "blocking",
 }
@@ -2295,6 +2319,7 @@ def _resolve_selection_policy(automl_config=None, evaluation_mode=None):
     legacy_profile = policy_profile == "legacy_permissive"
     policy = copy.deepcopy((automl_config or {}).get("selection_policy") or {})
     is_capital_facing = bool(getattr(evaluation_mode, "is_capital_facing", False))
+    apply_binding_defaults = bool(not legacy_profile and (is_capital_facing or evaluation_mode is None))
     enabled = bool(policy.get("enabled", True))
     if not enabled:
         return {
@@ -2315,11 +2340,12 @@ def _resolve_selection_policy(automl_config=None, evaluation_mode=None):
             "require_fold_stability_pass": False,
         }
     default_gate_modes = {}
-    if is_capital_facing and not legacy_profile:
+    if apply_binding_defaults:
         default_gate_modes = copy.deepcopy(_HARDENED_DEFAULT_SELECTION_GATE_MODES)
     gate_modes = default_gate_modes
     gate_modes.update(copy.deepcopy(policy.get("gate_modes") or {}))
-    return {
+    resolved_policy = copy.deepcopy(policy)
+    resolved_policy.update({
         "enabled": True,
         "policy_profile": policy_profile,
         "is_capital_facing": is_capital_facing,
@@ -2330,15 +2356,18 @@ def _resolve_selection_policy(automl_config=None, evaluation_mode=None):
         "max_param_fragility": float(policy.get("max_param_fragility", 0.30)),
         "max_complexity_score": float(policy.get("max_complexity_score", 18.0)),
         "min_validation_trade_count": int(policy.get("min_validation_trade_count", 10)),
+        "min_distinct_regimes": int(policy.get("min_distinct_regimes", 2)),
+        "max_dominant_regime_share": float(policy.get("max_dominant_regime_share", 0.80)),
         "min_locked_holdout_score": float(policy.get("min_locked_holdout_score", 0.0)),
         "max_feature_count_ratio": float(policy.get("max_feature_count_ratio", 1.0)),
         "max_trials_per_model_family": int(policy.get("max_trials_per_model_family", 64)),
         "local_perturbation_limit": int(policy.get("local_perturbation_limit", 8)),
         "require_locked_holdout_pass": bool(
-            policy.get("require_locked_holdout_pass", bool(is_capital_facing and not legacy_profile))
+            policy.get("require_locked_holdout_pass", apply_binding_defaults)
         ),
-        "require_fold_stability_pass": bool(policy.get("require_fold_stability_pass", bool(is_capital_facing))),
-    }
+        "require_fold_stability_pass": bool(policy.get("require_fold_stability_pass", apply_binding_defaults)),
+    })
+    return resolved_policy
 
 
 def _resolve_fold_stability_gate(training_summary, selection_policy):
@@ -2366,11 +2395,10 @@ def _resolve_evidence_gate(gate_name, report, *, selection_policy=None, failure_
     failure_reason = failure_reason or f"{gate_name}_failed"
     missing_reason = missing_reason or f"{gate_name}_evidence_missing"
     policy_profile = str((selection_policy or {}).get("policy_profile") or "").strip().lower()
-    is_capital_facing = bool((selection_policy or {}).get("is_capital_facing", False))
     default_mode = "advisory" if policy_profile == "legacy_permissive" else "blocking"
     gate_mode = resolve_promotion_gate_mode(selection_policy, gate_name, default=default_mode)
     if not details:
-        passed = gate_mode != "blocking" or not is_capital_facing
+        passed = gate_mode != "blocking"
         return {
             "details": {},
             "status": "unknown",
@@ -2399,7 +2427,7 @@ def _resolve_evidence_gate(gate_name, report, *, selection_policy=None, failure_
     normalized_details = dict(details)
     normalized_details["status"] = status
     normalized_details["reasons"] = reasons
-    passed = status == "passed" or (status == "unknown" and (gate_mode != "blocking" or not is_capital_facing))
+    passed = status == "passed" or (status == "unknown" and gate_mode != "blocking")
     return {
         "details": normalized_details,
         "status": status,
@@ -3315,6 +3343,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         data_certification = dict(training_summary.get("data_certification") or {})
         signal_decay = dict(training_summary.get("signal_decay") or {})
         regime_ablation_summary = dict((training_summary.get("regime") or {}).get("ablation_summary") or {})
+        regime_coverage_summary = dict((training_summary.get("regime") or {}).get("coverage_summary") or {})
         operational_monitoring = dict(training_summary.get("operational_monitoring") or {})
         feature_portability_gate = _resolve_evidence_gate(
             "feature_portability",
@@ -3334,6 +3363,13 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             selection_policy=selection_policy,
             failure_reason="regime_stability_failed",
             missing_reason="regime_ablation_evidence_missing",
+        )
+        regime_coverage_gate = _resolve_evidence_gate(
+            "regime_coverage",
+            regime_coverage_summary,
+            selection_policy=selection_policy,
+            failure_reason="regime_coverage_failed",
+            missing_reason="regime_coverage_unavailable",
         )
         operational_health_pass = bool(promotion_gates.get("operational_health", True))
         cross_venue_integrity_gate = _resolve_evidence_gate(
@@ -3357,6 +3393,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         feature_portability_pass = feature_portability_gate["passed"]
         feature_admission_pass = feature_admission_gate["passed"]
         regime_stability_pass = regime_stability_gate["passed"]
+        regime_coverage_pass = regime_coverage_gate["passed"]
         cross_venue_integrity_pass = cross_venue_integrity_gate["passed"]
         data_certification_pass = data_certification_gate["passed"]
         signal_decay_pass = signal_decay_gate["passed"]
@@ -3385,6 +3422,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "feature_portability": feature_portability_pass,
             "feature_admission": feature_admission_pass,
             "regime_stability": regime_stability_pass,
+            "regime_coverage": regime_coverage_pass,
             "operational_health": operational_health_pass,
             "cross_venue_integrity": cross_venue_integrity_pass,
             "data_certification": data_certification_pass,
@@ -3441,6 +3479,18 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 _gs("regime_stability", ec["regime_stability"],
                     regime_ablation_summary.get("stability_improvement"), True,
                     regime_stability_gate["reason"], regime_stability_gate["details"], mode=regime_stability_gate["mode"]),
+                _gs("regime_coverage", ec["regime_coverage"],
+                    {
+                        "fit": regime_coverage_summary.get("max_dominant_share_fit"),
+                        "validation": regime_coverage_summary.get("max_dominant_share_validation"),
+                        "test": regime_coverage_summary.get("max_dominant_share_test"),
+                    },
+                    regime_coverage_summary.get("configured_thresholds")
+                    or {
+                        "min_distinct_regimes": selection_policy.get("min_distinct_regimes"),
+                        "max_dominant_share": selection_policy.get("max_dominant_regime_share"),
+                    },
+                    regime_coverage_gate["reason"], regime_coverage_gate["details"], mode=regime_coverage_gate["mode"]),
                 _gs("operational_health", ec["operational_health"],
                     operational_monitoring.get("healthy"), True,
                     _first_failure_reason(operational_monitoring, "operational_monitoring_failed"), operational_monitoring),
@@ -4181,6 +4231,9 @@ def _sample_trial_overrides(trial, search_space):
         model_overrides = {"type": model_type}
         if "gap" in model_space:
             model_overrides["gap"] = _sample_from_spec(trial, "model.gap", model_space["gap"])
+        regime_aware_overrides = _sample_param_group(trial, "model.regime_aware", model_space.get("regime_aware", {}))
+        if regime_aware_overrides:
+            model_overrides["regime_aware"] = regime_aware_overrides
         for key, prefix in [
             ("calibration_params", "model.calibration_params"),
             ("meta_params", "model.meta_params"),
@@ -4838,11 +4891,14 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             reason=None if replication_report.get("promotion_pass", False) else _first_failure_reason(replication_report, "replication_failed"),
             details=replication_report,
         )
-    execution_realism = evaluate_execution_realism_gate(
+    post_selection_backtest = (
         (locked_holdout or {}).get("backtest")
-        or validation_holdout.get("backtest")
         or best_trial_report.get("backtest")
-        or {},
+        or validation_holdout.get("backtest")
+        or {}
+    )
+    execution_realism = evaluate_execution_realism_gate(
+        post_selection_backtest,
         policy=selection_policy,
     )
     best_trial_report["selection_policy"]["eligibility_checks"]["execution_realism"] = bool(execution_realism["passed"])
@@ -4857,12 +4913,17 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         reason=execution_realism.get("reason"),
         details=execution_realism,
     )
+    training_regime_summary = dict((best_trial_report.get("training") or {}).get("regime") or {})
+    regime_aware_summary = dict(training_regime_summary.get("regime_aware") or {})
+    regime_coverage_summary = dict(training_regime_summary.get("coverage_summary") or {})
+    if regime_coverage_summary:
+        regime_aware_summary.setdefault("strategy", regime_coverage_summary.get("strategy"))
+        regime_aware_summary.setdefault("fallback_rows", int(regime_coverage_summary.get("fallback_rows") or 0))
+        regime_aware_summary.setdefault("unseen_regimes", list(regime_coverage_summary.get("unseen_regimes") or []))
     stress_realism = evaluate_stress_realism_gate(
-        (locked_holdout or {}).get("backtest")
-        or validation_holdout.get("backtest")
-        or best_trial_report.get("backtest")
-        or {},
+        post_selection_backtest,
         policy=selection_policy,
+        regime_aware_summary=regime_aware_summary,
     )
     best_trial_report["selection_policy"]["eligibility_checks"]["stress_realism"] = bool(stress_realism["passed"])
     promotion_eligibility_report = upsert_promotion_gate(

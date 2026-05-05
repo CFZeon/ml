@@ -39,6 +39,119 @@ def _coerce_regime_label_series(value):
     return _safe_series(value)
 
 
+def _coerce_interval_to_timedelta(value):
+    if value in (None, "", False):
+        return None
+    if isinstance(value, pd.Timedelta):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return pd.Timedelta(text)
+    except Exception:
+        pass
+
+    if len(text) < 2 or not text[:-1].isdigit():
+        return None
+    amount = int(text[:-1])
+    unit = text[-1]
+    if unit == "m":
+        return pd.Timedelta(minutes=amount)
+    if unit == "h":
+        return pd.Timedelta(hours=amount)
+    if unit == "d":
+        return pd.Timedelta(days=amount)
+    if unit == "w":
+        return pd.Timedelta(days=7 * amount)
+    if unit == "M":
+        return pd.Timedelta(days=30 * amount)
+    return None
+
+
+def _resolve_drift_policy(config=None):
+    configured = dict(config or {})
+    resolved = {
+        "psi_threshold": 0.2,
+        "psi_feature_share_threshold": 0.3,
+        "ks_significance": 0.05,
+        "prediction_kl_threshold": 0.1,
+        "regime_psi_threshold": 0.2,
+        "regime_total_variation_threshold": 0.25,
+        "regime_transition_threshold": 0.2,
+        "cooldown_days": 21.0,
+        "cooldown_bars": None,
+        "max_days_between_retrain": 28.0,
+        "max_bars_between_retrain": None,
+        "min_sample_days": (200.0 / 24.0),
+        "min_samples": None,
+        "expected_trades_per_day": None,
+        "min_expected_trades": None,
+        "min_drift_signals": 2,
+        "adwin_delta": 0.002,
+        "interval": None,
+        "post_retrain_warmup_required": True,
+        "post_retrain_warmup_mode": "paper",
+    }
+    resolved.update(configured)
+
+    interval = resolved.get("interval") or resolved.get("bar_interval")
+    interval_delta = _coerce_interval_to_timedelta(interval)
+    bars_per_day = None
+    if interval_delta is not None and interval_delta > pd.Timedelta(0):
+        bars_per_day = (24.0 * 60.0 * 60.0) / float(interval_delta.total_seconds())
+
+    cooldown_bars = resolved.get("cooldown_bars")
+    if cooldown_bars is None:
+        if bars_per_day is not None:
+            cooldown_bars = int(max(1, math.ceil(float(resolved.get("cooldown_days", 21.0)) * bars_per_day)))
+        else:
+            cooldown_bars = 500
+
+    min_samples = resolved.get("min_samples")
+    if min_samples is None:
+        if bars_per_day is not None:
+            min_samples = int(
+                max(1, math.ceil(float(resolved.get("min_sample_days", (200.0 / 24.0))) * bars_per_day))
+            )
+        else:
+            min_samples = 200
+
+    trade_rate_min_samples = None
+    expected_trades_per_day = resolved.get("expected_trades_per_day")
+    min_expected_trades = resolved.get("min_expected_trades")
+    if (
+        bars_per_day is not None
+        and expected_trades_per_day not in (None, 0, 0.0)
+        and min_expected_trades not in (None, 0, 0.0)
+    ):
+        trade_rate_min_samples = int(
+            max(
+                1,
+                math.ceil((float(min_expected_trades) / float(expected_trades_per_day)) * bars_per_day),
+            )
+        )
+        min_samples = max(int(min_samples), trade_rate_min_samples)
+
+    max_bars_between_retrain = resolved.get("max_bars_between_retrain")
+    if max_bars_between_retrain is None:
+        if bars_per_day is not None:
+            max_bars_between_retrain = int(
+                max(1, math.ceil(float(resolved.get("max_days_between_retrain", 28.0)) * bars_per_day))
+            )
+        else:
+            max_bars_between_retrain = 24 * 28
+
+    resolved["interval"] = interval
+    resolved["bars_per_day"] = None if bars_per_day is None else float(bars_per_day)
+    resolved["cooldown_bars"] = int(max(0, int(cooldown_bars)))
+    resolved["min_samples"] = int(max(1, int(min_samples)))
+    resolved["max_bars_between_retrain"] = int(max(1, int(max_bars_between_retrain)))
+    resolved["trade_rate_min_samples"] = None if trade_rate_min_samples is None else int(trade_rate_min_samples)
+    return resolved
+
+
 def _population_stability_index(reference, current, bins=10, epsilon=1e-6):
     reference_series = _safe_series(reference).dropna().astype(float)
     current_series = _safe_series(current).dropna().astype(float)
@@ -206,21 +319,7 @@ class DriftMonitor:
         self.reference_features = _safe_frame(reference_features)
         self.reference_predictions = _safe_frame(reference_predictions)
         self.reference_regimes = _coerce_regime_label_series(reference_regimes)
-        self.config = {
-            "psi_threshold": 0.2,
-            "psi_feature_share_threshold": 0.3,
-            "ks_significance": 0.05,
-            "prediction_kl_threshold": 0.1,
-            "regime_psi_threshold": 0.2,
-            "regime_total_variation_threshold": 0.25,
-            "regime_transition_threshold": 0.2,
-            "cooldown_bars": 500,
-            "max_bars_between_retrain": 24 * 28,
-            "min_samples": 200,
-            "min_drift_signals": 2,
-            "adwin_delta": 0.002,
-        }
-        self.config.update(dict(config or {}))
+        self.config = _resolve_drift_policy(config)
         self.performance_detector = ADWINDetector(delta=self.config["adwin_delta"])
 
     def check(self, current_features, current_predictions=None, current_performance=None,
@@ -338,8 +437,13 @@ class DriftMonitor:
             "regime_drift": regime_drift,
             "performance_updates": performance_updates,
             "performance_drift": performance_drift,
+            "interval": self.config.get("interval"),
+            "bars_per_day": self.config.get("bars_per_day"),
+            "cooldown_bars": int(self.config["cooldown_bars"]),
+            "min_samples": int(self.config["min_samples"]),
             "model_ttl_expired": model_ttl_expired,
             "max_bars_between_retrain": max_bars_between_retrain,
+            "trade_rate_min_samples": self.config.get("trade_rate_min_samples"),
             "cooldown_active": cooldown_active,
             "minimum_samples_met": enough_samples,
             "evidence_count": evidence_count,
@@ -354,7 +458,7 @@ class DriftMonitor:
 
 
 def evaluate_drift_guardrails(drift_report, policy=None):
-    policy = dict(policy or {})
+    policy = _resolve_drift_policy(policy)
     minimum_samples = int(policy.get("min_samples", 200))
     cooldown_bars = int(policy.get("cooldown_bars", 500))
     minimum_signal_count = int(policy.get("min_drift_signals", 2))
@@ -387,8 +491,13 @@ def evaluate_drift_guardrails(drift_report, policy=None):
         "reasons": reasons,
         "sample_count": sample_count,
         "evidence_count": evidence_count,
+        "interval": policy.get("interval"),
+        "bars_per_day": policy.get("bars_per_day"),
+        "cooldown_bars": int(cooldown_bars),
+        "min_samples": int(minimum_samples),
         "model_ttl_expired": model_ttl_expired,
         "max_bars_between_retrain": max_bars_between_retrain,
+        "trade_rate_min_samples": policy.get("trade_rate_min_samples"),
     }
 
 

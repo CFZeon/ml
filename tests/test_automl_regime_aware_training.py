@@ -145,22 +145,12 @@ class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
                     "max_features": {"type": "categorical", "choices": [12]},
                     "min_mi_threshold": {"type": "categorical", "choices": [0.0]},
                 },
-                "labels": {
-                    "pt_mult": {"type": "categorical", "choices": [1.5]},
-                    "sl_mult": {"type": "categorical", "choices": [1.5]},
-                    "max_holding": {"type": "categorical", "choices": [12]},
-                    "min_return": {"type": "categorical", "choices": [0.0]},
-                    "volatility_window": {"type": "categorical", "choices": [12]},
-                    "barrier_tie_break": {"type": "categorical", "choices": ["sl"]},
-                },
                 "regime": {
                     "n_regimes": {"type": "categorical", "choices": [2]},
                 },
                 "model": {
                     "type": {"type": "categorical", "choices": ["logistic"]},
                     "gap": {"type": "categorical", "choices": [6]},
-                    "validation_fraction": {"type": "categorical", "choices": [0.2]},
-                    "meta_n_splits": {"type": "categorical", "choices": [2]},
                     "regime_aware": {
                         "enabled": {"type": "categorical", "choices": [True]},
                         "strategy": {"type": "categorical", "choices": ["feature"]},
