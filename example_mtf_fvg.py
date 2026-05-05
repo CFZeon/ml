@@ -5,6 +5,11 @@ Feature stack
   Base indicators (15m)
     - RSI(14), ATR(14)
     - FVG with 1 % minimum gap width filter
+  
+    Optional derivatives indicators (fetched inside indicators, no pipeline changes)
+        - Funding-rate first-derivative context from Binance USD-M futures
+                - Open-interest non-level change context from Binance USD-M futures
+        - Combined funding/OI interaction features
 
   Multi-timeframe context (resampled from 15m base via context_timeframes)
     - 1h, 4h, 1d OHLCV-derived statistics (trend, volatility, breakout, etc.)
@@ -27,6 +32,9 @@ Usage
 -----
     python example_mtf_fvg.py
     python example_mtf_fvg.py --local-certification
+
+When live open-interest context is enabled, the example automatically switches
+to a recent rolling window because Binance only exposes recent OI history.
 """
 
 import numpy as np
@@ -34,6 +42,9 @@ import pandas as pd
 
 from core import ResearchPipeline, fetch_binance_bars
 from core.execution import NAUTILUS_AVAILABLE
+from core.indicators.derivatives_combined import DerivativesCombined
+from core.indicators.funding_rate import FundingRateContext
+from core.indicators.open_interest import OpenInterestContext
 from example_utils import (
     build_custom_data_entry,
     build_spot_research_config,
@@ -55,17 +66,182 @@ from example_utils import (
 
 SYMBOL = "BTCUSDT"
 BASE_INTERVAL = "15m"
+BASE_INTERVAL_FLOOR = "15min"
 
 # Model window: 6 months of 15 m bars  ≈ 17 520 rows
-MODEL_START = "2024-01-01"
-MODEL_END = "2024-07-01"
+MODEL_START_DEFAULT = pd.Timestamp("2024-01-01", tz="UTC")
+MODEL_END_DEFAULT = pd.Timestamp("2024-07-01", tz="UTC")
 
 # SMA(200) needs 200 daily bars of warmup before MODEL_START.
 # Fetching 1d bars from 2 years prior ensures the SMA is fully warm on day 1.
-SMA_HISTORY_START = "2022-01-01"
+SMA_WARMUP_DAYS = 730
 
 # Minimum FVG width as a fraction of close price (1 %).
 MIN_GAP_PCT = 0.01
+
+DERIVATIVES_FLAGS = {
+    "use_funding_rate": True,
+    "use_open_interest": True,
+    "use_derivatives_combined": True,
+}
+
+DERIVATIVES_SETTINGS = {
+    "recent_window_days": 28,
+    "funding_window": 9,
+    "funding_warmup": "10D",
+    "funding_max_age": "8h",
+    "funding_zscore_threshold": 2.0,
+    "funding_min_coverage": 0.5,
+    "oi_period": "5m",
+    "oi_change_horizon": "4h",
+    "oi_trend_short_span": 12,
+    "oi_trend_long_span": 48,
+    "oi_warmup": "2D",
+    "oi_max_age": "30m",
+    "oi_min_coverage": 0.5,
+    "combined_volatility_window": 20,
+}
+
+
+def resolve_example_window():
+    """Resolve a market-data window compatible with optional live OI context."""
+    if not DERIVATIVES_FLAGS.get("use_open_interest"):
+        model_start = MODEL_START_DEFAULT
+        model_end = MODEL_END_DEFAULT
+        window_mode = "historical_static"
+        note = None
+    else:
+        model_end = pd.Timestamp.now(tz="UTC").floor(BASE_INTERVAL_FLOOR)
+        model_start = model_end - pd.Timedelta(days=DERIVATIVES_SETTINGS["recent_window_days"])
+        window_mode = "recent_live_derivatives"
+        note = (
+            "openInterestHist is a recent-history endpoint, so the example uses a "
+            f"rolling {DERIVATIVES_SETTINGS['recent_window_days']}-day window when OI is enabled."
+        )
+
+    sma_history_start = model_start - pd.Timedelta(days=SMA_WARMUP_DAYS)
+    return {
+        "model_start": model_start,
+        "model_end": model_end,
+        "sma_history_start": sma_history_start,
+        "window_mode": window_mode,
+        "note": note,
+    }
+
+
+def format_config_timestamp(timestamp: pd.Timestamp) -> str:
+    """Serialize UTC timestamps for example config helpers that add tzinfo."""
+    return timestamp.tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_indicator_specs(symbol: str):
+    """Build indicator instances without changing pipeline registration code."""
+    indicators = [
+        {"kind": "rsi", "params": {"period": 14}},
+        {"kind": "atr", "params": {"period": 14}},
+        {
+            "kind": "fvg",
+            "params": {
+                "name": "fvg_base",
+                "min_gap_pct": MIN_GAP_PCT,
+            },
+        },
+    ]
+
+    if DERIVATIVES_FLAGS.get("use_funding_rate"):
+        indicators.append(
+            FundingRateContext(
+                symbol=symbol,
+                name="funding_ctx",
+                rolling_window=DERIVATIVES_SETTINGS["funding_window"],
+                warmup=DERIVATIVES_SETTINGS["funding_warmup"],
+                max_age=DERIVATIVES_SETTINGS["funding_max_age"],
+                zscore_threshold=DERIVATIVES_SETTINGS["funding_zscore_threshold"],
+                min_coverage=DERIVATIVES_SETTINGS["funding_min_coverage"],
+            )
+        )
+
+    if DERIVATIVES_FLAGS.get("use_open_interest"):
+        indicators.append(
+            OpenInterestContext(
+                symbol=symbol,
+                name="oi_ctx",
+                period=DERIVATIVES_SETTINGS["oi_period"],
+                change_horizon=DERIVATIVES_SETTINGS["oi_change_horizon"],
+                trend_short_span=DERIVATIVES_SETTINGS["oi_trend_short_span"],
+                trend_long_span=DERIVATIVES_SETTINGS["oi_trend_long_span"],
+                warmup=DERIVATIVES_SETTINGS["oi_warmup"],
+                max_age=DERIVATIVES_SETTINGS["oi_max_age"],
+                min_coverage=DERIVATIVES_SETTINGS["oi_min_coverage"],
+            )
+        )
+
+    if (
+        DERIVATIVES_FLAGS.get("use_derivatives_combined")
+        and DERIVATIVES_FLAGS.get("use_funding_rate")
+        and DERIVATIVES_FLAGS.get("use_open_interest")
+    ):
+        indicators.append(
+            DerivativesCombined(
+                name="deriv_combo",
+                funding_prefix="funding_ctx",
+                oi_prefix="oi_ctx",
+                funding_window=DERIVATIVES_SETTINGS["funding_window"],
+                oi_change_horizon=DERIVATIVES_SETTINGS["oi_change_horizon"],
+                volatility_window=DERIVATIVES_SETTINGS["combined_volatility_window"],
+            )
+        )
+
+    return indicators
+
+
+def print_derivatives_indicator_summary(indicator_run):
+    """Print local diagnostics for funding/OI derivative coverage and distributions."""
+    funding_meta = indicator_run.metadata.get("funding_ctx", {})
+    oi_meta = indicator_run.metadata.get("oi_ctx", {})
+    funding_alignment = dict(funding_meta.get("alignment") or {})
+    oi_alignment = dict(oi_meta.get("alignment") or {})
+
+    if funding_alignment:
+        print(
+            "  funding coverage : "
+            f"{funding_alignment.get('coverage', 0.0):.1%}  "
+            f"matched={funding_alignment.get('matched_rows', 0)}  "
+            f"stale={funding_alignment.get('stale_rows', 0)}"
+        )
+    if oi_alignment:
+        print(
+            "  OI coverage      : "
+            f"{oi_alignment.get('coverage', 0.0):.1%}  "
+            f"matched={oi_alignment.get('matched_rows', 0)}  "
+            f"stale={oi_alignment.get('stale_rows', 0)}"
+        )
+
+    if "funding_ctx_delta" in indicator_run.frame:
+        funding_delta = indicator_run.frame["funding_ctx_delta"].dropna()
+        if not funding_delta.empty:
+            print(
+                "  funding delta    : "
+                f"mean={funding_delta.mean():.6f}  std={funding_delta.std(ddof=0):.6f}  "
+                f"p05={funding_delta.quantile(0.05):.6f}  p95={funding_delta.quantile(0.95):.6f}"
+            )
+
+    if "oi_ctx_log_change_4h" in indicator_run.frame:
+        oi_log_change = indicator_run.frame["oi_ctx_log_change_4h"].dropna()
+        if not oi_log_change.empty:
+            print(
+                "  OI log change    : "
+                f"mean={oi_log_change.mean():.6f}  std={oi_log_change.std(ddof=0):.6f}  "
+                f"p05={oi_log_change.quantile(0.05):.6f}  p95={oi_log_change.quantile(0.95):.6f}"
+            )
+    if "oi_ctx_pressure_vs_notional_volume" in indicator_run.frame:
+        oi_pressure = indicator_run.frame["oi_ctx_pressure_vs_notional_volume"].dropna()
+        if not oi_pressure.empty:
+            print(
+                "  OI pressure      : "
+                f"mean={oi_pressure.mean():.6f}  std={oi_pressure.std(ddof=0):.6f}  "
+                f"p05={oi_pressure.quantile(0.05):.6f}  p95={oi_pressure.quantile(0.95):.6f}"
+            )
 
 
 # ── enhanced FVG feature builder ──────────────────────────────────────────────
@@ -248,6 +424,12 @@ def build_mtf_regime_features(pipeline) -> pd.DataFrame:
         "efvg_bull_active_count",
         "efvg_bear_active_count",
         "price_vs_sma200_daily",
+        "funding_ctx_z_9",
+        "funding_ctx_delta",
+        "oi_ctx_log_change_4h",
+        "oi_ctx_trend_spread",
+        "oi_ctx_pressure_vs_notional_volume",
+        "deriv_combo_crowding_proxy",
     ]:
         if col in available:
             cols[col] = features[col]
@@ -262,6 +444,19 @@ def main():
         "Multi-timeframe FVG + SMA(200) daily example (BTCUSDT 15m spot)."
     )
     sep = "=" * 60
+    window = resolve_example_window()
+    model_start = window["model_start"]
+    model_end = window["model_end"]
+    sma_history_start = window["sma_history_start"]
+    config_model_start = format_config_timestamp(model_start)
+    config_model_end = format_config_timestamp(model_end)
+    indicators = build_indicator_specs(SYMBOL)
+
+    if window["note"]:
+        print(f"{sep}\nDerivatives window mode: {window['window_mode']}\n{sep}")
+        print(f"  note  : {window['note']}")
+        print(f"  start : {model_start}")
+        print(f"  end   : {model_end}")
 
     # ── 1. Pre-fetch data for custom feature computation ───────────────────────
     print_section(sep, 1, f"Pre-fetching {SYMBOL} data for custom feature computation")
@@ -269,8 +464,8 @@ def main():
     base_bars = fetch_binance_bars(
         symbol=SYMBOL,
         interval=BASE_INTERVAL,
-        start=MODEL_START,
-        end=MODEL_END,
+        start=model_start,
+        end=model_end,
         market="spot",
     )
     print(f"  {BASE_INTERVAL} bars (model window) : {len(base_bars)}")
@@ -279,8 +474,8 @@ def main():
     daily_bars = fetch_binance_bars(
         symbol=SYMBOL,
         interval="1d",
-        start=SMA_HISTORY_START,
-        end=MODEL_END,
+        start=sma_history_start,
+        end=model_end,
         market="spot",
     )
     print(f"  1d bars (SMA history)      : {len(daily_bars)}")
@@ -350,24 +545,14 @@ def main():
     config = build_spot_research_config(
         SYMBOL,
         BASE_INTERVAL,
-        MODEL_START,
-        MODEL_END,
-        indicators=[
-            {"kind": "rsi",  "params": {"period": 14}},
-            {"kind": "atr",  "params": {"period": 14}},
-            {
-                "kind": "fvg",
-                "params": {
-                    "name": "fvg_base",
-                    "min_gap_pct": MIN_GAP_PCT,   # 1 % width filter on the indicator too
-                },
-            },
-        ],
+        config_model_start,
+        config_model_end,
+        indicators=indicators,
         custom_data=[efvg_entry, sma200_entry],
         config_overrides={
             "data": {
-                # Futures context data is not aligned to 15m bars — disable it
-                # to avoid the TTL unknown-rate guard dropping all rows.
+                # Keep the shared futures-context path disabled so this example
+                # exercises the indicator-only extension path.
                 "futures_context": {"enabled": False},
             },
             "features": {
@@ -441,6 +626,11 @@ def main():
             },
         },
     )
+    config["derivatives"] = {
+        **DERIVATIVES_FLAGS,
+        "window_mode": window["window_mode"],
+        "recent_window_days": DERIVATIVES_SETTINGS["recent_window_days"],
+    }
 
     try:
         config = prepare_example_runtime_config(
@@ -467,7 +657,7 @@ def main():
         print(f"  mode  : {example_runtime.get('mode')}")
 
     # ── 7. Indicators ──────────────────────────────────────────────────────────
-    print_section(sep, 7, "Running indicators  (RSI, ATR, FVG 1 % min-gap)")
+    print_section(sep, 7, "Running indicators  (RSI, ATR, FVG, funding, OI, combined)")
 
     indicator_run = pipeline.run_indicators()
     fvg_meta = indicator_run.metadata.get("fvg_base", {})
@@ -483,15 +673,20 @@ def main():
     print(f"  FVG output cols  : {fvg_meta.get('output_columns', [])}")
     print(f"  bars w/ active bull gap (indicator): {active_bull_ind}")
     print(f"  bars w/ active bear gap (indicator): {active_bear_ind}")
+    print_derivatives_indicator_summary(indicator_run)
 
     # ── 8. Features ────────────────────────────────────────────────────────────
-    print_section(sep, 8, "Building features  (MTF 1h/4h/1d + eFVG + SMA200)")
+    print_section(sep, 8, "Building features  (MTF + eFVG + SMA200 + derivatives)")
 
     features = pipeline.build_features()
     mtf_cols  = [c for c in features.columns if c.startswith("mtf_")]
     efvg_cols = [c for c in features.columns if "efvg_" in c]
     sma_cols  = [c for c in features.columns if "sma200" in c]
     fvg_ind_cols = [c for c in features.columns if c.startswith("fvg_base")]
+    deriv_cols = [
+        c for c in features.columns
+        if c.startswith("funding_ctx_") or c.startswith("oi_ctx_") or c.startswith("deriv_combo_")
+    ]
 
     print(f"  total features    : {features.shape[1]}")
     print(f"  MTF features      : {len(mtf_cols)}")
@@ -502,6 +697,7 @@ def main():
     print(f"  eFVG features     : {len(efvg_cols)}  {efvg_cols}")
     print(f"  SMA200 features   : {len(sma_cols)}  {sma_cols}")
     print(f"  FVG-indicator cols: {len(fvg_ind_cols)}")
+    print(f"  derivatives cols  : {len(deriv_cols)}")
 
     # Sparse event-driven custom features can remain NaN for long stretches
     # (for example when one side of FVG is inactive). Use neutral zero values
@@ -509,7 +705,13 @@ def main():
     custom_sparse_cols = [
         col
         for col in features.columns
-        if col.startswith("enhanced_fvg_") or col.startswith("sma200_daily_")
+        if (
+            col.startswith("enhanced_fvg_")
+            or col.startswith("sma200_daily_")
+            or col.startswith("funding_ctx_")
+            or col.startswith("oi_ctx_")
+            or col.startswith("deriv_combo_")
+        )
     ]
     if custom_sparse_cols:
         na_before = int(features[custom_sparse_cols].isna().sum().sum())
@@ -520,6 +722,9 @@ def main():
             "  custom NaN fill  : "
             f"cols={len(custom_sparse_cols)}  before={na_before}  after={na_after}"
         )
+    if deriv_cols:
+        deriv_nonzero = int(features[deriv_cols].fillna(0.0).abs().sum().gt(0).sum())
+        print(f"  derivatives nonzero feature cols : {deriv_nonzero}")
 
     stationarity = pipeline.check_stationarity()
     print_stationarity_summary(stationarity)
