@@ -1,0 +1,9 @@
+"""Multi-feature futures example: technical signals plus funding-rate context."""
+
+from pathlib import Path
+
+from experiments import run_experiment
+
+
+if __name__ == "__main__":
+    run_experiment(Path(__file__).resolve().parents[1] / "configs" / "btc_multi_feature_funding.yaml")

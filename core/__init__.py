@@ -67,6 +67,8 @@ from .indicators import (
     WaveTrendOscillator,
     build_indicator,
     build_indicators,
+    discover_indicators,
+    list_available_indicators,
     run_indicators,
     attach_indicators,
 )

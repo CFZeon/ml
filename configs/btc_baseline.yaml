@@ -1,0 +1,34 @@
+experiment:
+  name: btc_baseline
+  description: Minimal single-symbol baseline for quick iteration.
+data:
+  source: binance_bars
+  market: spot
+  symbol: BTCUSDT
+  interval: 1h
+  start: 2024-01-01
+  end: 2024-04-01
+  futures_context:
+    enabled: false
+indicators:
+  - kind: returns
+    params:
+      periods: [1, 3, 6]
+  - kind: volatility
+    params:
+      window: 24
+model:
+  type: gbm
+  cv_method: walk_forward
+  n_splits: 3
+  train_size: 720
+  test_size: 168
+  gap: 24
+  expanding: false
+stationarity:
+  transform_order: [diff]
+backtest:
+  engine: vectorbt
+quick_overrides:
+  data:
+    end: 2024-03-01

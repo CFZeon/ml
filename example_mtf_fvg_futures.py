@@ -30,38 +30,29 @@ Usage
 
 import pandas as pd
 
-from core import ResearchPipeline, fetch_binance_bars
+from core import fetch_binance_bars
 from core.execution import NAUTILUS_AVAILABLE
 from core.indicators._derivatives_binance import fetch_funding_history
+from example_entrypoints import parse_example_args, run_example
 from example_mtf_fvg import (
     BASE_INTERVAL,
     DERIVATIVES_FLAGS,
     DERIVATIVES_SETTINGS,
     MIN_GAP_PCT,
     SYMBOL,
+    SMA_WARMUP_DAYS,
+    _fill_sparse_feature_columns,
     build_daily_sma200,
     build_indicator_specs,
     build_mtf_regime_features,
     compute_enhanced_fvg_features,
     format_config_timestamp,
-    print_derivatives_indicator_summary,
     resolve_example_window,
 )
 from example_utils import (
     build_custom_data_entry,
     build_futures_research_config,
-    parse_local_certification_args,
-    prepare_example_runtime_config,
-    print_alignment_summary,
-    print_backtest_summary,
-    print_feature_selection_summary,
-    print_label_summary,
-    print_regime_summary,
     print_section,
-    print_signal_summary,
-    print_stationarity_summary,
-    print_training_summary,
-    print_weight_summary,
 )
 
 
@@ -84,15 +75,31 @@ def align_runtime_funding_to_index(funding_frame: pd.DataFrame, index: pd.Dateti
     return funding.reset_index(drop=True)
 
 
+def _attach_runtime_funding_context(pipeline, data: pd.DataFrame) -> pd.DataFrame:
+    funding_frame = fetch_funding_history(
+        SYMBOL,
+        data.index.min(),
+        data.index.max() + pd.Timedelta(milliseconds=1),
+    )
+    funding_frame = align_runtime_funding_to_index(funding_frame, data.index)
+    pipeline.state["futures_context"] = {
+        **dict(pipeline.state.get("futures_context") or {}),
+        "funding": funding_frame.set_index("timestamp").sort_index(),
+    }
+    return data
+
+
 def main():
-    args = parse_local_certification_args(
+    args = parse_example_args(
         "Multi-timeframe FVG + SMA(200) daily futures example (BTCUSDT 15m USD-M futures)."
     )
     sep = "=" * 60
     window = resolve_example_window()
     model_start = window["model_start"]
     model_end = window["model_end"]
-    sma_history_start = window["sma_history_start"]
+    if args.quick:
+        model_start = max(model_start, model_end - pd.Timedelta(days=10))
+    sma_history_start = model_start - pd.Timedelta(days=SMA_WARMUP_DAYS)
     config_model_start = format_config_timestamp(model_start)
     config_model_end = format_config_timestamp(model_end)
     indicators = build_indicator_specs(SYMBOL)
@@ -240,129 +247,28 @@ def main():
         },
     )
     config["data"]["custom_data"] = [efvg_entry, sma200_entry]
+    config["experiment"] = {
+        "name": "mtf_fvg_futures",
+        "description": "Multi-timeframe FVG + SMA(200) daily futures example.",
+    }
     config["derivatives"] = {
         **DERIVATIVES_FLAGS,
         "window_mode": window["window_mode"],
         "recent_window_days": DERIVATIVES_SETTINGS["recent_window_days"],
     }
 
-    try:
-        config = prepare_example_runtime_config(
-            config,
-            market="um_futures",
-            local_certification=args.local_certification,
-            nautilus_available=NAUTILUS_AVAILABLE,
-            example_name="example_mtf_fvg_futures.py",
-        )
-    except RuntimeError as exc:
-        print(str(exc))
-        raise SystemExit(2) from exc
-
-    pipeline = ResearchPipeline(config)
-    example_runtime = dict(config.get("example_runtime") or {})
-
-    print_section(sep, 6, f"Fetching {SYMBOL} {BASE_INTERVAL} futures data via pipeline")
-    data = pipeline.fetch_data()
-    funding_frame = fetch_funding_history(
-        SYMBOL,
-        data.index.min(),
-        data.index.max() + pd.Timedelta(milliseconds=1),
+    run_example(
+        config,
+        market="um_futures",
+        local_certification=args.local_certification,
+        quiet=args.quiet,
+        nautilus_available=NAUTILUS_AVAILABLE,
+        example_name="example_mtf_fvg_futures.py",
+        hooks={
+            "after_fetch_data": _attach_runtime_funding_context,
+            "after_build_features": _fill_sparse_feature_columns,
+        },
     )
-    funding_frame = align_runtime_funding_to_index(funding_frame, data.index)
-    pipeline.state["futures_context"] = {
-        **dict(pipeline.state.get("futures_context") or {}),
-        "funding": funding_frame.set_index("timestamp").sort_index(),
-    }
-    filters = pipeline.state.get("symbol_filters", {})
-    contract_spec = pipeline.state.get("futures_contract_spec", {})
-    print(f"  rows  : {len(data)}")
-    print(f"  range : {data.index[0]} ... {data.index[-1]}")
-    if example_runtime:
-        print(f"  mode  : {example_runtime.get('mode')}")
-    if filters:
-        print(
-            "  filters: "
-            f"tick={filters.get('tick_size')}  step={filters.get('step_size')}  min_notional={filters.get('min_notional')}"
-        )
-    if contract_spec:
-        print(
-            "  contract: "
-            f"margin={contract_spec.get('margin_asset')}  liq_fee={contract_spec.get('liquidation_fee_rate')}"
-        )
-    print(f"  runtime funding rows: {len(funding_frame)}")
-
-    print_section(sep, 7, "Running indicators  (RSI, ATR, WaveTrend, FVG, funding delta, OI change, combined)")
-    indicator_run = pipeline.run_indicators()
-    fvg_meta = indicator_run.metadata.get("fvg_base", {})
-    print(f"  indicator names  : {list(indicator_run.metadata)}")
-    print(f"  FVG output cols  : {fvg_meta.get('output_columns', [])}")
-    print_derivatives_indicator_summary(indicator_run)
-
-    print_section(sep, 8, "Building features  (MTF + eFVG + SMA200 + derivatives)")
-    features = pipeline.build_features()
-    mtf_cols = [column for column in features.columns if column.startswith("mtf_")]
-    efvg_cols = [column for column in features.columns if "efvg_" in column]
-    sma_cols = [column for column in features.columns if "sma200" in column]
-    deriv_cols = [
-        column
-        for column in features.columns
-        if column.startswith("funding_ctx_") or column.startswith("oi_ctx_") or column.startswith("deriv_combo_")
-    ]
-    print(f"  total features    : {features.shape[1]}")
-    print(f"  MTF features      : {len(mtf_cols)}")
-    print(f"  eFVG features     : {len(efvg_cols)}")
-    print(f"  SMA200 features   : {len(sma_cols)}")
-    print(f"  derivatives cols  : {len(deriv_cols)}")
-
-    custom_sparse_cols = [
-        column
-        for column in features.columns
-        if (
-            column.startswith("enhanced_fvg_")
-            or column.startswith("sma200_daily_")
-            or column.startswith("funding_ctx_")
-            or column.startswith("oi_ctx_")
-            or column.startswith("deriv_combo_")
-        )
-    ]
-    if custom_sparse_cols:
-        na_before = int(features[custom_sparse_cols].isna().sum().sum())
-        features.loc[:, custom_sparse_cols] = features[custom_sparse_cols].fillna(0.0)
-        na_after = int(features[custom_sparse_cols].isna().sum().sum())
-        pipeline.state["features"] = features
-        print(f"  custom NaN fill  : cols={len(custom_sparse_cols)}  before={na_before}  after={na_after}")
-
-    stationarity = pipeline.check_stationarity()
-    print_stationarity_summary(stationarity)
-
-    print_section(sep, 9, "Detecting regimes")
-    print_regime_summary(pipeline.detect_regimes()["regimes"])
-
-    print_section(sep, 10, "Building labels and aligning research matrix")
-    labels = pipeline.build_labels()
-    aligned = pipeline.align_data()
-    print_label_summary(labels)
-    print_alignment_summary(aligned)
-
-    print_section(sep, 11, "Feature selection + sample weighting")
-    selection = pipeline.select_features()
-    print_feature_selection_summary(selection)
-    weights = pipeline.compute_sample_weights()
-    print_weight_summary(weights)
-
-    print_section(sep, 12, "CPCV training")
-    training = pipeline.train_models()
-    print_training_summary(training)
-
-    print_section(sep, 13, "Generating signals")
-    signals = pipeline.generate_signals()
-    print_signal_summary(signals)
-
-    print_section(sep, 14, "Backtesting")
-    backtest = pipeline.run_backtest()
-    print_backtest_summary(backtest)
-
-    print(f"\n{sep}\nFutures MTF FVG example complete.\n{sep}")
 
 
 if __name__ == "__main__":

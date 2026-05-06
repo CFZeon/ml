@@ -8,23 +8,9 @@ Usage
 
 import pandas as pd
 
-from core import (
-    ResearchPipeline,
-)
 from core.execution import NAUTILUS_AVAILABLE
+from example_entrypoints import parse_example_args, run_example
 from example_utils import (
-    parse_local_certification_args,
-    prepare_example_runtime_config,
-    print_alignment_summary,
-    print_backtest_summary,
-    print_feature_selection_summary,
-    print_label_summary,
-    print_regime_summary,
-    print_section,
-    print_signal_summary,
-    print_stationarity_summary,
-    print_training_summary,
-    print_weight_summary,
 )
 
 
@@ -41,14 +27,18 @@ def build_fvg_regime_features(pipeline):
 
 
 def main():
-    args = parse_local_certification_args("Run the Fair Value Gap feature example.")
-    sep = "=" * 60
+    args = parse_example_args("Run the Fair Value Gap feature example.")
+    end = "2024-03-01" if args.quick else "2024-06-01"
     config = {
+        "experiment": {
+            "name": "fvg_spot",
+            "description": "End-to-end spot pipeline using a config-driven Fair Value Gap indicator setup.",
+        },
         "data": {
             "symbol": "BTCUSDT",
             "interval": "1h",
             "start": "2024-01-01",
-            "end": "2024-06-01",
+            "end": end,
             "futures_context": {"enabled": False},
         },
         "indicators": [
@@ -106,84 +96,14 @@ def main():
             "signal_delay_bars": 2,
         },
     }
-    try:
-        config = prepare_example_runtime_config(
-            config,
-            market="spot",
-            local_certification=args.local_certification,
-            nautilus_available=NAUTILUS_AVAILABLE,
-            example_name="example_fvg.py",
-        )
-    except RuntimeError as exc:
-        print(str(exc))
-        raise SystemExit(2) from exc
-
-    pipeline = ResearchPipeline(config)
-
-    print_section(sep, 1, "Fetching BTCUSDT spot data")
-    df = pipeline.fetch_data()
-    example_runtime = dict(config.get("example_runtime") or {})
-    print(f"  rows         : {len(df)}")
-    print(f"  range        : {df.index[0]} -> {df.index[-1]}")
-    if example_runtime:
-        print(f"  runtime mode : {example_runtime.get('mode')}")
-        print(f"  runtime note : {example_runtime.get('note')}")
-
-    print_section(sep, 2, "Running config-driven indicators")
-    indicator_run = pipeline.run_indicators()
-    df = indicator_run.frame
-
-    fvg_meta = indicator_run.metadata["fvg_main"]
-    print(f"  indicator names: {list(indicator_run.metadata)}")
-    print(f"  FVG outputs: {fvg_meta['output_columns']}")
-    print(f"  FVG fill states: {fvg_meta['fill_state_encoding']}")
-
-    active_bull = int(df["fvg_main_bull_active_count"].gt(0).sum())
-    active_bear = int(df["fvg_main_bear_active_count"].gt(0).sum())
-    print(f"  bars with active bullish gaps: {active_bull}")
-    print(f"  bars with active bearish gaps: {active_bear}")
-
-    print_section(sep, 3, "Building features and screening stationarity")
-    features = pipeline.build_features()
-    print(f"  feature count: {features.shape[1]}")
-
-    stationarity = pipeline.check_stationarity()
-    print_stationarity_summary(stationarity)
-
-    print_section(sep, 4, "Previewing regime features")
-    regime_result = pipeline.detect_regimes()
-    regimes = regime_result["regimes"]
-    print_regime_summary(regimes)
-
-    print_section(sep, 5, "Building triple-barrier labels")
-    labels = pipeline.build_labels()
-    print_label_summary(labels)
-
-    print_section(sep, 6, "Aligning research matrix")
-    aligned = pipeline.align_data()
-    print_alignment_summary(aligned)
-
-    print_section(sep, 7, "Previewing feature-selection and weighting")
-    selection = pipeline.select_features()
-    print_feature_selection_summary(selection)
-    weights = pipeline.compute_sample_weights()
-    print_weight_summary(weights)
-
-    print_section(sep, 8, "CPCV training")
-    training = pipeline.train_models()
-    print_training_summary(training)
-
-    print_section(sep, 9, "Generating signals")
-    signal_result = pipeline.generate_signals()
-    print_signal_summary(signal_result, allow_short=False)
-
-    print_section(sep, 10, "Backtesting")
-    backtest = pipeline.run_backtest()
-    print_backtest_summary(backtest)
-    if float(backtest.get("total_trades") or 0.0) == 0.0:
-        print("  note         : the profitability filter abstained on every CPCV path, so this example finishes as a feature-and-validation smoke test.")
-
-    print(f"\n{sep}\nPipeline complete.\n{sep}")
+    run_example(
+        config,
+        market="spot",
+        local_certification=args.local_certification,
+        quiet=args.quiet,
+        nautilus_available=NAUTILUS_AVAILABLE,
+        example_name="example_fvg.py",
+    )
 
 
 if __name__ == "__main__":

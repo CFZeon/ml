@@ -1,0 +1,33 @@
+experiment:
+  name: btc_walk_forward
+  description: Walk-forward validation profile for explicit train/test split control.
+data:
+  source: binance_bars
+  market: spot
+  symbol: BTCUSDT
+  interval: 1h
+  start: 2024-01-01
+  end: 2024-05-01
+indicators:
+  - kind: returns
+    params:
+      periods: [1, 3, 6]
+  - kind: volatility
+    params:
+      window: 24
+  - kind: range_position
+    params:
+      window: 20
+model:
+  type: gbm
+  cv_method: walk_forward
+  n_splits: 4
+  train_size: 720
+  test_size: 168
+  gap: 24
+  expanding: false
+backtest:
+  engine: vectorbt
+quick_overrides:
+  data:
+    end: 2024-03-01

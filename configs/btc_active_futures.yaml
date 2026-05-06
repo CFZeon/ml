@@ -1,0 +1,58 @@
+experiment:
+  name: btc_active_futures
+  description: Active-trading futures demo with fixed-horizon labels.
+data:
+  market: um_futures
+  symbol: BTCUSDT
+  interval: 1h
+  start: 2024-01-01
+  end: 2024-04-01
+  context_symbols: [ETHUSDT]
+indicators:
+  - kind: rsi
+    params:
+      period: 14
+  - kind: macd
+  - kind: atr
+    params:
+      period: 14
+features:
+  lags: [1, 2, 3]
+  rolling_window: 12
+feature_selection:
+  max_features: 40
+regime:
+  enabled: false
+labels:
+  kind: fixed_horizon
+  horizon: 3
+  threshold: 0.0
+  cost_rate: 0.0
+model:
+  cv_method: walk_forward
+  n_splits: 4
+  train_size: 360
+  test_size: 96
+  gap: 3
+signals:
+  policy_mode: theory_only
+  avg_win: 0.012
+  avg_loss: 0.008
+  min_trades_for_kelly: 10
+  meta_threshold: 0.0
+  profitability_threshold: 0.0
+  tuning_min_trades: 1
+backtest:
+  leverage: 2.0
+  futures_account:
+    leverage_brackets_data:
+      brackets:
+        - bracket: 1
+          initial_leverage: 20.0
+          notional_floor: 0.0
+          notional_cap: 50000.0
+          maint_margin_ratio: 0.02
+          cum: 0.0
+quick_overrides:
+  data:
+    end: 2024-02-20

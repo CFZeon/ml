@@ -14,12 +14,16 @@ import pandas as pd
 from core import (
     LocalRegistryStore,
     ResearchPipeline,
+    build_deployment_readiness_report,
     build_model,
+    build_operational_limits_report,
+    build_paper_trading_report,
     create_promotion_eligibility_report,
     finalize_promotion_eligibility_report,
     resolve_canonical_promotion_score,
     upsert_promotion_gate,
 )
+from example_entrypoints import parse_example_args
 from example_utils import (
     print_deployment_readiness_summary,
     print_operational_limits_summary,
@@ -138,6 +142,7 @@ def _make_runtime_equity_curve(*, periods=24, final_drawdown=0.04):
 
 
 def main():
+    args = parse_example_args("Run the deterministic drift-retraining demo.", include_local_certification=False)
     sep = "=" * 60
     symbol = "BTCUSDT"
     registry_root = Path(".cache") / "registry" / "drift_cycle_demo"
@@ -145,9 +150,12 @@ def main():
         shutil.rmtree(registry_root)
     registry_root.mkdir(parents=True, exist_ok=True)
 
-    reference_features, current_features, reference_predictions, current_predictions, performance = _make_drift_inputs()
+    reference_features, current_features, reference_predictions, current_predictions, performance = _make_drift_inputs(
+        current_periods=120 if args.quick else 240
+    )
     store = LocalRegistryStore(root_dir=registry_root)
     champion_id = _register_champion(store, symbol, 0.12)
+    symbol_filters = {"tick_size": 0.1, "step_size": 0.001, "min_notional": 10.0}
 
     pipeline = ResearchPipeline({"data": {"symbol": symbol, "interval": "1h"}})
     pipeline.state["X"] = current_features
@@ -171,9 +179,10 @@ def main():
     print(f"  promotion reasons : {promoted['promotion_decision'].get('reasons')}")
 
     print_section(sep, 2, "Paper validation loop")
-    paper_report = pipeline.inspect_paper_trading_calibration(
+    paper_report = build_paper_trading_report(
         certified_expectations={"modeled_slippage_bps": 1.8, "modeled_fill_ratio": 0.94},
-        paper_observations=_make_paper_observations(),
+        paper_observations=_make_paper_observations(periods=28 if args.quick else 35),
+        symbol_filters=symbol_filters,
     )
     print_paper_calibration_summary(paper_report)
     current_champion = store.get_champion(symbol)["version_id"]
@@ -183,15 +192,21 @@ def main():
     print(f"  report path  : {paper_path}")
 
     print_section(sep, 3, "Micro-capital release gate")
-    green_limits = pipeline.inspect_operational_limits(
+    green_limits = build_operational_limits_report(
         operational_limits={"healthy": True, "kill_switch_ready": True},
-        equity_curve=_make_runtime_equity_curve(final_drawdown=0.04),
+        equity_curve=_make_runtime_equity_curve(periods=12 if args.quick else 24, final_drawdown=0.04),
     )
     print_operational_limits_summary(green_limits)
-    readiness = pipeline.inspect_deployment_readiness(
+    readiness = build_deployment_readiness_report(
         store=store,
+        symbol=symbol,
+        monitoring_report=pipeline.state["operational_monitoring"],
+        drift_cycle=promoted,
         backend_status={"adapter": "nautilus", "available": True, "reasons": []},
         release_request={"requested_stage": "micro_capital", "manual_acknowledged": True},
+        paper_report=paper_report,
+        symbol_filters=symbol_filters,
+        operational_limits=green_limits,
     )
     print_deployment_readiness_summary(readiness)
 
@@ -202,10 +217,16 @@ def main():
         if pd.notna(current_champion_row.get("promoted_at"))
         else pd.Timestamp(current_champion_row.get("created_at"))
     )
-    stale_readiness = pipeline.inspect_deployment_readiness(
+    stale_readiness = build_deployment_readiness_report(
         store=store,
+        symbol=symbol,
+        monitoring_report=pipeline.state["operational_monitoring"],
+        drift_cycle=promoted,
         backend_status={"adapter": "nautilus", "available": True, "reasons": []},
         release_request={"requested_stage": "micro_capital", "manual_acknowledged": True},
+        paper_report=paper_report,
+        symbol_filters=symbol_filters,
+        operational_limits=green_limits,
         policy={
             "max_model_age_days": 28,
             "warn_model_age_days": 21,
@@ -215,9 +236,9 @@ def main():
     print_deployment_readiness_summary(stale_readiness)
 
     print_section(sep, 5, "Kill switch breach and rollback")
-    breached_limits = pipeline.inspect_operational_limits(
+    breached_limits = build_operational_limits_report(
         operational_limits={"healthy": True, "kill_switch_ready": True},
-        equity_curve=_make_runtime_equity_curve(final_drawdown=0.14),
+        equity_curve=_make_runtime_equity_curve(periods=12 if args.quick else 24, final_drawdown=0.14),
     )
     print_operational_limits_summary(breached_limits)
     pipeline.state["operational_monitoring"] = {"healthy": True, "reasons": []}
@@ -238,10 +259,16 @@ def main():
     print(f"  current champion  : {store.get_champion(symbol)['version_id']}")
 
     print_section(sep, 6, "Operator hold decision after rollback")
-    blocked_readiness = pipeline.inspect_deployment_readiness(
+    blocked_readiness = build_deployment_readiness_report(
         store=store,
+        symbol=symbol,
+        monitoring_report=pipeline.state["operational_monitoring"],
+        drift_cycle=rollback_result,
         backend_status={"adapter": "nautilus", "available": True, "reasons": []},
         release_request={"requested_stage": "micro_capital", "manual_acknowledged": True},
+        paper_report=paper_report,
+        symbol_filters=symbol_filters,
+        operational_limits=breached_limits,
     )
     print_deployment_readiness_summary(blocked_readiness)
 

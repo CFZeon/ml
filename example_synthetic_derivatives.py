@@ -9,17 +9,8 @@ import numpy as np
 import pandas as pd
 
 from core import ATR, RSI, ResearchPipeline
+from example_entrypoints import parse_example_args, run_example
 from example_utils import (
-    print_alignment_summary,
-    print_backtest_summary,
-    print_feature_selection_summary,
-    print_label_summary,
-    print_regime_summary,
-    print_section,
-    print_signal_summary,
-    print_stationarity_summary,
-    print_training_summary,
-    print_weight_summary,
     seed_offline_pipeline_state,
 )
 
@@ -120,70 +111,74 @@ def make_futures_context(index, spot_close):
 
 
 def main():
-    sep = "=" * 60
-    index = pd.date_range("2025-01-01", periods=720, freq="1h", tz="UTC")
+    args = parse_example_args("Run the offline synthetic derivatives example.", include_local_certification=False)
+    periods = 240 if args.quick else 720
+    index = pd.date_range("2025-01-01", periods=periods, freq="1h", tz="UTC")
     raw_data = make_ohlcv(index)
     eth_data = make_ohlcv(index, drift=14.0, amplitude=2.0, volume_base=1_200.0)
     sol_data = make_ohlcv(index, drift=22.0, amplitude=4.0, volume_base=900.0)
 
-    pipeline = ResearchPipeline(
-        {
-            "data": {"symbol": "BTCUSDT", "interval": "1h", "market": "um_futures"},
-            "indicators": [RSI(14), ATR(14)],
-            "features": {
-                "lags": [1, 3, 6],
-                "frac_diff_d": 0.4,
-                "rolling_window": 24,
-                "context_timeframes": ["4h"],
-            },
-            "feature_selection": {"enabled": True, "max_features": 48, "min_mi_threshold": 0.0},
-            "regime": {"method": "hmm"},  # HMM with stable norm-sorted state ordering
-            "labels": {
-                "kind": "trend_scanning",
-                "min_horizon": 6,
-                "max_horizon": 24,
-                "step": 3,
-                "min_t_value": 0.5,
-                "min_return": 0.0001,
-            },
-            "model": {
-                "type": "logistic",
-                "cv_method": "cpcv",
-                "n_blocks": 4,
-                "test_blocks": 2,
-                "validation_fraction": 0.2,
-                "meta_n_splits": 2,
-            },
-            "signals": {
-                "policy_mode": "frozen_manual",
-                "avg_win": 0.04,
-                "avg_loss": 0.01,
-                "threshold": 0.0,
-                "edge_threshold": 0.0,
-                "shrinkage_alpha": 0.5,
-                "fraction": 0.75,
-                "min_trades_for_kelly": 30,
-                "max_kelly_fraction": 0.5,
-                "meta_threshold": 0.0,
-                "profitability_threshold": 0.0,
-                "expected_edge_threshold": 0.0,
-                "sizing_mode": "expected_utility",
-            },
-            "backtest": {
-                "equity": 10_000,
-                "fee_rate": 0.0005,
-                "slippage_rate": 0.0002,
-                "slippage_model": "sqrt_impact",
-                "engine": "vectorbt",
-                "valuation_price": "mark",
-                "apply_funding": True,
-                "allow_short": True,
-                "leverage": 1.5,
-                "use_open_execution": True,
-                "signal_delay_bars": 1,
-            },
-        }
-    )
+    config = {
+        "experiment": {
+            "name": "synthetic_derivatives_offline",
+            "description": "Offline synthetic derivatives example covering context and futures-style backtesting.",
+        },
+        "data": {"symbol": "BTCUSDT", "interval": "1h", "market": "um_futures", "start": str(index[0]), "end": str(index[-1])},
+        "indicators": [RSI(14), ATR(14)],
+        "features": {
+            "lags": [1, 3, 6],
+            "frac_diff_d": 0.4,
+            "rolling_window": 24,
+            "context_timeframes": ["4h"],
+        },
+        "feature_selection": {"enabled": True, "max_features": 48, "min_mi_threshold": 0.0},
+        "regime": {"method": "hmm"},
+        "labels": {
+            "kind": "trend_scanning",
+            "min_horizon": 6,
+            "max_horizon": 24,
+            "step": 3,
+            "min_t_value": 0.5,
+            "min_return": 0.0001,
+        },
+        "model": {
+            "type": "logistic",
+            "cv_method": "cpcv",
+            "n_blocks": 4,
+            "test_blocks": 2,
+            "validation_fraction": 0.2,
+            "meta_n_splits": 2,
+        },
+        "signals": {
+            "policy_mode": "frozen_manual",
+            "avg_win": 0.04,
+            "avg_loss": 0.01,
+            "threshold": 0.0,
+            "edge_threshold": 0.0,
+            "shrinkage_alpha": 0.5,
+            "fraction": 0.75,
+            "min_trades_for_kelly": 30,
+            "max_kelly_fraction": 0.5,
+            "meta_threshold": 0.0,
+            "profitability_threshold": 0.0,
+            "expected_edge_threshold": 0.0,
+            "sizing_mode": "expected_utility",
+        },
+        "backtest": {
+            "equity": 10_000,
+            "fee_rate": 0.0005,
+            "slippage_rate": 0.0002,
+            "slippage_model": "sqrt_impact",
+            "engine": "vectorbt",
+            "valuation_price": "mark",
+            "apply_funding": True,
+            "allow_short": True,
+            "leverage": 1.5,
+            "use_open_execution": True,
+            "signal_delay_bars": 1,
+        },
+    }
+    pipeline = ResearchPipeline(config)
 
     seed_offline_pipeline_state(
         pipeline,
@@ -192,56 +187,13 @@ def main():
         cross_asset_context={"ETHUSDT": eth_data, "SOLUSDT": sol_data},
         symbol_filters={"tick_size": 0.1, "step_size": 0.001, "min_notional": 10.0},
     )
-
-    print_section(sep, 1, "Loading offline synthetic market state")
-    print(f"  bars         : {len(raw_data)}")
-    print(f"  range        : {raw_data.index[0]} -> {raw_data.index[-1]}")
-    print("  network fetch: skipped")
-
-    print_section(sep, 2, "Running indicators")
-    indicator_run = pipeline.run_indicators()
-    print(f"  indicators   : {[result.kind for result in indicator_run.results]}")
-
-    print_section(sep, 3, "Building features and screening stationarity")
-    features = pipeline.build_features()
-    print(f"  feature count: {features.shape[1]}")
-    print(f"  has fut block: {'fut_funding_rate' in features.columns}")
-    print(f"  has ctx block: {'ctx_ethusdt_ret_1' in features.columns}")
-    print(f"  has mtf block: {'mtf_4h_trend' in features.columns}")
-    stationarity = pipeline.check_stationarity()
-    print_stationarity_summary(stationarity)
-
-    print_section(sep, 4, "Previewing regime features")
-    regimes = pipeline.detect_regimes()["regimes"]
-    print_regime_summary(regimes)
-
-    print_section(sep, 5, "Building labels and aligning research matrix")
-    labels = pipeline.build_labels()
-    aligned = pipeline.align_data()
-    print_label_summary(labels)
-    print_alignment_summary(aligned)
-
-    print_section(sep, 6, "Previewing feature-selection and weighting")
-    selection = pipeline.select_features()
-    print_feature_selection_summary(selection)
-    weights = pipeline.compute_sample_weights()
-    print_weight_summary(weights)
-
-    print_section(sep, 7, "CPCV training")
-    training = pipeline.train_models()
-    print_training_summary(training)
-
-    print_section(sep, 8, "Generating signals")
-    signals = pipeline.generate_signals()
-    print_signal_summary(signals)
-
-    print_section(sep, 9, "Backtesting")
-    backtest = pipeline.run_backtest()
-    print_backtest_summary(backtest)
-    if float(backtest.get("total_trades") or 0.0) == 0.0:
-        print("  note         : the profitability filter abstained on every CPCV path, so this example validates the derivatives feature stack without opening positions.")
-
-    print(f"\n{sep}\nSynthetic derivatives example complete.\n{sep}")
+    run_example(
+        config,
+        market="um_futures",
+        quiet=args.quiet,
+        example_name="example_synthetic_derivatives.py",
+        pipeline=pipeline,
+    )
 
 
 if __name__ == "__main__":

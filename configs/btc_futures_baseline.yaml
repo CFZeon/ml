@@ -1,0 +1,29 @@
+experiment:
+  name: btc_futures_baseline
+  description: Baseline USDT-M futures research example.
+data:
+  market: um_futures
+  symbol: BTCUSDT
+  interval: 1h
+  start: 2024-01-01
+  end: 2024-04-01
+  context_symbols: [ETHUSDT, SOLUSDT]
+indicators:
+  - kind: rsi
+    params:
+      period: 14
+  - kind: macd
+  - kind: atr
+    params:
+      period: 14
+model:
+  cv_method: walk_forward
+  n_splits: 3
+  train_size: 360
+  test_size: 120
+  gap: 3
+backtest:
+  engine: pandas
+quick_overrides:
+  data:
+    end: 2024-02-20

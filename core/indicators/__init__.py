@@ -6,6 +6,8 @@ from .registry import (
     attach_indicators,
     build_indicator,
     build_indicators,
+    discover_indicators,
+    list_available_indicators,
     register_indicator,
     run_indicators,
 )
@@ -39,6 +41,8 @@ __all__ = [
     "attach_indicators",
     "build_indicator",
     "build_indicators",
+    "discover_indicators",
+    "list_available_indicators",
     "register_indicator",
     "run_indicators",
 ]

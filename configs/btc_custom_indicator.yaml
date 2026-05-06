@@ -1,0 +1,25 @@
+experiment:
+  name: btc_custom_indicator
+  description: Copy-tweak-run example centered on the user-defined range_position indicator.
+data:
+  source: binance_bars
+  market: spot
+  symbol: BTCUSDT
+  interval: 1h
+  start: 2024-01-01
+  end: 2024-04-01
+indicators:
+  - kind: returns
+    params:
+      periods: [1, 3]
+  - kind: range_position
+    params:
+      window: 16
+model:
+  type: gbm
+  cv_method: cpcv
+backtest:
+  engine: vectorbt
+quick_overrides:
+  data:
+    end: 2024-02-10

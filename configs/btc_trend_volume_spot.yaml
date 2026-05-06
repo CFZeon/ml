@@ -1,0 +1,56 @@
+experiment:
+  name: btc_trend_volume_spot
+  description: Spot trend, volume, and breakout indicator stack.
+data:
+  market: spot
+  symbol: BTCUSDT
+  interval: 1h
+  start: 2024-01-01
+  end: 2024-06-01
+  context_symbols: [ETHUSDT, SOLUSDT, BNBUSDT]
+indicators:
+  - kind: rsi
+    params:
+      period: 14
+  - kind: macd
+  - kind: bollinger
+    params:
+      window: 20
+  - kind: atr
+    params:
+      period: 14
+  - kind: adx
+    params:
+      period: 14
+  - kind: stochastic
+    params:
+      period: 14
+      smooth_k: 3
+      smooth_d: 3
+  - kind: obv
+  - kind: donchian
+    params:
+      window: 20
+features:
+  lags: [1, 3, 6]
+  frac_diff_d: 0.4
+  rolling_window: 20
+  squeeze_quantile: 0.2
+  context_timeframes: [4h, 1d]
+feature_selection:
+  max_features: 120
+  min_mi_threshold: 0.0
+signals:
+  threshold: 0.0
+  edge_threshold: 0.0
+  fraction: 0.75
+  meta_threshold: 0.5
+  profitability_threshold: 0.5
+  expected_edge_threshold: 0.0
+  sizing_mode: expected_utility
+backtest:
+  engine: vectorbt
+  signal_delay_bars: 1
+quick_overrides:
+  data:
+    end: 2024-03-15
