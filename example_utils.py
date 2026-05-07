@@ -1033,6 +1033,110 @@ def print_regime_summary(regimes):
     print(f"  regime counts: {regime_counts}")
 
 
+def print_phase_zero_contract_summary(result, *, quiet=False):
+    if quiet:
+        return
+
+    from core import (
+        RouterManifest,
+        build_regime_observation_contracts,
+        build_specialist_library_snapshot,
+        summarize_regime_detection_result,
+    )
+
+    artifacts = dict(getattr(result, "artifacts", {}) or {})
+    config = dict(getattr(result, "config", {}) or {})
+    pipeline = getattr(result, "pipeline", None)
+    pipeline_state = getattr(pipeline, "state", {}) or {}
+    data_config = dict(config.get("data") or {})
+    regime_result = dict(artifacts.get("regimes") or {})
+    training = dict(artifacts.get("training") or {})
+    router_config = dict(config.get("router") or {})
+
+    print("\nPhase 0 Contracts")
+
+    if regime_result:
+        regime_trace = summarize_regime_detection_result(regime_result)
+        observation_frame = regime_result.get("regime_observations")
+        observation_contracts = []
+        if observation_frame is not None:
+            observation_contracts = build_regime_observation_contracts(
+                observation_frame,
+                source_map=dict(pipeline_state.get("regime_observation_sources") or {}),
+            )
+        preview_columns = list(regime_trace.observation_columns[:5])
+        print(
+            "  regime trace : "
+            f"rows={regime_trace.row_count}  "
+            f"available={regime_trace.available_rows}  "
+            f"transitions={regime_trace.transition_count}  "
+            f"dominant={regime_trace.dominant_label or 'n/a'}"
+        )
+        print(
+            "  observations : "
+            f"contracts={len(observation_contracts)}  "
+            f"cols={len(regime_trace.observation_columns)}  "
+            f"preview={preview_columns}"
+        )
+    else:
+        print("  regime trace : unavailable")
+
+    specialist_snapshot = None
+    last_model = training.get("last_model")
+    regime_section = dict(training.get("regime") or {})
+    regime_aware = dict(regime_section.get("regime_aware") or {})
+    if last_model is not None and hasattr(last_model, "strategy") and regime_aware.get("enabled"):
+        specialist_snapshot = build_specialist_library_snapshot(
+            last_model,
+            {
+                **regime_aware,
+                "coverage_summary": dict(regime_section.get("coverage_summary") or {}),
+            },
+            symbol=str(data_config.get("symbol", "unknown")),
+            timeframe=str(data_config.get("interval", "unknown")),
+        )
+
+    if specialist_snapshot is not None:
+        specialist_ids = [spec.model_id for spec in specialist_snapshot.specialists]
+        flagged_health = {
+            health.model_id: list(health.failure_flags)
+            for health in specialist_snapshot.health
+            if health.failure_flags
+        }
+        print(
+            "  specialists  : "
+            f"count={len(specialist_snapshot.specialists)}  "
+            f"fallback={specialist_snapshot.fallback_model_id or 'n/a'}  "
+            f"ids={specialist_ids}"
+        )
+        if flagged_health:
+            print(f"  health flags : {flagged_health}")
+    else:
+        print("  specialists  : unavailable")
+
+    if router_config:
+        router_manifest = RouterManifest(
+            router_type=str(router_config.get("type", "unknown")),
+            score_component_names=list(dict(router_config.get("score_weights") or {}).keys()),
+            policy_name="config_router",
+            hysteresis_margin=router_config.get("hysteresis_margin"),
+            min_persistence_bars=router_config.get("min_persistence_bars"),
+            cooldown_bars=router_config.get("cooldown_bars"),
+            metadata={
+                "fallback_confidence_floor": router_config.get("fallback_confidence_floor"),
+            },
+        )
+        print(
+            "  router       : "
+            f"type={router_manifest.router_type}  "
+            f"components={router_manifest.score_component_names}  "
+            f"hysteresis={router_manifest.hysteresis_margin}  "
+            f"cooldown={router_manifest.cooldown_bars}"
+        )
+    else:
+        print("  router       : unavailable")
+
+
 def print_label_summary(labels):
     print(f"  label rows   : {len(labels)}")
     integrity_report = dict(getattr(labels, "attrs", {}).get("integrity_report") or {})

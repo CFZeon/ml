@@ -3,6 +3,7 @@
 from core.execution import NAUTILUS_AVAILABLE
 
 from example_entrypoints import parse_example_args, resolve_repo_path, run_example
+from example_utils import print_phase_zero_contract_summary
 
 
 def _print_orchestration_summary(result, *, quiet: bool):
@@ -44,6 +45,7 @@ def main():
         example_name="example_regime_orchestration.py",
     )
     _print_orchestration_summary(result, quiet=args.quiet)
+    print_phase_zero_contract_summary(result, quiet=args.quiet)
 
 
 if __name__ == "__main__":
