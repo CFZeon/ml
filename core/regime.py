@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+
+from .regimes.contracts import (
+    BaseRegimeDetector,
+    RegimeDetectorManifest,
+    RegimeObservationContract,
+    RegimeStateContract,
+    RegimeTraceSummary,
+    RegimeTransitionContract,
+)
 
 from .context import (
     build_cross_asset_context_feature_block,
@@ -115,6 +125,164 @@ def normalize_regime_feature_set(value):
     if not provenance:
         provenance = summarize_regime_provenance(merged_source_map, columns=frame.columns)
     return RegimeFeatureSet(frame=frame, source_map=merged_source_map, provenance=provenance)
+
+
+def _coerce_contract_scalar(value: Any):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def build_regime_observation_contracts(observations, *, source_map=None, available_at=None, metadata=None):
+    feature_set = normalize_regime_feature_set({"frame": observations, "source_map": source_map or {}})
+    frame = feature_set.frame
+    shared_metadata = dict(metadata or {})
+    contracts = []
+    for timestamp, row in frame.iterrows():
+        values = {
+            str(column): _coerce_contract_scalar(value)
+            for column, value in row.items()
+            if not pd.isna(value)
+        }
+        contracts.append(
+            RegimeObservationContract(
+                as_of=timestamp,
+                available_at=(timestamp if available_at is None else available_at),
+                values=values,
+                source_map={str(key): str(value) for key, value in feature_set.source_map.items()},
+                metadata=shared_metadata,
+            )
+        )
+    return contracts
+
+
+def build_regime_state_contracts(regimes, *, available_at=None, metadata=None):
+    frame = regimes.copy() if isinstance(regimes, pd.DataFrame) else pd.DataFrame({"regime": pd.Series(regimes, copy=False)})
+    if frame.empty:
+        return []
+
+    shared_metadata = dict(metadata or {})
+    contracts = []
+    for timestamp, row in frame.iterrows():
+        detector_outputs = {
+            str(column): _coerce_contract_scalar(value)
+            for column, value in row.items()
+            if not pd.isna(value)
+        }
+        label = detector_outputs.get("regime")
+        if label is None and detector_outputs:
+            label = detector_outputs[next(iter(detector_outputs))]
+
+        probabilities = {
+            str(column): float(value)
+            for column, value in detector_outputs.items()
+            if (column.startswith("prob_") or column.endswith("_prob")) and value is not None
+        }
+        if not probabilities and label is not None:
+            probabilities = {str(label): 1.0}
+
+        confidence = detector_outputs.get("regime_confidence")
+        if confidence is None and probabilities:
+            confidence = max(float(value) for value in probabilities.values())
+
+        contracts.append(
+            RegimeStateContract(
+                as_of=timestamp,
+                available_at=(timestamp if available_at is None else available_at),
+                label=label,
+                probabilities=probabilities,
+                confidence=(None if confidence is None else float(confidence)),
+                detector_outputs=detector_outputs,
+                warm=bool(detector_outputs.get("warm", True)),
+                metadata=shared_metadata,
+            )
+        )
+    return contracts
+
+
+def build_regime_transition_contracts(regimes, *, available_at=None, metadata=None):
+    states = build_regime_state_contracts(regimes, available_at=available_at, metadata=metadata)
+    if not states:
+        return []
+
+    transitions = []
+    previous = states[0]
+    for current in states[1:]:
+        if current.label != previous.label:
+            confidence = current.confidence if current.confidence is not None else previous.confidence
+            transitions.append(
+                RegimeTransitionContract(
+                    as_of=current.as_of,
+                    available_at=current.available_at,
+                    from_label=previous.label,
+                    to_label=current.label,
+                    confidence=confidence,
+                    metadata=dict(metadata or {}),
+                )
+            )
+        previous = current
+    return transitions
+
+
+def build_regime_trace_summary(regimes, *, mode="preview", observation_columns=None, provenance=None, metadata=None):
+    frame = regimes.copy() if isinstance(regimes, pd.DataFrame) else pd.DataFrame({"regime": pd.Series(regimes, copy=False)})
+    if frame.empty:
+        return RegimeTraceSummary(
+            mode=mode,
+            row_count=0,
+            available_rows=0,
+            transition_count=0,
+            observation_columns=[str(item) for item in list(observation_columns or [])],
+            state_columns=[str(item) for item in list(frame.columns)],
+            provenance=dict(provenance or {}),
+            metadata=dict(metadata or {}),
+        )
+
+    labels = coerce_regime_label_series(frame).dropna()
+    distribution = labels.value_counts(dropna=True)
+    transitions = build_regime_transition_contracts(frame, metadata=metadata)
+    return RegimeTraceSummary(
+        mode=mode,
+        row_count=int(len(frame)),
+        available_rows=int(frame.dropna(how="all").shape[0]),
+        transition_count=int(len(transitions)),
+        observation_columns=[str(item) for item in list(observation_columns or [])],
+        state_columns=[str(item) for item in list(frame.columns)],
+        label_distribution={str(key): int(value) for key, value in distribution.items()},
+        dominant_label=(None if distribution.empty else str(distribution.index[0])),
+        provenance=dict(provenance or {}),
+        metadata=dict(metadata or {}),
+    )
+
+
+def summarize_regime_detection_result(result):
+    payload = dict(result or {})
+    observation_frame = payload.get("regime_observations")
+    if observation_frame is None:
+        observation_frame = payload.get("regime_features")
+    observation_columns = list(pd.DataFrame(observation_frame).columns) if observation_frame is not None else []
+    metadata = {
+        str(key): value
+        for key, value in payload.items()
+        if key not in {"regimes", "regime_observations", "regime_features", "provenance"}
+    }
+    return build_regime_trace_summary(
+        payload.get("regimes"),
+        mode=str(payload.get("mode", "preview")),
+        observation_columns=observation_columns,
+        provenance=dict(payload.get("provenance") or {}),
+        metadata=metadata,
+    )
 
 
 def _join_state_frame(base_frame, addition, source_name, source_map):
@@ -863,22 +1031,33 @@ def summarize_regime_ablation_reports(reports):
 
 
 __all__ = [
+    "BaseRegimeDetector",
     "CONTEXTUAL_REGIME_SOURCES",
     "REGIME_CROSS_ASSET_SOURCE",
     "REGIME_INSTRUMENT_SOURCE",
     "REGIME_MARKET_SOURCE",
     "REGIME_SOURCE_ORDER",
+    "RegimeDetectorManifest",
     "RegimeFeatureSet",
+    "RegimeObservationContract",
+    "RegimeStateContract",
+    "RegimeTraceSummary",
+    "RegimeTransitionContract",
     "build_cross_asset_regime_state",
     "build_default_regime_feature_set",
     "build_instrument_regime_state",
+    "build_regime_observation_contracts",
     "build_market_regime_state",
     "build_regime_ablation_report",
+    "build_regime_state_contracts",
+    "build_regime_trace_summary",
+    "build_regime_transition_contracts",
     "coerce_regime_label_series",
     "compute_regime_path_stability",
     "detect_regime",
     "infer_regime_source_map",
     "normalize_regime_feature_set",
+    "summarize_regime_detection_result",
     "summarize_regime_ablation_reports",
     "summarize_regime_provenance",
 ]

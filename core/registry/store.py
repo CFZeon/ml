@@ -257,6 +257,9 @@ class LocalRegistryStore:
             "promotion_score_basis",
             "eligibility_report_present",
             "promotion_ready",
+            "regime_contracts_present",
+            "specialist_library_present",
+            "router_manifest_present",
             "replication_present",
             "replication_coverage",
             "replication_pass_rate",
@@ -334,6 +337,9 @@ class LocalRegistryStore:
         replication=None,
         promotion_eligibility_report=None,
         lineage=None,
+        regime_contracts=None,
+        specialist_library=None,
+        router_manifest=None,
         status="challenger",
         meta_model=None,
     ):
@@ -378,6 +384,9 @@ class LocalRegistryStore:
             locked_holdout=locked_holdout,
             replication=replication,
             promotion_eligibility_report=promotion_eligibility_report,
+            regime_contracts=regime_contracts,
+            specialist_library=specialist_library,
+            router_manifest=router_manifest,
             promotion_ready=(
                 dict(promotion_eligibility_report or {}).get("promotion_ready")
                 if promotion_eligibility_report is not None

@@ -759,18 +759,302 @@ The migration must be staged. A full flag-day rewrite would create too much brea
 
 ### Phase 0: Contracts and compatibility scaffolding
 
-Add new contracts and facades without breaking the current public API.
+Phase 0 is the compatibility foundation. Its purpose is not to introduce routing behavior yet. Its purpose is to make the codebase structurally ready for later phases by adding typed contracts and additive module boundaries while keeping today's pipeline, examples, configs, and artifacts working.
 
-- add `core/regimes/contracts.py`, `core/specialists/contracts.py`, `core/routing/contracts.py`
-- keep `core/regime.py` and `core/regime_training.py` as forwarding facades
-- add compatibility serialization in `core/registry/`
-- add trace dataclasses without changing current examples yet
+The governing rule for this phase is simple: additive structure only, no default behavior change.
 
-Acceptance criteria:
+#### Phase 0 objectives
 
-- no existing example breaks
-- current regime-aware training still runs
-- new contracts serialize cleanly
+Phase 0 must accomplish five things:
+
+1. Introduce explicit typed contracts for regime state, specialist metadata, and routing decisions.
+2. Keep the current public import surface working through compatibility facades.
+3. Preserve current config-driven workflows and example entrypoints.
+4. Make the new contracts serializable and safe to store in manifests and summaries.
+5. Create one canonical place for future phases to extend rather than widening the current ad hoc dict surfaces.
+
+#### Phase 0 delivery rules
+
+- Do not change current training, backtest, or AutoML defaults.
+- Do not require `router`, `model_library`, or detector bundles for existing examples to run.
+- Do not remove or rename current exports from `core/__init__.py`, `core/regime.py`, or `core/regime_training.py`.
+- Do not introduce hidden runtime state inside contract or facade modules.
+- All new contracts must be plain dataclass-style payloads or enums that can round-trip through JSON-ready dicts.
+- New registry and summary fields must be optional and fail-open for historical artifacts, but fail-typed for newly written artifacts.
+
+#### Phase 0 scope boundaries
+
+Included in Phase 0:
+
+- contract dataclasses and protocols
+- package skeletons for `core/regimes/`, `core/specialists/`, and `core/routing/`
+- compatibility facades in existing modules
+- serialization helpers and manifest extensions
+- public export updates in `core/__init__.py`
+- narrow tests for contract shape, serialization, and backward compatibility
+
+Explicitly out of scope for Phase 0:
+
+- live router scoring or switching logic
+- specialist-library training and retirement behavior
+- regime detector ensemble implementation
+- backtest routing replay
+- promotion gating on router artifacts
+- AutoML search over detector or router bundles
+
+If any of those behaviors are required to satisfy a code change, that change belongs to Phase 1 or later, not Phase 0.
+
+#### Files to add in Phase 0
+
+Add these files even if some only contain contracts and no business logic yet:
+
+- `core/regimes/__init__.py`
+- `core/regimes/contracts.py`
+- `core/specialists/__init__.py`
+- `core/specialists/contracts.py`
+- `core/routing/__init__.py`
+- `core/routing/contracts.py`
+
+These files are intentionally contract-first. They should not depend on the current training implementation beyond shared primitive types such as pandas timestamps, enums, and JSON-ready metadata.
+
+#### Files to modify in Phase 0
+
+- `core/regime.py`
+- `core/regime_training.py`
+- `core/__init__.py`
+- `core/registry/` manifest helpers and versioned metadata emitters
+- `core/pipeline.py` only where current explicit state keys need typed aliases or summaries
+- `tests/` for new compatibility and serialization coverage
+
+#### Contract deliverables
+
+##### Regime contracts
+
+`core/regimes/contracts.py` should define the canonical regime payloads used by later phases.
+
+Minimum deliverables:
+
+- `RegimeObservationContract`
+- `RegimeStateContract`
+- `RegimeTransitionContract`
+- `RegimeDetectorManifest`
+- `RegimeTraceSummary`
+- `BaseRegimeDetector` protocol
+
+Required field expectations:
+
+- all contracts carry `schema_version`
+- all time-aware contracts carry `as_of` and `available_at` when applicable
+- all contracts carry a freeform `metadata` mapping for forward-compatible fields
+- all contracts expose `to_dict()` and `from_dict()` or equivalent normalization helpers
+
+Compatibility mapping to current code:
+
+- `RegimeObservationContract` must align with current `pipeline.state["regime_observations"]`
+- `RegimeStateContract` must align with current `pipeline.state["regime_state_frame"]` and `pipeline.state["regime_detection"]`
+- `RegimeTraceSummary` must be able to summarize current preview and fold-local regime reporting without requiring the future router
+
+##### Specialist contracts
+
+`core/specialists/contracts.py` should define the canonical metadata for regime specialists, even before a full specialist-library implementation exists.
+
+Minimum deliverables:
+
+- `SpecialistSpec`
+- `SpecialistArtifactRef`
+- `SpecialistHealthContract`
+- `SpecialistPerformanceSlice`
+- `SpecialistLifecycleState` enum
+- `SpecialistLibrarySnapshot`
+
+Required field expectations:
+
+- `SpecialistSpec` must capture compatible regimes, feature policy references, estimator family, symbol, timeframe, and training-window lineage
+- `SpecialistHealthContract` must capture stability, decay, calibration freshness, and failure flags
+- `SpecialistLibrarySnapshot` must support one fallback generalist plus zero or more specialists without implying routing logic yet
+
+Compatibility mapping to current code:
+
+- `RegimeAwareModelBundle` remains the current runtime carrier in `core/regime_training.py`
+- Phase 0 should add adapters that can summarize a `RegimeAwareModelBundle` into `SpecialistLibrarySnapshot` semantics without changing prediction behavior
+
+##### Router contracts
+
+`core/routing/contracts.py` should define the decision and state payloads that later router implementations must emit.
+
+Minimum deliverables:
+
+- `RoutingDecisionContract`
+- `RoutingScoreComponent`
+- `RouterStateSnapshot`
+- `RouterManifest`
+- `BaseRouter` protocol
+
+Required field expectations:
+
+- routing decisions must support hard switch and weighted selection fields simultaneously
+- score payloads must be decomposable by named component
+- router state must be serializable without requiring a live model object
+- manifests must be versioned and additive so historical summaries can omit them safely
+
+Compatibility mapping to current code:
+
+- there is no existing router module to preserve, so router contracts are additive
+- compatibility in this case means the new router package can be imported and serialized without changing any current caller behavior
+
+#### Compatibility facade plan
+
+##### `core/regime.py`
+
+`core/regime.py` remains the user-facing regime facade in Phase 0.
+
+Its role after Phase 0:
+
+- continue exporting current helpers such as `RegimeFeatureSet`, `build_default_regime_feature_set`, `detect_regime`, and ablation helpers
+- re-export new regime contracts from `core/regimes/contracts.py`
+- add small normalization helpers that convert existing preview/fold-local dicts into typed contract instances
+- keep all current function signatures intact
+
+No caller should need to import `core.regimes.contracts` directly unless they want the new typed layer.
+
+##### `core/regime_training.py`
+
+`core/regime_training.py` remains the current training facade.
+
+Its role after Phase 0:
+
+- continue exporting `RegimeAwareFeatureFrame`, `RegimeAwareModelBundle`, `summarize_regime_coverage`, `train_regime_aware_model`, and `train_regime_aware_walk_forward`
+- add adapter helpers that derive `SpecialistSpec`, `SpecialistHealthContract`, and `SpecialistLibrarySnapshot` summaries from the current bundle and training reports
+- keep current training entrypoints dict-compatible so existing tests and examples remain unchanged
+
+The crucial rule is that Phase 0 must not force the training path to consume the new specialist contracts before the specialist-library implementation exists.
+
+##### `core/__init__.py`
+
+`core/__init__.py` is the public compatibility boundary and must be treated as part of the Phase 0 deliverable.
+
+Changes required:
+
+- preserve every currently exported symbol
+- add exports for the new regime, specialist, and router contracts
+- keep import order stable enough that user code importing `from core import ...` does not break on optional package initialization
+- avoid circular imports by keeping contract modules dependency-light
+
+#### Pipeline touch points allowed in Phase 0
+
+`core/pipeline.py` should only receive the smallest compatibility edits required to expose typed aliases for the new layers.
+
+Allowed Phase 0 touches:
+
+- store typed-compatible summaries beside existing dict state
+- attach contract metadata to `regime_detection`, `training["regime"]`, or future routing placeholders
+- keep `build_regime_observations()` and `detect_regimes()` outputs backward-compatible while making them convertible to the new contracts
+
+Disallowed Phase 0 touches:
+
+- introducing real router selection in `TrainModelsStep` or `SignalsStep`
+- changing signal generation defaults
+- changing backtest behavior
+
+#### Registry and serialization plan
+
+Phase 0 must extend artifact and manifest handling before later phases write richer objects.
+
+Required work in `core/registry/` and adjacent storage helpers:
+
+- add JSON-ready serialization helpers for all new contracts
+- add optional manifest sections for:
+  - `regime_contracts`
+  - `specialist_library`
+  - `router_manifest`
+- include `schema_version` and `contract_type` in stored payloads
+- ensure historical manifests without these sections still load cleanly
+- ensure newly written manifests can be validated structurally without knowing future Phase 1+ fields
+
+Compatibility rule:
+
+- Phase 0 readers must accept old manifests
+- Phase 0 writers may emit the new optional sections
+- no capital-facing logic may require the new sections yet
+
+#### Detailed implementation order inside Phase 0
+
+Implement Phase 0 in this exact sequence:
+
+1. Create `__init__.py` and `contracts.py` files under `core/regimes/`, `core/specialists/`, and `core/routing/`.
+2. Add dataclasses, enums, and protocols with `to_dict()` and `from_dict()` support.
+3. Add lightweight normalization helpers for current dict-based pipeline state.
+4. Update `core/regime.py` to re-export regime contracts and provide regime contract adapters.
+5. Update `core/regime_training.py` to expose specialist snapshot adapters while preserving existing training entrypoints.
+6. Update `core/__init__.py` to re-export the new contract symbols.
+7. Extend registry and storage manifest helpers with optional contract blocks.
+8. Add narrow compatibility tests before any later-phase logic is introduced.
+
+This order matters because it guarantees that the public facade is preserved before registry writers and downstream code begin seeing the new payloads.
+
+#### Test plan for Phase 0
+
+Add these focused tests:
+
+- `tests/test_regime_contracts.py`
+- `tests/test_specialist_contracts.py`
+- `tests/test_router_contracts.py`
+- `tests/test_contract_serialization.py`
+- `tests/test_regime_facade_compatibility.py`
+- `tests/test_regime_training_facade_compatibility.py`
+- `tests/test_core_public_exports.py`
+- `tests/test_registry_manifest_contract_compatibility.py`
+
+The minimum behavior each test group must cover:
+
+- contracts instantiate with required fields only
+- contracts round-trip through `to_dict()` / `from_dict()`
+- old facade imports still resolve
+- current `ResearchPipeline.detect_regimes()` and regime-aware training outputs can be summarized into new contract forms
+- old manifests load without contract sections
+- new manifests write optional contract sections without breaking old readers
+
+#### User-facing compatibility matrix
+
+Phase 0 is only complete if this matrix remains true.
+
+Must remain unchanged for users:
+
+- root examples and `run.py --config ...`
+- current YAML sections such as `regime` and `model.regime_aware`
+- imports from `core`, `core.regime`, and `core.regime_training`
+- current training summary keys consumed by tests and examples
+- current preview regime outputs under `pipeline.detect_regimes()`
+
+May be added in Phase 0 but must be optional:
+
+- new contract classes exported from `core`
+- optional contract summaries in manifests and pipeline state
+- additive helper functions for contract normalization
+
+#### Risks and failure modes to prevent in Phase 0
+
+- circular imports between `core/__init__.py`, facade modules, and contract modules
+- contract modules importing heavy training or backtest logic
+- accidental renames of legacy exports
+- writing required manifest fields too early and breaking historical loads
+- mixing typed contracts and live model objects in the same serialized payload
+
+The simplest guardrail is to keep contract modules dependency-light and serialization-focused.
+
+#### Phase 0 acceptance criteria
+
+Phase 0 is complete only when all of these are true:
+
+- no existing example or config path requires changes
+- current regime preview and regime-aware training tests still pass unchanged
+- `core/regime.py` and `core/regime_training.py` remain valid public facades
+- new regime, specialist, and router contracts can be imported from `core`
+- all new contracts serialize to JSON-ready dicts and round-trip cleanly
+- registry manifests accept both legacy and Phase 0 payload shapes
+- no router behavior or specialist-library behavior has been activated by default
+
+If any default runtime behavior changes during this phase, Phase 0 has expanded past its intended scope and should be split before continuing.
 
 ### Phase 1: Online regime detection layer
 

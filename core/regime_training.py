@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,13 @@ from .models import (
     predict_probability_frame,
     train_model,
     walk_forward_split,
+)
+from .specialists.contracts import (
+    SpecialistHealthContract,
+    SpecialistLibrarySnapshot,
+    SpecialistLifecycleState,
+    SpecialistPerformanceSlice,
+    SpecialistSpec,
 )
 
 
@@ -343,6 +351,195 @@ class RegimeAwareModelBundle:
         return predictions, probabilities, report
 
 
+def _resolve_estimator_family(model):
+    estimator = model
+    if hasattr(model, "named_steps"):
+        estimator = model.named_steps.get("model") or next(reversed(model.named_steps.values()))
+    return str(estimator.__class__.__name__).lower()
+
+
+def _normalize_training_window(training_report):
+    coverage_summary = dict((training_report or {}).get("coverage_summary") or {})
+    return {
+        "strategy": str((training_report or {}).get("strategy") or "unknown"),
+        "coverage_status": coverage_summary.get("status"),
+        "promotion_pass": coverage_summary.get("promotion_pass"),
+    }
+
+
+def build_specialist_specs_from_bundle(bundle, training_report=None, *, symbol="unknown", timeframe="unknown", metadata=None):
+    training_report = dict(training_report or {})
+    shared_metadata = dict(metadata or {})
+    training_window = _normalize_training_window(training_report)
+    specs = []
+
+    if bundle.strategy == "feature":
+        compatible_regimes = list(dict((training_report.get("coverage_summary") or {}).get("regime_distribution") or {}).keys())
+        specs.append(
+            SpecialistSpec(
+                model_id=str(shared_metadata.get("model_id", "global_regime_feature_model")),
+                symbol=str(symbol),
+                timeframe=str(timeframe),
+                compatible_regimes=[str(item) for item in compatible_regimes],
+                estimator_family=_resolve_estimator_family(bundle.model),
+                feature_policy_id="regime_feature_strategy",
+                training_window=training_window,
+                metadata={
+                    **shared_metadata,
+                    "bundle_strategy": bundle.strategy,
+                    "feature_column_count": int(len(bundle.feature_columns)),
+                    "lifecycle_state": SpecialistLifecycleState.ACTIVE.value,
+                },
+            )
+        )
+        return specs
+
+    if bundle.fallback_model is not None:
+        specs.append(
+            SpecialistSpec(
+                model_id=str(shared_metadata.get("fallback_model_id", "fallback_generalist")),
+                symbol=str(symbol),
+                timeframe=str(timeframe),
+                compatible_regimes=[],
+                estimator_family=_resolve_estimator_family(bundle.fallback_model),
+                feature_policy_id="global_generalist",
+                training_window=training_window,
+                metadata={
+                    **shared_metadata,
+                    "bundle_strategy": bundle.strategy,
+                    "fallback_only": True,
+                    "lifecycle_state": SpecialistLifecycleState.ACTIVE.value,
+                },
+            )
+        )
+
+    for regime_value, model in dict(bundle.specialist_models or {}).items():
+        regime_name = str(regime_value)
+        specs.append(
+            SpecialistSpec(
+                model_id=f"specialist::{regime_name}",
+                symbol=str(symbol),
+                timeframe=str(timeframe),
+                compatible_regimes=[regime_name],
+                estimator_family=_resolve_estimator_family(model),
+                feature_policy_id="regime_specialist",
+                training_window=training_window,
+                metadata={
+                    **shared_metadata,
+                    "bundle_strategy": bundle.strategy,
+                    "regime_label": regime_name,
+                    "lifecycle_state": SpecialistLifecycleState.ACTIVE.value,
+                },
+            )
+        )
+    return specs
+
+
+def build_specialist_health_contracts(bundle, training_report=None, *, metadata=None):
+    training_report = dict(training_report or {})
+    shared_metadata = dict(metadata or {})
+    skipped_regimes = {str(key): str(value) for key, value in dict(training_report.get("skipped_regimes") or {}).items()}
+    health = []
+
+    if bundle.strategy == "feature":
+        health.append(
+            SpecialistHealthContract(
+                model_id=str(shared_metadata.get("model_id", "global_regime_feature_model")),
+                compatible_regimes=list(dict((training_report.get("coverage_summary") or {}).get("regime_distribution") or {}).keys()),
+                stability_score=None,
+                decay_score=None,
+                failure_flags=[],
+                fallback_only=False,
+                metadata={**shared_metadata, "bundle_strategy": bundle.strategy},
+            )
+        )
+        return health
+
+    if bundle.fallback_model is not None:
+        health.append(
+            SpecialistHealthContract(
+                model_id=str(shared_metadata.get("fallback_model_id", "fallback_generalist")),
+                compatible_regimes=[],
+                stability_score=None,
+                decay_score=None,
+                failure_flags=[],
+                fallback_only=True,
+                metadata={**shared_metadata, "bundle_strategy": bundle.strategy},
+            )
+        )
+
+    for regime_value in dict(bundle.specialist_models or {}).keys():
+        regime_name = str(regime_value)
+        health.append(
+            SpecialistHealthContract(
+                model_id=f"specialist::{regime_name}",
+                compatible_regimes=[regime_name],
+                stability_score=None,
+                decay_score=None,
+                failure_flags=[],
+                fallback_only=False,
+                metadata={**shared_metadata, "bundle_strategy": bundle.strategy},
+            )
+        )
+
+    for regime_name, reason in skipped_regimes.items():
+        health.append(
+            SpecialistHealthContract(
+                model_id=f"skipped::{regime_name}",
+                compatible_regimes=[regime_name],
+                stability_score=None,
+                decay_score=None,
+                failure_flags=[str(reason)],
+                fallback_only=False,
+                metadata={**shared_metadata, "bundle_strategy": bundle.strategy, "skipped": True},
+            )
+        )
+    return health
+
+
+def build_specialist_library_snapshot(bundle, training_report=None, *, symbol="unknown", timeframe="unknown", metadata=None):
+    training_report = dict(training_report or {})
+    shared_metadata = dict(metadata or {})
+    specs = build_specialist_specs_from_bundle(
+        bundle,
+        training_report,
+        symbol=symbol,
+        timeframe=timeframe,
+        metadata=shared_metadata,
+    )
+    health = build_specialist_health_contracts(bundle, training_report, metadata=shared_metadata)
+
+    performance_slices = []
+    trained_rows = {str(key): int(value) for key, value in dict(training_report.get("trained_rows_by_regime") or {}).items()}
+    for regime_name, row_count in trained_rows.items():
+        performance_slices.append(
+            SpecialistPerformanceSlice(
+                model_id=f"specialist::{regime_name}",
+                regime_label=regime_name,
+                split_role="training_slice",
+                row_count=int(row_count),
+                metric_summary={"trained_rows": int(row_count)},
+                metadata={**shared_metadata, "bundle_strategy": bundle.strategy},
+            )
+        )
+
+    return SpecialistLibrarySnapshot(
+        symbol=str(symbol),
+        timeframe=str(timeframe),
+        fallback_model_id=("fallback_generalist" if bundle.fallback_model is not None and bundle.strategy == "specialist" else None),
+        specialists=specs,
+        health=health,
+        performance_slices=performance_slices,
+        metadata={
+            **shared_metadata,
+            "bundle_strategy": bundle.strategy,
+            "feature_column_count": int(len(bundle.feature_columns)),
+            "trained_regimes": [str(item) for item in list(training_report.get("trained_regimes") or [])],
+            "skipped_regimes": {str(key): str(value) for key, value in dict(training_report.get("skipped_regimes") or {}).items()},
+        },
+    )
+
+
 def train_regime_aware_model(
     X,
     y,
@@ -565,6 +762,9 @@ __all__ = [
     "RegimeAwareFeatureFrame",
     "RegimeAwareModelBundle",
     "build_regime_aware_feature_frame",
+    "build_specialist_health_contracts",
+    "build_specialist_library_snapshot",
+    "build_specialist_specs_from_bundle",
     "evaluate_regime_aware_predictions",
     "summarize_regime_coverage",
     "train_regime_aware_model",

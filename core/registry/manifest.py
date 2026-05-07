@@ -5,8 +5,29 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
+from typing import Any
 
 import pandas as pd
+
+
+def _serialize_manifest_value(value: Any):
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return value.to_dict()
+    if isinstance(value, dict):
+        return {str(key): _serialize_manifest_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_serialize_manifest_value(item) for item in value]
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return value
 
 
 def build_feature_schema_hash(feature_columns):
@@ -29,6 +50,9 @@ class RegistryVersionManifest:
     locked_holdout: dict = field(default_factory=dict)
     replication: dict = field(default_factory=dict)
     promotion_eligibility_report: dict = field(default_factory=dict)
+    regime_contracts: dict = field(default_factory=dict)
+    specialist_library: dict = field(default_factory=dict)
+    router_manifest: dict = field(default_factory=dict)
     promotion_ready: bool | None = None
 
     def to_dict(self):
@@ -49,6 +73,9 @@ def build_registry_manifest(
     locked_holdout=None,
     replication=None,
     promotion_eligibility_report=None,
+    regime_contracts=None,
+    specialist_library=None,
+    router_manifest=None,
     promotion_ready=None,
 ):
     columns = list(feature_columns or [])
@@ -71,6 +98,9 @@ def build_registry_manifest(
         locked_holdout=dict(locked_holdout or {}),
         replication=dict(replication or {}),
         promotion_eligibility_report=dict(promotion_eligibility_report or {}),
+        regime_contracts=dict(_serialize_manifest_value(regime_contracts) or {}),
+        specialist_library=dict(_serialize_manifest_value(specialist_library) or {}),
+        router_manifest=dict(_serialize_manifest_value(router_manifest) or {}),
         promotion_ready=promotion_ready,
     )
 
@@ -83,6 +113,9 @@ def flatten_registry_record(manifest, *, current_status, version_dir, latest_dri
     locked_holdout = dict(payload.get("locked_holdout") or {})
     replication = dict(payload.get("replication") or {})
     promotion_eligibility_report = dict(payload.get("promotion_eligibility_report") or {})
+    regime_contracts = dict(payload.get("regime_contracts") or {})
+    specialist_library = dict(payload.get("specialist_library") or {})
+    router_manifest = dict(payload.get("router_manifest") or {})
     promotion_score = dict(promotion_eligibility_report.get("score") or {})
     return {
         "version_id": payload.get("version_id"),
@@ -100,6 +133,9 @@ def flatten_registry_record(manifest, *, current_status, version_dir, latest_dri
         "promotion_score_basis": promotion_score.get("basis"),
         "eligibility_report_present": bool(promotion_eligibility_report),
         "promotion_ready": payload.get("promotion_ready"),
+        "regime_contracts_present": bool(regime_contracts),
+        "specialist_library_present": bool(specialist_library),
+        "router_manifest_present": bool(router_manifest),
         "replication_present": bool(replication),
         "replication_coverage": replication.get("completed_cohort_count"),
         "replication_pass_rate": replication.get("pass_rate"),

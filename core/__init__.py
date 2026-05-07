@@ -76,6 +76,7 @@ from .pipeline import (
     AlignDataStep,
     AutoMLStep,
     BacktestStep,
+    BuildRegimeObservationsStep,
     DataQualityStep,
     DEFAULT_STEPS,
     FeatureSelectionStep,
@@ -92,11 +93,22 @@ from .pipeline import (
     TrainModelsStep,
 )
 from .regime import (
+    BaseRegimeDetector,
+    RegimeDetectorManifest,
     RegimeFeatureSet,
+    RegimeObservationContract,
+    RegimeStateContract,
+    RegimeTraceSummary,
+    RegimeTransitionContract,
     build_default_regime_feature_set,
+    build_regime_observation_contracts,
     build_regime_ablation_report,
+    build_regime_state_contracts,
+    build_regime_trace_summary,
+    build_regime_transition_contracts,
     compute_regime_path_stability,
     detect_regime,
+    summarize_regime_detection_result,
     summarize_regime_ablation_reports,
     summarize_regime_provenance,
 )
@@ -104,9 +116,19 @@ from .regime_training import (
     RegimeAwareFeatureFrame,
     RegimeAwareModelBundle,
     build_regime_aware_feature_frame,
+    build_specialist_health_contracts,
+    build_specialist_library_snapshot,
+    build_specialist_specs_from_bundle,
     summarize_regime_coverage,
     train_regime_aware_model,
     train_regime_aware_walk_forward,
+)
+from .routing import (
+    BaseRouter,
+    RouterManifest,
+    RouterStateSnapshot,
+    RoutingDecisionContract,
+    RoutingScoreComponent,
 )
 from .scenarios import (
     ScenarioEvent,
@@ -213,6 +235,13 @@ from .registry import (
     build_feature_schema_hash,
     build_registry_manifest,
     evaluate_challenger_promotion,
+)
+from .specialists import (
+    SpecialistHealthContract,
+    SpecialistLibrarySnapshot,
+    SpecialistLifecycleState,
+    SpecialistPerformanceSlice,
+    SpecialistSpec,
 )
 from .universe import (
     HistoricalUniverseSnapshot,
