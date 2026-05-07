@@ -1,6 +1,6 @@
 experiment:
   name: btc_regime_aware
-  description: Regime-aware spot model using a simple custom range-position indicator.
+  description: Regime-orchestration spot example with detector, specialist-library, and router sections.
 data:
   source: binance_bars
   market: spot
@@ -23,14 +23,76 @@ indicators:
     params:
       window: 20
 regime:
-  method: hmm
+  detectors:
+    - name: vol_trend_primary
+      type: volatility_trend_hybrid
+      primary: true
+      warmup_bars: 240
+      params:
+        method: explicit
+        n_regimes: 3
+        vol_window: 48
+        trend_window: 96
+    - name: liquidity_overlay
+      type: liquidity_state
+      warmup_bars: 120
+      params:
+        window: 48
+  ensemble:
+    type: weighted_vote
+    primary_detector: vol_trend_primary
+    confidence_floor: 0.55
+    disagreement_penalty: 0.20
+feature_adaptation:
+  scaling:
+    mode: regime_conditioned
+    fallback: global
+  selection:
+    mode: per_regime_mask
+    min_regime_samples: 96
+  interaction_budget:
+    enabled: true
+    max_features: 6
+    max_regimes: 6
+  disable_incompatible_features: true
+model_library:
+  fallback_model: global_generalist
+  min_samples_per_regime: 60
+  coverage_config:
+    max_dominant_share: 0.9
+    min_distinct_regimes: 2
+  specialists:
+    - model_id: trend_model
+      estimator: gbm
+      compatible_regimes: [trend_up_low_vol, trend_up_high_vol]
+      activation_floor: 0.55
+    - model_id: mean_reversion_model
+      estimator: logistic
+      compatible_regimes: [range_low_vol, range_normal_vol]
+      activation_floor: 0.55
+    - model_id: breakout_model
+      estimator: rf
+      compatible_regimes: [transition_high_vol, liquidity_shock]
+      activation_floor: 0.60
+router:
+  type: confidence_weighted
+  hysteresis_margin: 0.08
+  min_persistence_bars: 4
+  cooldown_bars: 8
+  fallback_confidence_floor: 0.45
+  score_weights:
+    regime_confidence: 0.40
+    specialist_stability: 0.25
+    transition_robustness: 0.20
+    switching_cost: 0.15
+maintenance:
+  retraining_policy: structural_only
+  min_new_regime_support: 256
+  break_persistence_bars: 24
+  library_review_cooldown_bars: 168
 model:
   type: gbm
   cv_method: cpcv
-  regime_aware:
-    enabled: true
-    strategy: specialist
-    min_samples_per_regime: 60
 backtest:
   engine: vectorbt
 quick_overrides:

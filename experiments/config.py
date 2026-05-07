@@ -61,6 +61,16 @@ def _clone_any(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+def _clone_mapping_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    cloned: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, Mapping):
+            cloned.append(_clone_mapping(item))
+    return cloned
+
+
 def _read_raw_config(config_source: str | Path | Mapping[str, Any]) -> tuple[dict[str, Any], Path | None]:
     if isinstance(config_source, Mapping):
         return _clone_mapping(config_source), None
@@ -105,6 +115,147 @@ def _normalize_indicator_specs(indicators: Any) -> list[Any]:
     return normalized_specs
 
 
+def _infer_legacy_regime_method(primary_detector: Mapping[str, Any] | None) -> str:
+    detector = dict(primary_detector or {})
+    params = dict(detector.get("params") or {})
+    configured = str(params.get("method", detector.get("method", "")) or "").strip().lower()
+    if configured in {"explicit", "hmm"}:
+        return configured
+
+    detector_type = str(detector.get("type", "explicit") or "explicit").strip().lower()
+    if "hmm" in detector_type or detector_type in {"hidden_markov", "filtered_hmm"}:
+        return "hmm"
+    return "explicit"
+
+
+def _select_primary_regime_detector(regime_config: Mapping[str, Any]) -> dict[str, Any] | None:
+    detectors = _clone_mapping_list(regime_config.get("detectors"))
+    if not detectors:
+        return None
+
+    ensemble = _clone_mapping(regime_config.get("ensemble") or {})
+    primary_name = str(ensemble.get("primary_detector", "") or "").strip()
+    if primary_name:
+        for detector in detectors:
+            if str(detector.get("name", "") or "").strip() == primary_name:
+                return detector
+
+    for detector in detectors:
+        if bool(detector.get("primary", False)):
+            return detector
+    return detectors[0]
+
+
+def _apply_regime_orchestration_compatibility(config: dict[str, Any]) -> dict[str, Any]:
+    working = _clone_mapping(config)
+    regime = _clone_mapping(working.get("regime") or {})
+    feature_adaptation = _clone_mapping(working.get("feature_adaptation") or {})
+    model_library = _clone_mapping(working.get("model_library") or {})
+    router = _clone_mapping(working.get("router") or {})
+    maintenance = _clone_mapping(working.get("maintenance") or {})
+    model = _clone_mapping(working.get("model") or {})
+
+    detectors = _clone_mapping_list(regime.get("detectors"))
+    if detectors:
+        primary_detector = _select_primary_regime_detector(regime)
+        primary_params = dict((primary_detector or {}).get("params") or {})
+        regime.setdefault("enabled", True)
+        regime.setdefault("column_name", "regime")
+        regime.setdefault("method", _infer_legacy_regime_method(primary_detector))
+
+        derived_n_regimes = (
+            regime.get("n_regimes")
+            or primary_params.get("n_regimes")
+            or primary_params.get("state_count")
+            or (primary_detector or {}).get("n_regimes")
+        )
+        if derived_n_regimes is not None:
+            regime["n_regimes"] = int(derived_n_regimes)
+
+        warmup_bars = [
+            int(detector.get("warmup_bars") or 0)
+            for detector in detectors
+            if detector.get("warmup_bars") is not None
+        ]
+        if regime.get("feature_lookback") is not None:
+            warmup_bars.append(int(regime.get("feature_lookback")))
+        if warmup_bars:
+            regime["feature_lookback"] = max(80, max(warmup_bars))
+
+        compatibility_adapter = _clone_mapping(regime.get("compatibility_adapter") or {})
+        compatibility_adapter.update(
+            {
+                "enabled": True,
+                "source": "experiments.config",
+                "primary_detector": str(
+                    (primary_detector or {}).get("name")
+                    or (primary_detector or {}).get("type")
+                    or "detector_0"
+                ),
+                "derived_method": regime.get("method", "explicit"),
+                "derived_n_regimes": regime.get("n_regimes"),
+            }
+        )
+        regime["compatibility_adapter"] = compatibility_adapter
+
+    if feature_adaptation or model_library or router or maintenance:
+        regime_aware = _clone_mapping(model.get("regime_aware") or {})
+        regime_aware.setdefault("enabled", True)
+        regime_aware.setdefault(
+            "strategy",
+            "specialist" if list(model_library.get("specialists") or []) else "feature",
+        )
+        regime_aware.setdefault(
+            "min_samples_per_regime",
+            int(
+                model_library.get("min_samples_per_regime")
+                or (_clone_mapping(model_library.get("specialist_defaults") or {}).get("min_training_samples") or 40)
+            ),
+        )
+        regime_aware.setdefault("regime_column", str(regime.get("column_name", "regime")))
+
+        scaling = _clone_mapping(feature_adaptation.get("scaling") or {})
+        selection = _clone_mapping(feature_adaptation.get("selection") or {})
+        interaction_budget = _clone_mapping(feature_adaptation.get("interaction_budget") or {})
+        if interaction_budget or scaling:
+            regime_aware.setdefault(
+                "regime_interactions",
+                bool(interaction_budget.get("enabled", scaling.get("mode") == "regime_conditioned")),
+            )
+        if interaction_budget.get("max_features") is not None:
+            regime_aware.setdefault("max_interaction_features", int(interaction_budget.get("max_features")))
+        if interaction_budget.get("max_regimes") is not None:
+            regime_aware.setdefault("max_interaction_regimes", int(interaction_budget.get("max_regimes")))
+        if selection.get("max_regime_states") is not None:
+            regime_aware.setdefault("max_dummy_cardinality", int(selection.get("max_regime_states")))
+
+        coverage_config = _clone_mapping(regime_aware.get("coverage_config") or {})
+        coverage_config.update(_clone_mapping(model_library.get("coverage_config") or {}))
+        if coverage_config:
+            regime_aware["coverage_config"] = coverage_config
+
+        if feature_adaptation:
+            regime_aware.setdefault("feature_adaptation", feature_adaptation)
+        if model_library:
+            regime_aware.setdefault("model_library", model_library)
+        if router:
+            regime_aware.setdefault("router", router)
+        if maintenance:
+            regime_aware.setdefault("maintenance", maintenance)
+        if feature_adaptation.get("disable_incompatible_features") is not None:
+            regime_aware.setdefault(
+                "disable_incompatible_features",
+                bool(feature_adaptation.get("disable_incompatible_features")),
+            )
+        model["regime_aware"] = regime_aware
+
+    if regime:
+        working["regime"] = regime
+    if model:
+        working["model"] = model
+    return working
+
+
 def _collect_validation_errors(config: Mapping[str, Any]) -> list[str]:
     errors: list[str] = []
 
@@ -139,6 +290,30 @@ def _collect_validation_errors(config: Mapping[str, Any]) -> list[str]:
                 "labels.kind must be one of ['fixed_horizon', 'trend_scanning', 'triple_barrier']"
             )
 
+    regime = config.get("regime")
+    if regime is not None and not isinstance(regime, Mapping):
+        errors.append("regime must be a mapping when provided")
+    elif isinstance(regime, Mapping) and regime.get("detectors") is not None and not isinstance(regime.get("detectors"), list):
+        errors.append("regime.detectors must be a list when provided")
+
+    feature_adaptation = config.get("feature_adaptation")
+    if feature_adaptation is not None and not isinstance(feature_adaptation, Mapping):
+        errors.append("feature_adaptation must be a mapping when provided")
+
+    model_library = config.get("model_library")
+    if model_library is not None and not isinstance(model_library, Mapping):
+        errors.append("model_library must be a mapping when provided")
+    elif isinstance(model_library, Mapping) and model_library.get("specialists") is not None and not isinstance(model_library.get("specialists"), list):
+        errors.append("model_library.specialists must be a list when provided")
+
+    router = config.get("router")
+    if router is not None and not isinstance(router, Mapping):
+        errors.append("router must be a mapping when provided")
+
+    maintenance = config.get("maintenance")
+    if maintenance is not None and not isinstance(maintenance, Mapping):
+        errors.append("maintenance must be a mapping when provided")
+
     return errors
 
 
@@ -158,6 +333,8 @@ def load_experiment_config(config_source: str | Path | Mapping[str, Any], *, qui
     working_config = _clone_mapping(raw_config)
     if quick:
         working_config = clone_config_with_overrides(working_config, _clone_mapping(working_config.get("quick_overrides") or {}))
+    user_config = _clone_any(working_config)
+    working_config = _apply_regime_orchestration_compatibility(working_config)
 
     validation_errors = _collect_validation_errors(working_config)
     if validation_errors:
@@ -241,7 +418,7 @@ def load_experiment_config(config_source: str | Path | Mapping[str, Any], *, qui
     resolved = _normalize_special_values(resolved)
     return ResolvedExperimentConfig(
         name=str(resolved["experiment"]["name"]),
-        raw_config=working_config,
+        raw_config=user_config,
         config=resolved,
         config_path=config_path,
         quick_mode=bool(quick),
