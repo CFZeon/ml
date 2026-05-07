@@ -1250,7 +1250,15 @@ def fit_stationarity_transforms(features, significance=0.05, transform_order=Non
             continue
 
         report["status"] = "failed_kept" if not drop_failed else "dropped_unrepaired"
-        report["final"] = report["candidates"][-1]["result"] if report["candidates"] else original
+        last_evaluated_result = next(
+            (
+                candidate.get("result")
+                for candidate in reversed(report["candidates"])
+                if candidate.get("result") is not None
+            ),
+            original,
+        )
+        report["final"] = last_evaluated_result
         reports[column] = report
         if drop_failed:
             dropped_features.append(column)

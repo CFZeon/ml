@@ -2330,18 +2330,98 @@ class _FoldScopedPipeline:
         return self._pipeline.state
 
 
-def _build_regime_feature_source(pipeline):
-    regime_features = pipeline.state.get("regime_features")
-    if regime_features is not None:
-        return regime_features
+def _cache_regime_observation_state(pipeline, feature_set):
+    observation_frame = feature_set.frame
+    observation_sources = dict(feature_set.source_map)
+    observation_provenance = dict(feature_set.provenance)
+
+    pipeline.state["regime_observations"] = observation_frame
+    pipeline.state["regime_observation_sources"] = observation_sources
+    pipeline.state["regime_observation_provenance"] = observation_provenance
+
+    # Preserve legacy state keys while the pipeline migrates from "features"
+    # terminology to explicit observation/state layers.
+    pipeline.state["regime_features"] = observation_frame
+    pipeline.state["regime_feature_sources"] = observation_sources
+    pipeline.state["regime_provenance"] = observation_provenance
+    return feature_set
+
+
+def _build_regime_observation_feature_set(pipeline):
+    observation_frame = pipeline.state.get("regime_observations")
+    if observation_frame is None:
+        observation_frame = pipeline.state.get("regime_features")
+
+    if observation_frame is not None:
+        feature_set = normalize_regime_feature_set(
+            {
+                "frame": observation_frame,
+                "source_map": (
+                    pipeline.state.get("regime_observation_sources")
+                    or pipeline.state.get("regime_feature_sources")
+                ),
+                "provenance": (
+                    pipeline.state.get("regime_observation_provenance")
+                    or pipeline.state.get("regime_provenance")
+                ),
+            }
+        )
+        return _cache_regime_observation_state(pipeline, feature_set)
 
     config = pipeline.section("regime")
     builder = config.get("builder") or _default_regime_features
     feature_set = normalize_regime_feature_set(builder(pipeline))
-    pipeline.state["regime_features"] = feature_set.frame
-    pipeline.state["regime_feature_sources"] = dict(feature_set.source_map)
-    pipeline.state["regime_provenance"] = dict(feature_set.provenance)
-    return feature_set.frame
+    return _cache_regime_observation_state(pipeline, feature_set)
+
+
+def _build_regime_feature_source(pipeline):
+    return _build_regime_observation_feature_set(pipeline).frame
+
+
+def _build_regime_state_frame(feature_set, config, *, index=None, fit_index=None):
+    regime_observations = feature_set.frame
+    state_index = regime_observations.index if index is None else index
+    regime_window = regime_observations if index is None else regime_observations.reindex(index)
+    fit_observations = regime_observations.reindex(fit_index) if fit_index is not None else None
+
+    if regime_window is None or (hasattr(regime_window, "empty") and regime_window.empty):
+        return pd.DataFrame(index=state_index), {
+            "provenance": dict(feature_set.provenance),
+            "source_map": dict(feature_set.source_map),
+            "observation_columns": list(regime_observations.columns),
+            "state_columns": [],
+            "available_rows": 0,
+            "ablation": {},
+        }
+
+    regimes = detect_regime(
+        regime_window,
+        n_regimes=config.get("n_regimes", 2),
+        method=config.get("method", "hmm"),
+        config=config,
+        fit_features=fit_observations,
+    )
+    ablation = build_regime_ablation_report(
+        {
+            "frame": regime_window,
+            "source_map": feature_set.source_map,
+            "provenance": feature_set.provenance,
+        },
+        n_regimes=config.get("n_regimes", 2),
+        method=config.get("method", "hmm"),
+        config=config,
+        fit_features=fit_observations,
+        full_regimes=regimes,
+    )
+    frame = _coerce_regime_frame(regimes, column_name=config.get("column_name", "regime")).reindex(state_index)
+    return frame, {
+        "provenance": dict(feature_set.provenance),
+        "source_map": dict(feature_set.source_map),
+        "observation_columns": list(regime_window.columns),
+        "state_columns": list(frame.columns),
+        "available_rows": int(frame.dropna(how="all").shape[0]),
+        "ablation": ablation,
+    }
 
 
 def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
@@ -2380,41 +2460,13 @@ def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
     builder = config.get("builder") or _default_regime_features
     scoped_pipeline = _FoldScopedPipeline(pipeline, buffered_data)
     feature_set = normalize_regime_feature_set(builder(scoped_pipeline))
-    regime_features = feature_set.frame
-
-    if regime_features is None or (hasattr(regime_features, "empty") and regime_features.empty):
-        pipeline.state["_last_regime_details"] = {
-            "provenance": dict(feature_set.provenance),
-            "ablation": {},
-        }
-        return pd.DataFrame(index=index), {}
-
-    regime_window = regime_features.reindex(index)
-    fit_features = regime_features.reindex(fit_index) if fit_index is not None else None
-    regimes = detect_regime(
-        regime_window,
-        n_regimes=config.get("n_regimes", 2),
-        method=config.get("method", "hmm"),
-        config=config,
-        fit_features=fit_features,
+    frame, details = _build_regime_state_frame(
+        feature_set,
+        config,
+        index=index,
+        fit_index=fit_index,
     )
-    ablation = build_regime_ablation_report(
-        {
-            "frame": regime_window,
-            "source_map": feature_set.source_map,
-            "provenance": feature_set.provenance,
-        },
-        n_regimes=config.get("n_regimes", 2),
-        method=config.get("method", "hmm"),
-        config=config,
-        fit_features=fit_features,
-        full_regimes=regimes,
-    )
-    pipeline.state["_last_regime_details"] = {
-        "provenance": dict(feature_set.provenance),
-        "ablation": ablation,
-    }
-    frame = _coerce_regime_frame(regimes, column_name=config.get("column_name", "regime")).reindex(index)
+    pipeline.state["_last_regime_details"] = details
     return frame, {column: "regime" for column in frame.columns}
 
 
@@ -3988,45 +4040,50 @@ class StationarityStep(PipelineStep):
         return results
 
 
+class BuildRegimeObservationsStep(PipelineStep):
+    name = "build_regime_observations"
+
+    def run(self, pipeline):
+        feature_set = _build_regime_observation_feature_set(pipeline)
+        return {
+            "regime_observations": feature_set.frame,
+            "regime_features": feature_set.frame,
+            "regime_observation_sources": dict(feature_set.source_map),
+            "regime_feature_sources": dict(feature_set.source_map),
+            "provenance": dict(feature_set.provenance),
+        }
+
+
 class RegimeStep(PipelineStep):
     name = "detect_regimes"
 
     def run(self, pipeline):
         config = pipeline.section("regime")
-        builder = config.get("builder") or _default_regime_features
-        feature_set = normalize_regime_feature_set(builder(pipeline))
-        regime_features = feature_set.frame
-        regimes = detect_regime(
-            regime_features,
-            n_regimes=config.get("n_regimes", 2),
-            method=config.get("method", "hmm"),
-            config=config,
-        )
-        ablation = build_regime_ablation_report(
-            feature_set,
-            n_regimes=config.get("n_regimes", 2),
-            method=config.get("method", "hmm"),
-            config=config,
-            full_regimes=regimes,
-        )
+        feature_set = _build_regime_observation_feature_set(pipeline)
+        regime_state_frame, detection_details = _build_regime_state_frame(feature_set, config)
+        ablation = detection_details.get("ablation", {})
 
-        pipeline.state["regime_features"] = regime_features
-        pipeline.state["regime_feature_sources"] = dict(feature_set.source_map)
-        pipeline.state["regime_provenance"] = dict(feature_set.provenance)
-        pipeline.state["regimes"] = regimes
+        pipeline.state["regime_state_frame"] = regime_state_frame
+        pipeline.state["regime_state_sources"] = {column: "regime" for column in regime_state_frame.columns}
+        pipeline.state["regime_state_details"] = detection_details
+        pipeline.state["regimes"] = regime_state_frame
         pipeline.state["regime_ablation"] = ablation
         pipeline.state["regime_detection"] = {
             "mode": "global_preview_only",
             "method": config.get("method", "hmm"),
-            "columns": list(regimes.columns) if isinstance(regimes, pd.DataFrame) else [config.get("column_name", "regime")],
-            "provenance": feature_set.provenance,
+            "observation_columns": detection_details.get("observation_columns", []),
+            "columns": detection_details.get("state_columns", []),
+            "available_rows": detection_details.get("available_rows", 0),
+            "provenance": detection_details.get("provenance", {}),
             "ablation": ablation,
         }
         return {
-            "regime_features": regime_features,
-            "regimes": regimes,
+            "regime_observations": feature_set.frame,
+            "regime_features": feature_set.frame,
+            "regime_state_frame": regime_state_frame,
+            "regimes": regime_state_frame,
             "mode": "global_preview_only",
-            "provenance": feature_set.provenance,
+            "provenance": detection_details.get("provenance", {}),
             "ablation": ablation,
         }
 
@@ -5635,6 +5692,7 @@ DEFAULT_STEPS = [
     AutoMLStep,
     FeaturesStep,
     StationarityStep,
+    BuildRegimeObservationsStep,
     RegimeStep,
     LabelsStep,
     AlignDataStep,
@@ -5730,6 +5788,12 @@ class ResearchPipeline:
             "universe_snapshot_meta",
             "eligible_symbols",
             "universe_report",
+            "regime_observations",
+            "regime_observation_sources",
+            "regime_observation_provenance",
+            "regime_state_frame",
+            "regime_state_sources",
+            "regime_state_details",
             "context_ttl_report",
             "data_certification",
             "operational_monitoring",
@@ -5751,6 +5815,7 @@ class ResearchPipeline:
 
         refit_pipeline.build_features()
         refit_pipeline.check_stationarity()
+        refit_pipeline.build_regime_observations()
         refit_pipeline.detect_regimes()
         refit_pipeline.build_labels()
         refit_pipeline.align_data()
@@ -5778,6 +5843,9 @@ class ResearchPipeline:
 
     def check_stationarity(self):
         return self.run_step("check_stationarity")
+
+    def build_regime_observations(self):
+        return self.run_step("build_regime_observations")
 
     def detect_regimes(self):
         return self.run_step("detect_regimes")

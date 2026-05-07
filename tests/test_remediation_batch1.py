@@ -43,6 +43,28 @@ class RemediationBatch1Test(unittest.TestCase):
         self.assertIn("reports", fitted)
         self.assertEqual(int(fitted.get("fit_window")), 120)
 
+    def test_fit_stationarity_transforms_handles_rejected_fracdiff_candidate(self):
+        index = pd.date_range("2026-02-15", periods=40, freq="1h", tz="UTC")
+        values = np.cumsum(np.random.default_rng(19).normal(0, 1, size=len(index))) + 100.0
+        features = pd.DataFrame({"close_like": values}, index=index)
+
+        fitted = fit_stationarity_transforms(
+            features,
+            transform_order=("frac_diff",),
+            config={
+                "drop_failed": False,
+                "frac_diff_d": 0.4,
+                "frac_diff_min_retained_ratio": 0.95,
+                "frac_diff_min_retained_samples": 80,
+            },
+        )
+
+        report = fitted["reports"]["close_like"]
+        self.assertEqual(report["status"], "failed_kept")
+        self.assertEqual(len(report["candidates"]), 1)
+        self.assertIsNotNone(report["final"])
+        self.assertFalse(report["candidates"][0].get("applicable", True))
+
     def test_triple_barrier_conservative_tie_break(self):
         index = pd.date_range("2026-03-01", periods=30, freq="1h", tz="UTC")
         close = pd.Series(100.0, index=index)

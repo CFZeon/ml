@@ -67,6 +67,51 @@ def _make_futures_context(index, spot_close):
 
 
 class RegimeLayerAblationTest(unittest.TestCase):
+    def test_detect_regimes_reuses_cached_regime_observations(self):
+        raw_data = _make_ohlcv(pd.date_range("2026-08-01", periods=180, freq="1h", tz="UTC"))
+        builder_calls = []
+
+        def builder(scoped_pipeline):
+            scoped = scoped_pipeline.require("data")
+            builder_calls.append(len(scoped))
+            frame = pd.DataFrame(
+                {
+                    "trend_20": scoped["close"].pct_change(4).fillna(0.0),
+                    "vol_20": scoped["close"].pct_change().rolling(5, min_periods=1).std().fillna(0.0),
+                    "liquidity_20": np.log1p(scoped["quote_volume"]).rolling(5, min_periods=1).mean().fillna(0.0),
+                },
+                index=scoped.index,
+            )
+            return RegimeFeatureSet(
+                frame=frame,
+                source_map={
+                    "trend_20": "instrument_state",
+                    "vol_20": "instrument_state",
+                    "liquidity_20": "instrument_state",
+                },
+            )
+
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "indicators": [],
+                "features": {"rolling_window": 20},
+                "regime": {"method": "explicit", "builder": builder},
+            }
+        )
+        pipeline.state["raw_data"] = raw_data
+        pipeline.state["data"] = raw_data.copy()
+
+        observation_result = pipeline.build_regime_observations()
+        regime_result = pipeline.detect_regimes()
+
+        self.assertEqual(len(builder_calls), 1)
+        self.assertIn("regime_observations", observation_result)
+        pd.testing.assert_frame_equal(pipeline.state["regime_observations"], pipeline.state["regime_features"])
+        pd.testing.assert_frame_equal(observation_result["regime_observations"], pipeline.state["regime_observations"])
+        pd.testing.assert_frame_equal(regime_result["regime_state_frame"], regime_result["regimes"])
+        self.assertTrue({"trend_regime", "volatility_regime", "liquidity_regime", "regime"}.issubset(regime_result["regimes"].columns))
+
     def test_context_aware_regime_preview_reports_distinct_provenance(self):
         index = pd.date_range("2026-08-01", periods=220, freq="1h", tz="UTC")
         raw_data = _make_ohlcv(index)

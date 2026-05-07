@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+from sklearn.dummy import DummyClassifier
 from sklearn.metrics import accuracy_score, f1_score
 
 from .models import (
@@ -42,6 +43,47 @@ def _subset_sampling_metadata(sampling_metadata, index):
     if close is not None:
         subset["close"] = pd.Series(close, copy=False)
     return subset
+
+
+def _train_constant_safe_model(
+    X,
+    y,
+    *,
+    sample_weight=None,
+    model_type="gbm",
+    model_params=None,
+    sampling_metadata=None,
+):
+    X_frame = pd.DataFrame(X).copy()
+    y_series = pd.Series(y, index=X_frame.index)
+    if y_series.nunique() < 2:
+        model = DummyClassifier(strategy="prior")
+        fit_kwargs = {}
+        if sample_weight is not None:
+            fit_kwargs["sample_weight"] = pd.Series(sample_weight, index=y_series.index, dtype=float).to_numpy()
+        model.fit(X_frame, y_series, **fit_kwargs)
+        return model, {
+            "sequential_bootstrap_enabled": False,
+            "sequential_bootstrap_used": False,
+            "reason": "single_class_training_fallback",
+            "warning": None,
+            "mean_uniqueness": None,
+            "uniqueness_threshold": None,
+            "high_concurrency": False,
+            "random_state": dict(model_params or {}).get("random_state", 42),
+            "bootstrap_sample_size": None,
+            "constant_class": y_series.iloc[0] if len(y_series) else None,
+        }
+
+    return train_model(
+        X_frame,
+        y_series,
+        sample_weight=sample_weight,
+        model_type=model_type,
+        model_params=model_params,
+        sampling_metadata=sampling_metadata,
+        return_report=True,
+    )
 
 
 def summarize_regime_coverage(regime_data, regime_column="regime", config=None):
@@ -324,14 +366,13 @@ def train_regime_aware_model(
 
     if strategy == "feature":
         feature_result = build_regime_aware_feature_frame(X_frame, regime_frame, config=feature_config)
-        model, sampling_report = train_model(
+        model, sampling_report = _train_constant_safe_model(
             feature_result.frame,
             y_series,
             sample_weight=sample_weight,
             model_type=model_type,
             model_params=model_params,
             sampling_metadata=sampling_metadata,
-            return_report=True,
         )
         bundle = RegimeAwareModelBundle(
             strategy="feature",
@@ -360,14 +401,13 @@ def train_regime_aware_model(
 
     target_column = regime_column if regime_column in regime_frame.columns else regime_frame.columns[0]
     labels = pd.Series(regime_frame[target_column], index=X_frame.index)
-    fallback_model, fallback_sampling_report = train_model(
+    fallback_model, fallback_sampling_report = _train_constant_safe_model(
         X_frame,
         y_series,
         sample_weight=sample_weight,
         model_type=model_type,
         model_params=model_params,
         sampling_metadata=sampling_metadata,
-        return_report=True,
     )
     specialist_models = {}
     specialist_rows = {}
