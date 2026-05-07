@@ -21,9 +21,11 @@ model:
   n_splits: 3
   train_size: 360
   test_size: 120
-  gap: 3
+  gap: 24
+stationarity:
+  transform_order: [diff]
 backtest:
   engine: pandas
 quick_overrides:
   data:
-    end: 2024-02-20
+    end: 2024-03-15

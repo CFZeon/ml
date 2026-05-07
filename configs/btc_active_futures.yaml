@@ -55,4 +55,6 @@ backtest:
           cum: 0.0
 quick_overrides:
   data:
-    end: 2024-02-20
+    end: 2024-03-15
+  backtest:
+    apply_funding: false

@@ -112,7 +112,7 @@ def make_futures_context(index, spot_close):
 
 def main():
     args = parse_example_args("Run the offline synthetic derivatives example.", include_local_certification=False)
-    periods = 240 if args.quick else 720
+    periods = 480 if args.quick else 720
     index = pd.date_range("2025-01-01", periods=periods, freq="1h", tz="UTC")
     raw_data = make_ohlcv(index)
     eth_data = make_ohlcv(index, drift=14.0, amplitude=2.0, volume_base=1_200.0)
@@ -131,6 +131,7 @@ def main():
             "rolling_window": 24,
             "context_timeframes": ["4h"],
         },
+        "stationarity": {"transform_order": ["diff"]},
         "feature_selection": {"enabled": True, "max_features": 48, "min_mi_threshold": 0.0},
         "regime": {"method": "hmm"},
         "labels": {
@@ -146,6 +147,7 @@ def main():
             "cv_method": "cpcv",
             "n_blocks": 4,
             "test_blocks": 2,
+            "embargo_bars": 6,
             "validation_fraction": 0.2,
             "meta_n_splits": 2,
         },

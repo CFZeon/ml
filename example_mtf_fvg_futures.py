@@ -195,6 +195,7 @@ def main():
                 },
                 "cross_asset_context_ttl": {"max_age": "2h", "max_unknown_rate": 1.0},
             },
+            "stationarity": {"transform_order": ["diff"]},
             "regime": {"method": "hmm", "builder": build_mtf_regime_features},
             "labels": {
                 "kind": "triple_barrier",

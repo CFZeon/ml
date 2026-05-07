@@ -21,7 +21,7 @@ indicators:
       period: 14
   - kind: donchian
     params:
-      window: 20
+      period: 20
 features:
   lags: [1, 2, 3]
   frac_diff_d: 0.4
@@ -59,7 +59,7 @@ signals:
   tuning_min_trades: 1
 backtest:
   engine: pandas
-  apply_funding: true
+  apply_funding: false
   allow_short: true
   leverage: 2.0
   signal_delay_bars: 1

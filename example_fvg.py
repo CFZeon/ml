@@ -10,8 +10,6 @@ import pandas as pd
 
 from core.execution import NAUTILUS_AVAILABLE
 from example_entrypoints import parse_example_args, run_example
-from example_utils import (
-)
 
 
 def build_fvg_regime_features(pipeline):

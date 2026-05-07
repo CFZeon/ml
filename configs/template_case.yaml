@@ -15,7 +15,7 @@ indicators:
   - kind: macd
   - kind: bollinger
     params:
-      window: 20
+      period: 20
   - kind: atr
     params:
       period: 14

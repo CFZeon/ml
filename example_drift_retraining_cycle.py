@@ -176,7 +176,8 @@ def main():
     print(f"  retrain status    : {promoted['retrain_status']}")
     print(f"  candidate version : {promoted['candidate_version_id']}")
     print(f"  new champion      : {store.get_champion(symbol)['version_id']}")
-    print(f"  promotion reasons : {promoted['promotion_decision'].get('reasons')}")
+    promotion_decision = promoted.get("promotion_decision") or {}
+    print(f"  promotion reasons : {promotion_decision.get('reasons')}")
 
     print_section(sep, 2, "Paper validation loop")
     paper_report = build_paper_trading_report(
