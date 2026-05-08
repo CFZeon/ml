@@ -111,6 +111,12 @@ class RegimeLayerAblationTest(unittest.TestCase):
         pd.testing.assert_frame_equal(observation_result["regime_observations"], pipeline.state["regime_observations"])
         pd.testing.assert_frame_equal(regime_result["regime_state_frame"], regime_result["regimes"])
         self.assertTrue({"trend_regime", "volatility_regime", "liquidity_regime", "regime"}.issubset(regime_result["regimes"].columns))
+        self.assertEqual(pipeline.state["regime_detection"]["trace_summary"].mode, "global_preview_only")
+        self.assertEqual(len(pipeline.state["regime_detection"]["detector_manifests"]), 1)
+        self.assertEqual(
+            pipeline.state["regime_detection"]["detector_manifests"][0].detector_type,
+            "compatibility_explicit",
+        )
 
     def test_context_aware_regime_preview_reports_distinct_provenance(self):
         index = pd.date_range("2026-08-01", periods=220, freq="1h", tz="UTC")
@@ -154,6 +160,38 @@ class RegimeLayerAblationTest(unittest.TestCase):
             ablation["full_provenance"]["total_columns"],
             ablation["endogenous_provenance"]["total_columns"],
         )
+
+    def test_native_primary_detector_routes_through_replay_and_keeps_ablation_available(self):
+        raw_data = _make_ohlcv(pd.date_range("2026-08-01", periods=180, freq="1h", tz="UTC"))
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "indicators": [],
+                "features": {"rolling_window": 20},
+                "regime": {
+                    "detectors": [
+                        {
+                            "name": "trend_native",
+                            "type": "trend_state",
+                            "primary": True,
+                            "params": {"lower_quantile": 0.25, "upper_quantile": 0.75},
+                        }
+                    ]
+                },
+            }
+        )
+        pipeline.state["raw_data"] = raw_data
+        pipeline.state["data"] = raw_data.copy()
+
+        result = pipeline.detect_regimes()
+
+        self.assertEqual(pipeline.state["regime_detection"]["method"], "trend")
+        self.assertEqual(pipeline.state["regime_detection"]["detector_type"], "trend")
+        self.assertEqual(len(pipeline.state["regime_detection"]["detector_manifests"]), 1)
+        self.assertIn("trend_regime", result["regime_state_frame"].columns)
+        self.assertIn("regime", result["regime_state_frame"].columns)
+        self.assertIn("ablation", pipeline.state["regime_detection"])
+        self.assertIn("endogenous_stability", pipeline.state["regime_detection"]["ablation"])
 
     def test_regime_stability_gate_rejects_contextual_layer_that_increases_switching(self):
         index = pd.date_range("2026-08-01", periods=120, freq="1h", tz="UTC")

@@ -79,12 +79,22 @@ from .models import (
 )
 from .monitoring import build_monitoring_report, write_monitoring_artifacts
 from .orchestration import run_drift_retraining_cycle as orchestrate_drift_retraining_cycle
+from .regimes.detectors import (
+    build_regime_detector,
+    can_replay_regime_detector_spec,
+    canonicalize_regime_detector_type,
+    resolve_authoritative_regime_detector_spec,
+)
+from .regimes.observations import (
+    build_default_regime_observation_feature_set,
+    build_fold_local_regime_observation_feature_set,
+    resolve_pipeline_regime_observation_feature_set,
+)
+from .regimes.online_state import replay_regime_detector_trace
 from .readiness import build_deployment_readiness_report
 from .regime import (
-    build_default_regime_feature_set,
     build_regime_ablation_report,
     detect_regime,
-    normalize_regime_feature_set,
     summarize_regime_ablation_reports,
 )
 from .regime_training import evaluate_regime_aware_predictions, summarize_regime_coverage, train_regime_aware_model
@@ -106,22 +116,7 @@ from .universe import (
 
 
 def _default_regime_features(pipeline):
-    data = pipeline.require("data")
-    features_config = pipeline.section("features")
-    reference_data = (
-        pipeline.state.get("reference_overlay_data")
-        if pipeline.state.get("reference_overlay_data") is not None
-        else pipeline.state.get("reference_data")
-    )
-    return build_default_regime_feature_set(
-        data,
-        base_interval=pipeline.section("data").get("interval", "1h"),
-        rolling_window=features_config.get("rolling_window", 20),
-        futures_context=pipeline.state.get("futures_context"),
-        cross_asset_context=pipeline.state.get("cross_asset_context"),
-        reference_data=reference_data,
-        context_timeframes=features_config.get("context_timeframes"),
-    )
+    return build_default_regime_observation_feature_set(pipeline)
 
 
 def _default_stationarity_specs(pipeline):
@@ -2303,33 +2298,6 @@ def _coerce_regime_frame(regimes, column_name="regime"):
     return pd.DataFrame({column_name: pd.Series(regimes, copy=False)})
 
 
-class _FoldScopedPipeline:
-    """Lightweight pipeline view that scopes 'data' and 'raw_data' to a fold window.
-
-    Passed to user-supplied regime feature builders so that rolling statistics
-    are computed only from fold-local data.  This prevents regime feature
-    quantile thresholds from being informed by bars outside the fold window.
-    """
-
-    _DATA_KEYS = frozenset({"raw_data", "data"})
-
-    def __init__(self, pipeline, windowed_data):
-        self._pipeline = pipeline
-        self._windowed_data = windowed_data
-
-    def section(self, key):
-        return self._pipeline.section(key)
-
-    def require(self, key):
-        if key in self._DATA_KEYS:
-            return self._windowed_data
-        return self._pipeline.require(key)
-
-    @property
-    def state(self):
-        return self._pipeline.state
-
-
 def _cache_regime_observation_state(pipeline, feature_set):
     observation_frame = feature_set.frame
     observation_sources = dict(feature_set.source_map)
@@ -2348,29 +2316,7 @@ def _cache_regime_observation_state(pipeline, feature_set):
 
 
 def _build_regime_observation_feature_set(pipeline):
-    observation_frame = pipeline.state.get("regime_observations")
-    if observation_frame is None:
-        observation_frame = pipeline.state.get("regime_features")
-
-    if observation_frame is not None:
-        feature_set = normalize_regime_feature_set(
-            {
-                "frame": observation_frame,
-                "source_map": (
-                    pipeline.state.get("regime_observation_sources")
-                    or pipeline.state.get("regime_feature_sources")
-                ),
-                "provenance": (
-                    pipeline.state.get("regime_observation_provenance")
-                    or pipeline.state.get("regime_provenance")
-                ),
-            }
-        )
-        return _cache_regime_observation_state(pipeline, feature_set)
-
-    config = pipeline.section("regime")
-    builder = config.get("builder") or _default_regime_features
-    feature_set = normalize_regime_feature_set(builder(pipeline))
+    feature_set = resolve_pipeline_regime_observation_feature_set(pipeline)
     return _cache_regime_observation_state(pipeline, feature_set)
 
 
@@ -2394,13 +2340,53 @@ def _build_regime_state_frame(feature_set, config, *, index=None, fit_index=None
             "ablation": {},
         }
 
-    regimes = detect_regime(
-        regime_window,
-        n_regimes=config.get("n_regimes", 2),
-        method=config.get("method", "hmm"),
-        config=config,
-        fit_features=fit_observations,
-    )
+    method = str(config.get("method", "hmm") or "hmm").lower()
+    authoritative_detector_spec = resolve_authoritative_regime_detector_spec(config) if config.get("detectors") else None
+    replay_result = None
+    runtime_method = method
+    ablation_detector_spec = None
+    if authoritative_detector_spec is not None and can_replay_regime_detector_spec(authoritative_detector_spec):
+        replay_result = replay_regime_detector_trace(
+            regime_window,
+            detector=build_regime_detector(
+                authoritative_detector_spec,
+                config=config,
+                source_map=feature_set.source_map,
+            ),
+            source_map=feature_set.source_map,
+            provenance=feature_set.provenance,
+            fit_observations=fit_observations,
+            mode=("fold_local_replay" if fit_index is not None else "global_preview_only"),
+            metadata={"method": method},
+        )
+        regimes = replay_result["state_frame"]
+        ablation_detector_spec = authoritative_detector_spec
+        runtime_method = canonicalize_regime_detector_type(authoritative_detector_spec.get("type"))
+        if runtime_method == "compatibility_explicit":
+            runtime_method = "explicit"
+    elif method == "explicit":
+        replay_result = replay_regime_detector_trace(
+            regime_window,
+            detector=build_regime_detector(
+                None,
+                config=config,
+                source_map=feature_set.source_map,
+            ),
+            source_map=feature_set.source_map,
+            provenance=feature_set.provenance,
+            fit_observations=fit_observations,
+            mode=("fold_local_replay" if fit_index is not None else "global_preview_only"),
+            metadata={"method": method},
+        )
+        regimes = replay_result["state_frame"]
+    else:
+        regimes = detect_regime(
+            regime_window,
+            n_regimes=config.get("n_regimes", 2),
+            method=method,
+            config=config,
+            fit_features=fit_observations,
+        )
     ablation = build_regime_ablation_report(
         {
             "frame": regime_window,
@@ -2412,9 +2398,11 @@ def _build_regime_state_frame(feature_set, config, *, index=None, fit_index=None
         config=config,
         fit_features=fit_observations,
         full_regimes=regimes,
+        detector_spec=ablation_detector_spec,
     )
     frame = _coerce_regime_frame(regimes, column_name=config.get("column_name", "regime")).reindex(state_index)
-    return frame, {
+    details = {
+        "method": runtime_method,
         "provenance": dict(feature_set.provenance),
         "source_map": dict(feature_set.source_map),
         "observation_columns": list(regime_window.columns),
@@ -2422,6 +2410,23 @@ def _build_regime_state_frame(feature_set, config, *, index=None, fit_index=None
         "available_rows": int(frame.dropna(how="all").shape[0]),
         "ablation": ablation,
     }
+    if replay_result is not None:
+        detector_manifest = replay_result["detector_manifests"][0] if replay_result["detector_manifests"] else None
+        details.update(
+            {
+                "trace_summary": replay_result["trace_summary"],
+                "detector_manifests": replay_result["detector_manifests"],
+                "state_contracts": replay_result["state_contracts"],
+                "transition_contracts": replay_result["transition_contracts"],
+                "detector_name": None if detector_manifest is None else detector_manifest.detector_name,
+                "detector_type": None if detector_manifest is None else detector_manifest.detector_type,
+                "replay": {
+                    "mode": replay_result["mode"],
+                    "detector_count": len(replay_result["detector_manifests"]),
+                },
+            }
+        )
+    return frame, details
 
 
 def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
@@ -2445,21 +2450,7 @@ def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
     # --- Per-fold data scoping: include a lookback buffer so rolling stats
     #     at the fold start are not NaN due to insufficient history, while
     #     still preventing future-bar data from influencing quantile thresholds.
-    raw_data = pipeline.state.get("raw_data")
-    if raw_data is None:
-        raw_data = pipeline.state.get("data")
-    lookback = int(config.get("feature_lookback", 80))
-    if raw_data is not None and hasattr(raw_data, "index"):
-        fold_start_pos = raw_data.index.searchsorted(index[0])
-        fold_end_pos = raw_data.index.searchsorted(index[-1], side="right")
-        buffer_start = max(0, fold_start_pos - lookback)
-        buffered_data = raw_data.iloc[buffer_start:fold_end_pos]
-    else:
-        buffered_data = raw_data
-
-    builder = config.get("builder") or _default_regime_features
-    scoped_pipeline = _FoldScopedPipeline(pipeline, buffered_data)
-    feature_set = normalize_regime_feature_set(builder(scoped_pipeline))
+    feature_set = build_fold_local_regime_observation_feature_set(pipeline, index)
     frame, details = _build_regime_state_frame(
         feature_set,
         config,
@@ -4070,12 +4061,17 @@ class RegimeStep(PipelineStep):
         pipeline.state["regime_ablation"] = ablation
         pipeline.state["regime_detection"] = {
             "mode": "global_preview_only",
-            "method": config.get("method", "hmm"),
+            "method": detection_details.get("method", config.get("method", "hmm")),
             "observation_columns": detection_details.get("observation_columns", []),
             "columns": detection_details.get("state_columns", []),
             "available_rows": detection_details.get("available_rows", 0),
             "provenance": detection_details.get("provenance", {}),
             "ablation": ablation,
+            "detector_name": detection_details.get("detector_name"),
+            "detector_type": detection_details.get("detector_type"),
+            "trace_summary": detection_details.get("trace_summary"),
+            "detector_manifests": detection_details.get("detector_manifests", []),
+            "replay": detection_details.get("replay", {}),
         }
         return {
             "regime_observations": feature_set.frame,

@@ -25,6 +25,7 @@ Feature stack
 Usage
 -----
     python example_mtf_fvg_futures.py
+    python example_mtf_fvg_futures.py --quick
     python example_mtf_fvg_futures.py --local-certification
 """
 
@@ -52,6 +53,7 @@ from example_mtf_fvg import (
 from example_utils import (
     build_custom_data_entry,
     build_futures_research_config,
+    print_phase_zero_contract_summary,
     print_section,
 )
 
@@ -258,10 +260,11 @@ def main():
         "recent_window_days": DERIVATIVES_SETTINGS["recent_window_days"],
     }
 
-    run_example(
+    result = run_example(
         config,
         market="um_futures",
         local_certification=args.local_certification,
+        quick=args.quick,
         quiet=args.quiet,
         nautilus_available=NAUTILUS_AVAILABLE,
         example_name="example_mtf_fvg_futures.py",
@@ -270,6 +273,7 @@ def main():
             "after_build_features": _fill_sparse_feature_columns,
         },
     )
+    print_phase_zero_contract_summary(result, quiet=args.quiet)
 
 
 if __name__ == "__main__":

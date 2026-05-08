@@ -1058,18 +1058,761 @@ If any default runtime behavior changes during this phase, Phase 0 has expanded 
 
 ### Phase 1: Online regime detection layer
 
-Implement the new detector interfaces and move current regime builders behind them.
+Phase 1 is the first runtime-bearing phase. It replaces the current ad hoc
+`detect_regime(...)` execution path with a typed causal detector runtime while
+preserving the current public facade and config-driven workflows.
 
-- port current default regime feature construction into `core/regimes/observations.py`
-- implement volatility, trend, liquidity, and break detectors
-- move HMM handling behind a filtered online interface
-- add detector ensemble and confidence logic
+The governing rule for this phase is simple: one canonical observation builder,
+one canonical replay engine, and no detector may inspect future rows.
+
+#### Phase 1 objectives
+
+Phase 1 must accomplish five things:
+
+1. Extract regime observation construction into a dedicated runtime module and
+   make it the canonical source for both global preview and fold-local replay.
+2. Implement concrete detector classes behind `BaseRegimeDetector` for the
+   first supported causal families: volatility, trend, liquidity, break, and
+   filtered HMM.
+3. Add an online replay engine that executes `fit -> initialize -> update`
+   causally and materializes a typed regime state trace.
+4. Add detector-bundle fusion so the runtime can emit confidence,
+   disagreement, warm-up state, and primary-label outputs from one place.
+5. Rewire `core/pipeline.py` and `core/regime.py` so all preview and fold-local
+   regime outputs are produced through the new runtime without breaking current
+   examples, tests, or public imports.
+
+#### Phase 1 delivery rules
+
+- No detector may consume rows beyond the current observation timestamp.
+- Filtered HMM probabilities are allowed; smoothed posteriors are forbidden in
+  preview, training, holdout, and backtest paths.
+- Legacy config keys such as `regime.method`, `regime.n_regimes`,
+  `regime.builder`, and `regime.column_name` must continue to work.
+- Current pipeline aliases must remain populated:
+  - `pipeline.state["regime_observations"]`
+  - `pipeline.state["regime_state_frame"]`
+  - `pipeline.state["regimes"]`
+  - `pipeline.state["regime_detection"]`
+- Warm-up rows and detector disagreement must be explicit in outputs rather
+  than hidden behind default labels.
+- Detector manifests and trace summaries may be added to state and summaries,
+  but feature adaptation, specialist selection, and router behavior remain out
+  of scope for this phase.
+
+#### Phase 1 scope boundaries
+
+Included in Phase 1:
+
+- `core/regimes/observations.py` for canonical observation building
+- concrete detector implementations under `core/regimes/`
+- an online replay engine for global preview and fold-local inference
+- detector ensemble and confidence fusion logic
+- native runtime support for both legacy and detector-bundle config shapes
+- detector diagnostics, manifests, and typed trace summaries
+- replay determinism and no-lookahead test coverage
+
+Explicitly out of scope for Phase 1:
+
+- regime-conditioned scaling, masking, or selector banks
+- specialist-library persistence and lifecycle behavior
+- router scoring, hysteresis, cooldown, and switching
+- routing-aware backtest replay and switching-cost accounting
+- AutoML search across detector-specialist-router bundles
+
+If a code change requires per-regime feature policies or routing behavior to be
+complete, that work belongs to Phase 2 or later, not Phase 1.
+
+#### Files to add in Phase 1
+
+Add these runtime modules even if some begin as thin wrappers around current
+logic:
+
+- `core/regimes/observations.py`
+- `core/regimes/detectors.py`
+- `core/regimes/ensemble.py`
+- `core/regimes/online_state.py`
+- `core/regimes/diagnostics.py`
+- `core/regimes/validation.py`
+
+Expected responsibilities:
+
+- `observations.py`: canonical observation-frame construction and normalization
+- `detectors.py`: concrete detector classes and fit/update helpers
+- `ensemble.py`: detector fusion, disagreement, and confidence rules
+- `online_state.py`: replay engine from observations to typed state trace
+- `diagnostics.py`: detector manifests, disagreement summaries, warm-up stats,
+  and trace-materialization helpers
+- `validation.py`: replay determinism checks and fold-local no-leakage helpers
+
+#### Files to modify in Phase 1
+
+- `core/regime.py`
+- `core/pipeline.py`
+- `core/__init__.py`
+- `experiments/config.py`
+- regime-focused tests under `tests/`
+
+Phase 1 should not require broad edits to examples or root config entrypoints.
+Existing examples must continue to run unless they explicitly opt into richer
+Phase 1 detector diagnostics.
+
+#### Runtime architecture plan
+
+##### Observation layer
+
+`core/regimes/observations.py` becomes the canonical regime observation source.
+
+Required responsibilities:
+
+- move the current default builder behavior out of `core/pipeline.py`
+- preserve `RegimeFeatureSet` semantics: `frame`, `source_map`, and
+  provenance summaries
+- support both full-preview and fold-local observation windows
+- reuse the current point-in-time-safe context joins from:
+  - futures context
+  - reference overlays
+  - cross-asset context
+  - multi-timeframe context
+- keep observation columns stable for the same config and source data
+
+Required public helper surface:
+
+- one function for global preview observation construction
+- one function for fold-local buffered observation construction
+- one normalization helper that returns a `RegimeFeatureSet`
+
+The current `_build_regime_observation_feature_set(...)` path in
+`core/pipeline.py` should become a thin delegating wrapper, not the owning
+implementation.
+
+##### Detector execution contract
+
+Each detector implementation must conform to `BaseRegimeDetector` and be usable
+in a causal replay loop.
+
+Operational contract:
+
+1. `fit(observations)` consumes only the training prefix or configured fit
+   window.
+2. `initialize(observations)` creates online runtime state using only fitted
+   parameters and any allowed warm-up prefix.
+3. `update(state, observation)` consumes exactly one decision-eligible
+   `RegimeObservationContract` and emits the next `RegimeStateContract`.
+4. `manifest()` returns frozen detector metadata including parameters,
+   warm-up requirements, fit-window lineage, and schema version.
+
+The replay engine in `core/regimes/online_state.py` should own iteration over
+observation rows so detectors never need ad hoc batch semantics in pipeline
+code.
+
+##### Concrete detectors to implement first
+
+The first implementation wave should support these concrete detectors:
+
+1. `VolatilityStateDetector`
+   - fit threshold bands from train-prefix volatility features
+   - use causal features such as `ewm_vol_*`, `vol_cluster_ratio_*`,
+     `shock_score_*`, and related range features
+   - emit interpretable labels such as `low_vol`, `normal_vol`, `high_vol`,
+     and optional `shock`
+
+2. `TrendStateDetector`
+   - use causal trend and mean-reversion features such as `trend_z_*`,
+     `mean_reversion_gap_*`, drawdown, and directional return features
+   - emit labels such as `trend_up`, `trend_down`, `range`, and
+     `mean_reverting`
+
+3. `LiquidityStateDetector`
+   - use quote-volume, turnover, illiquidity, and trade-count features where
+     available
+   - emit `liquid`, `normal_liquidity`, `illiquid`, and
+     `liquidity_shock`-style states
+
+4. `BreakStateDetector`
+   - wrap causal break and shock evidence such as online CUSUM-like scores
+   - emit a break-aware label or explicit break-score payload without requiring
+     structural retraining behavior yet
+
+5. `FilteredHMMDetector`
+   - fit only on the training prefix
+   - freeze scaler and HMM parameters after fit
+   - emit filtered forward probabilities only
+   - explicitly forbid smoothing in replay and summaries
+
+The migration-safe default should be a compatibility detector that reproduces
+the current explicit regime behavior behind the new detector protocol before
+additional detector families become default.
+
+##### Detector bundle and ensemble logic
+
+`core/regimes/ensemble.py` must support both single-detector and multi-detector
+execution.
+
+Minimum fusion responsibilities:
+
+- weighted vote over detector-level label probabilities
+- primary-detector fallback when the bundle is configured but fusion is
+  underdetermined
+- confidence floors and disagreement penalties
+- explicit `warm` state when one or more detectors are not yet decision-ready
+- detector-level evidence retained in diagnostics rather than collapsed away
+
+Required aggregated outputs:
+
+- `regime`
+- `regime_confidence`
+- `warm`
+- `detector_disagreement`
+- per-detector label and confidence fields
+- per-detector probability payloads when available
+
+The ensemble must reduce confidence when detectors disagree. It must not hide
+detector disagreement behind a final label without diagnostics.
+
+##### State trace materialization
+
+`core/regimes/online_state.py` should materialize a replayed detector trace into
+both typed contracts and DataFrame outputs.
+
+Required outputs for each replay:
+
+- ordered `RegimeObservationContract` sequence or equivalent trace summary
+- ordered `RegimeStateContract` sequence
+- optional `RegimeTransitionContract` sequence
+- a state DataFrame aligned to the requested index
+- detector manifests and replay metadata
+- warm-up counts, disagreement counts, and available-row counts
+
+The DataFrame representation must continue to satisfy current pipeline callers,
+especially `pipeline.state["regimes"]` and fold-local training paths.
+
+#### Config compatibility and migration plan
+
+Phase 1 should make the runtime understand the new detector-bundle shape
+natively while preserving the old shape.
+
+Required compatibility rules:
+
+- legacy shape:
+  - `regime.method`
+  - `regime.n_regimes`
+  - `regime.builder`
+  - `regime.column_name`
+- new shape:
+  - `regime.detectors`
+  - `regime.ensemble`
+
+Runtime policy:
+
+1. If `regime.detectors` is present, execute the native detector bundle.
+2. If only legacy keys are present, normalize them into a single-detector
+   bundle internally.
+3. Preserve `raw_config` fidelity in config loaders so old and new configs can
+   both round-trip through experiment summaries.
+
+`experiments/config.py` should remain the compatibility boundary for mixed old
+and new regime config shapes until later phases remove the legacy projection.
+
+#### Pipeline integration plan
+
+The controlling integration seam remains `core/pipeline.py`.
+
+Required Phase 1 pipeline changes:
+
+1. `BuildRegimeObservationsStep`
+   - delegate observation construction to `core/regimes/observations.py`
+   - keep current state keys and provenance aliases intact
+
+2. `RegimeStep`
+   - replace direct `detect_regime(...)` execution with the online replay
+     engine
+   - store detector manifests, replay details, disagreement summaries, and warm
+     counts inside `pipeline.state["regime_detection"]`
+   - continue returning backward-compatible fields:
+     - `regime_observations`
+     - `regime_state_frame`
+     - `regimes`
+     - `mode`
+     - `provenance`
+
+3. `_build_fold_local_regime_frame(...)`
+   - use the same observation builder and replay engine as global preview
+   - ensure buffered observation windows are used only for rolling feature
+     stabilization, not for future-aware threshold fitting
+   - ensure detector fit is restricted to `fit_index`
+
+4. `_build_regime_state_frame(...)`
+   - become a compatibility wrapper over the new runtime rather than owning the
+     logic directly
+
+The most important invariant is that global preview and fold-local replay must
+share the same observation-to-state implementation path.
+
+#### Diagnostics and artifact plan
+
+Phase 1 must make detector behavior inspectable before Phase 2 introduces
+feature adaptation.
+
+Add these diagnostics to pipeline state and summaries:
+
+- detector manifest list
+- observation column list
+- state column list
+- available row count
+- warm-up row count
+- detector disagreement summary
+- primary detector name
+- ensemble policy name
+- transition count
+- trace summary contract
+
+Add these optional artifact payloads where natural:
+
+- `regime_detection["detector_manifests"]`
+- `regime_detection["ensemble"]`
+- `regime_detection["trace_summary"]`
+- `regime_detection["detector_outputs"]`
+
+These additions must be additive and must not replace current legacy summary
+keys consumed by tests or examples.
+
+#### Detailed implementation order inside Phase 1
+
+Implement Phase 1 in this exact sequence:
+
+1. Move the current observation-building logic into
+   `core/regimes/observations.py` without changing behavior.
+2. Add one compatibility detector that reproduces the current explicit regime
+   method behind `BaseRegimeDetector`.
+3. Add the replay engine in `core/regimes/online_state.py` and route a
+   single-detector preview path through it.
+4. Add detector manifests, trace summaries, and diagnostics helpers.
+5. Implement volatility, trend, liquidity, and break detectors using the
+   canonical observation frame.
+6. Implement the filtered HMM detector with explicit no-smoothing guards.
+7. Add ensemble fusion and detector disagreement logic.
+8. Rewire fold-local regime construction and training-time replay through the
+   same runtime.
+9. Update config normalization so new detector-bundle config sections are
+   handled natively while legacy configs still run.
+10. Add focused replay, no-lookahead, and determinism tests.
+
+This order matters because it creates a low-risk bridge from the current
+single-path behavior into the multi-detector runtime before any detector bundle
+becomes authoritative.
+
+#### Concrete implementation slices for Phase 1
+
+Execute Phase 1 in the following slices. Each slice must end with a narrow test
+or replay validation before the next slice begins.
+
+##### Slice 1: Canonical observation runtime extraction
+
+Goal:
+
+Create `core/regimes/observations.py` as the owning module for preview and
+fold-local observation construction while preserving current behavior.
+
+Implementation scope:
+
+- move pipeline-facing default observation construction behind the new module
+- centralize reference-data resolution and fold-local buffered observation
+  scoping
+- keep `RegimeFeatureSet` and provenance behavior unchanged
+- make `core/pipeline.py` delegate rather than own the observation-building
+  logic
+
+Validation slice:
+
+- `tests/test_regime_layer_ablation.py`
+- one new focused observation-runtime test file
+
+##### Slice 2: Single-detector compatibility replay runtime
+
+Goal:
+
+Add the online replay engine and one compatibility detector that reproduces the
+current explicit regime path behind `BaseRegimeDetector`.
+
+Implementation scope:
+
+- add `core/regimes/online_state.py`
+- add a compatibility detector in `core/regimes/detectors.py`
+- route single-detector preview through replay
+- emit manifests and trace summaries without changing output keys
+
+Validation slice:
+
+- existing regime preview tests
+- new replay determinism test for the compatibility detector
+
+##### Slice 3: Native detector family rollout
+
+Goal:
+
+Introduce the first concrete detector families using the canonical observation
+frame.
+
+Implementation scope:
+
+- add four native `BaseRegimeDetector` implementations in
+  `core/regimes/detectors.py`:
+  - `TrendRegimeDetector`
+  - `VolatilityRegimeDetector`
+  - `LiquidityRegimeDetector`
+  - `BreakRegimeDetector`
+- factor shared detector helpers so native detectors do not duplicate:
+  - observation-frame normalization
+  - schema locking at fit time
+  - lexical / provenance-aware column selection
+  - threshold fitting on the training prefix only
+  - neutral fallback emission when evidence is unavailable
+- extend `core/regimes/online_state.py` only as needed so the existing replay
+  engine can run any one native detector without introducing multi-detector
+  fusion yet
+- update `core/pipeline.py` to resolve a selected detector instance and route
+  single-detector replay through the same preview / fold-local seam added in
+  Slice 2
+- extend `experiments/config.py` so one native detector can be configured
+  natively while explicitly rejecting multi-detector fusion requests until
+  Slice 5
+- keep detector outputs, manifests, and trace summaries additive; do not remove
+  or rename current legacy keys in `pipeline.state["regime_detection"]`
+
+Required invariants:
+
+- every detector may inspect the full fit prefix during `fit(...)`, but no
+  detector may inspect validation or test rows when replaying a fold-local
+  trace
+- detector schema must freeze at fit time; selected columns, source counts, and
+  threshold parameters must not change mid-replay
+- detector `update(...)` must be row-causal; if a detector requires prior state
+  such as a previous score, that state must be carried explicitly in the replay
+  state object rather than recomputed from future rows
+- `state_frame.index` must match the requested replay index exactly, including
+  warm-up rows that emit neutral or partial outputs
+- native detector rollout must be additive only: legacy `method: explicit`
+  behavior stays unchanged unless config explicitly selects a native detector
+- Slice 3 must not introduce detector fusion, weighted voting, disagreement
+  penalties, or any bundled authority over the final composite label; those are
+  reserved for Slice 5
+
+Detector contract for this slice:
+
+Each native detector should emit a `RegimeStateContract` whose
+`detector_outputs` contain at minimum:
+
+- `score`: scalar detector score for the current row
+- detector-specific threshold fields such as `lower_threshold`,
+  `upper_threshold`, or `trigger_threshold`
+- `selected_columns`: frozen fit-time column list or a serialized equivalent in
+  metadata
+- `selected_column_count`
+- `warm`: explicit readiness flag
+- one typed state column, for example `trend_regime`, `volatility_regime`,
+  `liquidity_regime`, or `structural_break_regime`
+- `regime`: detector-local label used by the existing replay surface when a
+  single detector is authoritative
+
+Detector manifests must include at minimum:
+
+- `detector_name`
+- `detector_type`
+- fit-time params actually used after defaults are resolved
+- `warmup_bars`
+- fit-window start, end, and row count
+- selected-column summary and source breakdown in `metadata`
+
+Proposed detector semantics:
+
+- trend detector:
+  - score source selection should default to columns whose names contain one of
+    `trend`, `ret_`, `return`, `momentum`, or `slope`
+  - default exclusions should include `vol`, `volume`, `liquid`, `break`, and
+    `shock`
+  - fit should compute frozen lower and upper quantile thresholds from the fit
+    prefix score series
+  - replay should emit `trend_regime` in `{-1, 0, 1}` representing bearish,
+    neutral, and bullish trend states
+- volatility detector:
+  - score source selection should default to columns matching `vol`, `range`,
+    `atr`, `dispersion`, `cluster`, `drawdown`, or `shock`
+  - replay should emit `volatility_regime` in `{-1, 0, 1}` representing calm,
+    neutral, and stressed volatility states
+  - fit must freeze quantile thresholds from the training prefix only
+- liquidity detector:
+  - primary score should aggregate `liquid`, `volume`, `turnover`, and `trade`
+    features
+  - illiquidity penalties should subtract `illiquid` and `amihud` features if
+    present
+  - replay should emit `liquidity_regime` in `{-1, 0, 1}` representing
+    illiquid, neutral, and liquid states
+  - any inversion rule must be stored in the manifest and never inferred later
+- break detector:
+  - score source selection should default to `break`, `shock`, `jump`,
+    `crash`, and `drawdown`
+  - this detector may also maintain explicit replay state for prior volatility
+    or prior break score if a first-difference acceleration term is used
+  - replay should emit `structural_break_regime` in `{0, 1}` with `1`
+    reserved for an active break / shock state
+  - thresholding should be upper-tail only by default; there is no need for a
+    symmetric lower threshold in Slice 3
+
+Config and routing rules for Slice 3:
+
+- accepted config surface for the first rollout should be the existing
+  `regime.detectors` list, but Slice 3 should allow exactly one enabled native
+  detector to be authoritative at runtime
+- if more than one non-compatibility detector is enabled, fail fast with a
+  precise error stating that detector fusion is deferred to Slice 5
+- if `regime.method` is set and `regime.detectors` is absent, preserve current
+  Slice 2 behavior unchanged
+- if a single native detector is configured, `core/pipeline.py` should resolve
+  it through a detector factory instead of the legacy `detect_regime(...)`
+  dispatcher
+- `experiments/config.py` should normalize one-detector native configs without
+  collapsing them back into legacy `method` aliases
+- config normalization must reject ambiguous combinations such as both
+  `method: explicit` and a single native detector marked `primary: true`
+
+Hidden dependency that must be addressed in Slice 3:
+
+The current ablation report in `core/regime.py` still calls
+`detect_regime(...)` internally. If Slice 3 introduces a native detector as the
+authoritative state producer, the ablation report must stop silently switching
+back to the legacy path.
+
+Plan for that dependency:
+
+- add a detector-aware ablation helper that replays the same detector over:
+  - the full canonical observation frame
+  - the endogenous-only observation subset
+- freeze schema separately for each replayed subset so contextual columns are
+  not accidentally carried into the endogenous baseline
+- compute stability, agreement, and gate decisions from replayed outputs, not
+  from a fallback call to `detect_regime(...)`
+- keep the public ablation payload shape unchanged where possible so existing
+  summaries remain readable
+
+Recommended implementation order inside Slice 3:
+
+1. refactor shared fit / update helpers in `core/regimes/detectors.py` so the
+   compatibility detector and native detectors share schema locking and scalar
+   coercion behavior
+2. implement `TrendRegimeDetector` first because it is the lowest-risk
+   three-state detector and provides the template for quantile-threshold
+   detectors
+3. implement `VolatilityRegimeDetector` and `LiquidityRegimeDetector` on the
+   same helper surface
+4. implement `BreakRegimeDetector` last because it is the only detector in this
+   slice that may require explicit replay state beyond frozen thresholds
+5. add a detector factory / resolver in `core/regimes/detectors.py` or a small
+   adjacent module, then route `core/pipeline.py` through it for the
+   single-native-detector case only
+6. migrate ablation reporting so native-detector preview does not fall back to
+   legacy `detect_regime(...)`
+7. add config normalization guards in `experiments/config.py`
+8. add focused tests and only then consider wiring one example config for
+   preview inspection
+
+Planned file-level changes:
+
+- `core/regimes/detectors.py`
+  - keep `ExplicitCompatibilityRegimeDetector`
+  - add native detector classes
+  - add shared score-selection and threshold-fit helpers
+  - add a factory such as `build_regime_detector(spec, config)`
+- `core/regimes/online_state.py`
+  - keep replay ownership centralized here
+  - add only the minimal metadata plumbing needed for detector-specific warm-up
+    diagnostics and detector-local outputs
+- `core/pipeline.py`
+  - replace the current `if method == "explicit"` branch with detector
+    resolution logic that can select either the compatibility detector or one
+    native detector
+  - keep the returned `regime_state_frame` and additive metadata keys stable
+- `core/regime.py`
+  - either adapt `build_regime_ablation_report(...)` to accept a detector
+    callback / replay hook or add a detector-aware sibling helper and route the
+    pipeline through it
+- `experiments/config.py`
+  - normalize one-detector native config
+  - reject unsupported multi-detector authority before Slice 5
+- tests:
+  - add `tests/test_regime_detectors.py`
+  - extend `tests/test_regime_layer_ablation.py`
+  - extend config-runtime compatibility coverage if native detector config is
+    accepted through entrypoints
+
+Validation slice:
+
+- `tests/test_regime_detectors.py`
+- `tests/test_regime_layer_ablation.py`
+- focused config-runtime compatibility coverage if a native detector becomes
+  user-selectable through config entrypoints
+
+Minimum validation behaviors:
+
+- replaying the same fit prefix twice yields identical detector thresholds,
+  manifests, and state frames
+- extending the dataset beyond a cutoff does not change detector outputs on the
+  already-observed prefix
+- fold-local replay never fits on rows outside `fit_index`
+- detectors with no selected columns emit explicit neutral / unavailable states
+  instead of crashing or silently borrowing unrelated columns
+- native-detector ablation compares detector replay against an endogenous-only
+  replay of the same detector, not against the legacy dispatcher
+- single-native-detector config routes correctly, while multi-detector
+  authority is rejected with a deterministic error message
+
+Suggested narrow validation commands while implementing Slice 3:
+
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_regime_detectors.py`
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_regime_layer_ablation.py`
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_regime_detectors.py tests/test_regime_layer_ablation.py tests/test_regime_observation_runtime.py`
 
 Acceptance criteria:
 
+- the repo contains four native detector classes with deterministic fit / update
+  behavior on canonical observation frames
+- one native detector can be selected as the authoritative replayed detector
+  without changing legacy explicit behavior for configs that do not opt in
+- detector manifests expose fit-time schema and thresholds clearly enough to
+  debug why a detector emitted a given state
+- ablation reporting remains causally correct when a native detector is used
+- the slice ends without any ensemble fusion, weighted vote, or multi-detector
+  final label logic being introduced early
+
+Explicit non-goals for Slice 3:
+
+- no filtered HMM work
+- no multi-detector fusion or disagreement scoring
+- no router integration
+- no example or docs churn beyond the minimum needed to exercise one native
+  detector path after tests pass
+
+##### Slice 4: Filtered HMM runtime
+
+Goal:
+
+Support HMM-based regime inference under explicit filtered-only replay rules.
+
+Implementation scope:
+
+- implement filtered HMM fit and update path
+- freeze fitted parameters per fold
+- explicitly block smoothed posterior usage
+
+Validation slice:
+
+- HMM replay test confirming filtered outputs only
+- regression coverage for fold-local prefix fitting
+
+##### Slice 5: Detector ensemble and confidence fusion
+
+Goal:
+
+Fuse multiple detectors into one typed regime trace with disagreement and warm
+diagnostics.
+
+Implementation scope:
+
+- add `core/regimes/ensemble.py`
+- implement weighted vote, primary-detector fallback, and disagreement penalty
+- expose bundle manifests and detector-level evidence in summaries
+
+Validation slice:
+
+- ensemble determinism tests
+- config compatibility tests for `regime.detectors` plus `regime.ensemble`
+
+##### Slice 6: Fold-local runtime unification
+
+Goal:
+
+Ensure training-time fold-local regime construction uses the same replay engine
+as global preview.
+
+Implementation scope:
+
+- route `_build_fold_local_regime_frame(...)` through the canonical runtime
+- restrict detector fit to `fit_index`
+- keep buffered observation windows only for rolling feature stabilization
+
+Validation slice:
+
+- fold-local regime tests
+- regime-aware training regression slice
+
+#### Concrete validation matrix for Phase 1
+
+At minimum, each slice should validate one of these behaviors directly:
+
+1. identical inputs and config yield identical observation frames
+2. buffered fold-local observation windows stop at the fold boundary
+3. detector fit windows never include validation or test rows
+4. replayed regime traces align exactly to the requested index
+5. warm-up and disagreement states are visible in the emitted trace
+6. filtered HMM outputs never include smoothed posterior fields
+7. legacy configs and detector-bundle configs both resolve successfully
+
+#### Test plan for Phase 1
+
+Add these focused tests:
+
+- `tests/test_regime_observation_runtime.py`
+- `tests/test_regime_detectors.py`
+- `tests/test_regime_hmm_filtered.py`
+- `tests/test_regime_ensemble.py`
+- `tests/test_regime_replay_determinism.py`
+- `tests/test_regime_config_runtime_compatibility.py`
+
+Extend these existing suites:
+
+- `tests/test_regime_layer_ablation.py`
+- `tests/test_experiment_config.py`
+- any pipeline slice that currently exercises fold-local regime behavior
+
+Minimum behavior each Phase 1 test group must cover:
+
+- observation frames are stable for identical input windows and config
+- fold-local observation buffering does not alter fit-prefix causality
+- explicit detectors fit only on the training prefix
+- filtered HMM replay never exposes smoothed probabilities
+- replaying the same detector bundle twice yields identical outputs
+- detector disagreement is visible in outputs and trace summaries
+- warm-up rows are explicit and not silently relabeled as fully confident
+- legacy `regime.method` configs and new `regime.detectors` configs both run
+
+#### Risks and failure modes to prevent in Phase 1
+
+- silently changing label taxonomy for current explicit preview paths
+- fitting detector thresholds on the full replay window instead of the fit
+  prefix
+- allowing HMM smoothing or future-scaled normalization in evaluation paths
+- dropping warm-up rows and thereby misaligning state frames with input index
+- exploding state-column width with inconsistent per-detector probability names
+- diverging global preview and fold-local regime logic into separate code paths
+
+The main guardrail is to make replay the only owner of regime-state production
+and treat all preview and fold-local consumers as wrappers around that runtime.
+
+#### Phase 1 acceptance criteria
+
+Phase 1 is complete only when all of these are true:
+
+- current root examples and legacy regime configs still run
+- current `pipeline.detect_regimes()` callers still receive backward-compatible
+  keys
+- both global preview and fold-local training paths use the same observation
+  and replay runtime
 - regime traces are reproducible under walk-forward replay
-- no detector uses future data
+- no detector uses future rows beyond the configured fit prefix
 - detector disagreement and warm-up states are visible in outputs
+- filtered HMM execution uses forward probabilities only
+- detector manifests and trace summaries are available in pipeline state and
+  summaries
 
 ### Phase 2: Feature adaptation layer
 

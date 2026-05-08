@@ -915,7 +915,47 @@ def _subset_regime_feature_set(feature_set, allowed_sources):
     )
 
 
-def build_regime_ablation_report(feature_set, *, n_regimes=2, method="hmm", config=None, fit_features=None, full_regimes=None):
+def _replay_regime_detector_state(feature_set, *, detector_spec, config=None, fit_features=None):
+    from .regimes.detectors import build_regime_detector
+    from .regimes.online_state import replay_regime_detector_trace
+
+    normalized = normalize_regime_feature_set(feature_set)
+    fit_frame = None
+    if fit_features is not None:
+        fit_reference = normalize_regime_feature_set(
+            {
+                "frame": fit_features,
+                "source_map": normalized.source_map,
+            }
+        )
+        fit_frame = fit_reference.frame.reindex(columns=normalized.frame.columns)
+
+    replay = replay_regime_detector_trace(
+        normalized.frame,
+        detector=build_regime_detector(
+            detector_spec,
+            config=config,
+            source_map=normalized.source_map,
+        ),
+        source_map=normalized.source_map,
+        provenance=normalized.provenance,
+        fit_observations=fit_frame,
+        mode="ablation_replay",
+        metadata={"ablation": True},
+    )
+    return replay["state_frame"], replay
+
+
+def build_regime_ablation_report(
+    feature_set,
+    *,
+    n_regimes=2,
+    method="hmm",
+    config=None,
+    fit_features=None,
+    full_regimes=None,
+    detector_spec=None,
+):
     normalized = normalize_regime_feature_set(feature_set)
     endogenous_only = _subset_regime_feature_set(normalized, {REGIME_INSTRUMENT_SOURCE})
     contextual_only = _subset_regime_feature_set(normalized, CONTEXTUAL_REGIME_SOURCES)
@@ -951,20 +991,34 @@ def build_regime_ablation_report(feature_set, *, n_regimes=2, method="hmm", conf
     if fit_reference is not None:
         endogenous_fit = fit_reference.frame.reindex(columns=endogenous_only.frame.columns)
 
-    baseline_regimes = detect_regime(
-        endogenous_only.frame,
-        n_regimes=n_regimes,
-        method=method,
-        config=config,
-        fit_features=endogenous_fit,
-    )
-    enriched_regimes = full_regimes if full_regimes is not None else detect_regime(
-        normalized.frame,
-        n_regimes=n_regimes,
-        method=method,
-        config=config,
-        fit_features=None if fit_reference is None else fit_reference.frame,
-    )
+    if detector_spec is not None:
+        baseline_regimes, _ = _replay_regime_detector_state(
+            endogenous_only,
+            detector_spec=detector_spec,
+            config=config,
+            fit_features=endogenous_fit,
+        )
+        enriched_regimes = full_regimes if full_regimes is not None else _replay_regime_detector_state(
+            normalized,
+            detector_spec=detector_spec,
+            config=config,
+            fit_features=None if fit_reference is None else fit_reference.frame,
+        )[0]
+    else:
+        baseline_regimes = detect_regime(
+            endogenous_only.frame,
+            n_regimes=n_regimes,
+            method=method,
+            config=config,
+            fit_features=endogenous_fit,
+        )
+        enriched_regimes = full_regimes if full_regimes is not None else detect_regime(
+            normalized.frame,
+            n_regimes=n_regimes,
+            method=method,
+            config=config,
+            fit_features=None if fit_reference is None else fit_reference.frame,
+        )
 
     baseline_stability = compute_regime_path_stability(baseline_regimes)
     enriched_stability = compute_regime_path_stability(enriched_regimes)

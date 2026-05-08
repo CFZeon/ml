@@ -10,6 +10,7 @@ from typing import Any, Mapping
 import yaml
 
 from core import build_indicator, list_available_indicators
+from core.regimes.detectors import is_native_regime_detector_spec
 from example_utils import build_futures_research_config, build_spot_research_config, clone_config_with_overrides
 
 
@@ -161,7 +162,11 @@ def _apply_regime_orchestration_compatibility(config: dict[str, Any]) -> dict[st
         primary_params = dict((primary_detector or {}).get("params") or {})
         regime.setdefault("enabled", True)
         regime.setdefault("column_name", "regime")
-        regime.setdefault("method", _infer_legacy_regime_method(primary_detector))
+        if is_native_regime_detector_spec(primary_detector):
+            if regime.get("method") in (None, ""):
+                regime["method"] = None
+        else:
+            regime.setdefault("method", _infer_legacy_regime_method(primary_detector))
 
         derived_n_regimes = (
             regime.get("n_regimes")
@@ -182,21 +187,22 @@ def _apply_regime_orchestration_compatibility(config: dict[str, Any]) -> dict[st
         if warmup_bars:
             regime["feature_lookback"] = max(80, max(warmup_bars))
 
-        compatibility_adapter = _clone_mapping(regime.get("compatibility_adapter") or {})
-        compatibility_adapter.update(
-            {
-                "enabled": True,
-                "source": "experiments.config",
-                "primary_detector": str(
-                    (primary_detector or {}).get("name")
-                    or (primary_detector or {}).get("type")
-                    or "detector_0"
-                ),
-                "derived_method": regime.get("method", "explicit"),
-                "derived_n_regimes": regime.get("n_regimes"),
-            }
-        )
-        regime["compatibility_adapter"] = compatibility_adapter
+        if not is_native_regime_detector_spec(primary_detector):
+            compatibility_adapter = _clone_mapping(regime.get("compatibility_adapter") or {})
+            compatibility_adapter.update(
+                {
+                    "enabled": True,
+                    "source": "experiments.config",
+                    "primary_detector": str(
+                        (primary_detector or {}).get("name")
+                        or (primary_detector or {}).get("type")
+                        or "detector_0"
+                    ),
+                    "derived_method": regime.get("method", "explicit"),
+                    "derived_n_regimes": regime.get("n_regimes"),
+                }
+            )
+            regime["compatibility_adapter"] = compatibility_adapter
 
     if feature_adaptation or model_library or router or maintenance:
         regime_aware = _clone_mapping(model.get("regime_aware") or {})
@@ -295,6 +301,15 @@ def _collect_validation_errors(config: Mapping[str, Any]) -> list[str]:
         errors.append("regime must be a mapping when provided")
     elif isinstance(regime, Mapping) and regime.get("detectors") is not None and not isinstance(regime.get("detectors"), list):
         errors.append("regime.detectors must be a list when provided")
+    elif isinstance(regime, Mapping):
+        detectors = [dict(item) for item in list(regime.get("detectors") or []) if isinstance(item, Mapping)]
+        enabled_native = [detector for detector in detectors if detector.get("enabled", True) is not False and is_native_regime_detector_spec(detector)]
+        if len(enabled_native) > 1:
+            errors.append("regime.detectors supports at most one enabled native detector before Slice 5")
+
+        primary_detector = _select_primary_regime_detector(regime)
+        if is_native_regime_detector_spec(primary_detector) and regime.get("method") not in (None, ""):
+            errors.append("regime.method cannot be combined with a native primary regime detector")
 
     feature_adaptation = config.get("feature_adaptation")
     if feature_adaptation is not None and not isinstance(feature_adaptation, Mapping):
@@ -400,6 +415,12 @@ def load_experiment_config(config_source: str | Path | Mapping[str, Any], *, qui
     overrides["indicators"] = indicator_specs
 
     resolved = clone_config_with_overrides(pipeline_config, overrides)
+
+    resolved_regime = _clone_mapping(resolved.get("regime") or {})
+    if is_native_regime_detector_spec(_select_primary_regime_detector(resolved_regime)) and resolved_regime.get("method") is None:
+        resolved_regime.pop("method", None)
+        resolved["regime"] = resolved_regime
+
     passthrough_sections = {
         key: _clone_any(value)
         for key, value in working_config.items()

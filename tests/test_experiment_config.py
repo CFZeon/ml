@@ -109,6 +109,67 @@ maintenance:
         self.assertEqual(resolved.config["model_library"]["specialists"][0]["model_id"], "trend_model")
         self.assertEqual(resolved.config["router"]["type"], "confidence_weighted")
 
+    def test_load_experiment_config_keeps_native_primary_detector_without_legacy_method_alias(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "native_detector.yaml"
+            config_path.write_text(
+                """
+experiment:
+  name: btc_native_regime
+data:
+  symbol: BTCUSDT
+  interval: 1h
+  start: 2024-01-01
+  end: 2024-04-01
+indicators:
+  - kind: returns
+regime:
+  detectors:
+    - name: trend_native
+      type: trend_state
+      primary: true
+      warmup_bars: 96
+      params:
+        lower_quantile: 0.25
+        upper_quantile: 0.75
+""".strip(),
+                encoding="utf-8",
+            )
+
+            resolved = load_experiment_config(config_path)
+
+        self.assertNotIn("method", resolved.config["regime"])
+        self.assertEqual(resolved.config["regime"]["feature_lookback"], 96)
+        self.assertEqual(resolved.config["regime"]["detectors"][0]["type"], "trend_state")
+        self.assertNotIn("compatibility_adapter", resolved.config["regime"])
+
+    def test_load_experiment_config_rejects_native_primary_detector_with_legacy_method(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "invalid_native_detector.yaml"
+            config_path.write_text(
+                """
+experiment:
+  name: invalid_native_regime
+data:
+  symbol: BTCUSDT
+  interval: 1h
+  start: 2024-01-01
+  end: 2024-04-01
+indicators:
+  - kind: returns
+regime:
+  method: explicit
+  detectors:
+    - name: trend_native
+      type: trend_state
+      primary: true
+""".strip(),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "regime.method cannot be combined with a native primary regime detector"):
+                load_experiment_config(config_path)
+
 
 if __name__ == "__main__":
     unittest.main()
