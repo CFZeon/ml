@@ -41,25 +41,36 @@ These constraints must remain binding through the refactor.
 
 - No full-sample clustering over the complete dataset.
 - No future-aware regime labeling.
-- No HMM smoothing for live or backtest decisions. Only filtered state probabilities are allowed at decision time.
-- Any clustering-based detector must fit on the training prefix only and infer online on later data.
-- Any detector that requires state prototypes or thresholds must freeze them per fold before validation and holdout.
-- Feature adaptation must use only the regime state available at the same timestamp.
-- Router performance priors must update only after outcome maturity and execution delay.
-- Validation, holdout, and promotion must preserve the existing purging and embargo discipline.
+- No HMM smoothing for live or backtest decisions. Only filtered state
+  probabilities are allowed at decision time.
+- Any clustering-based detector must fit on the training prefix only and infer
+  online on later data.
+- Any detector that requires state prototypes or thresholds must freeze them
+  per fold before validation and holdout.
+- Feature adaptation must use only the regime state available at the same
+  timestamp.
+- Router performance priors must update only after outcome maturity and
+  execution delay.
+- Validation, holdout, and promotion must preserve the existing purging and
+  embargo discipline.
 
 ### Temporal correctness
 
 - Regime state must be stamped with `as_of` and `available_at` timestamps.
-- Regime probabilities, feature transforms, and routing decisions must all respect publication delays and availability lags.
-- Backtests must simulate delayed regime recognition, switching latency, and switching costs.
+- Regime probabilities, feature transforms, and routing decisions must all
+  respect publication delays and availability lags.
+- Backtests must simulate delayed regime recognition, switching latency, and
+  switching costs.
 
 ### Statistical defensibility
 
 - Aggregate metrics are insufficient for admissibility.
-- Performance must be reported by regime, by transition, and on unseen or weakly covered regimes.
-- Drift monitors must distinguish temporary turbulence from persistent structural change.
-- Retraining must be a governed maintenance decision, not the default reaction to short-horizon degradation.
+- Performance must be reported by regime, by transition, and on unseen or
+  weakly covered regimes.
+- Drift monitors must distinguish temporary turbulence from persistent
+  structural change.
+- Retraining must be a governed maintenance decision, not the default reaction
+  to short-horizon degradation.
 
 ### Product constraints that remain fixed
 
@@ -91,25 +102,38 @@ The architecture also needs three distinct control loops:
 2. Medium loop: delayed performance attribution, router recalibration, and specialist health updates.
 3. Slow loop: specialist discovery, retirement, replacement, and controlled retraining.
 
-This separation is critical. The current design implicitly collapses all three loops into retraining. The upgraded system must not do that.
+This separation is critical. Phase 1 established the fast regime-inference loop,
+but the feature-adaptation, specialist, router, and maintenance loops are still
+missing as first-class runtime layers.
 
 ## Current-to-Target Gap Summary
 
-The current repo has regime features and regime-aware training hooks, but it does not yet have:
+Implemented through Phase 1:
 
-- a first-class online regime state contract
-- a detector ensemble abstraction
-- regime-conditioned feature policies as a separate layer
-- a specialist model library with compatibility metadata
-- a router with hysteresis, persistence logic, and cooldowns
-- regime-transition-aware backtest replay and diagnostics
-- a maintenance policy that prefers routing and specialist replacement over constant retraining
+- typed regime, specialist, and router contracts
+- canonical regime observation construction in `core/regimes/observations.py`
+- canonical replay runtime in `core/regimes/online_state.py`
+- compatibility, native score-based, and filtered-HMM detectors in
+  `core/regimes/detectors.py`
+- additive detector manifests and trace summaries in
+  `pipeline.state["regime_detection"]`
 
-The plan below closes those gaps in a staged way.
+Still missing for the target architecture:
+
+- first-class feature-adaptation contracts, manifests, and replay artifacts
+- fold-local regime-conditioned scaling and masking fitted on `X_fit` only
+- specialist-library persistence and lifecycle management
+- router scoring, hysteresis, and switching traces
+- validation and backtest replay across the full
+  `detector -> adaptation -> router` loop
+- maintenance policy that prefers reroute and recalibration over retrain
+
+The remaining phases below close those gaps without reopening the Phase 1
+detector seam.
 
 ## Refactored Module Structure
 
-The recommended target structure is:
+Current realized structure after Phase 1:
 
 ```text
 core/
@@ -118,217 +142,124 @@ core/
     contracts.py
     observations.py
     detectors.py
-    ensemble.py
     online_state.py
-    transitions.py
-    breaks.py
-    diagnostics.py
-    validation.py
+  pipeline.py
+  regime.py
+  regime_training.py
+```
+
+Target additions for the remaining phases:
+
+```text
+core/
   feature_adaptation/
     __init__.py
     contracts.py
+    runtime.py
     scaling.py
-    gating.py
-    selection.py
+    masking.py
     diagnostics.py
   specialists/
-    __init__.py
-    contracts.py
     training.py
-    calibration.py
     library.py
     health.py
-    retirement.py
   routing/
-    __init__.py
-    contracts.py
     scorer.py
     hysteresis.py
-    policies.py
     router.py
     diagnostics.py
   validation/
-    __init__.py
     regime_walk_forward.py
     transition_metrics.py
     unseen_regime.py
-    regime_reports.py
-  backtest_regime_trace.py
-  backtest_routing_trace.py
-  backtest_switching_costs.py
-  orchestration_regime_library.py
-  orchestration_router_maintenance.py
 ```
 
 Existing files should be repurposed rather than abandoned:
 
-- `core/regime.py` becomes a compatibility facade and high-level entrypoint over `core/regimes/`
-- `core/regime_training.py` becomes a compatibility facade over `core/specialists/training.py`
-- `core/drift.py` is split into regime drift, feature drift, model decay, and structural break monitors
-- `core/pipeline.py` becomes the canonical orchestration point for new regime and router steps
-- `core/automl.py` becomes a regime-centric study runner rather than a retraining-centric tuner
-- `core/registry/` is extended to store specialist-library manifests and router artifacts
+- `core/regime.py` remains the compatibility facade and high-level entrypoint
+  over `core/regimes/`
+- `core/regime_training.py` remains the compatibility bridge until feature
+  adaptation and specialist training are extracted cleanly
+- `core/pipeline.py` remains the canonical orchestration point for detector,
+  adaptation, training, and backtest steps
+- `core/automl.py` should shift from retraining-centric search to bundle-
+  centric search only after the runtime layers exist
+- `core/drift.py` must eventually split regime drift, feature drift, model
+  decay, and structural-break actions
 
 ## Core Contracts and Interfaces
 
-The refactor should begin by introducing explicit contracts. Without them, the redesign will sprawl into implicit state and ad hoc dictionaries.
+The redesign must continue to rely on explicit runtime contracts rather than ad
+hoc dictionaries. Phase 0 already introduced the regime, specialist, and router
+contract families. The next contract family to add is the feature-adaptation
+layer.
 
-### Regime contracts
-
-```python
-from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, Sequence
-
-import pandas as pd
-
-@dataclass(frozen=True)
-class RegimeObservation:
-    as_of: pd.Timestamp
-    available_at: pd.Timestamp
-    values: Mapping[str, float]
-    source_map: Mapping[str, str]
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-@dataclass(frozen=True)
-class RegimeState:
-    as_of: pd.Timestamp
-    available_at: pd.Timestamp
-    label: str
-    probabilities: Mapping[str, float]
-    confidence: float
-    detector_outputs: Mapping[str, Any]
-    warm: bool
-    transition_id: str | None = None
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-class BaseRegimeDetector(Protocol):
-    def fit(self, observations: pd.DataFrame) -> "BaseRegimeDetector": ...
-    def initialize(self, observations: pd.DataFrame) -> Any: ...
-    def update(self, state: Any, observation: RegimeObservation) -> tuple[Any, RegimeState]: ...
-    def min_history(self) -> int: ...
-```
-
-Detector rules:
-
-- `fit(...)` may only consume the training prefix of a fold.
-- `update(...)` must emit the next decision-eligible state using only past and current information.
-- any latent-state model must emit filtered probabilities, never smoothed probabilities.
-
-### Feature adaptation contracts
+Required Phase 2 contract surface:
 
 ```python
 @dataclass(frozen=True)
-class FeaturePolicy:
-    feature_columns: Sequence[str]
-    disabled_columns: Sequence[str]
-    scaling_policy: str
-    selector_version: str
-    metadata: Mapping[str, Any] = field(default_factory=dict)
+class FeaturePolicyContract:
+    policy_id: str
+    feature_columns: list[str]
+    disabled_columns: list[str]
+    generated_columns: list[str]
+    regime_column: str
+    scaling_mode: str
+    fallback_mode: str
+    sparse_regimes: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
 
 class BaseFeatureAdapter(Protocol):
-    def fit(self, X: pd.DataFrame, regime_history: pd.DataFrame) -> "BaseFeatureAdapter": ...
-    def transform(self, X: pd.DataFrame, regime_state: RegimeState) -> tuple[pd.DataFrame, FeaturePolicy]: ...
-```
-
-Feature adaptation rules:
-
-- scalers and selectors must be fit on the training slice only
-- regime-conditioned transforms must fall back deterministically when regime confidence is low or regime-specific samples are too sparse
-- the applied policy must be logged for every prediction step in backtest and live paths
-
-### Specialist model contracts
-
-```python
-@dataclass(frozen=True)
-class SpecialistSpec:
-    model_id: str
-    symbol: str
-    timeframe: str
-    compatible_regimes: Sequence[str]
-    estimator_family: str
-    feature_policy_id: str
-    calibration_id: str | None
-    training_window: Mapping[str, Any]
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-@dataclass(frozen=True)
-class SpecialistHealth:
-    model_id: str
-    compatible_regimes: Sequence[str]
-    last_calibrated_at: pd.Timestamp | None
-    stability_score: float
-    decay_score: float
-    failure_flags: Sequence[str]
-    fallback_only: bool = False
-```
-
-The specialist library must support:
-
-- multiple specialists per symbol
-- explicit regime compatibility mappings
-- performance history by regime and by transition
-- calibration lineage
-- champion and challenger status per specialist family
-- clean retirement and rollback
-
-### Router contracts
-
-```python
-@dataclass(frozen=True)
-class RoutingDecision:
-    as_of: pd.Timestamp
-    available_at: pd.Timestamp
-    selected_model_id: str | None
-    weights: Mapping[str, float]
-    regime_label: str
-    regime_confidence: float
-    route_reason: str
-    hysteresis_applied: bool
-    cooldown_active: bool
-    candidate_scores: Mapping[str, float]
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-class BaseRouter(Protocol):
-    def initialize(self, specialists: Sequence[SpecialistSpec]) -> Any: ...
-    def select(
+    def fit(
         self,
-        state: Any,
-        regime_state: RegimeState,
-        specialist_health: Sequence[SpecialistHealth],
-        timestamp: pd.Timestamp,
-    ) -> tuple[Any, RoutingDecision]: ...
+        X: pd.DataFrame,
+        regime_frame: pd.DataFrame,
+        feature_metadata: Mapping[str, Any] | None = None,
+    ) -> "BaseFeatureAdapter": ...
+
+    def transform(
+        self,
+        X: pd.DataFrame,
+        regime_frame: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, FeaturePolicyContract]: ...
+
+    def manifest(self) -> dict[str, Any]: ...
 ```
 
-The router must be explicit, deterministic, serializable, and backtest-replayable.
+Adapter rules:
+
+- `fit(...)` may inspect only the fold-local training prefix
+- `transform(...)` must reuse the frozen fit-time schema, masks, and scaling
+  statistics
+- low-confidence, warm, or sparse-regime rows must fall back deterministically
+- generated feature lineage must be explicit enough to feed existing
+  governance and portability diagnostics
 
 ## Regime Detection Subsystem
 
-### Objectives
+Phase 1 now owns the regime runtime and should not be reopened in later phases
+except through additive integration points.
 
-The regime subsystem must provide:
+The regime subsystem already provides:
 
 - discrete labels
-- soft probabilities
-- confidence scores
+- soft probabilities when a detector supports them
+- confidence and warm-state signaling
 - transition events
-- detector provenance
+- detector provenance, manifests, and trace summaries
 
-### Supported detector families
+Supported detector families after Phase 1:
 
-The initial implementation should support these causal detector families behind one interface:
+1. explicit compatibility replay
+2. native trend, volatility, liquidity, and break detectors
+3. filtered HMM replay with filtered-only posterior output
 
-1. Volatility state detector.
-2. Trend versus mean-reversion detector.
-3. Online change-point detector.
-4. Hidden Markov detector with filtered posterior only.
-5. Microstructure and liquidity state detector.
-6. Ensemble regime combiner.
+Later phases may consume these outputs, but they should not reintroduce
+parallel regime-state implementations in pipeline code.
+
 
 ### Detector design details
-
-#### Volatility and trend detectors
-
-- Reuse and expand the causal features already built in `core/regime.py`.
 - Use rolling and exponentially weighted statistics only.
 - Emit interpretable state probabilities such as `low_vol`, `normal_vol`, `high_vol`, `trend_up`, `trend_down`, `mean_reverting`.
 
@@ -1700,14 +1631,293 @@ Support HMM-based regime inference under explicit filtered-only replay rules.
 
 Implementation scope:
 
-- implement filtered HMM fit and update path
-- freeze fitted parameters per fold
-- explicitly block smoothed posterior usage
+- add `FilteredHMMDetector` to `core/regimes/detectors.py` behind the same
+  `BaseRegimeDetector` protocol used by Slice 2 and Slice 3 detectors
+- fit the HMM only on the training prefix and freeze all replay-time artifacts:
+  - selected observation schema and column order
+  - scaler parameters
+  - fitted HMM parameters
+  - state remap / label-order mapping
+  - any warm-up or burn-in metadata
+- replace the current batch `GaussianHMM.fit(...); predict(...)` path with a
+  causal filtered forward pass in replay
+- route a single authoritative `filtered_hmm` detector through the existing
+  replay seam in `core/regimes/online_state.py`
+- migrate legacy `regime.method: hmm` preview and fold-local paths onto the
+  same filtered detector runtime so pipeline code no longer owns a second HMM
+  implementation path
+- expose HMM-specific manifests and diagnostics without changing current public
+  pipeline keys
+
+Required invariants:
+
+- the HMM may fit on the full fit prefix, but replay must never inspect rows
+  beyond the current observation timestamp
+- scaler statistics must be frozen from the fit prefix only; no replay-time
+  re-centering, re-scaling, or normalization on future rows is allowed
+- state ordering must be deterministic and frozen at fit time so labels do not
+  drift within a fold or change merely because future replay rows were added
+- filtered probabilities must be computed incrementally from prior filtered
+  state and the current emission likelihood only; no backward pass is allowed
+- `state_frame.index` must match the requested replay index exactly, including
+  rows that are marked unavailable, warm, or degenerate
+- Slice 4 must not introduce detector fusion, smoothing-based diagnostics,
+  adaptive online re-estimation, or live/backtest divergence in HMM logic
+
+Filtered HMM detector contract:
+
+`FilteredHMMDetector` should own four responsibilities:
+
+1. schema resolution
+   - default to all numeric observation columns unless explicit `columns` are
+     configured
+   - support explicit exclusion lists and fail fast when the effective schema
+     is empty unless neutral fallback is explicitly allowed
+   - freeze selected column order at fit time
+2. fit-time artifact capture
+   - freeze scaler mean and scale
+   - freeze fitted `GaussianHMM` parameters
+   - freeze state remap from raw latent states to ordered output labels
+   - record fit-window lineage and model hyperparameters in the manifest
+3. replay-time filtering
+   - transform each new observation with the frozen scaler
+   - compute emission log-likelihood for that single observation
+   - advance one forward-filter step from the previous filtered state
+   - normalize probabilities in log space to prevent underflow
+4. typed output emission
+   - emit `regime`, `regime_confidence`, and per-state probability fields
+   - expose `warm` explicitly
+   - include detector-local evidence in `detector_outputs` and metadata
+
+Required HMM replay outputs per row:
+
+- `regime`: argmax of the remapped filtered state probabilities
+- `regime_confidence`: max filtered probability after remap
+- stable probability field names such as `prob_state_0`, `prob_state_1`, ...
+- `warm`: explicit readiness flag
+- `selected_column_count`
+- optional diagnostic fields such as `log_evidence` or `degenerate_fallback`
+  only if they are additive and stable
+
+No-smoothing enforcement rules:
+
+- replay code must not call `GaussianHMM.predict(...)`,
+  `GaussianHMM.predict_proba(...)`, `GaussianHMM.decode(...)`, or
+  `GaussianHMM.score_samples(...)` on the replay sequence
+- replay must compute filtered probabilities from frozen parameters and the
+  current row only
+- manifests and summaries must mark the posterior mode explicitly as
+  `filtered`
+- no smoothed posterior fields may appear in `state_frame`, detector outputs,
+  manifests, summaries, or example output
+
+Algorithm plan for Slice 4:
+
+- fit stage:
+  - clean the fit prefix and align it to the frozen selected schema
+  - fit a frozen scaler on the fit prefix only
+  - fit `GaussianHMM` on the scaled fit prefix
+  - extract and freeze:
+    - `startprob_`
+    - `transmat_`
+    - emission parameters (`means_`, `covars_`, covariance type)
+    - state ordering / remap
+- replay stage:
+  - initialize the prior from the frozen start probabilities
+  - for each row, compute one-step emission log-likelihood under the frozen
+    Gaussian emissions
+  - run a log-space forward recursion using the frozen transition matrix
+  - normalize with `logsumexp`
+  - remap latent-state probabilities into the frozen ordered label space
+  - emit `RegimeStateContract` from the filtered probabilities
+
+State remap policy for deterministic labels:
+
+The raw HMM state IDs returned by EM are not stable enough for user-facing
+labels. Slice 4 must freeze an ordering policy at fit time and persist it in
+the manifest.
+
+Recommended policy:
+
+- compute a deterministic scalar summary for each latent state from the fitted
+  emission means in scaled space
+- sort states by that summary and map raw state IDs to ordered output states
+- persist that mapping in the manifest metadata
+- apply the same remap consistently to:
+  - `regime`
+  - per-state probability fields
+  - ablation replays
+  - fold-local replays
+
+Numerical stability and fallback requirements:
+
+- forward recursion must run in log space
+- covariance handling must be explicit; do not silently approximate unsupported
+  covariance types
+- if the fit prefix is too short for the requested state count, collapse to a
+  deterministic one-state fallback instead of raising unpredictably
+- if HMM fit fails numerically, replay must emit an explicit fallback state and
+  mark the manifest / detector outputs with the failure mode
+- if replay rows contain NaNs across the selected schema, emit an unavailable or
+  warm row rather than fabricating a confident state
+
+Covariance-type policy for the first rollout:
+
+- Slice 4 must support `diag` covariance because it is the current default
+- if `full` covariance is implemented, it must be tested independently from
+  `diag`
+- if `spherical` or `tied` covariance are not implemented in replay, fail fast
+  with a precise config/runtime error instead of silently coercing them
+
+Warm-up policy:
+
+- HMM replay should be decision-ready from the first valid filtered row once a
+  fit has succeeded, unless the config explicitly sets `warmup_bars`
+- if `warmup_bars` is configured, emit filtered probabilities but keep `warm`
+  false until that replay count is reached
+- warm-up rows must remain present in the state frame and trace summary
+
+Config and routing rules for Slice 4:
+
+- add native detector support for `type: filtered_hmm`
+- support detector params such as:
+  - `n_regimes` / `state_count`
+  - `covariance_type`
+  - `n_iter`
+  - `tol`
+  - `random_state`
+  - `columns`
+  - `exclude_columns`
+  - `warmup_bars`
+- preserve Slice 3 policy that only one native detector may be authoritative at
+  runtime before Slice 5
+- route legacy `regime.method: hmm` through the filtered HMM detector runtime
+  instead of the old batch `_detect_hmm_regime(...)` path
+- if both `regime.method: hmm` and a native primary detector are configured,
+  keep the existing validation rule and reject the config as ambiguous
+
+Hidden dependencies that must be addressed in Slice 4:
+
+1. `core/regime.py` still contains `_detect_hmm_regime(...)`, which currently
+   fits a batch HMM and calls `predict(...)` over the replay window.
+   Slice 4 must ensure authoritative pipeline and ablation paths stop using
+   that implementation.
+2. Slice 3 made ablation detector-aware, but legacy `method: hmm` configs will
+   still bypass that unless the pipeline converts them into a detector-backed
+   replay path.
+3. State ordering for HMMs is more fragile than the score-detector families.
+   The plan must freeze and persist remap logic or fold-local comparisons will
+   be unstable.
+
+Plan for those dependencies:
+
+- extend `build_regime_detector(...)` to construct `FilteredHMMDetector`
+- add a compatibility translation so legacy `method: hmm` resolves to the same
+  filtered detector used by native `filtered_hmm` specs
+- ensure `build_regime_ablation_report(...)` receives a detector spec for HMM
+  paths so the endogenous baseline is replayed through the same filtered logic
+- either convert `_detect_hmm_regime(...)` into a thin compatibility façade
+  over filtered replay or remove it from every authoritative runtime path by the
+  end of the slice
+
+Recommended implementation order inside Slice 4:
+
+1. add HMM-specific helper functions in `core/regimes/detectors.py` for:
+   - schema resolution
+   - emission log-likelihood computation
+   - log-space forward filtering
+   - deterministic state remap
+2. implement `FilteredHMMDetector.fit(...)`, `initialize(...)`, `update(...)`,
+   and `manifest(...)`
+3. extend the detector factory and canonical type mapping so
+   `filtered_hmm` becomes a supported replay detector
+4. route a single `filtered_hmm` detector spec through `core/pipeline.py`
+5. migrate legacy `method: hmm` routing onto the same detector-backed replay
+   path
+6. ensure detector-aware ablation uses the filtered HMM replay path for both
+   full and endogenous-only baselines
+7. add focused tests that prove replay is filtered-only and prefix-invariant
+8. only after those tests pass, consider exposing one example or config that
+   opts into `filtered_hmm`
+
+Planned file-level changes:
+
+- `core/regimes/detectors.py`
+  - add `FilteredHMMDetector`
+  - add HMM-specific fit and forward-filter helpers
+  - extend detector factory and type canonicalization
+- `core/regimes/online_state.py`
+  - keep replay ownership centralized here
+  - add only the minimal metadata plumbing needed for per-state probabilities,
+    confidence, and posterior-mode reporting
+- `core/pipeline.py`
+  - route both native `filtered_hmm` specs and legacy `method: hmm` through the
+    same replay surface
+  - keep additive output keys stable
+- `core/regime.py`
+  - stop relying on batch `_detect_hmm_regime(...)` in authoritative preview,
+    ablation, and fold-local paths
+  - keep public compatibility behavior only if it delegates to the filtered
+    runtime
+- `experiments/config.py`
+  - preserve current config-validation rules
+  - allow `filtered_hmm` native detector specs without collapsing them into a
+    second HMM runtime
+- tests:
+  - add `tests/test_regime_hmm_filtered.py`
+  - extend `tests/test_regime_layer_ablation.py`
+  - extend config/runtime compatibility coverage if legacy `method: hmm`
+    translation changes
 
 Validation slice:
 
-- HMM replay test confirming filtered outputs only
-- regression coverage for fold-local prefix fitting
+- `tests/test_regime_hmm_filtered.py`
+- `tests/test_regime_layer_ablation.py`
+- focused config/runtime compatibility coverage if legacy `method: hmm` is
+  rerouted through the filtered detector runtime
+
+Minimum validation behaviors:
+
+- replaying the same filtered HMM twice with the same fit prefix yields
+  identical manifests, remap metadata, and state frames
+- extending the replay horizon does not change filtered outputs on the already
+  observed prefix
+- replay does not invoke `predict`, `predict_proba`, `decode`, or
+  `score_samples` on the replay sequence
+- legacy `method: hmm` preview and native `filtered_hmm` preview both produce
+  filtered-only outputs through the same replay seam
+- fold-local fit windows never include validation or test rows
+- HMM ablation replays use the same filtered detector logic for both full and
+  endogenous-only baselines
+- degenerate or short fit windows fall back deterministically instead of
+  raising unstable numerical errors
+
+Suggested narrow validation commands while implementing Slice 4:
+
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_regime_hmm_filtered.py`
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_regime_hmm_filtered.py tests/test_regime_layer_ablation.py`
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_regime_hmm_filtered.py tests/test_regime_detectors.py tests/test_regime_layer_ablation.py tests/test_experiment_config.py tests/test_regime_compatibility_replay.py tests/test_regime_observation_runtime.py`
+
+Acceptance criteria:
+
+- the repo contains a `FilteredHMMDetector` that emits forward-filtered state
+  probabilities only
+- authoritative HMM preview and fold-local paths no longer depend on the old
+  batch `predict(...)` regime path
+- legacy `regime.method: hmm` and native `filtered_hmm` configs both resolve to
+  the same causal replay runtime
+- manifests clearly expose frozen schema, fit window, covariance policy, and
+  state-remap metadata
+- HMM replay is prefix-invariant, deterministic, and explicit about fallback /
+  degenerate conditions
+- no smoothed posterior fields appear anywhere in outputs or summaries
+
+Explicit non-goals for Slice 4:
+
+- no detector ensemble or disagreement fusion yet
+- no smoothing-based retrospective diagnostics
+- no online HMM re-fitting or adaptive parameter updates during replay
+- no new latent-state model families beyond the filtered Gaussian HMM runtime
 
 ##### Slice 5: Detector ensemble and confidence fusion
 
@@ -1816,17 +2026,1012 @@ Phase 1 is complete only when all of these are true:
 
 ### Phase 2: Feature adaptation layer
 
-Insert an explicit feature adaptation step between regime detection and model training.
+Phase 2 is the next implementation phase. Phase 1 made regime detection causal
+and replayable; Phase 2 must make feature usage causal and replayable under the
+same fold-local rules.
 
-- implement regime-conditioned scaling and masks
-- log applied feature policy per fold and per backtest step
-- add deterministic fallback behavior under low confidence and sparse support
+The governing rule for this phase is simple: every adapted feature seen by the
+model must come from a policy fit on `X_fit` and `fit_regime_view` only, then
+reused unchanged for validation, test, refit, and inference.
+
+#### Phase 2 objectives
+
+Phase 2 must accomplish five things:
+
+1. Add a typed feature-adaptation runtime and make it the owning
+   implementation for regime-conditioned scaling, masks, and bounded
+   interaction expansion.
+2. Integrate the adapter into `TrainModelsStep` so each validation fold runs
+   `fit -> transform(train/val/test)` with a frozen schema before supervised
+   feature selection and model fit.
+3. Reuse the new runtime inside `core/regime_training.py` so the current
+   `build_regime_aware_feature_frame(...)` path becomes a compatibility
+   wrapper instead of a second implementation.
+4. Persist per-fold policy manifests, fallback reasons, disabled columns,
+   generated columns, and regime sample counts in training output and
+   post-selection refit artifacts.
+5. Keep default behavior additive: configs without `feature_adaptation` or
+   with `enabled: false` must continue to behave like the current pass-through
+   path.
+
+#### Phase 2 delivery rules
+
+- Adapter fit may inspect only `X_fit`, `fit_regime_view`, and feature
+  metadata derived from the same fold.
+- Validation and test rows must be transformed using frozen fit-time
+  statistics, masks, generated-column order, and fallback thresholds.
+- Adapted schemas must be prefix-invariant: extending the dataset may not
+  change transformed outputs on an already-observed prefix.
+- Low-confidence, warm, missing, or sparse-regime rows must follow an explicit
+  fallback policy; no implicit borrowing from future occupancy is allowed.
+- New generated columns must either be stationarity-safe by construction or
+  pass a post-adaptation screening step fit on `X_fit` only.
+- Feature-adaptation diagnostics must be additive to current training
+  summaries; do not remove existing `feature_selection`,
+  `feature_governance`, or `regime` payloads.
+
+#### Phase 2 scope boundaries
+
+Included in Phase 2:
+
+- typed feature policy and adapter contracts
+- fold-local regime-conditioned scaling
+- per-regime feature masking and `disable_incompatible_features` logic
+- bounded regime interaction features driven by config
+- deterministic fallback for low-confidence and sparse-regime states
+- policy manifests, diagnostics, and artifact propagation
+- compatibility migration for `build_regime_aware_feature_frame(...)` and
+  `model.regime_aware.strategy == "feature"`
+
+Explicitly out of scope for Phase 2:
+
+- specialist-library persistence or certification logic
+- router scoring, hysteresis, or switching traces
+- regime-conditioned specialist selection
+- full adaptive backtest replay beyond transformed feature reuse
+- AutoML search across adaptation bundles beyond config passthrough
+
+#### Files to add in Phase 2
+
+Add these runtime modules:
+
+- `core/feature_adaptation/__init__.py`
+- `core/feature_adaptation/contracts.py`
+- `core/feature_adaptation/runtime.py`
+- `core/feature_adaptation/scaling.py`
+- `core/feature_adaptation/masking.py`
+- `core/feature_adaptation/diagnostics.py`
+
+Expected responsibilities:
+
+- `contracts.py`: `FeaturePolicyContract`, adapter manifest payloads, and
+  typed summaries
+- `runtime.py`: adapter factory, fold-local fit/transform orchestration, and
+  identity fallback
+- `scaling.py`: global and regime-conditioned scaler-bank fitting with frozen
+  statistics
+- `masking.py`: per-regime masks, confidence fallback, sparse-regime fallback,
+  and generated-column registry
+- `diagnostics.py`: policy summaries, row-count diagnostics, and schema
+  lineage augmentation
+
+#### Files to modify in Phase 2
+
+- `core/pipeline.py`
+- `core/regime_training.py`
+- `core/features.py`
+- `core/feature_governance.py`
+- `core/__init__.py`
+- `experiments/config.py`
+- training and manifest consumers that summarize fold diagnostics
+- feature- and regime-focused tests under `tests/`
+
+`core/automl.py` should only be touched if additive training-summary fields
+must be carried through study manifests or promotion reports.
+
+#### Runtime architecture plan
+
+##### Owning adaptation seam
+
+The owning Phase 2 seam is the fold loop in `TrainModelsStep`, immediately
+after fold-local regime construction and row alignment, and before supervised
+feature selection.
+
+Required fold order:
+
+1. build `fold_frame` from screened base features plus the fold-local
+   `regime_frame`
+2. align `X_fit`, `X_val`, and `X_test` to valid rows only
+3. fit the feature adapter on `X_fit` plus `fit_regime_view` only
+4. transform fit, validation, and test frames through the frozen adapter
+5. run any post-adaptation stationarity guard on the adapted fit slice only
+   and project the frozen adapted schema into validation and test
+6. run supervised selection and feature-admission governance on the adapted
+   feature frame
+7. train the model bundle on the adapted selected columns
+
+The feature-adaptation runtime must not be implemented as a global preview step
+that fits on the full sample. The authoritative fit happens inside the
+fold-local training loop.
+
+##### Initial policy set
+
+The first rollout should support four policy families behind one adapter
+surface:
+
+1. `identity`
+   - no-op transform used when `feature_adaptation` is absent or disabled
+   - produces a manifest and policy summary so the runtime shape is stable
+
+2. `regime_conditioned` scaling
+   - fit a global scaler on `X_fit`
+   - fit per-regime scaler banks only for regimes with sufficient support
+   - select the per-row scaler using the current regime label only
+   - fall back to the global scaler when the row is warm, low-confidence,
+     missing, or in a sparse regime
+
+3. `per_regime_mask`
+   - derive a fit-time active-column mask per regime using `X_fit` only
+   - disable columns that are degenerate, unavailable, or below configured
+     support thresholds within that regime
+   - preserve one frozen union schema across fit, validation, and test by
+     reindexing masked columns to zero rather than dropping them per row
+
+4. bounded interaction expansion
+   - migrate the current `build_regime_aware_feature_frame(...)` interaction
+     behavior behind the adapter
+   - cap interaction generation with the configured `interaction_budget`
+   - log generated column lineage explicitly so downstream governance and
+     summaries can distinguish raw, scaled, and regime-conditioned features
+
+##### Fallback and confidence rules
+
+The adapter must resolve one explicit fallback decision for every row.
+
+Required fallback inputs:
+
+- `regime`
+- `regime_confidence` when available
+- `warm`
+- configured `min_regime_samples`
+- configured fallback mode such as `global`, `identity`, or `disable`
+
+Required fallback behavior:
+
+- warm or unavailable regime rows use the global or identity policy
+- low-confidence rows use the configured fallback policy even if a regime label
+  exists
+- sparse regimes may reuse the global scaler and global mask, but that choice
+  must be explicit in the policy metadata
+- no fallback path may inspect future regime occupancy or future model
+  performance
+
+##### Governance and lineage plan
+
+Phase 2 must extend, not replace, the current feature-governance stack.
+
+Required integration points:
+
+- preserve `feature_blocks`, `feature_families`, and `feature_metadata` for
+  adapted columns
+- append adaptation lineage such as `regime_scale:<label>`,
+  `regime_mask:<label>`, or `regime_interaction:<label>` to the transform
+  chain for generated columns
+- run `evaluate_feature_admission(...)` on the adapted selected columns rather
+  than on the raw screened frame
+- keep retirement behavior deterministic when a column is disabled globally by
+  the adapter versus retired by governance
+
+##### Compatibility and migration plan
+
+The current repo already contains a partial regime-aware feature path in
+`core/regime_training.py`. Phase 2 must unify that code with the new adapter
+runtime rather than maintain two feature-conditioning implementations.
+
+Required migration rules:
+
+1. `feature_adaptation` becomes the authoritative config surface for runtime
+   feature conditioning.
+2. If `feature_adaptation` is absent or disabled, the pipeline runs the
+   identity adapter and preserves current behavior.
+3. `build_regime_aware_feature_frame(...)` becomes a thin compatibility
+   wrapper over the new adapter with a preset that enables bounded regime
+   interactions.
+4. `train_regime_aware_model(..., strategy="feature")` must use the same
+   adapter runtime for both fit and inference paths.
+5. Existing `feature_selection` and `feature_governance` config sections stay
+   valid and continue to run after adaptation.
+
+The key invariant is that the repo ends Phase 2 with one feature-adaptation
+implementation, not separate pipeline and regime-training branches.
+
+##### Diagnostics and artifact plan
+
+Phase 2 must make the adapted feature policy inspectable.
+
+Add these diagnostics to training state and summaries:
+
+- adapter type and policy id
+- per-fold disabled-column count
+- per-fold generated-column count
+- per-fold sparse-regime counts
+- per-fold fallback-row counts by reason
+- fit-time regime sample counts used to build scaler banks and masks
+- adapted schema column list for the selected model input
+- policy manifest for the final refit path
+
+Recommended additive payloads:
+
+- `pipeline.state["feature_adaptation"]`
+- `training["feature_adaptation"]`
+- `post_selection_refit["feature_adaptation"]`
+- `training["selection_freeze"]["feature_policy"]` or an equivalent final
+  manifest slot
+
+These payloads must be JSON-safe so they can flow into current experiment,
+promotion, and artifact summaries.
+
+#### Detailed implementation order inside Phase 2
+
+Implement Phase 2 in this exact sequence:
+
+1. Completed: add feature-adaptation contracts, an identity adapter, and a
+  no-op runtime integration seam inside `TrainModelsStep`.
+2. Completed on 2026-05-08: implement regime-conditioned scaler-bank fitting,
+   explicit fail-closed guards for `model.regime_aware.strategy == "feature"`,
+   and fallback inference parity through the stored final adapter.
+3. Implement per-regime masks, sparse-regime fallback, and disabled-column
+   diagnostics.
+4. Migrate bounded regime interactions behind the adapter and retire the
+   duplicate feature-conditioning logic in `core/regime_training.py`.
+5. Thread manifests and per-fold diagnostics into training, refit, and summary
+   payloads.
+6. Add config normalization and validation for `feature_adaptation`.
+7. Add focused tests for prefix invariance, sparse fallback, compatibility, and
+   JSON-safe diagnostics.
+
+This order matters because it lands the integration seam first, then the
+stateful transforms, and only then the compatibility migration and artifact
+plumbing.
+
+#### Concrete implementation slices for Phase 2
+
+Execute Phase 2 in the following slices. Each slice must end with a narrow test
+or replay validation before the next slice begins.
+
+##### Slice 1: Contracts and identity adapter seam
+
+Status:
+
+Completed on 2026-05-08.
+
+Goal:
+
+Add `core/feature_adaptation/` with typed contracts and integrate an identity
+adapter into the fold-local training loop without changing current model
+behavior.
+
+Implementation scope:
+
+- add `FeaturePolicyContract` and an identity adapter
+- add runtime helpers that return unchanged frames plus policy metadata
+- integrate the no-op adapter into `TrainModelsStep`
+- persist additive per-fold adaptation diagnostics even when the adapter is a
+  no-op
+
+Validation slice:
+
+- new focused runtime test for identity adaptation
+- one pipeline regression proving no-op equivalence on existing configs
+
+Delivered:
+
+- added `core/feature_adaptation/__init__.py`
+- added `core/feature_adaptation/contracts.py`
+- added `core/feature_adaptation/runtime.py` with an identity adapter and
+  batch split helper
+- routed fold-local `X_fit` / `X_val` / `X_test` through the feature-
+  adaptation seam in `TrainModelsStep`
+- exposed additive JSON-safe feature-adaptation summaries in training state
+- added `tests/test_feature_adaptation_runtime.py`
+- extended `tests/test_automl_regime_aware_training.py`
+
+##### Slice 2: Regime-conditioned scaling bank
+
+Status:
+
+Completed on 2026-05-08.
+
+Binding decision for this slice:
+
+- Slice 2 must fail closed for `model.regime_aware.strategy == "feature"`
+  whenever non-identity scaling is requested, unless the exact same frozen
+  scaling policy is also available on the inference path through the same
+  adapter runtime.
+- The planned implementation for Slice 2 is to block that path explicitly and
+  defer feature-bundle integration to Slice 4.
+
+Goal:
+
+Support frozen global and per-regime scaling fitted on `X_fit` only.
+
+Implementation scope:
+
+- implement a first real adapter-backed transform in
+  `core/feature_adaptation/scaling.py` behind the Slice 1 runtime seam
+- add one mandatory global scaler bank plus optional per-regime scaler banks
+  fitted on `X_fit` only
+- keep transformed column order identical to the fit-time feature order; this
+  slice must not add, drop, or reorder columns
+- use `fit_regime_view` only to decide which rows qualify for regime-local
+  scaler fitting
+- use the current-row regime state only to assign rows to a regime scaler or a
+  fallback path at transform time
+- emit policy manifests and fold diagnostics showing which scaler banks were
+  fitted, which regimes were skipped, and why rows fell back to the global or
+  identity policy
+
+Required invariants:
+
+- extending validation or test horizons must not change scaled outputs on an
+  already-observed prefix
+- the transformed frame must preserve the exact fit-time index, column names,
+  column order, and width; Slice 2 is not allowed to widen or shrink schema
+- no mean, scale, variance, or support statistic may consume validation or test
+  rows
+- scaler-bank fitting must use only `X_fit` plus `fit_regime_view` aligned to
+  the same index
+- transform-time scaler assignment must use only row-local regime information:
+  label, confidence, warm/unavailable flags, and configured fallback thresholds
+- this slice must not silently train on scaled inputs and infer on unscaled
+  inputs for regime-aware feature bundles
+- this slice must not introduce masking, interaction generation, or schema
+  freeze logic that belongs to Slice 3 and Slice 4
+
+Scaling target selection rules:
+
+- scale continuous numeric columns only
+- preserve excluded columns unchanged when they represent discrete regime state
+  or binary availability markers, including:
+  - `regime`
+  - any column ending with `_regime`
+  - `warm`
+  - `unavailable`
+  - `degenerate_fallback`
+  - `selected_column_count`
+- keep continuous regime diagnostics such as `score`, `regime_confidence`,
+  `prob_state_*`, and `log_evidence` eligible for scaling
+- record both scaled and excluded column sets in the manifest so later slices
+  can reason about them deterministically
+
+Fit-time algorithm plan:
+
+1. Resolve the frozen scaling schema from `X_fit.columns`.
+2. Partition columns into:
+   - continuous numeric columns eligible for scaling
+   - passthrough columns that remain unchanged
+3. Fit one mandatory global scaler on eligible `X_fit` columns.
+4. Build a regime-eligibility mask from `fit_regime_view` using only fit rows:
+   - non-null regime label
+   - row is decision-eligible if warm/unavailable flags exist
+   - row meets configured confidence floor if `regime_confidence` exists
+5. Group eligible rows by regime label and fit a per-regime scaler only when
+   the group satisfies `min_regime_samples`.
+6. Record skipped regimes with explicit reasons such as:
+   - `insufficient_rows`
+   - `missing_regime_labels`
+   - `confidence_below_floor`
+   - `no_eligible_scaling_columns`
+7. Freeze the bank using fit-time column order and per-regime sample counts.
+
+Transform-time algorithm plan:
+
+1. Reindex incoming frames to the frozen fit-time column order.
+2. Compute the global-scaled frame once for all eligible columns.
+3. If `scaling.mode != regime_conditioned`, return the global-scaled frame.
+4. If `scaling.mode == regime_conditioned`, derive one scaler assignment per
+   row using only the current row’s regime payload.
+5. For rows assigned to a fitted regime bank, overwrite the global-scaled
+   values with the regime-scaled values for the eligible columns.
+6. Leave excluded passthrough columns unchanged.
+7. Emit per-row fallback counts by reason:
+   - `missing_regime`
+   - `warm_or_unavailable`
+   - `confidence_below_floor`
+   - `sparse_regime`
+   - `missing_regime_bank`
+   - `identity_fallback_configured`
+
+Scaler-bank policy decisions for the first rollout:
+
+- use a standard z-score bank for Slice 2: fit mean and standard deviation on
+  `X_fit` only
+- do not add robust scaling, EWM scaling, whitening, PCA, or mixed scaler-bank
+  families in Slice 2
+- treat zero-variance columns as scale `1.0` and record them explicitly as
+  constant columns in the manifest
+- fit statistics on finite values only; any missing values encountered during
+  transform should map to a zero-centered standardized output where possible so
+  the transformed frame remains model-safe
+- keep raw scaler arrays in the runtime object, but expose only JSON-safe
+  summarized manifests in pipeline state and training summaries
+
+Fallback policy plan:
+
+- always fit a global scaler bank even when regime-conditioned scaling is
+  enabled; global is the default safe fallback
+- support `fallback: global` as the canonical Slice 2 fallback mode
+- preserve `fallback: identity` as an explicit opt-out path for rows that must
+  not consume the global bank
+- derive `min_regime_samples` using the narrowest available config in this
+  order:
+  1. `feature_adaptation.scaling.min_regime_samples`
+  2. `feature_adaptation.selection.min_regime_samples`
+  3. `model.regime_aware.min_samples_per_regime`
+  4. default `40`
+- if no per-regime bank exists for a row’s label, fall back deterministically;
+  never approximate by borrowing another regime’s scaler
+
+Hidden dependency that must be resolved before implementation:
+
+`RegimeAwareModelBundle` still owns prediction-time feature transformation for
+`strategy="feature"` in `core/regime_training.py`. Slice 2 must not create a
+train/inference mismatch where the pipeline trains on scaled features but the
+bundle predicts on unscaled features.
+
+Resolution for Slice 2:
+
+- do not thread the frozen scaling bank into the regime-aware feature bundle in
+  this slice
+- reject non-identity scaling for `model.regime_aware.strategy == "feature"`
+  with a precise config/runtime error that explains the path is deferred until
+  Slice 4 runtime unification
+
+The unsafe option is to scale only inside the training fold loop and leave the
+bundle inference path untouched. That option remains forbidden.
+
+Recommended file-level changes:
+
+- `core/feature_adaptation/scaling.py`
+  - add frozen scaler-stat dataclasses or equivalent private structs
+  - add pure fit/transform helpers for global and per-regime banks
+  - add column-resolution helpers for eligible versus passthrough columns
+- `core/feature_adaptation/runtime.py`
+  - extend `build_feature_adapter(...)` to return a scaling adapter when
+    `scaling.mode == regime_conditioned`
+  - keep Slice 1 deferred markers for selection, masking, and interaction
+    sections not implemented yet
+- `core/feature_adaptation/contracts.py`
+  - extend policy metadata only if needed for scaler-bank summaries
+  - avoid widening the public contract surface unless the scaling manifest
+    genuinely requires it
+- `core/pipeline.py`
+  - preserve the same fold-local integration seam added in Slice 1
+  - add fold diagnostics for fitted banks, fallback reasons, constant columns,
+    and excluded scaling columns
+- `core/regime_training.py`
+  - only if required to enforce the fail-closed guard for
+    `strategy="feature"`
+  - do not add a scaling bridge here in Slice 2
+- tests:
+  - add `tests/test_feature_adaptation_scaling.py`
+  - extend `tests/test_feature_adaptation_runtime.py`
+  - extend `tests/test_automl_regime_aware_training.py`
+  - add a focused config/runtime guard test for the blocked feature-strategy
+    scaling path
+
+Validation slice:
+
+- prefix-invariance test for transformed prefixes
+- no-lookahead test proving validation and test rows do not alter fit-time
+  scaling statistics
+- deterministic fallback test for sparse and low-confidence regimes
+- fail-closed test proving non-identity scaling is rejected for
+  `strategy="feature"` in Slice 2
+
+Minimum validation behaviors:
+
+- replaying the same fit prefix twice yields identical global and regime-bank
+  manifests
+- extending the dataset beyond a cutoff does not change scaled outputs on the
+  already-observed prefix
+- no validation or test row can change fit-time means or scales
+- excluded regime label columns remain unchanged after transformation
+- zero-variance columns do not produce NaN or inf outputs
+- rows without a fitted regime bank fall back deterministically and record the
+  exact reason
+- if `strategy="feature"` requests non-identity scaling, the config/runtime is
+  blocked explicitly with a deterministic error
+
+Suggested narrow validation commands while implementing Slice 2:
+
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_feature_adaptation_scaling.py`
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_feature_adaptation_runtime.py tests/test_feature_adaptation_scaling.py`
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_feature_adaptation_runtime.py tests/test_feature_adaptation_scaling.py tests/test_automl_regime_aware_training.py`
 
 Acceptance criteria:
 
-- feature transforms are prefix-invariant at cutoffs
+- the repo contains a frozen global/per-regime scaling bank that fits on
+  `X_fit` only and transforms validation/test rows without mutating schema
+- transform-time scaler assignment uses only row-local regime state and frozen
+  fit-time banks
+- training summaries expose JSON-safe scaler-bank diagnostics and fallback
+  counts
+- continuous regime diagnostics can be scaled while discrete regime-state
+  columns remain unchanged
+- prefix invariance and no-lookahead behavior are covered by focused tests
+- the slice resolves the regime-aware feature-bundle train/inference symmetry
+  problem explicitly by blocking the unsafe feature-strategy scaling path
+- no config path can train on scaled inputs and infer on unscaled inputs after
+  Slice 2 lands
+
+Explicit non-goals for Slice 2:
+
+- no per-regime masking yet
+- no disable-incompatible-features behavior yet
+- no interaction generation migration yet
+- no schema-width changes or new generated columns
+- no bridge of non-identity scaling into `RegimeAwareModelBundle` yet
+- no specialist-library or router integration
+
+##### Slice 3: Per-regime masking and sparse-support fallback
+
+Status:
+
+Completed on 2026-05-08. Delivered frozen per-regime masks, a composite
+`scale -> mask` adapter runtime, fold-local disabled-column gating, and
+fallback-inference reuse through the stored adapter. Conservative scope held:
+no interaction generation, config normalization, or
+`core/regime_training.py` feature-bundle migration in this slice.
+
+Binding decisions for this slice:
+
+- Slice 3 must preserve the Slice 2 fail-closed rule for
+  `model.regime_aware.strategy == "feature"` whenever any non-identity
+  `selection.mode` or `disable_incompatible_features` behavior is requested.
+  The authoritative feature-bundle inference reuse path still lands in Slice
+  4.
+- Slice 3 must reuse the same stored adapter object on the fallback inference
+  path. Do not introduce a second masking code path in `SignalsStep`.
+- Slice 3 must keep transformed frames schema-preserving. Masking is zero-fill
+  only; no per-row drop, reorder, or width change is allowed.
+- `disabled_columns` in this slice are fold-local policy-disabled columns, not
+  retired features. Slice 3 must not mutate retirement registries or rewrite
+  global `pipeline.state["feature_metadata"]` to represent adaptation-level
+  disables.
+
+Goal:
+
+Add frozen per-regime active-column masks, deterministic sparse-support
+fallback, and explicit policy-disabled column semantics on top of the Slice 2
+scaling runtime.
+
+Owning architecture decision:
+
+- `build_feature_adapter(...)` should evolve from a single-stage selector into
+  an ordered composite adapter surface.
+- Required stage order for Slice 3:
+  1. identity or scaling stage
+  2. masking stage
+- The composite adapter must still expose one `fit(...)`, one `transform(...)`,
+  and one JSON-safe manifest so `TrainModelsStep` and `SignalsStep` fallback
+  continue to reuse exactly one authoritative runtime object.
+
+Implementation scope:
+
+- add `core/feature_adaptation/masking.py`
+- fit a mandatory global mask plus optional per-regime masks on post-scaling
+  `X_fit` only
+- derive maskable versus passthrough columns using the frozen fit-time schema,
+  `fit_regime_view`, and fit-local feature metadata
+- support `selection.mode: per_regime_mask` with `fallback: global` as the
+  canonical fallback and `fallback: identity` as an explicit opt-out
+- support `disable_incompatible_features: true` by deriving fold-local
+  globally disabled columns and excluding them from downstream model-input
+  candidate columns
+- preserve the frozen union schema in transformed frames by zero-filling
+  masked or disabled columns rather than dropping them
+- emit policy metadata and fold summaries for:
+  - active columns by regime and globally
+  - disabled columns and disable reasons
+  - sparse-regime and low-confidence fallback counts
+  - masked-row and masked-cell totals
+
+Required invariants:
+
+- mask fitting may inspect only the post-scaling adapted `X_fit`,
+  `fit_regime_view`, and feature metadata derived from the same fold
+- no support, variance, activity, or disabled-column statistic may consume
+  validation or test rows
+- extending validation or test horizons must not change masked outputs on an
+  already-observed prefix
+- all columns present in `fit_regime_view` must remain passthrough and
+  unmasked
+- any column listed in `policy.disabled_columns` must remain present in the
+  transformed frame but must be excluded from downstream model candidate
+  columns
+- when feature selection is disabled, policy-disabled columns must still be
+  removed from `selected_columns` before model fit
+- sparse, missing, low-confidence, warm, or unavailable rows must follow one
+  deterministic fallback mask; no borrowing of another regime’s mask is
+  allowed
+- Slice 3 must not introduce interaction generation, post-adaptation schema
+  widening, or feature-bundle runtime migration
+
+Mask candidate resolution rules:
+
+- start from the frozen post-scaling fit schema
+- passthrough columns for Slice 3 are:
+  - every column present in `fit_regime_view`
+  - `regime`
+  - any column ending with `_regime`
+  - `warm`
+  - `unavailable`
+  - `degenerate_fallback`
+  - `selected_column_count`
+  - any non-numeric column
+- mask candidates are numeric columns in the frozen schema not in the
+  passthrough set
+- already-retired features are out of scope because they should already be
+  absent before adaptation runs
+- `disable_incompatible_features` may apply only to mask candidates;
+  passthrough columns can never be policy-disabled in Slice 3
+
+Fit-time algorithm plan:
+
+1. Run Stage 1 identity or scaling on `X_fit` using the Slice 2 runtime.
+2. Freeze the union schema from the Stage 1 output column order.
+3. Partition Stage 1 columns into passthrough versus mask candidates.
+4. Compute a global support summary on mask candidates using fit rows only:
+   - finite row count
+   - active row count using `abs(value) > activity_epsilon`
+   - active share
+   - standard deviation or variance
+5. Derive a global active mask using deterministic thresholds:
+   - `finite_count >= min_feature_rows`
+   - `active_share >= min_active_share`
+   - `std > min_variance`
+6. Build the regime-eligibility mask from `fit_regime_view` using the same
+   fit-only gates as Slice 2 scaling:
+   - non-null regime label
+   - warm or unavailable eligibility
+   - confidence floor when `regime_confidence` exists
+7. For each eligible regime with at least `min_regime_samples`, fit a
+   per-regime active mask over the globally active candidate columns using the
+   same support thresholds.
+8. Record skipped regimes with explicit reasons:
+   - `insufficient_rows`
+   - `missing_regime_labels`
+   - `confidence_below_floor`
+   - `no_global_active_columns`
+9. If `disable_incompatible_features` is enabled, derive global disabled
+   columns and reasons:
+   - `below_global_support_threshold`
+   - `globally_constant`
+   - `inactive_in_all_supported_regimes`
+10. Freeze the mask bank with:
+    - union schema
+    - global active columns
+    - per-regime active columns
+    - globally disabled columns and reasons
+    - thresholds and regime sample counts
+
+Transform-time algorithm plan:
+
+1. Reindex incoming frames to the frozen post-scaling union schema.
+2. Run Stage 1 identity or scaling first.
+3. Apply the global disable pass, zero-filling `policy.disabled_columns` for
+   all rows when enabled.
+4. If `selection.mode != per_regime_mask`, return the globally-disabled Stage
+   1 frame plus policy metadata.
+5. If `selection.mode == per_regime_mask`, resolve one mask assignment per row
+   using only:
+   - current-row regime label
+   - `warm`
+   - `unavailable`
+   - `regime_confidence`
+   - frozen `min_regime_samples` and confidence thresholds
+6. For rows assigned to a fitted regime mask, zero-fill candidate columns not
+   active in that regime.
+7. For fallback rows, apply either:
+   - `fallback: global` -> zero-fill columns not in the frozen global active
+     mask
+   - `fallback: identity` -> keep Stage 1 values for non-disabled candidate
+     columns
+8. Preserve passthrough columns unchanged for all rows.
+9. Emit diagnostics for:
+   - fallback rows by reason
+   - mask assignment counts by regime
+   - total masked cells
+   - disabled columns by reason
+   - active candidate counts by regime and globally
+
+Mask policy decisions for the first rollout:
+
+- canonical `selection.mode` values for Slice 3:
+  - `identity`
+  - `per_regime_mask`
+- canonical `selection.fallback` values for Slice 3:
+  - `global`
+  - `identity`
+- do not add soft or probabilistic masks, top-k masks, weighted gating, or
+  learned per-regime selectors in Slice 3
+- compute support using deterministic thresholds, not supervised feature
+  importance or downstream model scores
+- keep support thresholds configurable but narrow:
+  - `selection.min_feature_rows`
+  - `selection.min_active_share`
+  - `selection.min_variance`
+  - `selection.activity_epsilon`
+  - `selection.min_regime_samples`
+- resolve `selection.min_regime_samples` using the same precedence order as
+  Slice 2 scaling
+- preserve `disable_incompatible_features` as a boolean only; do not add a
+  semantic incompatibility DSL in Slice 3
+
+Compatibility and governance rules:
+
+- adaptation-disabled columns must remain distinct from governance-retired
+  columns
+- `AlignDataStep` retirement remains the only place that globally removes
+  retired features from `pipeline.state["X"]`
+- `TrainModelsStep` should seed candidate `selected_columns` from
+  `fit_policy.feature_columns - fit_policy.disabled_columns`
+- `feature_selection` and `evaluate_feature_admission(...)` must run on the
+  adaptation-eligible candidate set, not on policy-disabled columns
+- training summaries must report both:
+  - `feature_adaptation.disabled_columns`
+  - `feature_governance.retired_columns` and rejected columns
+  without conflating them
+
+Hidden dependencies that must be resolved before implementation:
+
+1. Slice 2 persisted the final adapter and reuses it in `SignalsStep`
+   fallback. Slice 3 must extend that same runtime object instead of
+   introducing a masking-only inference shim.
+2. `model.regime_aware.strategy == "feature"` still owns a separate
+   feature-bundle inference path in `RegimeAwareModelBundle`. Non-identity
+   masking would recreate the same train/inference mismatch that Slice 2
+   blocked for scaling.
+
+Resolution for Slice 3:
+
+- continue to reject `selection.mode != identity` or
+  `disable_incompatible_features: true` for `strategy="feature"`
+- limit Slice 3 runtime enablement to non-regime-aware models and
+  `strategy="specialist"` until Slice 4 unifies the feature-bundle path
+
+Recommended file-level changes:
+
+- `core/feature_adaptation/masking.py`
+  - add frozen mask-bank dataclasses and pure fit/transform helpers
+  - add candidate-resolution helpers for passthrough versus maskable columns
+  - add disabled-column reason summarizers
+- `core/feature_adaptation/runtime.py`
+  - introduce a staged or composite adapter returned by
+    `build_feature_adapter(...)`
+  - preserve current identity and scaling manifests while adding stage-level
+    mask metadata
+  - extend runtime support validation to fail closed for feature-strategy
+    masking or disable requests
+- `core/feature_adaptation/contracts.py`
+  - keep the public contract unchanged unless a new top-level field is truly
+    unavoidable
+  - prefer storing mask diagnostics inside `FeaturePolicyContract.metadata`
+- `core/pipeline.py`
+  - preserve the existing fold-local adaptation seam
+  - exclude policy-disabled columns from downstream model candidate selection
+    even when feature selection is disabled
+  - surface mask-bank diagnostics in fold and final summaries
+- `core/regime_training.py`
+  - only to extend the fail-closed guard for feature-strategy masking or
+    disable requests
+  - do not migrate feature-bundle runtime here in Slice 3
+- tests:
+  - add `tests/test_feature_adaptation_masking.py`
+  - extend `tests/test_feature_adaptation_runtime.py`
+  - extend `tests/test_automl_regime_aware_training.py`
+  - extend `tests/test_regime_leakage_controls.py`
+  - optionally extend `tests/test_feature_admission_policy.py` for
+    disabled-versus-retired separation
+
+Validation slice:
+
+- deterministic schema-freeze test proving fit, validation, and test frames
+  keep identical column order and width under masking
+- prefix-invariance test for masked prefixes
+- sparse-regime fallback test proving global or identity mask fallback is
+  deterministic
+- passthrough-column test proving regime-state columns remain unchanged
+- policy-disabled-column test proving disabled columns remain present in
+  transformed frames but are excluded from model candidate columns
+- fail-closed test for `strategy="feature"` masking or disable requests
+- fallback inference test proving `SignalsStep` reapplies the final mask
+  adapter on post-training rows
+
+Minimum validation behaviors:
+
+- extending the dataset beyond a cutoff does not change masked outputs on the
+  already-observed prefix
+- no validation or test row can change fit-time active column sets
+- sparse regimes do not borrow another regime’s mask
+- passthrough regime-state columns remain unchanged after transform
+- globally disabled columns appear in the policy manifest with explicit
+  reasons
+- feature selection disabled still prevents policy-disabled columns from
+  entering model fit
+- fallback inference uses the same mask policy as training for the final
+  stored adapter
+- `strategy="feature"` requests non-identity masking or disable flags are
+  blocked explicitly
+
+Suggested narrow validation commands while implementing Slice 3:
+
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_feature_adaptation_masking.py`
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_feature_adaptation_runtime.py tests/test_feature_adaptation_masking.py`
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_regime_leakage_controls.py::RegimeLeakageControlsTest::test_signals_fallback_reapplies_final_feature_adapter tests/test_feature_adaptation_masking.py`
+- `g:/N/repos/ml/.venv/Scripts/python.exe -m pytest tests/test_feature_adaptation_runtime.py tests/test_feature_adaptation_masking.py tests/test_automl_regime_aware_training.py`
+
+Acceptance criteria:
+
+- the runtime can fit one authoritative `scale -> mask` adapter on `X_fit`
+  only and reuse it unchanged for validation, test, and fallback inference
+- per-regime masks and globally disabled columns are persisted in JSON-safe
+  manifests and fold summaries
+- transformed frames preserve the frozen union schema while rows receive
+  deterministic zero-filled masks
+- sparse, missing, warm, unavailable, and low-confidence rows follow an
+  explicit fallback mask policy
+- policy-disabled columns are excluded from model candidate inputs without
+  being misreported as retired features
+- no config path can train with masked inputs and infer with unmasked inputs
+  after Slice 3 lands
+
+Explicit non-goals for Slice 3:
+
+- no bounded interaction generation yet
+- no feature-bundle runtime migration yet
+- no semantic incompatibility DSL
+- no learned or soft masks
+- no config normalization beyond narrow runtime validation
+- no specialist-library or router work
+
+##### Slice 4: Interaction budget and regime-training migration
+
+Status:
+
+Completed on 2026-05-09. Delivered a dedicated feature-strategy adapter in
+`core/feature_adaptation/feature_strategy.py`, routed
+`build_regime_aware_feature_frame(...)` through that adapter, reused the same
+frozen adapter in `RegimeAwareModelBundle` inference, and threaded resolved
+feature-adaptation config into both primary and inner regime-aware training
+paths. Scope stayed narrow: no pre-selection pipeline semantics were widened.
+
+Goal:
+
+Move the existing regime-aware feature engineering helper behind the new
+adapter runtime and eliminate duplicate feature-conditioning logic.
+
+Implementation scope:
+
+- route `build_regime_aware_feature_frame(...)` through the adapter
+- support bounded interaction generation using `interaction_budget`
+- reuse the same adapter in `RegimeAwareModelBundle` fit and inference paths
+- preserve current `strategy="feature"` behavior while making the runtime
+  authoritative
+
+Validation slice:
+
+- `tests/test_regime_aware_training.py`
+- focused adapter test for generated-column lineage and interaction caps
+
+##### Slice 5: Diagnostics, manifests, and refit propagation
+
+Status:
+
+Completed on 2026-05-09. Delivered feature-adaptation config validation,
+AutoML training-summary propagation, explicit post-selection refit surfacing,
+and user-facing policy summaries in `experiments/runner.py` and
+`example_utils.py`.
+
+Goal:
+
+Persist adaptation diagnostics through training summaries, post-selection
+refits, and user-facing experiment artifacts.
+
+Implementation scope:
+
+- add JSON-safe fold diagnostics and final manifests
+- carry feature-adaptation summaries through training and refit artifacts
+- add config validation for `feature_adaptation`
+- ensure examples and experiment summaries can show the active policy
+
+Validation slice:
+
+- manifest serialization tests
+- training-summary regression tests
+- focused config-compatibility coverage
+
+#### Concrete validation matrix for Phase 2
+
+At minimum, each slice should validate one of these behaviors directly:
+
+1. disabled or absent `feature_adaptation` yields a no-op transform with stable
+   manifests
+2. extending the dataset does not change adapted outputs on an already-observed
+   prefix
+3. no adaptation statistic is fit on validation or test rows
+4. sparse-regime rows fall back deterministically and record the reason
+5. masked columns do not change output schema across fit, validation, and test
+6. generated interaction columns respect the configured budget
+7. regime-aware feature strategy and pipeline training share the same adapter
+   runtime
+
+#### Test plan for Phase 2
+
+Add these focused tests:
+
+- `tests/test_feature_adaptation_runtime.py`
+- `tests/test_feature_adaptation_scaling.py`
+- `tests/test_feature_adaptation_masking.py`
+
+Extend these existing suites:
+
+- `tests/test_regime_aware_training.py`
+- `tests/test_feature_admission_policy.py`
+- `tests/test_experiment_config.py`
+- any training-summary or experiment-manifest slice that asserts JSON-safe
+  payloads
+
+Minimum behavior each Phase 2 test group must cover:
+
+- identity adapter preserves current behavior when the feature-adaptation layer
+  is disabled
+- regime-conditioned scaling is prefix-invariant and fold-local
 - per-regime masks do not leak future occupancy
-- fallback behavior is explicit and tested
+- generated columns preserve explicit lineage and deterministic ordering
+- low-confidence and warm rows fall back to the configured policy
+- training and inference paths use the same adapter manifest
+- diagnostics remain JSON-safe and additive in training output
+
+#### Risks and failure modes to prevent in Phase 2
+
+- fitting scaler banks or masks on the combined fit-plus-test window
+- allowing adapted schemas to drift between fit and inference because masks are
+  applied by dropping columns instead of reindexing a frozen union schema
+- generating regime interactions outside the configured budget and silently
+  exploding feature width
+- reintroducing a second feature-conditioning implementation in
+  `core/regime_training.py`
+- treating low-confidence rows as fully regime-qualified instead of invoking
+  fallback policy
+- bypassing stationarity discipline for newly generated columns
+
+The main guardrail is to make one adapter runtime own every regime-conditioned
+feature transform, then reuse that runtime everywhere else.
+
+#### Phase 2 acceptance criteria
+
+Phase 2 is complete only when all of these are true:
+
+- the repo contains a typed feature-adaptation runtime with identity,
+  regime-conditioned scaling, masking, and bounded interaction support
+- fold-local training fits the adapter on `X_fit` only and reuses frozen policy
+  artifacts for validation and test
+- `build_regime_aware_feature_frame(...)` and the pipeline share the same
+  authoritative adapter implementation
+- low-confidence, warm, and sparse-regime fallbacks are explicit and recorded
+- training and refit artifacts persist JSON-safe feature-policy manifests and
+  diagnostics
+- adapted feature schemas are deterministic and prefix-invariant
+- newly generated columns do not bypass stationarity and governance checks
+
+Explicit non-goals for Phase 2:
+
+- no specialist-library certification or routing logic yet
+- no router-aware switching-cost replay
+- no detector-fusion redesign beyond consuming the existing regime trace
+- no broad AutoML search redesign beyond carrying the new diagnostics forward
 
 ### Phase 3: Specialist library
 

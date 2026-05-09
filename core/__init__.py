@@ -156,6 +156,21 @@ from .feature_governance import (
     summarize_feature_admission_reports,
     summarize_feature_portability,
 )
+from .feature_adaptation import (
+    BaseFeatureAdapter,
+    FeatureAdaptationBatchResult,
+    FeaturePolicyContract,
+    IdentityFeatureAdapter,
+    RegimeConditionedScalingAdapter,
+    RegimeFeatureStrategyAdapter,
+    apply_feature_adaptation_to_splits,
+    build_feature_adapter,
+    build_feature_strategy_adapter,
+    resolve_feature_adaptation_config,
+    resolve_feature_strategy_adapter_config,
+    validate_feature_adaptation_config_contract,
+    validate_feature_adaptation_runtime_support,
+)
 from .labeling import (
     triple_barrier_labels,
     fixed_horizon_labels,

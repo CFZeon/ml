@@ -1,4 +1,5 @@
 import unittest
+from io import StringIO
 from unittest.mock import patch
 
 import numpy as np
@@ -79,6 +80,14 @@ class _FakePipeline:
             "avg_accuracy": 0.74,
             "avg_f1_macro": 0.69,
             "last_selected_columns": ["returns_1", "volatility_24"],
+            "feature_adaptation": {
+                "enabled": True,
+                "applied_in_any_fold": True,
+                "deferred_runtime": False,
+                "requested_scaling_mode": "regime_conditioned",
+                "requested_selection_mode": "per_regime_mask",
+                "last_manifest": {"adapter_type": "composite_feature_adaptation"},
+            },
         }
 
     def generate_signals(self):
@@ -103,6 +112,22 @@ class ExperimentRunnerTest(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.artifacts["training"]["last_selected_columns"], ["returns_1", "volatility_24"])
         self.assertTrue(any("Too-good-to-be-true" in warning for warning in result.warnings))
+
+    @patch("experiments.runner.ResearchPipeline", _FakePipeline)
+    def test_run_experiment_prints_feature_adaptation_summary(self):
+        with patch("sys.stdout", new_callable=StringIO) as stdout:
+            run_experiment(
+                {
+                    "experiment": {"name": "runner_feature_adaptation"},
+                    "data": {"symbol": "BTCUSDT", "interval": "1h", "start": "2024-01-01", "end": "2024-02-01"},
+                    "indicators": [{"kind": "returns"}],
+                },
+                quiet=False,
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("Feature adapt", output)
+        self.assertIn("Adapt policy", output)
 
 
 if __name__ == "__main__":

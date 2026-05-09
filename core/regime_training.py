@@ -10,6 +10,7 @@ import pandas as pd
 from sklearn.dummy import DummyClassifier
 from sklearn.metrics import accuracy_score, f1_score
 
+from .feature_adaptation import build_feature_strategy_adapter, validate_feature_adaptation_runtime_support
 from .models import (
     _evaluate_directional_probability_quality,
     predict_probability_frame,
@@ -157,78 +158,29 @@ class RegimeAwareFeatureFrame:
     regime_columns: list[str] = field(default_factory=list)
     normalized_columns: list[str] = field(default_factory=list)
     interaction_columns: list[str] = field(default_factory=list)
+    adapter: Any | None = None
+    policy: dict[str, Any] = field(default_factory=dict)
+    manifest: dict[str, Any] = field(default_factory=dict)
 
 
 def build_regime_aware_feature_frame(X, regime_data, config=None):
-    config = dict(config or {})
+    resolved_config = dict(config or {})
+    regime_column = str(resolved_config.get("regime_column", "regime"))
     base = pd.DataFrame(X).copy()
-    base = base.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
     regime_frame = _coerce_regime_frame(regime_data, index=base.index)
-    if regime_frame.empty:
-        return RegimeAwareFeatureFrame(frame=base)
-
-    max_dummy_cardinality = int(config.get("max_dummy_cardinality", 16))
-    max_interaction_features = int(config.get("max_interaction_features", 4))
-    max_interaction_regimes = int(config.get("max_interaction_regimes", 6))
-    add_interactions = bool(config.get("regime_interactions", True))
-
-    numeric_regime = regime_frame.select_dtypes(include=[np.number]).copy()
-    regime_state_columns = []
-    for column in numeric_regime.columns:
-        engineered_name = f"regime_state__{column}"
-        base[engineered_name] = numeric_regime[column].fillna(0.0).astype(float)
-        regime_state_columns.append(engineered_name)
-
-    dummy_frames = []
-    dummy_columns = []
-    for column in regime_frame.columns:
-        non_null = regime_frame[column].dropna()
-        if non_null.empty or int(non_null.nunique()) > max_dummy_cardinality:
-            continue
-        encoded = regime_frame[column].fillna("missing").astype(str)
-        dummies = pd.get_dummies(encoded, prefix=f"regime__{column}", dtype=float)
-        dummy_frames.append(dummies)
-        dummy_columns.extend(list(dummies.columns))
-    if dummy_frames:
-        base = pd.concat([base] + dummy_frames, axis=1)
-
-    normalized_columns = []
-    volatility_candidates = [
-        column for column in numeric_regime.columns
-        if any(term in column.lower() for term in ("vol", "atr", "range", "dispersion"))
-    ]
-    return_like_columns = [
-        column for column in base.columns
-        if any(term in column.lower() for term in ("ret", "return", "momentum", "slope"))
-        and not column.startswith(("regime_state__", "regime__", "vol_norm__", "cond__"))
-    ]
-    if volatility_candidates and return_like_columns:
-        volatility_scale = numeric_regime[volatility_candidates[0]].abs().replace(0.0, np.nan).fillna(1.0)
-        volatility_scale = volatility_scale.clip(lower=1e-6)
-        for column in return_like_columns:
-            engineered_name = f"vol_norm__{column}"
-            base[engineered_name] = pd.to_numeric(base[column], errors="coerce").fillna(0.0) / volatility_scale
-            normalized_columns.append(engineered_name)
-
-    interaction_columns = []
-    if add_interactions and dummy_columns:
-        candidate_columns = [
-            column for column in base.columns
-            if column not in dummy_columns
-            and not column.startswith(("regime_state__", "vol_norm__", "cond__"))
-        ][:max_interaction_features]
-        for feature_name in candidate_columns:
-            feature_values = pd.to_numeric(base[feature_name], errors="coerce").fillna(0.0)
-            for dummy_name in dummy_columns[:max_interaction_regimes]:
-                interaction_name = f"cond__{feature_name}__{dummy_name}"
-                base[interaction_name] = feature_values * base[dummy_name]
-                interaction_columns.append(interaction_name)
-
+    adapter = build_feature_strategy_adapter(resolved_config, regime_column=regime_column)
+    adapter.fit(base, regime_frame)
+    transformed, policy = adapter.transform(base, regime_frame)
+    policy_dict = policy.to_dict()
+    metadata = dict(policy.metadata or {})
     return RegimeAwareFeatureFrame(
-        frame=base,
-        regime_columns=regime_state_columns + dummy_columns,
-        normalized_columns=normalized_columns,
-        interaction_columns=interaction_columns,
+        frame=transformed,
+        regime_columns=[str(column) for column in list(metadata.get("regime_columns") or [])],
+        normalized_columns=[str(column) for column in list(metadata.get("normalized_columns") or [])],
+        interaction_columns=[str(column) for column in list(metadata.get("interaction_columns") or [])],
+        adapter=adapter,
+        policy=policy_dict,
+        manifest=dict(adapter.manifest() or {}),
     )
 
 
@@ -266,6 +218,9 @@ class RegimeAwareModelBundle:
         specialist_models=None,
         feature_config=None,
         feature_columns=None,
+        feature_adapter=None,
+        feature_policy=None,
+        feature_manifest=None,
         regime_column="regime",
         ordered_classes=(-1, 0, 1),
     ):
@@ -275,10 +230,18 @@ class RegimeAwareModelBundle:
         self.specialist_models = dict(specialist_models or {})
         self.feature_config = dict(feature_config or {})
         self.feature_columns = list(feature_columns or [])
+        self.feature_adapter = feature_adapter
+        self.feature_policy = dict(feature_policy or {})
+        self.feature_manifest = dict(feature_manifest or {})
         self.regime_column = regime_column
         self.ordered_classes = tuple(ordered_classes)
 
     def _transform_feature_strategy(self, X, regime_data):
+        if self.feature_adapter is not None:
+            X_frame = pd.DataFrame(X).copy()
+            regime_frame = _coerce_regime_frame(regime_data, index=X_frame.index)
+            transformed, _ = self.feature_adapter.transform(X_frame, regime_frame)
+            return transformed.reindex(columns=self.feature_columns, fill_value=0.0)
         feature_result = build_regime_aware_feature_frame(X, regime_data, config=self.feature_config)
         return feature_result.frame.reindex(columns=self.feature_columns, fill_value=0.0)
 
@@ -559,6 +522,10 @@ def train_regime_aware_model(
     y_series = pd.Series(y, index=X_frame.index)
     regime_frame = _coerce_regime_frame(regime_data, index=X_frame.index)
     strategy = str(strategy).lower()
+    validate_feature_adaptation_runtime_support(
+        dict(feature_config or {}).get("feature_adaptation") or {},
+        regime_aware_strategy=strategy,
+    )
     coverage_summary = summarize_regime_coverage(regime_frame, regime_column=regime_column, config=coverage_config)
 
     if strategy == "feature":
@@ -576,6 +543,9 @@ def train_regime_aware_model(
             model=model,
             feature_config=feature_config,
             feature_columns=list(feature_result.frame.columns),
+            feature_adapter=feature_result.adapter,
+            feature_policy=feature_result.policy,
+            feature_manifest=feature_result.manifest,
             regime_column=regime_column,
         )
         report = {
@@ -585,6 +555,10 @@ def train_regime_aware_model(
             "normalized_columns": list(feature_result.normalized_columns),
             "interaction_columns": list(feature_result.interaction_columns),
             "regime_alignment": "inference_aligned_input",
+            "feature_adaptation": {
+                "policy": dict(feature_result.policy or {}),
+                "manifest": dict(feature_result.manifest or {}),
+            },
             "coverage_summary": coverage_summary,
             "sampling_report": sampling_report,
         }

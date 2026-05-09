@@ -6,7 +6,9 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 
 from ..regime import detect_regime
 from .contracts import RegimeDetectorManifest, RegimeObservationContract, RegimeStateContract
@@ -34,7 +36,7 @@ _DETECTOR_TYPE_ALIASES = {
     "volatility_state": "volatility",
     "volatility_trend_hybrid": "compatibility_explicit",
 }
-_NATIVE_DETECTOR_TYPES = {"break", "liquidity", "trend", "volatility"}
+_NATIVE_DETECTOR_TYPES = {"break", "filtered_hmm", "liquidity", "trend", "volatility"}
 
 
 def canonicalize_regime_detector_type(detector_type: Any) -> str:
@@ -182,6 +184,113 @@ def _select_detector_columns(
 def _summarize_selected_sources(columns: Sequence[str], source_map: Mapping[str, str] | None) -> dict[str, int]:
     counter = Counter(str((source_map or {}).get(column, "unknown")) for column in columns)
     return {key: int(value) for key, value in sorted(counter.items())}
+
+
+def _logsumexp(values: Sequence[float]) -> float:
+    array = np.asarray(values, dtype=float)
+    if array.size == 0:
+        return float("-inf")
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return float("-inf")
+    max_value = float(finite.max())
+    return float(max_value + np.log(np.exp(array - max_value).sum()))
+
+
+def _safe_log_probabilities(values: Sequence[float]) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    safe = np.full(array.shape, float("-inf"), dtype=float)
+    positive = array > 0
+    safe[positive] = np.log(array[positive])
+    return safe
+
+
+def _select_hmm_columns(
+    frame: pd.DataFrame,
+    *,
+    explicit_columns: Sequence[str] = (),
+    exclude_columns: Sequence[str] = (),
+    allowed_sources: Sequence[str] = (),
+    source_map: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    source_map = dict(source_map or {})
+    excluded = {str(item) for item in exclude_columns if str(item)}
+    allowed_source_set = {str(item) for item in allowed_sources if str(item)}
+
+    if explicit_columns:
+        selected = []
+        for column in explicit_columns:
+            if column not in frame.columns or column in excluded:
+                continue
+            if allowed_source_set and source_map.get(column) not in allowed_source_set:
+                continue
+            selected.append(column)
+        return tuple(selected)
+
+    selected = []
+    for column in frame.columns:
+        if column in excluded:
+            continue
+        if allowed_source_set and source_map.get(column) not in allowed_source_set:
+            continue
+        numeric = pd.to_numeric(frame[column], errors="coerce")
+        if numeric.notna().any():
+            selected.append(column)
+    return tuple(selected)
+
+
+def _coerce_numeric_frame(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    if not columns:
+        return pd.DataFrame(index=frame.index)
+    return frame.loc[:, list(columns)].apply(pd.to_numeric, errors="coerce")
+
+
+def _diag_gaussian_log_likelihood(
+    observation: np.ndarray,
+    means: np.ndarray,
+    covars: np.ndarray,
+) -> np.ndarray:
+    raw_covars = np.asarray(covars, dtype=float)
+    if raw_covars.ndim == 3:
+        variances = np.diagonal(raw_covars, axis1=1, axis2=2)
+    else:
+        variances = raw_covars
+    variances = np.maximum(variances, 1e-12)
+    centered = observation[None, :] - np.asarray(means, dtype=float)
+    quadratic = ((centered ** 2) / variances).sum(axis=1)
+    log_det = np.log(variances).sum(axis=1)
+    dimension = float(observation.shape[0])
+    return -0.5 * (dimension * np.log(2.0 * np.pi) + log_det + quadratic)
+
+
+def _deterministic_hmm_state_order(means: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    norms = np.linalg.norm(np.asarray(means, dtype=float), ord=1, axis=1)
+    ordered_state_indices = np.argsort(norms)
+    raw_to_ordered = np.empty(len(ordered_state_indices), dtype=int)
+    for ordered_label, raw_label in enumerate(ordered_state_indices):
+        raw_to_ordered[int(raw_label)] = int(ordered_label)
+    return ordered_state_indices.astype(int), raw_to_ordered.astype(int)
+
+
+def _forward_filter_step(
+    emission_log_likelihood: np.ndarray,
+    *,
+    log_startprob: np.ndarray,
+    log_transmat: np.ndarray,
+    previous_filtered_log_prob: np.ndarray | None,
+) -> np.ndarray:
+    emission = np.asarray(emission_log_likelihood, dtype=float)
+    if previous_filtered_log_prob is None:
+        unnormalized = log_startprob + emission
+    else:
+        transition_terms = previous_filtered_log_prob[:, None] + log_transmat
+        predicted = np.asarray([_logsumexp(transition_terms[:, column]) for column in range(transition_terms.shape[1])])
+        unnormalized = predicted + emission
+
+    normalizer = _logsumexp(unnormalized)
+    if not np.isfinite(normalizer):
+        raise ValueError("Filtered HMM forward step produced a non-finite normalizer")
+    return unnormalized - normalizer
 
 
 def _select_primary_regime_detector(regime_config: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -444,6 +553,286 @@ class BreakRegimeDetector(_NativeScoreRegimeDetector):
 
 
 @dataclass
+class FilteredHMMDetector:
+    config: Mapping[str, Any] | None = None
+    detector_name: str = "filtered_hmm"
+    column_name: str = "regime"
+    source_map: Mapping[str, str] | None = None
+    _fit_frame: pd.DataFrame = field(default_factory=pd.DataFrame, init=False, repr=False)
+    _fit_window: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    _selected_columns: tuple[str, ...] = field(default_factory=tuple, init=False, repr=False)
+    _selected_source_counts: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _scaler_mean: np.ndarray = field(default_factory=lambda: np.array([], dtype=float), init=False, repr=False)
+    _scaler_scale: np.ndarray = field(default_factory=lambda: np.array([], dtype=float), init=False, repr=False)
+    _startprob: np.ndarray = field(default_factory=lambda: np.array([], dtype=float), init=False, repr=False)
+    _transmat: np.ndarray = field(default_factory=lambda: np.array([[]], dtype=float), init=False, repr=False)
+    _means: np.ndarray = field(default_factory=lambda: np.array([[]], dtype=float), init=False, repr=False)
+    _covars: np.ndarray = field(default_factory=lambda: np.array([[]], dtype=float), init=False, repr=False)
+    _ordered_state_indices: np.ndarray = field(default_factory=lambda: np.array([], dtype=int), init=False, repr=False)
+    _raw_to_ordered: np.ndarray = field(default_factory=lambda: np.array([], dtype=int), init=False, repr=False)
+    _fit_status: str = field(default="unfitted", init=False, repr=False)
+    _fallback_reason: str | None = field(default=None, init=False, repr=False)
+    _posterior_mode: str = field(default="filtered", init=False, repr=False)
+    _state_count: int = field(default=0, init=False, repr=False)
+    _clean_fit_rows: int = field(default=0, init=False, repr=False)
+    _covariance_type: str = field(default="diag", init=False, repr=False)
+
+    @property
+    def params(self) -> dict[str, Any]:
+        return dict(self.config or {})
+
+    def _fallback_to_one_state(self, reason: str) -> "FilteredHMMDetector":
+        self._fit_status = "fallback"
+        self._fallback_reason = reason
+        self._state_count = 1
+        self._startprob = np.array([1.0], dtype=float)
+        self._transmat = np.array([[1.0]], dtype=float)
+        self._means = np.zeros((1, len(self._selected_columns)), dtype=float)
+        self._covars = np.ones((1, len(self._selected_columns)), dtype=float)
+        self._ordered_state_indices = np.array([0], dtype=int)
+        self._raw_to_ordered = np.array([0], dtype=int)
+        return self
+
+    def fit(self, observations: Any) -> "FilteredHMMDetector":
+        try:
+            from hmmlearn.hmm import GaussianHMM
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "hmmlearn is required for FilteredHMMDetector. Install it with: pip install hmmlearn>=0.3"
+            ) from exc
+
+        params = self.params
+        self._fit_frame = _normalize_frame(observations)
+        self._fit_window = _fit_window_payload(self._fit_frame)
+        self._covariance_type = str(params.get("covariance_type", "diag") or "diag").strip().lower()
+        if self._covariance_type != "diag":
+            raise ValueError(
+                "FilteredHMMDetector currently supports covariance_type='diag' only. "
+                f"Got {self._covariance_type!r}."
+            )
+
+        self._selected_columns = _select_hmm_columns(
+            self._fit_frame,
+            explicit_columns=_coerce_sequence(params.get("columns")),
+            exclude_columns=_coerce_sequence(params.get("exclude_columns")),
+            allowed_sources=_coerce_sequence(params.get("allowed_sources")),
+            source_map=self.source_map,
+        )
+        self._selected_source_counts = _summarize_selected_sources(self._selected_columns, self.source_map)
+        if not self._selected_columns:
+            allow_fallback = bool(params.get("allow_empty_schema_fallback", True))
+            if not allow_fallback:
+                raise ValueError("FilteredHMMDetector resolved an empty observation schema")
+            return self._fallback_to_one_state("empty_schema")
+
+        numeric_fit = _coerce_numeric_frame(self._fit_frame, self._selected_columns)
+        clean_fit = numeric_fit.dropna()
+        self._clean_fit_rows = int(len(clean_fit))
+
+        requested_state_count = int(params.get("state_count") or params.get("n_regimes") or 2)
+        requested_state_count = max(1, requested_state_count)
+        if clean_fit.empty:
+            return self._fallback_to_one_state("empty_fit_window")
+
+        state_count = max(1, min(requested_state_count, len(clean_fit)))
+        if state_count <= 1:
+            return self._fallback_to_one_state("insufficient_fit_rows")
+
+        scaler = StandardScaler()
+        scaler.fit(clean_fit)
+        self._scaler_mean = np.asarray(scaler.mean_, dtype=float)
+        self._scaler_scale = np.asarray(scaler.scale_, dtype=float)
+        self._scaler_scale = np.where(self._scaler_scale == 0, 1.0, self._scaler_scale)
+
+        normed_fit = scaler.transform(clean_fit)
+        hmm_model = GaussianHMM(
+            n_components=state_count,
+            covariance_type=self._covariance_type,
+            n_iter=int(params.get("n_iter", 100)),
+            tol=float(params.get("tol", 1e-3)),
+            random_state=int(params.get("random_state", 42)),
+        )
+        try:
+            hmm_model.fit(normed_fit)
+        except Exception:  # noqa: BLE001
+            return self._fallback_to_one_state("fit_failure")
+
+        self._fit_status = "fit"
+        self._fallback_reason = None
+        self._state_count = int(state_count)
+        self._startprob = np.asarray(hmm_model.startprob_, dtype=float)
+        self._transmat = np.asarray(hmm_model.transmat_, dtype=float)
+        self._means = np.asarray(hmm_model.means_, dtype=float)
+        self._covars = np.asarray(hmm_model.covars_, dtype=float)
+        self._ordered_state_indices, self._raw_to_ordered = _deterministic_hmm_state_order(self._means)
+        return self
+
+    def initialize(self, observations: Any | None = None) -> dict[str, Any]:
+        del observations
+        return {"position": 0, "filtered_log_prob": None}
+
+    def _emit_unavailable_contract(
+        self,
+        observation: RegimeObservationContract,
+        *,
+        runtime_state: dict[str, Any],
+        reason: str,
+    ) -> tuple[dict[str, Any], RegimeStateContract]:
+        detector_outputs = {
+            self.column_name: 0,
+            "regime_confidence": 0.0,
+            "selected_column_count": int(len(self._selected_columns)),
+            "warm": 0,
+            "degenerate_fallback": int(self._fit_status == "fallback"),
+            "unavailable": 1,
+        }
+        for state_label in range(max(1, self._state_count)):
+            detector_outputs[f"prob_state_{state_label}"] = 0.0
+
+        runtime_state["position"] = int(runtime_state.get("position", 0)) + 1
+        return runtime_state, RegimeStateContract(
+            as_of=observation.as_of,
+            available_at=observation.available_at,
+            label=0,
+            probabilities={},
+            confidence=0.0,
+            detector_outputs=detector_outputs,
+            warm=False,
+            metadata={
+                "detector_name": self.detector_name,
+                "detector_type": "filtered_hmm",
+                "posterior_mode": self._posterior_mode,
+                "reason": reason,
+                "selected_columns": list(self._selected_columns),
+            },
+        )
+
+    def update(
+        self,
+        state: Any,
+        observation: RegimeObservationContract,
+    ) -> tuple[Any, RegimeStateContract]:
+        runtime_state = dict(state or {})
+        selected_column_count = len(self._selected_columns)
+        warmup_bars = self.params.get("warmup_bars")
+
+        if self._fit_status == "unfitted":
+            return self._emit_unavailable_contract(observation, runtime_state=runtime_state, reason="unfitted")
+
+        if self._fit_status == "fallback":
+            position = int(runtime_state.get("position", 0))
+            warm = warmup_bars is None or position + 1 >= int(warmup_bars)
+            detector_outputs = {
+                self.column_name: 0,
+                "regime_confidence": 1.0,
+                "selected_column_count": int(selected_column_count),
+                "warm": int(warm),
+                "degenerate_fallback": 1,
+                "prob_state_0": 1.0,
+            }
+            runtime_state["position"] = position + 1
+            runtime_state["filtered_log_prob"] = np.array([0.0], dtype=float)
+            return runtime_state, RegimeStateContract(
+                as_of=observation.as_of,
+                available_at=observation.available_at,
+                label=0,
+                probabilities={"0": 1.0},
+                confidence=1.0,
+                detector_outputs=detector_outputs,
+                warm=bool(warm),
+                metadata={
+                    "detector_name": self.detector_name,
+                    "detector_type": "filtered_hmm",
+                    "posterior_mode": self._posterior_mode,
+                    "reason": self._fallback_reason,
+                    "selected_columns": list(self._selected_columns),
+                },
+            )
+
+        row = _to_numeric_series(observation.values, self._selected_columns)
+        if row.isna().any():
+            return self._emit_unavailable_contract(observation, runtime_state=runtime_state, reason="missing_observation")
+
+        scaled = (row.to_numpy(dtype=float) - self._scaler_mean) / self._scaler_scale
+        emission_log_likelihood = _diag_gaussian_log_likelihood(scaled, self._means, self._covars)
+        filtered_log_prob = _forward_filter_step(
+            emission_log_likelihood,
+            log_startprob=_safe_log_probabilities(self._startprob),
+            log_transmat=_safe_log_probabilities(self._transmat),
+            previous_filtered_log_prob=runtime_state.get("filtered_log_prob"),
+        )
+        runtime_state["filtered_log_prob"] = filtered_log_prob
+        runtime_state["position"] = int(runtime_state.get("position", 0)) + 1
+
+        raw_probabilities = np.exp(filtered_log_prob)
+        ordered_probabilities = raw_probabilities[self._ordered_state_indices]
+        label = int(np.argmax(ordered_probabilities)) if ordered_probabilities.size else 0
+        confidence = float(ordered_probabilities[label]) if ordered_probabilities.size else 0.0
+        warm = warmup_bars is None or int(runtime_state["position"]) >= int(warmup_bars)
+        detector_outputs = {
+            self.column_name: int(label),
+            "regime_confidence": float(confidence),
+            "selected_column_count": int(selected_column_count),
+            "warm": int(warm),
+            "log_evidence": float(_logsumexp(emission_log_likelihood)),
+            "degenerate_fallback": 0,
+        }
+        probability_payload = {}
+        for state_label, probability in enumerate(ordered_probabilities):
+            detector_outputs[f"prob_state_{state_label}"] = float(probability)
+            probability_payload[str(state_label)] = float(probability)
+
+        return runtime_state, RegimeStateContract(
+            as_of=observation.as_of,
+            available_at=observation.available_at,
+            label=int(label),
+            probabilities=probability_payload,
+            confidence=float(confidence),
+            detector_outputs=detector_outputs,
+            warm=bool(warm),
+            metadata={
+                "detector_name": self.detector_name,
+                "detector_type": "filtered_hmm",
+                "posterior_mode": self._posterior_mode,
+                "selected_columns": list(self._selected_columns),
+            },
+        )
+
+    def manifest(self) -> RegimeDetectorManifest:
+        params = dict(self.params)
+        metadata = {
+            "posterior_mode": self._posterior_mode,
+            "fit_status": self._fit_status,
+            "fallback_reason": self._fallback_reason,
+            "selected_columns": list(self._selected_columns),
+            "selected_source_counts": dict(self._selected_source_counts),
+            "state_remap": {
+                str(int(raw_state)): int(ordered_state)
+                for raw_state, ordered_state in enumerate(self._raw_to_ordered.tolist() if self._raw_to_ordered.size else [])
+            },
+            "clean_fit_rows": int(self._clean_fit_rows),
+        }
+        return RegimeDetectorManifest(
+            detector_name=self.detector_name,
+            detector_type="filtered_hmm",
+            params={
+                "n_regimes": int(self.params.get("state_count") or self.params.get("n_regimes") or max(1, self._state_count or 1)),
+                "covariance_type": self._covariance_type,
+                "n_iter": int(params.get("n_iter", 100)),
+                "tol": float(params.get("tol", 1e-3)),
+                "random_state": int(params.get("random_state", 42)),
+            },
+            warmup_bars=(
+                None
+                if params.get("warmup_bars") is None and params.get("feature_lookback") is None
+                else int(params.get("warmup_bars", params.get("feature_lookback")))
+            ),
+            fit_window=dict(self._fit_window),
+            metadata=metadata,
+        )
+
+
+@dataclass
 class ExplicitCompatibilityRegimeDetector:
     config: Mapping[str, Any] | None = None
     detector_name: str = "compatibility_explicit"
@@ -587,15 +976,18 @@ def build_regime_detector(
         return LiquidityRegimeDetector(**detector_kwargs)
     if canonical_type == "break":
         return BreakRegimeDetector(**detector_kwargs)
+    if canonical_type == "filtered_hmm":
+        return FilteredHMMDetector(**detector_kwargs)
     raise ValueError(
         f"Unsupported regime detector type={resolved_spec.get('type')!r}. "
-        "Supported Slice 3 replay detectors: ['explicit', 'trend', 'volatility', 'liquidity', 'break']."
+        "Supported replay detectors: ['explicit', 'trend', 'volatility', 'liquidity', 'break', 'filtered_hmm']."
     )
 
 
 __all__ = [
     "BreakRegimeDetector",
     "ExplicitCompatibilityRegimeDetector",
+    "FilteredHMMDetector",
     "LiquidityRegimeDetector",
     "TrendRegimeDetector",
     "VolatilityRegimeDetector",

@@ -1,0 +1,56 @@
+experiment:
+  name: btc_filtered_hmm
+  description: Spot example using the filtered-HMM detector-backed regime runtime.
+data:
+  source: binance_bars
+  market: spot
+  symbol: BTCUSDT
+  interval: 1h
+  start: 2024-01-01
+  end: 2024-05-01
+  context_symbols: [ETHUSDT]
+indicators:
+  - kind: returns
+    params:
+      periods: [1, 3, 6]
+  - kind: volatility
+    params:
+      window: 24
+  - kind: rsi
+    params:
+      period: 14
+  - kind: range_position
+    params:
+      window: 20
+regime:
+  detectors:
+    - name: hmm_primary
+      type: filtered_hmm
+      primary: true
+      warmup_bars: 48
+      params:
+        n_regimes: 2
+        covariance_type: diag
+        n_iter: 40
+        tol: 0.001
+        random_state: 42
+model:
+  type: gbm
+  cv_method: cpcv
+backtest:
+  engine: vectorbt
+quick_overrides:
+  data:
+    end: 2024-02-15
+    context_symbols: []
+    futures_context:
+      enabled: false
+  feature_selection:
+    max_features: 64
+  model:
+    cv_method: walk_forward
+    n_splits: 2
+    train_size: 336
+    test_size: 72
+    gap: 6
+    expanding: false

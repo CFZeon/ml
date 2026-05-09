@@ -1052,8 +1052,37 @@ def print_phase_zero_contract_summary(result, *, quiet=False):
     regime_result = dict(artifacts.get("regimes") or {})
     training = dict(artifacts.get("training") or {})
     router_config = dict(config.get("router") or {})
+    regime_detection = dict(pipeline_state.get("regime_detection") or {})
+    detector_manifests = list(regime_detection.get("detector_manifests") or [])
+    primary_manifest = detector_manifests[0] if detector_manifests else None
+    trace_summary = regime_detection.get("trace_summary")
 
-    print("\nPhase 0 Contracts")
+    print("\nRegime Runtime")
+
+    if primary_manifest is not None:
+        posterior_mode = dict(primary_manifest.metadata or {}).get("posterior_mode", "n/a")
+        print(
+            "  detector     : "
+            f"name={primary_manifest.detector_name}  "
+            f"type={primary_manifest.detector_type}  "
+            f"method={regime_detection.get('method', 'n/a')}  "
+            f"posterior={posterior_mode}  "
+            f"warmup={primary_manifest.warmup_bars if primary_manifest.warmup_bars is not None else 'n/a'}"
+        )
+        print(
+            "  replay       : "
+            f"mode={dict(regime_detection.get('replay') or {}).get('mode', 'n/a')}  "
+            f"detectors={len(detector_manifests)}  "
+            f"available={regime_detection.get('available_rows', 0)}"
+        )
+    elif trace_summary is not None:
+        print(
+            "  detector     : "
+            f"method={regime_detection.get('method', 'n/a')}  "
+            f"available={trace_summary.available_rows}"
+        )
+    else:
+        print("  detector     : unavailable")
 
     if regime_result:
         regime_trace = summarize_regime_detection_result(regime_result)
@@ -1254,6 +1283,22 @@ def print_training_summary(training):
         print(f"  avg brier    : {_format_metric(training.get('avg_brier_score'))}")
     if training.get("avg_calibration_error") is not None:
         print(f"  avg calib    : {_format_metric(training.get('avg_calibration_error'))}")
+
+    feature_adaptation = training.get("feature_adaptation", {})
+    if feature_adaptation:
+        last_manifest = dict(feature_adaptation.get("last_manifest") or {})
+        print(
+            "  feature adapt: "
+            f"enabled={bool(feature_adaptation.get('enabled', False))}  "
+            f"applied={bool(feature_adaptation.get('applied_in_any_fold', False))}  "
+            f"deferred={bool(feature_adaptation.get('deferred_runtime', False))}"
+        )
+        print(
+            "  adapt policy : "
+            f"adapter={last_manifest.get('adapter_type', 'identity')}  "
+            f"scaling={feature_adaptation.get('requested_scaling_mode', 'identity')}  "
+            f"selection={feature_adaptation.get('requested_selection_mode', 'identity')}"
+        )
 
     feature_selection = training.get("feature_selection", {})
     if feature_selection:

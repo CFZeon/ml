@@ -1,6 +1,6 @@
 experiment:
   name: btc_regime_aware
-  description: Regime-orchestration spot example with detector, specialist-library, and router sections.
+  description: Regime-orchestration spot example using a native detector-backed regime runtime.
 data:
   source: binance_bars
   market: spot
@@ -24,25 +24,13 @@ indicators:
       window: 20
 regime:
   detectors:
-    - name: vol_trend_primary
-      type: volatility_trend_hybrid
+    - name: trend_native_primary
+      type: trend_state
       primary: true
       warmup_bars: 240
       params:
-        method: explicit
-        n_regimes: 3
-        vol_window: 48
-        trend_window: 96
-    - name: liquidity_overlay
-      type: liquidity_state
-      warmup_bars: 120
-      params:
-        window: 48
-  ensemble:
-    type: weighted_vote
-    primary_detector: vol_trend_primary
-    confidence_floor: 0.55
-    disagreement_penalty: 0.20
+        lower_quantile: 0.25
+        upper_quantile: 0.75
 feature_adaptation:
   scaling:
     mode: regime_conditioned
@@ -97,4 +85,16 @@ backtest:
   engine: vectorbt
 quick_overrides:
   data:
-    end: 2024-03-01
+    end: 2024-02-15
+    context_symbols: [ETHUSDT]
+    futures_context:
+      enabled: false
+  feature_selection:
+    max_features: 64
+  model:
+    cv_method: walk_forward
+    n_splits: 2
+    train_size: 336
+    test_size: 72
+    gap: 6
+    expanding: false

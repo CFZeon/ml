@@ -34,6 +34,11 @@ from .data_contracts import (
 from .data_quality import check_data_quality
 from .evaluation_modes import resolve_evaluation_mode
 from .execution import resolve_execution_policy
+from .feature_adaptation import (
+    apply_feature_adaptation_to_splits,
+    resolve_feature_adaptation_config,
+    validate_feature_adaptation_runtime_support,
+)
 from .feature_governance import (
     apply_feature_retirement,
     derive_feature_metadata,
@@ -350,6 +355,15 @@ def _resolve_regime_aware_config(model_config):
         "min_samples_per_regime": int(configured.get("min_samples_per_regime", 40)),
         "coverage_config": dict(configured.get("coverage_config") or {}),
     }
+
+
+def _with_feature_adaptation_regime_config(regime_aware_config, feature_adaptation_config):
+    resolved = dict(regime_aware_config or {})
+    if not resolved.get("enabled"):
+        return resolved
+    if feature_adaptation_config:
+        resolved["feature_adaptation"] = dict(feature_adaptation_config)
+    return resolved
 
 
 def _predict_primary_model_outputs(model, X, regime_data=None):
@@ -2364,11 +2378,14 @@ def _build_regime_state_frame(feature_set, config, *, index=None, fit_index=None
         runtime_method = canonicalize_regime_detector_type(authoritative_detector_spec.get("type"))
         if runtime_method == "compatibility_explicit":
             runtime_method = "explicit"
-    elif method == "explicit":
+    elif method in {"explicit", "hmm"}:
+        legacy_detector_spec = None
+        if method == "hmm":
+            legacy_detector_spec = {"name": "legacy_hmm", "type": "filtered_hmm"}
         replay_result = replay_regime_detector_trace(
             regime_window,
             detector=build_regime_detector(
-                None,
+                legacy_detector_spec,
                 config=config,
                 source_map=feature_set.source_map,
             ),
@@ -2379,6 +2396,8 @@ def _build_regime_state_frame(feature_set, config, *, index=None, fit_index=None
             metadata={"method": method},
         )
         regimes = replay_result["state_frame"]
+        if legacy_detector_spec is not None:
+            ablation_detector_spec = legacy_detector_spec
     else:
         regimes = detect_regime(
             regime_window,
@@ -3383,6 +3402,78 @@ def _resolve_fallback_signal_frame(X, training):
     return safe_X, fallback_scope
 
 
+def _resolve_last_feature_adapter_state(pipeline, training):
+    adapter = pipeline.state.get("last_feature_adapter")
+    feature_adaptation = dict(training.get("feature_adaptation") or pipeline.state.get("feature_adaptation") or {})
+    manifest = dict(feature_adaptation.get("last_manifest") or {})
+    policy = dict(feature_adaptation.get("last_policy") or {})
+    return adapter, manifest, policy
+
+
+def _prepare_fallback_primary_model_inputs(pipeline, X, training, model, *, selected_columns):
+    adapter, adapter_manifest, _ = _resolve_last_feature_adapter_state(pipeline, training)
+    adapter_feature_columns = [str(column) for column in list(adapter_manifest.get("feature_columns") or [])]
+    scaling_mode = str(
+        adapter_manifest.get("scaling_mode")
+        or adapter_manifest.get("requested_scaling_mode")
+        or "identity"
+    )
+    selection_mode = str(
+        adapter_manifest.get("selection_mode")
+        or adapter_manifest.get("requested_selection_mode")
+        or "identity"
+    )
+    required_columns = set(selected_columns) | set(adapter_feature_columns)
+    missing_required_columns = [column for column in required_columns if column not in X.columns]
+    needs_regime_frame = (
+        bool(missing_required_columns)
+        or _is_regime_aware_model(model)
+        or scaling_mode == "regime_conditioned"
+        or selection_mode == "per_regime_mask"
+    )
+
+    regime_frame = None
+    if needs_regime_frame:
+        regime_frame, _ = _build_fold_local_regime_frame(
+            pipeline,
+            X.index,
+            fit_index=training.get("last_regime_fit_index"),
+        )
+
+    X_context = X.copy()
+    if regime_frame is not None and not regime_frame.empty:
+        join_columns = [column for column in regime_frame.columns if column not in X_context.columns]
+        if join_columns:
+            X_context = X_context.join(regime_frame.loc[:, join_columns])
+
+    applied_policy = None
+    X_model_source = X_context
+    if adapter is not None:
+        missing_adapter_columns = [column for column in adapter_feature_columns if column not in X_context.columns]
+        if missing_adapter_columns:
+            preview = ", ".join(missing_adapter_columns[:8])
+            raise RuntimeError(
+                "SignalsStep fallback could not reconstruct final feature-adaptation inputs: "
+                f"{preview}"
+            )
+        regime_view = (
+            regime_frame.reindex(X_context.index)
+            if regime_frame is not None and not regime_frame.empty
+            else pd.DataFrame(index=X_context.index)
+        )
+        X_model_source, applied_policy = adapter.transform(X_context, regime_view)
+
+    missing_selected_columns = [column for column in selected_columns if column not in X_model_source.columns]
+    if missing_selected_columns:
+        preview = ", ".join(missing_selected_columns[:8])
+        raise RuntimeError(
+            "SignalsStep fallback could not reconstruct final training columns after feature adaptation: "
+            f"{preview}"
+        )
+
+    return X_context, X_model_source, regime_frame, applied_policy, adapter_manifest
+
+
 def _score_signal_state(backtest, signal_config):
     score = float(backtest.get("net_profit_pct", 0.0))
     score += float(signal_config.get("tuning_weight_sharpe", 0.03)) * float(backtest.get("sharpe_ratio", 0.0))
@@ -4276,6 +4367,22 @@ class TrainModelsStep(PipelineStep):
         backtest_config = pipeline.section("backtest")
         signal_policy_builder = SignalPolicyBuilder(signal_config, backtest_config)
         regime_aware_config = _resolve_regime_aware_config(config)
+        raw_feature_adaptation_config = dict(
+            regime_aware_config.get("feature_adaptation") or pipeline.section("feature_adaptation") or {}
+        )
+        if regime_aware_config.get("enabled") and raw_feature_adaptation_config:
+            raw_feature_adaptation_config.setdefault(
+                "default_min_regime_samples",
+                regime_aware_config.get("min_samples_per_regime"),
+            )
+        feature_adaptation_config = validate_feature_adaptation_runtime_support(
+            raw_feature_adaptation_config,
+            regime_aware_strategy=(regime_aware_config.get("strategy") if regime_aware_config.get("enabled") else None),
+        )
+        regime_training_config = _with_feature_adaptation_regime_config(
+            regime_aware_config,
+            feature_adaptation_config,
+        )
         feature_blocks = pipeline.state.get("feature_blocks", {})
         stationarity_config = _resolve_stationarity_screening_config(pipeline)
         binary_primary = config.get("binary_primary", True)
@@ -4348,6 +4455,7 @@ class TrainModelsStep(PipelineStep):
         fold_purging = []
         fold_regime = []
         fold_regime_aware = []
+        fold_feature_adaptation = []
         fold_bootstrap = []
         fold_backtest_reports = []
         inference_latencies_ms = []
@@ -4356,6 +4464,9 @@ class TrainModelsStep(PipelineStep):
         last_primary_calibrator = None
         last_meta_calibrator = None
         last_selected_columns = list(X.columns)
+        last_feature_adapter = None
+        last_feature_adaptation_policy = None
+        last_feature_adaptation_manifest = None
         last_regime_fit_index = X.index[:0]
         last_test_index = X.index[:0]
         last_signal_params = dict(default_signal_policy["params"])
@@ -4500,6 +4611,39 @@ class TrainModelsStep(PipelineStep):
             if X_val is not None and X_val.empty:
                 X_val, y_val, labels_val = None, None, None
 
+            fit_regime_view = regime_frame.reindex(X_fit.index) if not regime_frame.empty else pd.DataFrame(index=X_fit.index)
+            val_regime_view = (
+                regime_frame.reindex(X_val.index)
+                if X_val is not None and not regime_frame.empty
+                else pd.DataFrame(index=X_val.index if X_val is not None else pd.Index([], dtype=object))
+            )
+            test_regime_view = regime_frame.reindex(X_test.index) if not regime_frame.empty else pd.DataFrame(index=X_test.index)
+
+            adaptation_result = apply_feature_adaptation_to_splits(
+                X_fit,
+                X_val,
+                X_test,
+                fit_regime_frame=fit_regime_view,
+                validation_regime_frame=val_regime_view,
+                test_regime_frame=test_regime_view,
+                feature_metadata=pipeline.state.get("feature_metadata"),
+                config=feature_adaptation_config,
+                regime_column=regime_aware_config.get("regime_column", "regime"),
+            )
+            X_fit = adaptation_result.fit_frame
+            X_val = adaptation_result.validation_frame
+            X_test = adaptation_result.test_frame
+            last_feature_adapter = adaptation_result.adapter
+            last_feature_adaptation_policy = adaptation_result.fit_policy.to_dict()
+            last_feature_adaptation_manifest = dict(adaptation_result.manifest or {})
+            fold_feature_adaptation.append(
+                {
+                    "fold": fold,
+                    "split_id": split_id,
+                    **adaptation_result.summary,
+                }
+            )
+
             w_fit = _compute_fold_sample_weights(labels_fit, close_all).reindex(X_fit.index).fillna(1.0)
             w_val = None
             if X_val is not None and labels_val is not None and not labels_val.empty:
@@ -4519,34 +4663,53 @@ class TrainModelsStep(PipelineStep):
                 }
             )
 
-            selected_columns = list(X_fit.columns)
+            policy_disabled_columns = [
+                str(column)
+                for column in adaptation_result.fit_policy.disabled_columns
+                if str(column) in X_fit.columns
+            ]
+            disabled_column_set = set(policy_disabled_columns)
+            candidate_columns = [
+                str(column)
+                for column in X_fit.columns
+                if str(column) not in disabled_column_set
+            ]
+            if not candidate_columns:
+                raise ValueError(
+                    "feature_adaptation disabled all candidate training columns; "
+                    f"fold={fold} split_id={split_id}"
+                )
+
+            selected_columns = list(candidate_columns)
             selection_result = None
             if selection_config.get("enabled", True):
                 selection_result = select_features(
-                    X_fit,
+                    X_fit.loc[:, candidate_columns],
                     y_fit,
                     feature_blocks=fold_feature_blocks,
                     config=selection_config,
                 )
                 if not selection_result.frame.empty:
-                    selected_columns = [column for column in selection_result.frame.columns if column in X_fit.columns]
+                    selected_columns = [
+                        column for column in selection_result.frame.columns if column in candidate_columns
+                    ]
                     if selected_columns:
                         fold_feature_blocks = selection_result.feature_blocks
                     else:
-                        selected_columns = list(X_fit.columns)
+                        selected_columns = list(candidate_columns)
 
             family_summary = summarize_feature_families(fold_feature_blocks, columns=selected_columns)
 
             X_fit_model = X_fit.loc[:, selected_columns]
             X_test_model = X_test.loc[:, selected_columns]
             X_val_model = X_val.loc[:, selected_columns] if X_val is not None else None
-            fit_regime_view = regime_frame.reindex(X_fit_model.index) if not regime_frame.empty else pd.DataFrame(index=X_fit_model.index)
+            fit_regime_view = fit_regime_view.reindex(X_fit_model.index) if not fit_regime_view.empty else pd.DataFrame(index=X_fit_model.index)
             val_regime_view = (
-                regime_frame.reindex(X_val_model.index)
-                if X_val_model is not None and not regime_frame.empty
+                val_regime_view.reindex(X_val_model.index)
+                if X_val_model is not None and not val_regime_view.empty
                 else pd.DataFrame(index=X_val_model.index if X_val_model is not None else pd.Index([], dtype=object))
             )
-            test_regime_view = regime_frame.reindex(X_test_model.index) if not regime_frame.empty else pd.DataFrame(index=X_test_model.index)
+            test_regime_view = test_regime_view.reindex(X_test_model.index) if not test_regime_view.empty else pd.DataFrame(index=X_test_model.index)
 
             fold_feature_metadata = filter_feature_metadata(
                 pipeline.state.get("feature_metadata") or derive_feature_metadata(fold_feature_blocks, columns=selected_columns),
@@ -4621,7 +4784,7 @@ class TrainModelsStep(PipelineStep):
                     strategy=regime_aware_config.get("strategy", "feature"),
                     model_type=config.get("type", "gbm"),
                     model_params=config.get("params"),
-                    feature_config=regime_aware_config,
+                    feature_config=regime_training_config,
                     coverage_config=regime_aware_config.get("coverage_config"),
                     regime_column=regime_aware_config.get("regime_column", "regime"),
                     min_samples_per_regime=regime_aware_config.get("min_samples_per_regime", 40),
@@ -4747,7 +4910,7 @@ class TrainModelsStep(PipelineStep):
                 ),
                 context_frame=meta_context_frame.reindex(X_fit_model.index) if meta_context_frame is not None else None,
                 regime_data=fit_regime_view if not fit_regime_view.empty else None,
-                regime_aware_config=regime_aware_config,
+                regime_aware_config=regime_training_config,
                 feature_lag_bars=feature_lag_bars,
             )
             fold_avg_win = default_avg_win
@@ -5193,6 +5356,22 @@ class TrainModelsStep(PipelineStep):
             "strategy": regime_aware_config.get("strategy"),
             "folds": fold_regime_aware,
         }
+        feature_adaptation_summary = {
+            "enabled": bool(feature_adaptation_config.get("enabled", False)),
+            "mode": "fold_local",
+            "requested_scaling_mode": feature_adaptation_config.get("requested_scaling_mode", "identity"),
+            "requested_selection_mode": feature_adaptation_config.get("requested_selection_mode", "identity"),
+            "selection_fallback_mode": feature_adaptation_config.get("selection_fallback_mode", "identity"),
+            "fallback_mode": feature_adaptation_config.get("fallback_mode", "identity"),
+            "requested_sections": list(feature_adaptation_config.get("requested_sections") or []),
+            "deferred_runtime": bool(any(row.get("deferred_runtime", False) for row in fold_feature_adaptation)),
+            "applied_in_any_fold": bool(any(not row.get("no_op", True) for row in fold_feature_adaptation)),
+            "folds": fold_feature_adaptation,
+        }
+        if last_feature_adaptation_policy is not None:
+            feature_adaptation_summary["last_policy"] = last_feature_adaptation_policy
+        if last_feature_adaptation_manifest is not None:
+            feature_adaptation_summary["last_manifest"] = last_feature_adaptation_manifest
         if regime_aware_config.get("enabled"):
             trained_regimes = set()
             trained_rows_by_regime = {}
@@ -5335,6 +5514,7 @@ class TrainModelsStep(PipelineStep):
             "feature_block_diagnostics": feature_diagnostics,
             "feature_family_diagnostics": feature_family_diagnostics,
             "feature_portability_diagnostics": feature_portability_diagnostics,
+            "feature_adaptation": feature_adaptation_summary,
             "cross_venue_integrity": reference_integrity_report,
             "data_certification": data_certification_report,
             "signal_decay": signal_decay,
@@ -5404,6 +5584,8 @@ class TrainModelsStep(PipelineStep):
                 training["executable_validation"] = executable_validation
         training["validation_sources"] = _resolve_pipeline_validation_sources(pipeline, training)
         pipeline.state["training"] = training
+        pipeline.state["last_feature_adapter"] = last_feature_adapter
+        pipeline.state["feature_adaptation"] = feature_adaptation_summary
         pipeline.state["operational_monitoring"] = operational_monitoring
         return training
 
@@ -5502,18 +5684,15 @@ class SignalsStep(PipelineStep):
                 return result
 
             selected_columns = training.get("last_selected_columns") or list(X.columns)
-            missing_columns = [column for column in selected_columns if column not in X.columns]
             model = training["last_model"]
-            regime_frame = None
-            if missing_columns or _is_regime_aware_model(model):
-                regime_frame, _ = _build_fold_local_regime_frame(
-                    pipeline,
-                    X.index,
-                    fit_index=training.get("last_regime_fit_index"),
-                )
-                if missing_columns and regime_frame is not None and not regime_frame.empty:
-                    X = X.join(regime_frame)
-            X_model = X.loc[:, selected_columns]
+            X_context_source, X_model_source, regime_frame, fallback_feature_policy, fallback_feature_manifest = _prepare_fallback_primary_model_inputs(
+                pipeline,
+                X,
+                training,
+                model,
+                selected_columns=selected_columns,
+            )
+            X_model = X_model_source.loc[:, selected_columns]
             meta_model = training["last_meta"]
             predictions, probability_frame_raw, _ = _predict_primary_model_outputs(
                 model,
@@ -5527,11 +5706,11 @@ class SignalsStep(PipelineStep):
             _META_CTX_PREFIXES = ("regime", "trend_regime", "volatility_regime", "liquidity_regime")
             _META_CTX_SUFFIXES = ("_atr_pct", "_vol_zscore", "_bw_zscore")
             signals_ctx_cols = [
-                col for col in X.columns
+                col for col in X_context_source.columns
                 if any(col.startswith(p) for p in _META_CTX_PREFIXES)
                 or any(col.endswith(s) for s in _META_CTX_SUFFIXES)
             ][:8]
-            signals_context_frame = X[signals_ctx_cols] if signals_ctx_cols else None
+            signals_context_frame = X_context_source[signals_ctx_cols] if signals_ctx_cols else None
             X_meta = build_meta_feature_frame(predictions, probability_frame_raw, context=signals_context_frame)
             meta_prob_raw = pd.Series(_positive_class_probability(meta_model, X_meta), index=X_model.index)
             meta_prob_series = pd.Series(
@@ -5544,6 +5723,28 @@ class SignalsStep(PipelineStep):
             ).clip(0.0, 1.0) if training.get("last_meta_calibrator") is not None else meta_prob_raw.clip(0.0, 1.0)
             prediction_series = predictions
             signal_source = "post_final_training_fallback"
+            if fallback_feature_policy is not None:
+                fallback_scope["feature_adaptation_applied"] = True
+                fallback_scope["feature_adaptation_policy_id"] = fallback_feature_policy.policy_id
+                fallback_scope["feature_adaptation_scaling_mode"] = fallback_feature_policy.scaling_mode
+                fallback_scope["feature_adaptation_selection_mode"] = fallback_feature_policy.metadata.get(
+                    "selection_mode",
+                    fallback_feature_manifest.get("requested_selection_mode", "identity"),
+                )
+                fallback_scope["feature_adaptation_adapter_type"] = fallback_feature_policy.metadata.get(
+                    "adapter_type"
+                )
+                fallback_scope["feature_adaptation_no_op"] = bool(
+                    fallback_feature_policy.metadata.get("no_op", False)
+                )
+                fallback_scope["feature_adaptation_regime_bank_count"] = int(
+                    fallback_feature_manifest.get("regime_bank_count", 0)
+                )
+                fallback_scope["feature_adaptation_regime_mask_count"] = int(
+                    fallback_feature_manifest.get("regime_mask_count", 0)
+                )
+            else:
+                fallback_scope["feature_adaptation_applied"] = False
 
         prediction_series = prediction_series.sort_index()
         probability_frame = probability_frame.reindex(prediction_series.index).fillna(0.0)
@@ -5830,6 +6031,11 @@ class ResearchPipeline:
             "selection_freeze": copy.deepcopy(resolved_summary.get("selection_freeze")),
             "best_overrides": copy.deepcopy(resolved_summary.get("best_overrides") or {}),
             "training": copy.deepcopy(refit_pipeline.state.get("training") or {}),
+            "feature_adaptation": copy.deepcopy(
+                (refit_pipeline.state.get("training") or {}).get("feature_adaptation")
+                or refit_pipeline.state.get("feature_adaptation")
+                or {}
+            ),
             "signals": copy.deepcopy(refit_pipeline.state.get("signals") or {}),
             "backtest": copy.deepcopy(refit_pipeline.state.get("backtest") or {}),
             "pipeline": refit_pipeline,

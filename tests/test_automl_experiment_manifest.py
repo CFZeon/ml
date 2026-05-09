@@ -304,7 +304,10 @@ class AutoMLExperimentManifestTest(unittest.TestCase):
         temp_dir = tempfile.mkdtemp()
         try:
             base_pipeline = _build_base_pipeline(Path(temp_dir) / "study.db")
-            with mock.patch("core.automl._sample_trial_overrides", return_value={}):
+            with mock.patch(
+                "core.automl._sample_trial_overrides",
+                return_value={"model": {"type": "logistic"}},
+            ):
                 summary = run_automl_study(base_pipeline, pipeline_class=_AutoMLManifestPipeline, trial_step_classes=[])
 
             manifest_path = Path(summary["experiment_artifacts"]["manifest"])

@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from core import train_regime_aware_walk_forward
+from core import build_regime_aware_feature_frame, train_regime_aware_model, train_regime_aware_walk_forward
 
 
 class RegimeAwareTrainingTest(unittest.TestCase):
@@ -83,6 +83,102 @@ class RegimeAwareTrainingTest(unittest.TestCase):
         self.assertIn("2", fold["inference_report"]["unseen_regimes"])
         self.assertIn("0", fold["training_report"]["trained_regimes"])
         self.assertIn("1", fold["training_report"]["trained_regimes"])
+
+    def test_feature_strategy_rejects_non_identity_feature_adaptation_scaling(self):
+        X, y, regime_frame = self._make_balanced_dataset()
+
+        with self.assertRaisesRegex(ValueError, "strategy='feature'"):
+            train_regime_aware_walk_forward(
+                X,
+                y,
+                regime_frame,
+                strategy="feature",
+                model_type="logistic",
+                model_params={"random_state": 7, "max_iter": 400},
+                feature_config={
+                    "regime_interactions": True,
+                    "feature_adaptation": {
+                        "scaling": {"mode": "regime_conditioned", "fallback": "global"}
+                    },
+                },
+                coverage_config={"max_dominant_share": 0.7, "min_distinct_regimes": 2},
+                n_splits=1,
+                train_size=120,
+                test_size=30,
+            )
+
+    def test_feature_strategy_rejects_non_identity_feature_adaptation_masking(self):
+        X, y, regime_frame = self._make_balanced_dataset()
+
+        with self.assertRaisesRegex(ValueError, "strategy='feature'"):
+            train_regime_aware_walk_forward(
+                X,
+                y,
+                regime_frame,
+                strategy="feature",
+                model_type="logistic",
+                model_params={"random_state": 7, "max_iter": 400},
+                feature_config={
+                    "regime_interactions": True,
+                    "feature_adaptation": {
+                        "selection": {"mode": "per_regime_mask", "fallback": "global"},
+                        "disable_incompatible_features": True,
+                    },
+                },
+                coverage_config={"max_dominant_share": 0.7, "min_distinct_regimes": 2},
+                n_splits=1,
+                train_size=120,
+                test_size=30,
+            )
+
+    def test_feature_strategy_bundle_reuses_frozen_adapter_at_inference(self):
+        X, y, regime_frame = self._make_balanced_dataset(n=160, seed=4)
+        train_X = X.iloc[:120]
+        train_y = y.iloc[:120]
+        train_regime = regime_frame.iloc[:120]
+        test_X = X.iloc[120:140]
+        test_regime = regime_frame.iloc[120:140].drop(columns=["ewm_vol_20"])
+
+        bundle, report = train_regime_aware_model(
+            train_X,
+            train_y,
+            train_regime,
+            strategy="feature",
+            model_type="logistic",
+            model_params={"random_state": 7, "max_iter": 400},
+            feature_config={
+                "regime_interactions": True,
+                "feature_adaptation": {
+                    "interaction_budget": {
+                        "enabled": True,
+                        "max_features": 1,
+                        "max_regimes": 1,
+                    }
+                },
+            },
+            coverage_config={"max_dominant_share": 0.7, "min_distinct_regimes": 2},
+        )
+
+        transformed = bundle._transform_feature_strategy(test_X, test_regime)
+        recomputed = build_regime_aware_feature_frame(
+            test_X,
+            test_regime,
+            config={
+                "regime_interactions": True,
+                "feature_adaptation": {
+                    "interaction_budget": {
+                        "enabled": True,
+                        "max_features": 1,
+                        "max_regimes": 1,
+                    }
+                },
+            },
+        ).frame.reindex(columns=bundle.feature_columns, fill_value=0.0)
+
+        self.assertIsNotNone(bundle.feature_adapter)
+        self.assertIn("feature_adaptation", report)
+        self.assertIn("vol_norm__ret_signal", transformed.columns)
+        self.assertFalse(transformed.equals(recomputed))
 
 
 if __name__ == "__main__":

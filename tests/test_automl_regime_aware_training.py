@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -7,7 +8,7 @@ import pandas as pd
 
 import core.automl as automl_module
 from core import ResearchPipeline
-from core.automl import run_automl_study
+from core.automl import _summarize_training, run_automl_study
 
 
 def _make_market_frame(rows=280, seed=0):
@@ -36,7 +37,7 @@ def _make_market_frame(rows=280, seed=0):
     )
 
 
-def _make_pipeline_config(*, automl=None, strategy="feature"):
+def _make_pipeline_config(*, automl=None, strategy="feature", feature_adaptation=None):
     config = {
         "data": {"symbol": "BTCUSDT", "interval": "1h"},
         "indicators": [],
@@ -77,11 +78,19 @@ def _make_pipeline_config(*, automl=None, strategy="feature"):
     }
     if automl is not None:
         config["automl"] = automl
+    if feature_adaptation is not None:
+        config["feature_adaptation"] = feature_adaptation
     return config
 
 
-def _build_pipeline(raw, *, automl=None, strategy="feature"):
-    pipeline = ResearchPipeline(_make_pipeline_config(automl=automl, strategy=strategy))
+def _build_pipeline(raw, *, automl=None, strategy="feature", feature_adaptation=None):
+    pipeline = ResearchPipeline(
+        _make_pipeline_config(
+            automl=automl,
+            strategy=strategy,
+            feature_adaptation=feature_adaptation,
+        )
+    )
     pipeline.state["raw_data"] = raw
     pipeline.state["data"] = raw.copy()
     return pipeline
@@ -111,6 +120,218 @@ class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
         self.assertIn("test", coverage_summary["folds"][0])
         self.assertEqual(list(signals["continuous_signals"].index), list(training["oos_predictions"].index))
         self.assertGreaterEqual(backtest["total_trades"], 0)
+
+    def test_train_models_reports_identity_feature_adaptation_metadata(self):
+        pipeline = _build_pipeline(
+            _make_market_frame(seed=23),
+            strategy="feature",
+            feature_adaptation={
+                "scaling": {"mode": "identity", "fallback": "identity"},
+                "interaction_budget": {"enabled": True, "max_features": 3, "max_regimes": 2},
+            },
+        )
+
+        pipeline.build_features()
+        pipeline.build_labels()
+        pipeline.align_data()
+        training = pipeline.train_models()
+
+        adaptation = training["feature_adaptation"]
+        self.assertTrue(adaptation["enabled"])
+        self.assertEqual(adaptation["mode"], "fold_local")
+        self.assertEqual(adaptation["requested_scaling_mode"], "identity")
+        self.assertEqual(adaptation["requested_selection_mode"], "identity")
+        self.assertTrue(adaptation["deferred_runtime"])
+        self.assertFalse(adaptation["applied_in_any_fold"])
+        self.assertGreater(len(adaptation["folds"]), 0)
+        self.assertEqual(adaptation["folds"][0]["adapter_type"], "identity")
+        self.assertEqual(adaptation["folds"][0]["input_features"], adaptation["folds"][0]["output_features"])
+        self.assertEqual(adaptation["last_manifest"]["adapter_type"], "identity")
+        self.assertEqual(adaptation["last_policy"]["scaling_mode"], "identity")
+        self.assertEqual(pipeline.state["feature_adaptation"]["requested_scaling_mode"], "identity")
+        json.dumps(adaptation)
+
+    def test_train_models_applies_regime_conditioned_scaling_for_specialists(self):
+        pipeline = _build_pipeline(
+            _make_market_frame(seed=31),
+            strategy="specialist",
+            feature_adaptation={
+                "scaling": {
+                    "mode": "regime_conditioned",
+                    "fallback": "global",
+                    "min_regime_samples": 12,
+                    "confidence_floor": 0.0,
+                }
+            },
+        )
+
+        pipeline.build_features()
+        pipeline.build_labels()
+        pipeline.align_data()
+        training = pipeline.train_models()
+        signals = pipeline.generate_signals()
+
+        adaptation = training["feature_adaptation"]
+        self.assertTrue(adaptation["enabled"])
+        self.assertTrue(adaptation["applied_in_any_fold"])
+        self.assertEqual(adaptation["requested_scaling_mode"], "regime_conditioned")
+        self.assertEqual(adaptation["folds"][0]["adapter_type"], "regime_conditioned_scaling")
+        self.assertGreater(adaptation["last_manifest"]["eligible_scaling_column_count"], 0)
+        self.assertGreaterEqual(adaptation["last_manifest"]["regime_bank_count"], 1)
+        self.assertIsNotNone(signals["continuous_signals"])
+
+    def test_train_models_applies_regime_conditioned_masking_for_specialists(self):
+        pipeline = _build_pipeline(
+            _make_market_frame(seed=33),
+            strategy="specialist",
+            feature_adaptation={
+                "selection": {
+                    "mode": "per_regime_mask",
+                    "fallback": "global",
+                    "min_regime_samples": 12,
+                    "min_feature_rows": 8,
+                    "min_active_share": 0.1,
+                },
+                "disable_incompatible_features": True,
+            },
+        )
+
+        pipeline.build_features()
+        pipeline.build_labels()
+        pipeline.align_data()
+        training = pipeline.train_models()
+        signals = pipeline.generate_signals()
+
+        adaptation = training["feature_adaptation"]
+        disabled_columns = set(adaptation["last_policy"].get("disabled_columns") or [])
+        self.assertTrue(adaptation["enabled"])
+        self.assertTrue(adaptation["applied_in_any_fold"])
+        self.assertEqual(adaptation["requested_selection_mode"], "per_regime_mask")
+        self.assertEqual(adaptation["last_manifest"]["adapter_type"], "composite_feature_adaptation")
+        self.assertGreater(adaptation["last_manifest"]["mask_candidate_column_count"], 0)
+        self.assertGreaterEqual(adaptation["last_manifest"]["regime_mask_count"], 1)
+        self.assertTrue(disabled_columns.isdisjoint(set(training["last_selected_columns"])))
+        self.assertIsNotNone(signals["continuous_signals"])
+
+    def test_train_models_rejects_feature_strategy_scaling(self):
+        pipeline = _build_pipeline(
+            _make_market_frame(seed=37),
+            strategy="feature",
+            feature_adaptation={
+                "scaling": {"mode": "regime_conditioned", "fallback": "global"},
+            },
+        )
+
+        pipeline.build_features()
+        pipeline.build_labels()
+        pipeline.align_data()
+        with self.assertRaisesRegex(ValueError, "strategy='feature'"):
+            pipeline.train_models()
+
+    def test_train_models_rejects_feature_strategy_masking(self):
+        pipeline = _build_pipeline(
+            _make_market_frame(seed=41),
+            strategy="feature",
+            feature_adaptation={
+                "selection": {"mode": "per_regime_mask", "fallback": "global"},
+                "disable_incompatible_features": True,
+            },
+        )
+
+        pipeline.build_features()
+        pipeline.build_labels()
+        pipeline.align_data()
+        with self.assertRaisesRegex(ValueError, "strategy='feature'"):
+            pipeline.train_models()
+
+    def test_train_models_feature_strategy_bundle_honors_interaction_budget(self):
+        pipeline = _build_pipeline(
+            _make_market_frame(seed=43),
+            strategy="feature",
+            feature_adaptation={
+                "interaction_budget": {
+                    "enabled": True,
+                    "max_features": 1,
+                    "max_regimes": 1,
+                }
+            },
+        )
+
+        pipeline.build_features()
+        pipeline.build_labels()
+        pipeline.align_data()
+        training = pipeline.train_models()
+
+        regime_fold = training["regime"]["regime_aware"]["folds"][0]
+        feature_adaptation = regime_fold["training_report"]["feature_adaptation"]
+        manifest = feature_adaptation["manifest"]
+
+        self.assertEqual(manifest["adapter_type"], "regime_feature_strategy")
+        self.assertEqual(manifest["max_interaction_features"], 1)
+        self.assertEqual(manifest["max_interaction_regimes"], 1)
+        self.assertLessEqual(manifest["interaction_column_count"], 1)
+        self.assertGreater(manifest["generated_column_count"], 0)
+
+    def test_automl_training_summary_preserves_feature_adaptation(self):
+        pipeline = _build_pipeline(
+            _make_market_frame(seed=47),
+            strategy="specialist",
+            feature_adaptation={
+                "selection": {
+                    "mode": "per_regime_mask",
+                    "fallback": "global",
+                    "min_regime_samples": 12,
+                    "min_feature_rows": 8,
+                    "min_active_share": 0.1,
+                },
+                "disable_incompatible_features": True,
+            },
+        )
+
+        pipeline.build_features()
+        pipeline.build_labels()
+        pipeline.align_data()
+        training = pipeline.train_models()
+        summary = _summarize_training(training)
+
+        self.assertIn("feature_adaptation", summary)
+        self.assertEqual(summary["feature_adaptation"]["last_manifest"]["adapter_type"], "composite_feature_adaptation")
+        json.dumps(automl_module._json_ready(summary["feature_adaptation"]))
+
+    def test_refit_artifact_surfaces_feature_adaptation(self):
+        pipeline = _build_pipeline(
+            _make_market_frame(rows=220, seed=53),
+            strategy="specialist",
+            feature_adaptation={
+                "selection": {
+                    "mode": "per_regime_mask",
+                    "fallback": "global",
+                    "min_regime_samples": 10,
+                    "min_feature_rows": 6,
+                    "min_active_share": 0.1,
+                },
+                "disable_incompatible_features": True,
+            },
+        )
+
+        pipeline.build_features()
+        pipeline.build_labels()
+        pipeline.align_data()
+        pipeline.train_models()
+
+        artifact = pipeline.refit_selected_candidate(
+            {
+                "best_overrides": {"model": {"type": "logistic"}},
+                "selection_freeze": {"candidate_hash": "candidate-1", "trial_number": 0},
+            }
+        )
+
+        self.assertIn("feature_adaptation", artifact)
+        self.assertEqual(
+            artifact["feature_adaptation"].get("last_manifest", {}).get("adapter_type"),
+            "composite_feature_adaptation",
+        )
+        self.assertEqual(artifact["feature_adaptation"], artifact["training"].get("feature_adaptation"))
 
     def test_run_automl_study_preserves_regime_aware_trial_metadata(self):
         if automl_module.optuna is None:

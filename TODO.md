@@ -13,9 +13,27 @@ is the execution-oriented checklist derived from that plan.
 - Phase 0 is complete.
 - Phase 0 delivered additive contracts, compatibility facades, optional
   registry payload support, and example-level Phase 0 summaries.
+- Phase 1 is complete.
+- Phase 2 is complete.
+- Phase 2 Slice 1 delivered typed feature-adaptation contracts, an identity
+   adapter seam in `TrainModelsStep`, additive training metadata, and focused
+   runtime and pipeline tests.
+- Phase 2 Slice 2 delivered a frozen global and per-regime scaling bank,
+   explicit fail-closed guards for `model.regime_aware.strategy == "feature"`,
+   and fallback-inference parity through the stored final adapter.
+- Phase 2 Slice 3 delivered frozen per-regime masking, a composite
+   `scale -> mask` adapter runtime, fold-local policy-disabled column gating,
+   and fallback-inference parity for masking through the stored final adapter.
+- Phase 2 Slice 4 delivered a dedicated feature-strategy adapter, bounded
+   `interaction_budget` generation, and frozen adapter reuse in
+   `RegimeAwareModelBundle` fit and inference paths.
+- Phase 2 Slice 5 delivered feature-adaptation config validation, AutoML
+   training-summary propagation, explicit post-selection refit surfacing, and
+   user-facing training summary output in the experiment runner and example
+   helpers.
 - Default runtime behavior has not been switched to specialist-library or router
   execution yet.
-- The next required implementation phase is Phase 1.
+- The next required implementation slice is Phase 3 Slice 1.
 
 ## Phase Checklist
 
@@ -39,12 +57,24 @@ Completion criteria met:
 
 ### Phase 1: Online Regime Detection Layer
 
-Status: pending
+Status: completed
 
 Objective:
 
 Move regime detection behind the new detector interfaces and make regime traces
 causal, replayable, and explicit.
+
+Delivered:
+
+1. Canonical regime observation building in `core/regimes/observations.py`.
+2. Canonical replay runtime in `core/regimes/online_state.py`.
+3. Compatibility, native score-based, and filtered-HMM detectors in
+   `core/regimes/detectors.py`.
+4. Config normalization for native-primary and compatibility detector shapes.
+5. Detector manifests, replay metadata, and trace summaries surfaced in
+   `pipeline.state["regime_detection"]`.
+6. Example propagation for native detector and filtered-HMM paths plus focused
+   replay/runtime tests.
 
 Implementation targets:
 
@@ -54,28 +84,31 @@ Implementation targets:
 3. Move HMM handling behind a filtered online interface.
 4. Add detector ensemble and confidence logic.
 
-Acceptance criteria:
+Acceptance criteria met:
 
 1. Regime traces are reproducible under walk-forward replay.
 2. No detector uses future data.
 3. Detector disagreement and warm-up states are visible in outputs.
 
-Immediate next slice:
-
-1. Extract regime observation building into `core/regimes/observations.py`.
-2. Add concrete detector classes and manifests in `core/regimes/detectors.py`.
-3. Rewire the `detect_regimes` flow through the new runtime modules while
-   keeping `core/regime.py` as the compatibility facade.
-4. Add walk-forward replay tests for causal detector output.
-
 ### Phase 2: Feature Adaptation Layer
 
-Status: pending
+Status: completed
 
 Objective:
 
 Insert an explicit feature adaptation step between regime detection and model
 training.
+
+Delivered so far:
+
+1. Added `core/feature_adaptation/` with `FeaturePolicyContract`,
+   `BaseFeatureAdapter`, and the Slice 1 identity runtime.
+2. Routed fold-local fit/validation/test frames through the feature-adaptation
+   seam in `TrainModelsStep` without changing model behavior.
+3. Added additive JSON-safe `training["feature_adaptation"]` and
+   `pipeline.state["feature_adaptation"]` payloads.
+4. Added focused coverage in `tests/test_feature_adaptation_runtime.py` and
+   extended `tests/test_automl_regime_aware_training.py`.
 
 Implementation targets:
 
@@ -88,6 +121,14 @@ Acceptance criteria:
 1. Feature transforms are prefix-invariant at cutoffs.
 2. Per-regime masks do not leak future occupancy.
 3. Fallback behavior is explicit and tested.
+
+Immediate next slice:
+
+1. Start Phase 3 by introducing specialist-library persistence and lifecycle
+   state transitions without changing default routing behavior.
+2. Define the first registry-backed specialist snapshot and fallback-generalist
+   selection contract so routing can be added in later slices without another
+   training-path refactor.
 
 ### Phase 3: Specialist Library
 
@@ -199,13 +240,12 @@ Acceptance criteria:
 
 Implement the remaining phases in this sequence:
 
-1. Phase 1: Online regime detection layer
-2. Phase 2: Feature adaptation layer
-3. Phase 3: Specialist library
-4. Phase 4: Router implementation
-5. Phase 5: Validation and backtest overhaul
-6. Phase 6: AutoML and experiment redesign
-7. Phase 7: Maintenance and governance
+1. Phase 2: Feature adaptation layer
+2. Phase 3: Specialist library
+3. Phase 4: Router implementation
+4. Phase 5: Validation and backtest overhaul
+5. Phase 6: AutoML and experiment redesign
+6. Phase 7: Maintenance and governance
 
 ## Definition Of Done
 

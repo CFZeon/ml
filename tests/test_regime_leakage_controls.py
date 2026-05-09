@@ -5,10 +5,24 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from core import ResearchPipeline, detect_regime, sequential_bootstrap
+from core import ResearchPipeline, build_feature_adapter, detect_regime, sequential_bootstrap
 from core.features import FeatureSelectionResult
 from core.models import train_model
-from core.pipeline import SignalsStep, _FoldScopedPipeline
+from core.pipeline import SignalsStep
+
+
+class _FoldScopedPipeline:
+    def __init__(self, base_pipeline, fold_frame):
+        self._base_pipeline = base_pipeline
+        self._fold_frame = fold_frame
+
+    def require(self, key):
+        if key in {"data", "raw_data"}:
+            return self._fold_frame
+        return self._base_pipeline.require(key)
+
+    def section(self, key):
+        return self._base_pipeline.section(key)
 
 
 class RegimeLeakageControlsTest(unittest.TestCase):
@@ -435,6 +449,273 @@ class RegimeLeakageControlsTest(unittest.TestCase):
         self.assertEqual(signal_result["signal_source"], "post_final_training_fallback")
         self.assertEqual(signal_result["fallback_scope"]["scored_row_count"], len(expected_index))
         self.assertEqual(signal_result["fallback_scope"]["excluded_row_count"], 4)
+
+    def test_signals_fallback_reapplies_final_feature_adapter(self):
+        index = pd.date_range("2026-05-01", periods=6, freq="1h", tz="UTC")
+        X = pd.DataFrame({"feature": [1.0, 2.0, 3.0, 10.0, 11.0, 12.0]}, index=index)
+        regime_full = pd.DataFrame(
+            {
+                "regime": [0, 0, 0, 1, 1, 1],
+                "warm": [1, 1, 1, 1, 1, 1],
+                "regime_confidence": [0.95, 0.96, 0.97, 0.98, 0.99, 0.99],
+            },
+            index=index,
+        )
+        fit_index = index[:4]
+        fallback_index = index[index > index[3]]
+        adapter_input_fit = X.loc[fit_index].join(regime_full.loc[fit_index])
+        adapter = build_feature_adapter(
+            {
+                "scaling": {
+                    "mode": "regime_conditioned",
+                    "fallback": "global",
+                    "min_regime_samples": 1,
+                    "confidence_floor": 0.0,
+                }
+            },
+            regime_column="regime",
+        )
+        adapter.fit(adapter_input_fit, regime_full.loc[fit_index])
+        _, fit_policy = adapter.transform(adapter_input_fit, regime_full.loc[fit_index])
+        expected_source = X.loc[fallback_index].join(regime_full.loc[fallback_index])
+        expected_transformed, _ = adapter.transform(expected_source, regime_full.loc[fallback_index])
+
+        class RecordingClassifier:
+            def __init__(self, classes, probabilities):
+                self.classes_ = np.array(classes)
+                self._probabilities = np.array(probabilities, dtype=float)
+                self.last_predict_frame = None
+
+            def predict(self, frame):
+                self.last_predict_frame = frame.copy()
+                return np.where(frame["feature"].to_numpy() >= 0.0, 1, -1)
+
+            def predict_proba(self, frame):
+                return np.tile(self._probabilities, (len(frame), 1))
+
+        class DummyMetaClassifier:
+            def __init__(self, classes, probabilities):
+                self.classes_ = np.array(classes)
+                self._probabilities = np.array(probabilities, dtype=float)
+
+            def predict(self, frame):
+                return np.ones(len(frame), dtype=int)
+
+            def predict_proba(self, frame):
+                return np.tile(self._probabilities, (len(frame), 1))
+
+        model = RecordingClassifier(classes=[-1, 1], probabilities=[0.25, 0.75])
+        meta_model = DummyMetaClassifier(classes=[0, 1], probabilities=[0.2, 0.8])
+        training = {
+            "last_model": model,
+            "last_meta": meta_model,
+            "last_selected_columns": ["feature"],
+            "last_regime_fit_index": fit_index,
+            "last_primary_calibrator": None,
+            "last_meta_calibrator": None,
+            "last_signal_params": {
+                "threshold": 0.0,
+                "edge_threshold": 0.0,
+                "meta_threshold": 0.5,
+                "fraction": 0.5,
+            },
+            "oos_predictions": None,
+            "oos_probabilities": None,
+            "oos_meta_prob": None,
+            "oos_continuous_signals": None,
+            "oos_avg_win": 0.02,
+            "oos_avg_loss": 0.01,
+            "feature_adaptation": {
+                "last_manifest": adapter.manifest(),
+                "last_policy": fit_policy.to_dict(),
+            },
+            "fallback_inference": {
+                "mode": "post_final_training_only",
+                "last_fold_train_end": index[3],
+                "aligned_safe_row_count": int(len(fallback_index)),
+            },
+        }
+
+        class FakePipeline:
+            def __init__(self):
+                self.state = {
+                    "X": X,
+                    "training": training,
+                    "last_feature_adapter": adapter,
+                    "feature_adaptation": training["feature_adaptation"],
+                }
+
+            def require(self, key):
+                return self.state[key]
+
+            def section(self, key):
+                if key == "signals":
+                    return {
+                        "threshold": 0.0,
+                        "edge_threshold": 0.0,
+                        "meta_threshold": 0.5,
+                        "fraction": 0.5,
+                        "avg_win": 0.02,
+                        "avg_loss": 0.01,
+                        "holding_bars": 1,
+                    }
+                return {}
+
+        def fake_regime_frame(_pipeline, fold_index, fit_index=None):
+            return regime_full.reindex(fold_index), {"regime": "regime"}
+
+        with patch("core.pipeline._build_fold_local_regime_frame", side_effect=fake_regime_frame):
+            signal_result = SignalsStep().run(FakePipeline())
+
+        pd.testing.assert_index_equal(signal_result["signals"].index, fallback_index)
+        pd.testing.assert_frame_equal(
+            model.last_predict_frame,
+            expected_transformed.loc[:, ["feature"]],
+        )
+        self.assertFalse(model.last_predict_frame.equals(X.loc[fallback_index, ["feature"]]))
+        self.assertTrue(signal_result["fallback_scope"]["feature_adaptation_applied"])
+        self.assertEqual(signal_result["fallback_scope"]["feature_adaptation_scaling_mode"], "regime_conditioned")
+
+    def test_signals_fallback_reapplies_final_mask_adapter(self):
+        index = pd.date_range("2026-05-02", periods=6, freq="1h", tz="UTC")
+        X = pd.DataFrame(
+            {
+                "feature_a": [1.0, 2.0, 0.0, 0.0, 4.0, 3.0],
+                "feature_b": [0.0, 0.0, 10.0, 11.0, 2.0, 12.0],
+                "shared_feature": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            },
+            index=index,
+        )
+        regime_full = pd.DataFrame(
+            {
+                "regime": [0, 0, 1, 1, 0, 1],
+                "warm": [1, 1, 1, 1, 1, 1],
+                "regime_confidence": [0.95, 0.96, 0.97, 0.98, 0.99, 0.99],
+            },
+            index=index,
+        )
+        fit_index = index[:4]
+        fallback_index = index[index > index[3]]
+        adapter_input_fit = X.loc[fit_index].join(regime_full.loc[fit_index])
+        adapter = build_feature_adapter(
+            {
+                "selection": {
+                    "mode": "per_regime_mask",
+                    "fallback": "global",
+                    "min_regime_samples": 2,
+                    "min_feature_rows": 1,
+                    "min_active_share": 0.1,
+                    "min_variance": 0.0,
+                    "activity_epsilon": 1e-9,
+                }
+            },
+            regime_column="regime",
+        )
+        adapter.fit(adapter_input_fit, regime_full.loc[fit_index])
+        _, fit_policy = adapter.transform(adapter_input_fit, regime_full.loc[fit_index])
+        expected_source = X.loc[fallback_index].join(regime_full.loc[fallback_index])
+        expected_transformed, _ = adapter.transform(expected_source, regime_full.loc[fallback_index])
+
+        class RecordingClassifier:
+            def __init__(self, classes, probabilities):
+                self.classes_ = np.array(classes)
+                self._probabilities = np.array(probabilities, dtype=float)
+                self.last_predict_frame = None
+
+            def predict(self, frame):
+                self.last_predict_frame = frame.copy()
+                return np.where(frame["feature_a"].to_numpy() >= frame["feature_b"].to_numpy(), 1, -1)
+
+            def predict_proba(self, frame):
+                return np.tile(self._probabilities, (len(frame), 1))
+
+        class DummyMetaClassifier:
+            def __init__(self, classes, probabilities):
+                self.classes_ = np.array(classes)
+                self._probabilities = np.array(probabilities, dtype=float)
+
+            def predict(self, frame):
+                return np.ones(len(frame), dtype=int)
+
+            def predict_proba(self, frame):
+                return np.tile(self._probabilities, (len(frame), 1))
+
+        model = RecordingClassifier(classes=[-1, 1], probabilities=[0.3, 0.7])
+        meta_model = DummyMetaClassifier(classes=[0, 1], probabilities=[0.25, 0.75])
+        training = {
+            "last_model": model,
+            "last_meta": meta_model,
+            "last_selected_columns": ["feature_a", "feature_b", "shared_feature"],
+            "last_regime_fit_index": fit_index,
+            "last_primary_calibrator": None,
+            "last_meta_calibrator": None,
+            "last_signal_params": {
+                "threshold": 0.0,
+                "edge_threshold": 0.0,
+                "meta_threshold": 0.5,
+                "fraction": 0.5,
+            },
+            "oos_predictions": None,
+            "oos_probabilities": None,
+            "oos_meta_prob": None,
+            "oos_continuous_signals": None,
+            "oos_avg_win": 0.02,
+            "oos_avg_loss": 0.01,
+            "feature_adaptation": {
+                "last_manifest": adapter.manifest(),
+                "last_policy": fit_policy.to_dict(),
+            },
+            "fallback_inference": {
+                "mode": "post_final_training_only",
+                "last_fold_train_end": index[3],
+                "aligned_safe_row_count": int(len(fallback_index)),
+            },
+        }
+
+        class FakePipeline:
+            def __init__(self):
+                self.state = {
+                    "X": X,
+                    "training": training,
+                    "last_feature_adapter": adapter,
+                    "feature_adaptation": training["feature_adaptation"],
+                }
+
+            def require(self, key):
+                return self.state[key]
+
+            def section(self, key):
+                if key == "signals":
+                    return {
+                        "threshold": 0.0,
+                        "edge_threshold": 0.0,
+                        "meta_threshold": 0.5,
+                        "fraction": 0.5,
+                        "avg_win": 0.02,
+                        "avg_loss": 0.01,
+                        "holding_bars": 1,
+                    }
+                return {}
+
+        def fake_regime_frame(_pipeline, fold_index, fit_index=None):
+            return regime_full.reindex(fold_index), {"regime": "regime"}
+
+        with patch("core.pipeline._build_fold_local_regime_frame", side_effect=fake_regime_frame):
+            signal_result = SignalsStep().run(FakePipeline())
+
+        pd.testing.assert_index_equal(signal_result["signals"].index, fallback_index)
+        pd.testing.assert_frame_equal(
+            model.last_predict_frame,
+            expected_transformed.loc[:, ["feature_a", "feature_b", "shared_feature"]],
+        )
+        self.assertFalse(
+            model.last_predict_frame.equals(X.loc[fallback_index, ["feature_a", "feature_b", "shared_feature"]])
+        )
+        self.assertTrue(signal_result["fallback_scope"]["feature_adaptation_applied"])
+        self.assertEqual(
+            signal_result["fallback_scope"]["feature_adaptation_selection_mode"],
+            "per_regime_mask",
+        )
 
     def test_signals_fallback_warns_and_returns_empty_when_no_post_training_rows(self):
         index = pd.date_range("2026-05-01", periods=4, freq="1h", tz="UTC")

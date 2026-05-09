@@ -216,6 +216,23 @@ def _print_training_summary(training: dict[str, Any], *, config: dict[str, Any],
         _emit(f"Avg log loss  : {_format_metric(training.get('avg_log_loss'))}", quiet=quiet)
     if training.get("avg_directional_accuracy") is not None:
         _emit(f"Dir accuracy  : {_format_metric(training.get('avg_directional_accuracy'))}", quiet=quiet)
+    feature_adaptation = dict(training.get("feature_adaptation") or {})
+    if feature_adaptation:
+        last_manifest = dict(feature_adaptation.get("last_manifest") or {})
+        _emit(
+            "Feature adapt : "
+            f"enabled={bool(feature_adaptation.get('enabled', False))}  "
+            f"applied={bool(feature_adaptation.get('applied_in_any_fold', False))}  "
+            f"deferred={bool(feature_adaptation.get('deferred_runtime', False))}",
+            quiet=quiet,
+        )
+        _emit(
+            "Adapt policy  : "
+            f"adapter={last_manifest.get('adapter_type', 'identity')}  "
+            f"scaling={feature_adaptation.get('requested_scaling_mode', 'identity')}  "
+            f"selection={feature_adaptation.get('requested_selection_mode', 'identity')}",
+            quiet=quiet,
+        )
 
 
 def _print_backtest_summary(backtest: dict[str, Any], *, quiet: bool) -> None:

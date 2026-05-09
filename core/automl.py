@@ -1221,6 +1221,9 @@ def _resolve_validation_sources(training, backtest, validation_contract, *, hold
 def _summarize_training(training):
     primary_training, primary_source = _resolve_primary_training_payload(training)
     feature_selection = training.get("feature_selection") or {}
+    feature_adaptation = _json_ready(
+        primary_training.get("feature_adaptation") or training.get("feature_adaptation") or {}
+    )
     bootstrap = training.get("bootstrap") or {}
     feature_governance = training.get("feature_governance") or {}
     feature_portability_diagnostics = training.get("feature_portability_diagnostics") or {}
@@ -1255,6 +1258,7 @@ def _summarize_training(training):
             "avg_input_features": feature_selection.get("avg_input_features"),
             "avg_selected_features": feature_selection.get("avg_selected_features"),
         },
+        "feature_adaptation": feature_adaptation,
         "bootstrap": {
             "model_type": bootstrap.get("model_type"),
             "used_in_any_fold": bootstrap.get("used_in_any_fold"),
