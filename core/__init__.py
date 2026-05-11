@@ -125,10 +125,14 @@ from .regime_training import (
 )
 from .routing import (
     BaseRouter,
+    build_router,
+    HardSwitchRouter,
+    replay_router_trace,
     RouterManifest,
     RouterStateSnapshot,
     RoutingDecisionContract,
     RoutingScoreComponent,
+    WeightedRouter,
 )
 from .scenarios import (
     ScenarioEvent,
@@ -194,6 +198,7 @@ from .promotion import (
     build_promotion_gate_check_map,
     create_promotion_eligibility_report,
     evaluate_execution_realism_gate,
+    evaluate_router_stability_gate,
     evaluate_stress_realism_gate,
     finalize_promotion_eligibility_report,
     resolve_canonical_promotion_score,
@@ -252,10 +257,24 @@ from .registry import (
     evaluate_challenger_promotion,
 )
 from .specialists import (
+    apply_specialist_health_update,
+    apply_specialist_governance,
+    apply_specialist_lifecycle_transition,
+    attach_specialist_artifact_refs,
+    build_specialist_selection_contract,
+    evaluate_specialist_certification_policy,
+    evaluate_specialist_degradation_policy,
+    evaluate_specialist_library_governance,
+    merge_specialist_health_contracts,
+    normalize_specialist_health_update,
+    normalize_specialist_library_snapshot,
+    project_specialist_library_snapshot,
     SpecialistHealthContract,
     SpecialistLibrarySnapshot,
     SpecialistLifecycleState,
     SpecialistPerformanceSlice,
+    upsert_specialist_performance_slices,
+    resolve_specialist_lifecycle_transition,
     SpecialistSpec,
 )
 from .universe import (

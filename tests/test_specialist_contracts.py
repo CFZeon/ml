@@ -9,7 +9,7 @@ from core.regime_training import (
     build_specialist_library_snapshot,
     build_specialist_specs_from_bundle,
 )
-from core.specialists import SpecialistLibrarySnapshot
+from core.specialists import SpecialistLibrarySnapshot, SpecialistSpec, apply_specialist_health_update
 
 
 def _fit_dummy_classifier(label):
@@ -68,3 +68,59 @@ class SpecialistContractsTest(unittest.TestCase):
         self.assertEqual(roundtrip.symbol, "BTCUSDT")
         self.assertEqual(roundtrip.timeframe, "1h")
         self.assertEqual(len(roundtrip.specialists), len(snapshot.specialists))
+
+    def test_specialist_health_updates_preserve_selection_contract(self):
+        snapshot = SpecialistLibrarySnapshot(
+            symbol="BTCUSDT",
+            timeframe="1h",
+            fallback_model_id="fallback_generalist",
+            specialists=[
+                SpecialistSpec(
+                    model_id="fallback_generalist",
+                    symbol="BTCUSDT",
+                    timeframe="1h",
+                    compatible_regimes=[],
+                    estimator_family="logisticregression",
+                    metadata={"fallback_only": True, "lifecycle_state": "candidate"},
+                ),
+                SpecialistSpec(
+                    model_id="specialist::bull",
+                    symbol="BTCUSDT",
+                    timeframe="1h",
+                    compatible_regimes=["bull"],
+                    estimator_family="logisticregression",
+                    metadata={"regime_label": "bull", "lifecycle_state": "candidate"},
+                ),
+            ],
+        )
+
+        updated = apply_specialist_health_update(
+            snapshot,
+            {
+                "recorded_at": "2026-05-09T00:00:00+00:00",
+                "source": "specialist_monitoring",
+                "health": [
+                    {
+                        "model_id": "specialist::bull",
+                        "compatible_regimes": ["bull"],
+                        "stability_score": 0.72,
+                        "decay_score": 0.14,
+                        "failure_flags": [],
+                    }
+                ],
+                "performance_slices": [
+                    {
+                        "model_id": "specialist::bull",
+                        "regime_label": "bull",
+                        "split_role": "monitoring_window",
+                        "row_count": 24,
+                        "metric_summary": {"f1_macro": 0.57},
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(updated.metadata["selection_contract"]["candidate_model_ids"], ["fallback_generalist", "specialist::bull"])
+        self.assertEqual(updated.metadata["health_history"]["update_count"], 1)
+        self.assertEqual(updated.health[0].model_id, "specialist::bull")
+        self.assertEqual(len(updated.performance_slices), 1)

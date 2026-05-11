@@ -100,6 +100,29 @@ def _resolve_model_choice(*, config: dict[str, Any], automl: dict[str, Any] | No
     return str((config.get("model") or {}).get("type", "unknown"))
 
 
+def _print_automl_bundle_summary(automl: dict[str, Any], *, quiet: bool) -> None:
+    bundle = dict(automl.get("best_bundle_lineage") or {})
+    if not bundle:
+        return
+
+    primary_detector = dict(bundle.get("primary_detector") or {})
+    router = dict(bundle.get("router") or {})
+    specialists = list(bundle.get("specialist_model_ids") or [])
+    detector_name = primary_detector.get("name") or "n/a"
+    detector_type = primary_detector.get("type") or "n/a"
+
+    _emit(f"Bundle        : {bundle.get('bundle_name') or 'n/a'}", quiet=quiet)
+    if bundle.get("bundle_description"):
+        _emit(f"Bundle desc   : {bundle.get('bundle_description')}", quiet=quiet)
+    _emit(
+        "Bundle path   : "
+        f"detector={detector_name}:{detector_type}  "
+        f"router={router.get('type', 'n/a')}  "
+        f"specialists={specialists if specialists else ['fallback_only']}",
+        quiet=quiet,
+    )
+
+
 def _print_overview(resolved: ResolvedExperimentConfig, *, quiet: bool) -> None:
     config = resolved.config
     data = dict(config.get("data") or {})
@@ -244,6 +267,16 @@ def _print_backtest_summary(backtest: dict[str, Any], *, quiet: bool) -> None:
     _emit(f"Trades        : {backtest.get('total_trades', 'n/a')}", quiet=quiet)
     if backtest.get("win_rate") is not None:
         _emit(f"Win rate      : {_format_metric(backtest.get('win_rate'), percent=True)}", quiet=quiet)
+    router_report = dict(backtest.get("router_stability_report") or {})
+    if router_report.get("enabled"):
+        _emit(
+            "Router        : "
+            f"switches={router_report.get('switch_count', 'n/a')}  "
+            f"switch_rate={_format_metric(router_report.get('switch_rate'), percent=True)}  "
+            f"blocked={router_report.get('blocked_switch_count', 'n/a')}  "
+            f"controls={router_report.get('configured_control_count', 'n/a')}",
+            quiet=quiet,
+        )
 
 
 def _collect_warnings(*, aligned: dict[str, Any] | None, training: dict[str, Any] | None, backtest: dict[str, Any] | None) -> list[str]:
@@ -374,6 +407,7 @@ def _run_automl_experiment(pipeline: ResearchPipeline, *, config: dict[str, Any]
     _emit(f"Selection     : {automl.get('selection_metric')} ({automl.get('selection_mode')})", quiet=quiet)
     _emit(f"Trials        : {automl.get('trial_count')}", quiet=quiet)
     _emit(f"Best value    : {_format_metric(automl.get('best_value'))}", quiet=quiet)
+    _print_automl_bundle_summary(automl, quiet=quiet)
 
     if not automl.get("best_overrides"):
         selection_outcome = dict(automl.get("selection_outcome") or {})

@@ -99,10 +99,16 @@ from .regimes.online_state import replay_regime_detector_trace
 from .readiness import build_deployment_readiness_report
 from .regime import (
     build_regime_ablation_report,
+    build_regime_state_contracts,
     detect_regime,
     summarize_regime_ablation_reports,
 )
-from .regime_training import evaluate_regime_aware_predictions, summarize_regime_coverage, train_regime_aware_model
+from .regime_training import (
+    build_specialist_library_snapshot,
+    evaluate_regime_aware_predictions,
+    summarize_regime_coverage,
+    train_regime_aware_model,
+)
 from .slippage import (
     DepthCurveImpactModel,
     FillAwareCostModel,
@@ -1732,6 +1738,7 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "futures_account": futures_account,
         "futures_contract": pipeline.state.get("futures_contract_spec"),
         "futures_leverage_brackets": pipeline.state.get("futures_leverage_brackets"),
+        "regime_states": _resolve_backtest_regime_states(pipeline, index),
         "symbol_lifecycle": pipeline.state.get("symbol_lifecycle"),
         "symbol_lifecycle_policy": pipeline.state.get("universe_policy"),
         "scenario_schedule": backtest_config.get("scenario_schedule"),
@@ -1884,6 +1891,28 @@ def _resolve_signal_profitability_threshold(training_payload, config):
     return float(break_even_prob), float(profitability_threshold)
 
 
+def _resolve_backtest_regime_states(pipeline, index):
+    details = pipeline.state.get("regime_state_details") or {}
+    state_contracts = details.get("state_contracts")
+    if state_contracts:
+        return list(state_contracts)
+
+    regime_frame = pipeline.state.get("regime_state_frame")
+    if regime_frame is None:
+        regime_frame = pipeline.state.get("regimes")
+    if regime_frame is None:
+        return None
+    if isinstance(regime_frame, pd.Series):
+        regime_frame = regime_frame.to_frame(name=regime_frame.name or "regime")
+    if not isinstance(regime_frame, pd.DataFrame) or regime_frame.empty:
+        return None
+
+    aligned = regime_frame.reindex(index)
+    if aligned.dropna(how="all").empty:
+        return None
+    return build_regime_state_contracts(aligned)
+
+
 def _build_cpcv_path_results(training, pipeline, config, validation_method):
     break_even_prob, profitability_threshold = _resolve_signal_profitability_threshold(training, config)
     holding_bars = _resolve_signal_holding_bars(pipeline, config)
@@ -1918,6 +1947,7 @@ def _build_cpcv_path_results(training, pipeline, config, validation_method):
                 "used_flat_kelly_fallback": path.get("used_flat_kelly_fallback", False),
                 "tuned_params": path.get("signal_params", {}),
                 "signal_policy": path.get("signal_policy"),
+                "regime_states": copy.deepcopy(path.get("regime_states")),
             }
         )
     return path_results
@@ -1961,6 +1991,9 @@ def _run_path_backtests(pipeline, config, path_entries):
         positions = path["continuous_signals"] if config.get("use_continuous_positions", True) else path["signals"]
         valuation_close = _resolve_backtest_valuation_close(pipeline, positions.index)
         execution_prices = _resolve_backtest_execution_prices(pipeline, positions.index)
+        runtime_kwargs = dict(_resolve_backtest_runtime_kwargs(pipeline, positions.index) or {})
+        if path.get("regime_states") is not None:
+            runtime_kwargs["regime_states"] = copy.deepcopy(path.get("regime_states"))
         path_backtest = run_backtest(
             close=valuation_close,
             signals=positions,
@@ -1969,7 +2002,7 @@ def _run_path_backtests(pipeline, config, path_entries):
             slippage_rate=config.get("slippage_rate", 0.0),
             signal_delay_bars=_resolve_signal_delay_bars(config),
             execution_prices=execution_prices,
-            **_resolve_backtest_runtime_kwargs(pipeline, positions.index),
+            **runtime_kwargs,
         )
         path_backtests.append(
             {
@@ -2077,6 +2110,192 @@ def _summarize_path_backtests(path_backtests):
             }
     if metrics:
         summary["metrics"] = metrics
+
+    regime_reports = []
+    transition_reports = []
+    router_stability_reports = []
+    for path in path_backtests:
+        backtest = path.get("backtest", {})
+        regime_report = backtest.get("regime_segment_report")
+        if isinstance(regime_report, dict) and regime_report.get("enabled"):
+            regime_reports.append(regime_report)
+        transition_report = backtest.get("transition_segment_report")
+        if isinstance(transition_report, dict) and transition_report.get("enabled"):
+            transition_reports.append(transition_report)
+        router_stability_report = backtest.get("router_stability_report")
+        if isinstance(router_stability_report, dict) and router_stability_report.get("enabled"):
+            router_stability_reports.append(router_stability_report)
+
+    if regime_reports:
+        label_buckets = {}
+        label_distribution = {}
+        for report in regime_reports:
+            for label, count in dict(report.get("label_distribution") or {}).items():
+                label_distribution[str(label)] = label_distribution.get(str(label), 0) + int(count)
+            for label, metrics_payload in dict(report.get("by_label") or {}).items():
+                bucket = label_buckets.setdefault(
+                    str(label),
+                    {
+                        "path_count": 0,
+                        "bar_count": [],
+                        "active_bar_count": [],
+                        "segment_count": [],
+                        "net_profit": [],
+                        "mean_bar_return": [],
+                        "active_bar_win_rate": [],
+                        "total_turnover": [],
+                        "mean_confidence": [],
+                    },
+                )
+                bucket["path_count"] += 1
+                bucket["bar_count"].append(float(metrics_payload.get("bar_count", 0)))
+                bucket["active_bar_count"].append(float(metrics_payload.get("active_bar_count", 0)))
+                bucket["segment_count"].append(float(metrics_payload.get("segment_count", 0)))
+                bucket["net_profit"].append(float(metrics_payload.get("net_profit", 0.0)))
+                bucket["mean_bar_return"].append(float(metrics_payload.get("mean_bar_return", 0.0)))
+                bucket["active_bar_win_rate"].append(float(metrics_payload.get("active_bar_win_rate", 0.0)))
+                bucket["total_turnover"].append(float(metrics_payload.get("total_turnover", 0.0)))
+                mean_confidence = metrics_payload.get("mean_confidence")
+                if mean_confidence is not None:
+                    bucket["mean_confidence"].append(float(mean_confidence))
+
+        summary["regime_segment_report"] = {
+            "enabled": True,
+            "aggregate_mode": "path_diagnostics_only",
+            "path_count": int(len(regime_reports)),
+            "label_distribution": dict(label_distribution),
+            "by_label": {},
+        }
+        for label, bucket in label_buckets.items():
+            summary["regime_segment_report"]["by_label"][label] = {
+                "path_count": int(bucket["path_count"]),
+                "mean_bar_count": float(np.mean(bucket["bar_count"])),
+                "mean_active_bar_count": float(np.mean(bucket["active_bar_count"])),
+                "mean_segment_count": float(np.mean(bucket["segment_count"])),
+                "mean_net_profit": float(np.mean(bucket["net_profit"])),
+                "mean_bar_return": float(np.mean(bucket["mean_bar_return"])),
+                "mean_active_bar_win_rate": float(np.mean(bucket["active_bar_win_rate"])),
+                "mean_total_turnover": float(np.mean(bucket["total_turnover"])),
+                "mean_confidence": (
+                    None
+                    if not bucket["mean_confidence"]
+                    else float(np.mean(bucket["mean_confidence"]))
+                ),
+            }
+
+    if transition_reports:
+        transition_buckets = {}
+        for report in transition_reports:
+            for transition_key, metrics_payload in dict(report.get("by_transition") or {}).items():
+                bucket = transition_buckets.setdefault(
+                    str(transition_key),
+                    {
+                        "path_count": 0,
+                        "occurrence_count": [],
+                        "destination_bar_count": [],
+                        "destination_net_profit": [],
+                        "destination_mean_bar_return": [],
+                        "destination_turnover": [],
+                        "recognition_delay_bars": [],
+                        "mean_delay_window_return": [],
+                        "mean_post_delay_return": [],
+                        "mean_positive_cumulative_onset_lag_bars": [],
+                        "median_positive_cumulative_onset_lag_bars": [],
+                        "no_positive_cumulative_onset_rate": [],
+                        "shorter_than_delay_count": [],
+                        "mean_confidence": [],
+                    },
+                )
+                bucket["path_count"] += 1
+                bucket["occurrence_count"].append(float(metrics_payload.get("occurrence_count", 0)))
+                bucket["destination_bar_count"].append(float(metrics_payload.get("destination_bar_count", 0)))
+                bucket["destination_net_profit"].append(float(metrics_payload.get("destination_net_profit", 0.0)))
+                bucket["destination_mean_bar_return"].append(float(metrics_payload.get("destination_mean_bar_return", 0.0)))
+                bucket["destination_turnover"].append(float(metrics_payload.get("destination_turnover", 0.0)))
+                bucket["recognition_delay_bars"].append(float(metrics_payload.get("recognition_delay_bars", 0)))
+                bucket["mean_delay_window_return"].append(float(metrics_payload.get("mean_delay_window_return", 0.0)))
+                bucket["mean_post_delay_return"].append(float(metrics_payload.get("mean_post_delay_return", 0.0)))
+                mean_onset_lag = metrics_payload.get("mean_positive_cumulative_onset_lag_bars")
+                if mean_onset_lag is not None:
+                    bucket["mean_positive_cumulative_onset_lag_bars"].append(float(mean_onset_lag))
+                median_onset_lag = metrics_payload.get("median_positive_cumulative_onset_lag_bars")
+                if median_onset_lag is not None:
+                    bucket["median_positive_cumulative_onset_lag_bars"].append(float(median_onset_lag))
+                bucket["no_positive_cumulative_onset_rate"].append(float(metrics_payload.get("no_positive_cumulative_onset_rate", 0.0)))
+                bucket["shorter_than_delay_count"].append(float(metrics_payload.get("shorter_than_delay_count", 0)))
+                mean_confidence = metrics_payload.get("mean_confidence")
+                if mean_confidence is not None:
+                    bucket["mean_confidence"].append(float(mean_confidence))
+
+        summary["transition_segment_report"] = {
+            "enabled": True,
+            "aggregate_mode": "path_diagnostics_only",
+            "path_count": int(len(transition_reports)),
+            "by_transition": {},
+        }
+        for transition_key, bucket in transition_buckets.items():
+            summary["transition_segment_report"]["by_transition"][transition_key] = {
+                "path_count": int(bucket["path_count"]),
+                "mean_occurrence_count": float(np.mean(bucket["occurrence_count"])),
+                "mean_destination_bar_count": float(np.mean(bucket["destination_bar_count"])),
+                "mean_destination_net_profit": float(np.mean(bucket["destination_net_profit"])),
+                "mean_destination_bar_return": float(np.mean(bucket["destination_mean_bar_return"])),
+                "mean_destination_turnover": float(np.mean(bucket["destination_turnover"])),
+                "mean_recognition_delay_bars": float(np.mean(bucket["recognition_delay_bars"])),
+                "mean_delay_window_return": float(np.mean(bucket["mean_delay_window_return"])),
+                "mean_post_delay_return": float(np.mean(bucket["mean_post_delay_return"])),
+                "mean_positive_cumulative_onset_lag_bars": (
+                    None
+                    if not bucket["mean_positive_cumulative_onset_lag_bars"]
+                    else float(np.mean(bucket["mean_positive_cumulative_onset_lag_bars"]))
+                ),
+                "median_positive_cumulative_onset_lag_bars": (
+                    None
+                    if not bucket["median_positive_cumulative_onset_lag_bars"]
+                    else float(np.mean(bucket["median_positive_cumulative_onset_lag_bars"]))
+                ),
+                "mean_no_positive_cumulative_onset_rate": float(np.mean(bucket["no_positive_cumulative_onset_rate"])),
+                "mean_shorter_than_delay_count": float(np.mean(bucket["shorter_than_delay_count"])),
+                "mean_confidence": (
+                    None
+                    if not bucket["mean_confidence"]
+                    else float(np.mean(bucket["mean_confidence"]))
+                ),
+            }
+
+    if router_stability_reports:
+        blocked_switch_reasons = {}
+        switching_cost_estimates = []
+        switching_cost_shares = []
+        for report in router_stability_reports:
+            for reason, count in dict(report.get("blocked_switch_reasons") or {}).items():
+                blocked_switch_reasons[str(reason)] = blocked_switch_reasons.get(str(reason), 0) + int(count)
+            switching_cost_estimate = report.get("switching_cost_estimate")
+            if switching_cost_estimate is not None:
+                switching_cost_estimates.append(float(switching_cost_estimate))
+            switching_cost_share = report.get("switching_cost_share_of_starting_equity")
+            if switching_cost_share is not None:
+                switching_cost_shares.append(float(switching_cost_share))
+
+        summary["router_stability_report"] = {
+            "enabled": True,
+            "aggregate_mode": "path_diagnostics_only",
+            "path_count": int(len(router_stability_reports)),
+            "applicable_path_count": int(sum(1 for report in router_stability_reports if report.get("applicable", False))),
+            "mean_decision_count": float(np.mean([float(report.get("decision_count", 0)) for report in router_stability_reports])),
+            "mean_switch_count": float(np.mean([float(report.get("switch_count", 0)) for report in router_stability_reports])),
+            "mean_switch_rate": float(np.mean([float(report.get("switch_rate", 0.0)) for report in router_stability_reports])),
+            "mean_blocked_switch_count": float(np.mean([float(report.get("blocked_switch_count", 0)) for report in router_stability_reports])),
+            "mean_blocked_switch_rate": float(np.mean([float(report.get("blocked_switch_rate", 0.0)) for report in router_stability_reports])),
+            "mean_configured_control_count": float(np.mean([float(report.get("configured_control_count", 0)) for report in router_stability_reports])),
+            "mean_switching_cost_estimate": (
+                None if not switching_cost_estimates else float(np.mean(switching_cost_estimates))
+            ),
+            "mean_switching_cost_share_of_starting_equity": (
+                None if not switching_cost_shares else float(np.mean(switching_cost_shares))
+            ),
+            "blocked_switch_reasons": blocked_switch_reasons,
+        }
 
     return summary
 
@@ -3256,7 +3475,7 @@ def _build_empty_signal_state(index, signal_config, avg_win, avg_loss, holding_b
     )
 
 
-def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None):
+def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None, fold_backtests=None):
     configured_thresholds = dict(coverage_config or {})
     if not folds:
         return {
@@ -3277,6 +3496,21 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None)
             "fallback_rows": 0,
             "unseen_regimes": [],
             "specialist_shortfalls": {},
+            "unseen_regime_degradation_report": {
+                "enabled": False,
+                "basis": "fold_local_unseen_regime_fallback",
+                "fold_count": 0,
+                "affected_fold_count": 0,
+                "affected_fold_share": None,
+                "fallback_rows": 0,
+                "fallback_evidence_rows": 0,
+                "fallback_row_share": None,
+                "unseen_regimes": [],
+                "by_regime": {},
+                "affected_folds": [],
+                "affected_fold_metrics": None,
+                "clean_fold_metrics": None,
+            },
             "strategy": strategy,
         }
 
@@ -3318,6 +3552,14 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None)
     unseen_regimes = set()
     specialist_shortfalls = {}
     fallback_rows = 0
+    fallback_evidence_rows = 0
+    backtests_by_key = {}
+    for row in list(fold_backtests or []):
+        backtests_by_key[(int(row.get("fold", -1)), str(row.get("split_id")))] = dict(row)
+    degradation_by_regime = {}
+    affected_folds = []
+    affected_backtests = []
+    clean_backtests = []
     for fold in folds:
         for stage_name in ("fit", "validation", "test"):
             stage = dict(fold.get(stage_name) or {})
@@ -3325,11 +3567,62 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None)
                 stages.append(str(stage.get("status") or "unknown"))
                 reasons.extend(list(stage.get("reasons") or []))
         inference_report = dict(fold.get("inference_report") or {})
-        fallback_rows += int(inference_report.get("fallback_rows", 0) or 0)
-        unseen_regimes.update(str(value) for value in inference_report.get("unseen_regimes", []) if value is not None)
+        fold_fallback_rows = int(inference_report.get("fallback_rows", 0) or 0)
+        fallback_rows += fold_fallback_rows
+        fold_unseen_regimes = sorted(
+            {str(value) for value in inference_report.get("unseen_regimes", []) if value is not None}
+        )
+        unseen_regimes.update(fold_unseen_regimes)
         training_report = dict(fold.get("training_report") or {})
         for regime_name, reason in dict(training_report.get("skipped_regimes") or {}).items():
             specialist_shortfalls[str(regime_name)] = reason
+        test_report = dict(fold.get("test") or {})
+        fold_evidence_rows = int(test_report.get("available_rows", 0) or 0)
+        fallback_evidence_rows += fold_evidence_rows
+        fold_fallback_row_share = (
+            float(fold_fallback_rows / fold_evidence_rows)
+            if fold_evidence_rows > 0
+            else None
+        )
+        fold_key = (int(fold.get("fold", -1)), str(fold.get("split_id")))
+        backtest_row = backtests_by_key.get(fold_key)
+        if fold_unseen_regimes or fold_fallback_rows > 0:
+            affected_fold_payload = {
+                "fold": int(fold.get("fold", -1)),
+                "split_id": fold.get("split_id"),
+                "unseen_regimes": list(fold_unseen_regimes),
+                "fallback_rows": fold_fallback_rows,
+                "fallback_evidence_rows": fold_evidence_rows,
+                "fallback_row_share": (
+                    None
+                    if fold_fallback_row_share is None
+                    else round(float(fold_fallback_row_share), 4)
+                ),
+            }
+            if backtest_row is not None:
+                affected_fold_payload.update(
+                    {
+                        "net_profit_pct": backtest_row.get("net_profit_pct"),
+                        "sharpe_ratio": backtest_row.get("sharpe_ratio"),
+                        "max_drawdown": backtest_row.get("max_drawdown"),
+                        "total_trades": backtest_row.get("total_trades"),
+                    }
+                )
+                affected_backtests.append(backtest_row)
+            affected_folds.append(affected_fold_payload)
+            for regime_name in fold_unseen_regimes:
+                regime_bucket = degradation_by_regime.setdefault(
+                    regime_name,
+                    {
+                        "affected_fold_count": 0,
+                        "fallback_row_shares": [],
+                    },
+                )
+                regime_bucket["affected_fold_count"] += 1
+                if fold_fallback_row_share is not None:
+                    regime_bucket["fallback_row_shares"].append(float(fold_fallback_row_share))
+        elif backtest_row is not None:
+            clean_backtests.append(backtest_row)
 
     if "failed" in stages:
         status = "failed"
@@ -3337,6 +3630,54 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None)
         status = "unknown"
     else:
         status = "passed"
+
+    def _summarize_backtest_group(rows):
+        if not rows:
+            return None
+        summary = {}
+        for source_key, target_key in (
+            ("net_profit_pct", "mean_net_profit_pct"),
+            ("sharpe_ratio", "mean_sharpe_ratio"),
+            ("max_drawdown", "mean_max_drawdown"),
+            ("total_trades", "mean_total_trades"),
+        ):
+            values = [
+                float(row.get(source_key))
+                for row in rows
+                if row.get(source_key) is not None
+            ]
+            summary[target_key] = None if not values else round(float(np.mean(values)), 6)
+        return summary
+
+    unseen_regime_degradation_report = {
+        "enabled": True,
+        "basis": "fold_local_unseen_regime_fallback",
+        "fold_count": int(len(folds)),
+        "affected_fold_count": int(len(affected_folds)),
+        "affected_fold_share": round(float(len(affected_folds) / len(folds)), 4),
+        "fallback_rows": int(fallback_rows),
+        "fallback_evidence_rows": int(fallback_evidence_rows),
+        "fallback_row_share": (
+            None
+            if fallback_evidence_rows <= 0
+            else round(float(fallback_rows / fallback_evidence_rows), 4)
+        ),
+        "unseen_regimes": sorted(unseen_regimes),
+        "by_regime": {},
+        "affected_folds": affected_folds,
+        "affected_fold_metrics": _summarize_backtest_group(affected_backtests),
+        "clean_fold_metrics": _summarize_backtest_group(clean_backtests),
+    }
+    for regime_name, bucket in degradation_by_regime.items():
+        unseen_regime_degradation_report["by_regime"][regime_name] = {
+            "affected_fold_count": int(bucket["affected_fold_count"]),
+            "affected_fold_share": round(float(bucket["affected_fold_count"] / len(folds)), 4),
+            "mean_fallback_row_share": (
+                None
+                if not bucket["fallback_row_shares"]
+                else round(float(np.mean(bucket["fallback_row_shares"])), 4)
+            ),
+        }
 
     return {
         "status": status,
@@ -3366,6 +3707,7 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None)
         "fallback_rows": int(fallback_rows),
         "unseen_regimes": sorted(unseen_regimes),
         "specialist_shortfalls": specialist_shortfalls,
+        "unseen_regime_degradation_report": unseen_regime_degradation_report,
         "strategy": strategy,
     }
 
@@ -4467,6 +4809,8 @@ class TrainModelsStep(PipelineStep):
         last_feature_adapter = None
         last_feature_adaptation_policy = None
         last_feature_adaptation_manifest = None
+        last_regime_training_report = None
+        last_specialist_library = None
         last_regime_fit_index = X.index[:0]
         last_test_index = X.index[:0]
         last_signal_params = dict(default_signal_policy["params"])
@@ -4585,6 +4929,17 @@ class TrainModelsStep(PipelineStep):
             if not regime_frame.empty:
                 fold_frame = fold_frame.join(regime_frame)
                 fold_feature_blocks.update(regime_feature_blocks)
+                for column in ["warm", "degenerate_fallback", "unavailable"]:
+                    if column in regime_frame.columns:
+                        fold_frame[column] = pd.Series(fold_frame[column], copy=False).fillna(0.0)
+                for column in regime_frame.columns:
+                    non_null = regime_frame[column].dropna()
+                    if not non_null.empty and non_null.map(lambda value: isinstance(value, (bool, np.bool_))).all():
+                        fold_frame[column] = fold_frame[column].fillna(False)
+            fold_frame, fold_feature_blocks, _, _ = _drop_all_nan_feature_columns(
+                fold_frame,
+                fold_feature_blocks,
+            )
             fold_regime.append(
                 {
                     "fold": fold,
@@ -4600,6 +4955,18 @@ class TrainModelsStep(PipelineStep):
             X_fit = fold_frame.reindex(X_fit.index)
             X_val = fold_frame.reindex(X_val.index) if X_val is not None else None
             X_test = fold_frame.reindex(X_test_raw.index)
+
+            split_frames = [frame for frame in [X_fit, X_val, X_test] if frame is not None]
+            if split_frames:
+                combined_split_frame = pd.concat(split_frames, axis=0)
+                combined_split_frame, fold_feature_blocks, _, _ = _drop_all_nan_feature_columns(
+                    combined_split_frame,
+                    fold_feature_blocks,
+                )
+                retained_columns = list(combined_split_frame.columns)
+                X_fit = X_fit.reindex(columns=retained_columns)
+                X_val = X_val.reindex(columns=retained_columns) if X_val is not None else None
+                X_test = X_test.reindex(columns=retained_columns)
 
             X_fit, y_fit, labels_fit, _ = _align_and_drop_invalid_rows(X_fit, y_fit, labels_fit)
             if X_val is not None:
@@ -4791,6 +5158,7 @@ class TrainModelsStep(PipelineStep):
                     sample_weight=w_train_primary,
                     sampling_metadata=sampling_metadata,
                 )
+                last_regime_training_report = dict(regime_training_report or {})
                 bootstrap_report = (
                     regime_training_report.get("sampling_report")
                     or regime_training_report.get("fallback_sampling_report")
@@ -5233,6 +5601,12 @@ class TrainModelsStep(PipelineStep):
                     regime_frame=regime_frame.reindex(X_test_model.index) if not regime_frame.empty else None,
                 )
             )
+            path_regime_states = None
+            if not test_regime_view.empty:
+                path_regime_states = [
+                    contract.to_dict()
+                    for contract in build_regime_state_contracts(test_regime_view)
+                ]
             oos_paths.append(
                 {
                     "fold": fold,
@@ -5263,6 +5637,7 @@ class TrainModelsStep(PipelineStep):
                     "causal_cutoff_timestamp": signal_policy_context.get("causal_cutoff_timestamp"),
                     "calibration_policy": signal_policy_context.get("calibration_policy"),
                     "cross_fold_borrowing_allowed": signal_policy_context.get("cross_fold_borrowing_allowed"),
+                    "regime_states": path_regime_states,
                 }
             )
             last_model = model
@@ -5272,6 +5647,21 @@ class TrainModelsStep(PipelineStep):
             last_selected_columns = list(selected_columns)
             last_regime_fit_index = X_fit.index.copy()
             last_test_index = X_test_model.index.copy()
+            if (
+                regime_aware_config.get("enabled")
+                and regime_aware_config.get("strategy") == "specialist"
+                and hasattr(model, "specialist_models")
+            ):
+                last_specialist_library = build_specialist_library_snapshot(
+                    model,
+                    last_regime_training_report,
+                    symbol=pipeline.section("data").get("symbol", "unknown"),
+                    timeframe=pipeline.section("data").get("interval", "unknown"),
+                    metadata={
+                        "source": "train_models",
+                        "validation_method": validation_method,
+                    },
+                ).to_dict()
             last_signal_params = {**fold_signal_config}
             last_signal_policy = dict(signal_policy_report["policy_quality"])
             last_avg_win = fold_avg_win
@@ -5350,6 +5740,7 @@ class TrainModelsStep(PipelineStep):
             fold_regime_aware,
             coverage_config=regime_aware_config.get("coverage_config"),
             strategy=regime_aware_config.get("strategy"),
+            fold_backtests=fold_backtests,
         ) if regime_aware_config.get("enabled") else None
         regime_aware_summary = {
             "enabled": bool(regime_aware_config.get("enabled", False)),
@@ -5391,6 +5782,9 @@ class TrainModelsStep(PipelineStep):
                     "fallback_rows": int((regime_coverage_summary or {}).get("fallback_rows", 0) or 0),
                     "fallback_evidence_rows": int(fallback_evidence_rows),
                     "unseen_regimes": list((regime_coverage_summary or {}).get("unseen_regimes") or []),
+                    "unseen_regime_degradation_report": copy.deepcopy(
+                        (regime_coverage_summary or {}).get("unseen_regime_degradation_report") or {}
+                    ),
                     "trained_regimes": sorted(trained_regimes),
                     "trained_rows_by_regime": trained_rows_by_regime,
                 }
@@ -5515,6 +5909,7 @@ class TrainModelsStep(PipelineStep):
             "feature_family_diagnostics": feature_family_diagnostics,
             "feature_portability_diagnostics": feature_portability_diagnostics,
             "feature_adaptation": feature_adaptation_summary,
+            "specialist_library": copy.deepcopy(last_specialist_library or {}),
             "cross_venue_integrity": reference_integrity_report,
             "data_certification": data_certification_report,
             "signal_decay": signal_decay,
@@ -5586,6 +5981,7 @@ class TrainModelsStep(PipelineStep):
         pipeline.state["training"] = training
         pipeline.state["last_feature_adapter"] = last_feature_adapter
         pipeline.state["feature_adaptation"] = feature_adaptation_summary
+        pipeline.state["specialist_library"] = copy.deepcopy(last_specialist_library or {})
         pipeline.state["operational_monitoring"] = operational_monitoring
         return training
 
@@ -5836,6 +6232,11 @@ class BacktestStep(PipelineStep):
             if signal_state.get("primary_validation_method") != signal_state.get("validation_method"):
                 backtest["diagnostic_validation_method"] = signal_state.get("validation_method")
         training = pipeline.state.get("training") or {}
+        unseen_regime_degradation_report = copy.deepcopy(
+            ((training.get("regime") or {}).get("coverage_summary") or {}).get("unseen_regime_degradation_report") or {}
+        )
+        if unseen_regime_degradation_report:
+            backtest["unseen_regime_degradation_report"] = unseen_regime_degradation_report
         feature_frame = pipeline.state.get("X")
         feature_columns = list(feature_frame.columns) if isinstance(feature_frame, pd.DataFrame) else []
         signal_decay_report = dict(training.get("signal_decay") or {})
@@ -5869,6 +6270,10 @@ class BacktestStep(PipelineStep):
                 "path_count": int(len(path_backtests)),
                 "summary": _summarize_path_backtests(path_backtests),
             }
+            if unseen_regime_degradation_report:
+                backtest["diagnostic_validation"]["summary"]["unseen_regime_degradation_report"] = copy.deepcopy(
+                    unseen_regime_degradation_report
+                )
             backtest["debug"] = {
                 "cpcv_path_backtests": path_backtests,
             }
@@ -6036,6 +6441,11 @@ class ResearchPipeline:
                 or refit_pipeline.state.get("feature_adaptation")
                 or {}
             ),
+            "specialist_library": copy.deepcopy(
+                (refit_pipeline.state.get("training") or {}).get("specialist_library")
+                or refit_pipeline.state.get("specialist_library")
+                or {}
+            ),
             "signals": copy.deepcopy(refit_pipeline.state.get("signals") or {}),
             "backtest": copy.deepcopy(refit_pipeline.state.get("backtest") or {}),
             "pipeline": refit_pipeline,
@@ -6083,10 +6493,14 @@ class ResearchPipeline:
         reference_predictions=None,
         current_predictions=None,
         current_performance=None,
+        current_router_stability_report=None,
         bars_since_last_retrain=None,
         scheduled_window_open=False,
         train_challenger=None,
         drift_config=None,
+        library_review_policy=None,
+        router_recalibration_policy=None,
+        structural_invalidation_policy=None,
         promotion_policy=None,
         current_monitoring_report=None,
         rollback_policy=None,
@@ -6111,6 +6525,8 @@ class ResearchPipeline:
             equity_curve = backtest.get("equity_curve")
             if isinstance(equity_curve, pd.Series) and not equity_curve.empty:
                 current_performance = equity_curve.pct_change().dropna()
+        if current_router_stability_report is None:
+            current_router_stability_report = dict((self.state.get("backtest") or {}).get("router_stability_report") or {})
         if current_monitoring_report is None:
             current_monitoring_report = (
                 self.state.get("operational_monitoring")
@@ -6126,10 +6542,14 @@ class ResearchPipeline:
             reference_predictions=reference_predictions,
             current_predictions=current_predictions,
             current_performance=current_performance,
+            current_router_stability_report=current_router_stability_report,
             bars_since_last_retrain=bars_since_last_retrain,
             scheduled_window_open=scheduled_window_open,
             train_challenger=train_challenger,
             drift_config=drift_config,
+            library_review_policy=library_review_policy,
+            router_recalibration_policy=router_recalibration_policy,
+            structural_invalidation_policy=structural_invalidation_policy,
             promotion_policy=promotion_policy,
             current_monitoring_report=current_monitoring_report,
             rollback_policy=rollback_policy,

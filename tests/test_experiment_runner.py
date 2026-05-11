@@ -97,6 +97,68 @@ class _FakePipeline:
         return {"engine": "vectorbt", "sharpe_ratio": 3.4, "net_profit_pct": 0.18, "max_drawdown": -0.04, "total_trades": 8}
 
 
+class _FakeAutoMLPipeline(_FakePipeline):
+    def __init__(self, config):
+        super().__init__(config)
+        self.state = {}
+
+    def run_automl(self):
+        return {
+            "objective": "sharpe_ratio",
+            "selection_metric": "sharpe_ratio",
+            "selection_mode": "maximize",
+            "trial_count": 2,
+            "best_value": 0.84,
+            "best_overrides": {
+                "experiment": {"bundle_name": "trend_native_weighted"},
+                "model": {"type": "gbm"},
+            },
+            "best_bundle_lineage": {
+                "bundle_name": "trend_native_weighted",
+                "bundle_description": "Native trend-state detector with weighted routing.",
+                "primary_detector": {"name": "trend_native_primary", "type": "trend_state", "primary": True},
+                "specialist_model_ids": ["trend_model", "breakout_model"],
+                "router": {"type": "confidence_weighted"},
+            },
+        }
+
+    def refit_selected_candidate(self, automl):
+        features = self.build_features()
+        stationarity = self.check_stationarity()
+        regimes = self.detect_regimes()["regimes"]
+        labels = self.build_labels()
+        aligned = self.align_data()
+        self.state = {
+            "features": features,
+            "stationarity": stationarity,
+            "regimes": regimes,
+            "labels": labels,
+            "X": aligned["X"],
+            "y": aligned["y"],
+            "labels_aligned": labels,
+        }
+        return {
+            "pipeline": self,
+            "training": self.train_models(),
+            "signals": self.generate_signals(),
+            "backtest": {
+                "engine": "vectorbt",
+                "sharpe_ratio": 1.6,
+                "net_profit_pct": 0.11,
+                "max_drawdown": -0.05,
+                "total_trades": 12,
+                "router_stability_report": {
+                    "enabled": True,
+                    "applicable": True,
+                    "switch_count": 3,
+                    "switch_rate": 0.25,
+                    "blocked_switch_count": 1,
+                    "configured_control_count": 3,
+                },
+            },
+        }
+
+
 class ExperimentRunnerTest(unittest.TestCase):
     @patch("experiments.runner.ResearchPipeline", _FakePipeline)
     def test_run_experiment_returns_artifacts_and_warnings(self):
@@ -128,6 +190,25 @@ class ExperimentRunnerTest(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("Feature adapt", output)
         self.assertIn("Adapt policy", output)
+
+    @patch("experiments.runner.ResearchPipeline", _FakeAutoMLPipeline)
+    def test_run_experiment_prints_bundle_and_router_summary_for_automl(self):
+        with patch("sys.stdout", new_callable=StringIO) as stdout:
+            run_experiment(
+                {
+                    "experiment": {"name": "runner_bundle_automl"},
+                    "data": {"symbol": "BTCUSDT", "interval": "1h", "start": "2024-01-01", "end": "2024-02-01"},
+                    "indicators": [{"kind": "returns"}],
+                    "automl": {"enabled": True},
+                },
+                quiet=False,
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("Bundle        : trend_native_weighted", output)
+        self.assertIn("Bundle path   : detector=trend_native_primary:trend_state", output)
+        self.assertIn("Router        : switches=3", output)
+        self.assertIn("switch_rate=25.00%", output)
 
 
 if __name__ == "__main__":

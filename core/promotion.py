@@ -215,6 +215,133 @@ def evaluate_stress_realism_gate(backtest_summary=None, policy=None, regime_awar
     }
 
 
+def evaluate_router_stability_gate(backtest_summary=None, policy=None):
+    backtest_summary = dict(backtest_summary or {})
+    policy = dict(policy or {})
+    evaluation_mode = str(backtest_summary.get("evaluation_mode") or policy.get("evaluation_mode") or "research_only").lower()
+
+    report = dict(backtest_summary.get("router_stability_report") or {})
+    if not report and "router_decision_count" in backtest_summary:
+        decision_count = int(backtest_summary.get("router_decision_count", 0) or 0)
+        switch_count = int(backtest_summary.get("router_switch_count", 0) or 0)
+        switch_opportunities = int(max(decision_count - 1, 0))
+        blocked_switch_reasons = {
+            str(reason): int(count)
+            for reason, count in dict(backtest_summary.get("router_blocked_switch_reasons") or {}).items()
+        }
+        blocked_switch_count = int(sum(blocked_switch_reasons.values()))
+        manifest = dict(backtest_summary.get("router_manifest") or {})
+        control_flags = {
+            "hysteresis": bool(float(manifest.get("hysteresis_margin") or 0.0) > 0.0),
+            "persistence": bool(int(manifest.get("min_persistence_bars") or 0) > 1),
+            "cooldown": bool(int(manifest.get("cooldown_bars") or 0) > 0),
+        }
+        switching_cost_estimate = _coerce_float(backtest_summary.get("router_switching_cost_estimate"))
+        starting_equity = _coerce_float(backtest_summary.get("starting_equity"))
+        switching_cost_share = None
+        if switching_cost_estimate is not None and starting_equity is not None and starting_equity > 0.0:
+            switching_cost_share = float(switching_cost_estimate / starting_equity)
+        report = {
+            "enabled": True,
+            "applicable": bool(decision_count > 0),
+            "decision_count": decision_count,
+            "switch_opportunities": switch_opportunities,
+            "switch_count": switch_count,
+            "switch_rate": float(switch_count / switch_opportunities) if switch_opportunities > 0 else 0.0,
+            "blocked_switch_count": blocked_switch_count,
+            "blocked_switch_rate": float(blocked_switch_count / switch_opportunities) if switch_opportunities > 0 else 0.0,
+            "blocked_switch_reasons": blocked_switch_reasons,
+            "control_flags": control_flags,
+            "configured_control_count": int(sum(1 for enabled in control_flags.values() if enabled)),
+            "switching_cost_estimate": switching_cost_estimate,
+            "switching_cost_share_of_starting_equity": switching_cost_share,
+        }
+
+    applicable = bool(report.get("enabled", False) and report.get("applicable", False))
+    max_router_switch_rate = _coerce_float(policy.get("max_router_switch_rate"))
+    if max_router_switch_rate is None and evaluation_mode == "trade_ready":
+        max_router_switch_rate = 0.35
+    max_router_switching_cost_share = _coerce_float(policy.get("max_router_switching_cost_share"))
+    min_router_decision_count = int(policy.get("min_router_decision_count", 25 if evaluation_mode == "trade_ready" else 0))
+    require_router_stability_controls = bool(
+        policy.get("require_router_stability_controls", evaluation_mode == "trade_ready")
+    )
+
+    decision_count = int(report.get("decision_count", 0) or 0)
+    switch_count = int(report.get("switch_count", 0) or 0)
+    switch_rate = _coerce_float(report.get("switch_rate"))
+    configured_control_count = int(report.get("configured_control_count", 0) or 0)
+    switching_cost_share = _coerce_float(report.get("switching_cost_share_of_starting_equity"))
+    missing_metrics = []
+
+    if not applicable:
+        passed = True
+        reason = None
+        status = "not_applicable"
+        failure_class = None
+    elif decision_count < min_router_decision_count:
+        passed = True
+        reason = None
+        status = "insufficient_evidence"
+        failure_class = None
+    elif require_router_stability_controls and switch_count > 0 and configured_control_count <= 0:
+        passed = False
+        reason = "router_stability_controls_missing"
+        status = "failed"
+        failure_class = "router_controls_missing"
+    elif max_router_switch_rate is not None and switch_rate is None:
+        passed = False
+        reason = "router_switch_rate_missing"
+        status = "failed"
+        failure_class = "router_metrics_incomplete"
+        missing_metrics.append("switch_rate")
+    elif max_router_switch_rate is not None and switch_rate is not None and switch_rate > float(max_router_switch_rate):
+        passed = False
+        reason = "router_switch_rate_above_limit"
+        status = "failed"
+        failure_class = "router_over_switching"
+    elif (
+        max_router_switching_cost_share is not None
+        and switching_cost_share is not None
+        and switching_cost_share > float(max_router_switching_cost_share)
+    ):
+        passed = False
+        reason = "router_switching_cost_share_above_limit"
+        status = "failed"
+        failure_class = "router_over_switching"
+    else:
+        passed = True
+        reason = None
+        status = "passed"
+        failure_class = None
+
+    return {
+        "passed": passed,
+        "reason": reason,
+        "status": status,
+        "failure_class": failure_class,
+        "applicable": applicable,
+        "decision_count": decision_count,
+        "switch_count": switch_count,
+        "switch_rate": switch_rate,
+        "blocked_switch_count": int(report.get("blocked_switch_count", 0) or 0),
+        "blocked_switch_rate": _coerce_float(report.get("blocked_switch_rate")),
+        "blocked_switch_reasons": dict(report.get("blocked_switch_reasons") or {}),
+        "configured_control_count": configured_control_count,
+        "control_flags": dict(report.get("control_flags") or {}),
+        "switching_cost_estimate": _coerce_float(report.get("switching_cost_estimate")),
+        "switching_cost_share_of_starting_equity": switching_cost_share,
+        "missing_metrics": missing_metrics,
+        "thresholds": {
+            "min_router_decision_count": min_router_decision_count,
+            "max_router_switch_rate": max_router_switch_rate,
+            "max_router_switching_cost_share": max_router_switching_cost_share,
+            "require_router_stability_controls": require_router_stability_controls,
+        },
+        "research_only": not passed,
+    }
+
+
 def set_promotion_score(report, *, basis, value, metadata=None):
     payload = copy.deepcopy(report or create_promotion_eligibility_report())
     payload["score"] = {
@@ -385,6 +512,7 @@ __all__ = [
     "build_promotion_gate_check_map",
     "create_promotion_eligibility_report",
     "evaluate_execution_realism_gate",
+    "evaluate_router_stability_gate",
     "evaluate_stress_realism_gate",
     "finalize_promotion_eligibility_report",
     "get_promotion_score",

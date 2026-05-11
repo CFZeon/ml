@@ -6,6 +6,7 @@ import json
 import pandas as pd
 
 from core import LocalRegistryStore, build_model
+from core.specialists import SpecialistLibrarySnapshot, SpecialistSpec
 
 
 def _fit_logistic_model():
@@ -14,6 +15,32 @@ def _fit_logistic_model():
     model = build_model("logistic", {"c": 1.0})
     model.fit(X, y)
     return model, list(X.columns)
+
+
+def _make_specialist_library():
+    return SpecialistLibrarySnapshot(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        fallback_model_id="fallback_generalist",
+        specialists=[
+            SpecialistSpec(
+                model_id="fallback_generalist",
+                symbol="BTCUSDT",
+                timeframe="1h",
+                compatible_regimes=[],
+                estimator_family="logisticregression",
+                metadata={"fallback_only": True, "lifecycle_state": "candidate"},
+            ),
+            SpecialistSpec(
+                model_id="specialist::bull",
+                symbol="BTCUSDT",
+                timeframe="1h",
+                compatible_regimes=["bull"],
+                estimator_family="logisticregression",
+                metadata={"regime_label": "bull", "lifecycle_state": "candidate"},
+            ),
+        ],
+    )
 
 
 class LocalRegistryFlowTest(unittest.TestCase):
@@ -187,6 +214,221 @@ class LocalRegistryFlowTest(unittest.TestCase):
 
             self.assertEqual(row["promotion_score_basis"], "selection_value")
             self.assertAlmostEqual(float(row["promotion_score"]), 0.12)
+
+    def test_registry_auto_persists_specialist_library_and_projects_active_runtime_state(self):
+        model, feature_columns = _fit_logistic_model()
+        specialist_library = _make_specialist_library()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            version_id = store.register_version(
+                model,
+                symbol="BTCUSDT",
+                feature_columns=feature_columns,
+                training_summary={"avg_f1_macro": 0.75, "specialist_library": specialist_library.to_dict()},
+                validation_summary={"raw_objective_value": 0.12},
+            )
+
+            manifest = store.read_version_manifest(version_id, symbol="BTCUSDT")
+            runtime_before = store.read_specialist_library(version_id, symbol="BTCUSDT")
+            store.promote(version_id, "champion", symbol="BTCUSDT", decision={"approved": True, "reasons": ["approved"]})
+            runtime_after = store.read_specialist_library(version_id, symbol="BTCUSDT")
+
+        manifest_states = {
+            spec["model_id"]: spec["metadata"].get("lifecycle_state")
+            for spec in manifest["specialist_library"]["specialists"]
+        }
+        runtime_before_states = runtime_before["metadata"]["selection_contract"]["lifecycle_state_by_model_id"]
+        runtime_after_states = runtime_after["metadata"]["selection_contract"]["lifecycle_state_by_model_id"]
+
+        self.assertEqual(manifest_states["specialist::bull"], "candidate")
+        self.assertEqual(runtime_before_states["specialist::bull"], "candidate")
+        self.assertEqual(runtime_after_states["specialist::bull"], "candidate")
+        self.assertEqual(runtime_after_states["fallback_generalist"], "active")
+        self.assertEqual(runtime_after["metadata"]["selection_contract"]["active_model_ids"], ["fallback_generalist"])
+        self.assertEqual(len(manifest["specialist_library"]["artifact_refs"]), 2)
+
+    def test_registry_promotes_certified_specialists_without_overwriting_runtime_state(self):
+        model, feature_columns = _fit_logistic_model()
+        specialist_library = _make_specialist_library()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            version_id = store.register_version(
+                model,
+                symbol="BTCUSDT",
+                feature_columns=feature_columns,
+                specialist_library=specialist_library,
+                training_summary={"avg_f1_macro": 0.75},
+                validation_summary={"raw_objective_value": 0.12},
+            )
+
+            certified_runtime = None
+            store.record_specialist_lifecycle_transition(
+                version_id,
+                "specialist::bull",
+                "certified",
+                symbol="BTCUSDT",
+                reason="specialist_certification_passed",
+            )
+            certified_runtime = store.read_specialist_library(version_id, symbol="BTCUSDT")
+            store.promote(version_id, "champion", symbol="BTCUSDT", decision={"approved": True, "reasons": ["approved"]})
+            active_runtime = store.read_specialist_library(version_id, symbol="BTCUSDT")
+
+        certified_states = certified_runtime["metadata"]["selection_contract"]["lifecycle_state_by_model_id"]
+        active_states = active_runtime["metadata"]["selection_contract"]["lifecycle_state_by_model_id"]
+
+        self.assertEqual(certified_states["specialist::bull"], "certified")
+        self.assertEqual(active_states["specialist::bull"], "active")
+        self.assertEqual(active_runtime["metadata"]["selection_contract"]["active_model_ids"], ["fallback_generalist", "specialist::bull"])
+
+    def test_registry_records_specialist_lifecycle_events_without_mutating_manifest(self):
+        model, feature_columns = _fit_logistic_model()
+        specialist_library = _make_specialist_library()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            version_id = store.register_version(
+                model,
+                symbol="BTCUSDT",
+                feature_columns=feature_columns,
+                specialist_library=specialist_library,
+                training_summary={"avg_f1_macro": 0.75},
+                validation_summary={"raw_objective_value": 0.12},
+            )
+            manifest_before = store.read_version_manifest(version_id, symbol="BTCUSDT")
+            store.promote(version_id, "champion", symbol="BTCUSDT", decision={"approved": True, "reasons": ["approved"]})
+
+            store.record_specialist_lifecycle_transition(
+                version_id,
+                "specialist::bull",
+                "certified",
+                symbol="BTCUSDT",
+                reason="specialist_certification_passed",
+            )
+            store.record_specialist_lifecycle_transition(
+                version_id,
+                "specialist::bull",
+                "active",
+                symbol="BTCUSDT",
+                reason="specialist_activated",
+            )
+
+            lifecycle_event = store.record_specialist_lifecycle_transition(
+                version_id,
+                "specialist::bull",
+                "degraded",
+                symbol="BTCUSDT",
+                reason="performance_decay",
+            )
+            runtime = store.read_specialist_library(version_id, symbol="BTCUSDT")
+            manifest_after = store.read_version_manifest(version_id, symbol="BTCUSDT")
+            row = next(record for record in store.list_versions("BTCUSDT") if record["version_id"] == version_id)
+
+        runtime_states = runtime["metadata"]["selection_contract"]["lifecycle_state_by_model_id"]
+
+        self.assertEqual(lifecycle_event["target_state"], "degraded")
+        self.assertEqual(runtime_states["specialist::bull"], "degraded")
+        self.assertEqual(manifest_before["specialist_library"], manifest_after["specialist_library"])
+        self.assertTrue(str(row["latest_specialist_lifecycle_report"]).endswith(".json"))
+
+    def test_registry_replays_specialist_health_updates_without_mutating_manifest(self):
+        model, feature_columns = _fit_logistic_model()
+        specialist_library = _make_specialist_library()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            version_id = store.register_version(
+                model,
+                symbol="BTCUSDT",
+                feature_columns=feature_columns,
+                specialist_library=specialist_library,
+                training_summary={"avg_f1_macro": 0.75},
+                validation_summary={"raw_objective_value": 0.12},
+            )
+            manifest_before = store.read_version_manifest(version_id, symbol="BTCUSDT")
+            update = store.attach_specialist_health_update(
+                version_id,
+                symbol="BTCUSDT",
+                update={
+                    "recorded_at": "2026-05-09T00:00:00+00:00",
+                    "source": "paper_monitoring",
+                    "metadata": {
+                        "window_start": "2026-05-01T00:00:00+00:00",
+                        "window_end": "2026-05-08T00:00:00+00:00",
+                    },
+                    "health": [
+                        {
+                            "model_id": "specialist::bull",
+                            "compatible_regimes": ["bull"],
+                            "stability_score": 0.61,
+                            "decay_score": 0.18,
+                            "last_calibrated_at": "2026-05-08T00:00:00+00:00",
+                            "failure_flags": ["drawdown_watch"],
+                            "metadata": {"support_window": "2026Q2"},
+                        }
+                    ],
+                    "performance_slices": [
+                        {
+                            "model_id": "specialist::bull",
+                            "regime_label": "bull",
+                            "split_role": "monitoring_window",
+                            "row_count": 48,
+                            "metric_summary": {"f1_macro": 0.55, "win_rate": 0.58},
+                            "metadata": {
+                                "window_start": "2026-05-01T00:00:00+00:00",
+                                "window_end": "2026-05-08T00:00:00+00:00",
+                            },
+                        }
+                    ],
+                },
+            )
+            runtime = store.read_specialist_library(version_id, symbol="BTCUSDT")
+            manifest_after = store.read_version_manifest(version_id, symbol="BTCUSDT")
+            row = next(record for record in store.list_versions("BTCUSDT") if record["version_id"] == version_id)
+
+        bull_health = next(item for item in runtime["health"] if item["model_id"] == "specialist::bull")
+        bull_performance = [
+            item
+            for item in runtime["performance_slices"]
+            if item["model_id"] == "specialist::bull" and item["split_role"] == "monitoring_window"
+        ]
+        history = runtime["metadata"]["health_history"]
+
+        self.assertEqual(update["source"], "paper_monitoring")
+        self.assertAlmostEqual(float(bull_health["stability_score"]), 0.61)
+        self.assertEqual(bull_health["metadata"]["health_source"], "paper_monitoring")
+        self.assertEqual(bull_health["metadata"]["health_recorded_at"], "2026-05-09T00:00:00+00:00")
+        self.assertEqual(len(bull_performance), 1)
+        self.assertAlmostEqual(float(bull_performance[0]["metric_summary"]["f1_macro"]), 0.55)
+        self.assertEqual(bull_performance[0]["metadata"]["source"], "paper_monitoring")
+        self.assertEqual(history["update_count"], 1)
+        self.assertEqual(history["latest_update_at"], "2026-05-09T00:00:00+00:00")
+        self.assertEqual(history["failure_flagged_model_ids"], ["specialist::bull"])
+        self.assertEqual(history["updated_model_ids"], ["specialist::bull"])
+        self.assertEqual(manifest_before["specialist_library"], manifest_after["specialist_library"])
+        self.assertTrue(str(row["latest_specialist_health_report"]).endswith(".json"))
+
+    def test_registry_rejects_malformed_specialist_health_updates(self):
+        model, feature_columns = _fit_logistic_model()
+        specialist_library = _make_specialist_library()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            version_id = store.register_version(
+                model,
+                symbol="BTCUSDT",
+                feature_columns=feature_columns,
+                specialist_library=specialist_library,
+                training_summary={"avg_f1_macro": 0.75},
+                validation_summary={"raw_objective_value": 0.12},
+            )
+
+            with self.assertRaisesRegex(ValueError, "model_id"):
+                store.attach_specialist_health_update(
+                    version_id,
+                    symbol="BTCUSDT",
+                    health=[{"stability_score": 0.4}],
+                )
+
+            row = next(record for record in store.list_versions("BTCUSDT") if record["version_id"] == version_id)
+
+        self.assertTrue(pd.isna(row["latest_specialist_health_report"]))
 
 
 if __name__ == "__main__":

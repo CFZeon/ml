@@ -21,10 +21,12 @@ Use this map instead of scanning every example manually.
 | Conservative futures research baseline | `example_futures.py` | Shows mark-price valuation, funding, and liquidation-aware futures setup |
 | Attach custom exogenous data | `example_custom_data.py` | Demonstrates point-in-time-safe custom data joins |
 | Run an offline deterministic case | `example_synthetic_derivatives.py` | Seeds `pipeline.state` directly and avoids network fetches |
+| Inspect detector and router orchestration without AutoML | `example_regime_orchestration.py` | Uses the shared config-driven runner to surface detector/runtime/router choices directly from YAML |
 | Run strict local certification AutoML | `example_local_certification_automl.py` | Keeps fail-closed data policies, locked holdout, replication, and an explicit `local_certification_surrogate` fallback when Nautilus is unavailable; suitable for paper or pre-capital evidence, not live-capital release |
 | Run trade-ready AutoML research | `example_trade_ready_automl.py` | Uses the stronger certification profile with locked holdout, replication cohorts, blocking feature-surface lookahead certification, binding selection gates, and promotion-readiness reporting; add `--smoke` for a visibly reduced-power run that still requires Nautilus, and read `oos_evidence.class`, `execution_evidence.class`, plus `funding_coverage_status` before any Sharpe or net-profit number |
-| Run drift-governed retraining flow | `example_drift_retraining_cycle.py` | Shows champion/challenger registration, a paper-validation loop, a kill-switch / drawdown gate, scheduled retraining, hybrid rollback, and the final operator deploy/hold decision |
 | Run research-only AutoML with locked holdout separation | `example_automl.py` | Keeps the public surrogate path research-only, but now preserves a contiguous validation replay, a final locked holdout, SPA-based post-selection inference, and a minimum significance floor before any post-selection refit |
+| Compare detector, specialist, and router bundles via AutoML | `example_regime_bundle_automl.py` | Uses the shared config-driven runner plus `configs/btc_regime_bundle_automl.yaml` so bundle search and selected bundle lineage stay explicit in YAML and console output |
+| Run post-certification maintenance and rollback review | `example_drift_retraining_cycle.py` | Shows the downstream maintenance path after selection/certification: paper validation, drift review, challenger promotion, rollback, and deploy-or-hold gating |
 | Run the old unsafe AutoML smoke path | `example_automl.py --research-demo` | Restores the fast demo mode that disables locked holdout and selection gates |
 | Explore MTF FVG plus derivatives context | `example_mtf_fvg.py` and `example_mtf_fvg_futures.py` | Show the shared MTF FVG workflow with WaveTrend, funding, non-level OI features, and custom FVG/SMA regime context |
 | Explore FVG-specific features | `example_fvg.py` | Narrow feature example; useful as a feature smoke test |
@@ -289,9 +291,10 @@ This is the right path when you need:
 
 Use `example_synthetic_derivatives.py` as the working reference.
 
-## Run Drift-Governed Retraining
+## Run Maintenance And Drift Review
 
-Use `example_drift_retraining_cycle.py` when you want the operational path from drift signal to challenger decision.
+Use `example_drift_retraining_cycle.py` when you want the downstream maintenance path from drift signal to challenger decision.
+Do not start there when you are still choosing a strategy. Start with `example_regime_orchestration.py`, `example_regime_bundle_automl.py`, or one of the certification AutoML entrypoints first.
 The example now builds a paper-calibration report first with `ResearchPipeline.inspect_paper_trading_calibration(...)`, attaches that report to the champion artifact, computes an operational-limits report with `ResearchPipeline.inspect_operational_limits(...)`, and then ends with `ResearchPipeline.inspect_deployment_readiness(...)`, which turns the promoted champion, champion age, current monitoring state, drift outcome, backend status, rollback availability, attached paper evidence, and kill-switch status into one explicit deploy-or-hold verdict.
 
 The important runtime pieces are:

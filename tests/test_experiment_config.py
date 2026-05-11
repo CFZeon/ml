@@ -170,6 +170,21 @@ regime:
             with self.assertRaisesRegex(ValueError, "regime.method cannot be combined with a native primary regime detector"):
                 load_experiment_config(config_path)
 
+    def test_load_experiment_config_preserves_orchestration_bundle_automl_config(self):
+        config_path = Path(__file__).resolve().parents[1] / "configs" / "btc_regime_bundle_automl.yaml"
+
+        resolved = load_experiment_config(config_path, quick=True)
+
+        self.assertEqual(resolved.name, "btc_regime_bundle_automl")
+        self.assertTrue(resolved.quick_mode)
+        self.assertEqual(resolved.config["data"]["end"], "2024-02-15")
+        self.assertEqual(resolved.config["automl"]["n_trials"], 1)
+        bundle_choices = resolved.config["automl"]["search_space"]["orchestration"]["bundle"]["choices"]
+        self.assertEqual(len(bundle_choices), 2)
+        self.assertEqual(bundle_choices[0]["name"], "trend_native_weighted")
+        self.assertEqual(bundle_choices[0]["router"]["type"], "confidence_weighted")
+        self.assertEqual(bundle_choices[1]["regime"]["detectors"][0]["type"], "filtered_hmm")
+
 
 if __name__ == "__main__":
     unittest.main()

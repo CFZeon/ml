@@ -83,7 +83,7 @@ The repo now includes:
 - `example_active_spot.py`, `example_active_futures.py`: runnable active-trading demos
 - `example_trend_volume_spot.py`, `example_trend_breakout_futures.py`: runnable expanded-indicator demos
 - `example_mtf_fvg.py`, `example_mtf_fvg_futures.py`: multi-timeframe FVG plus WaveTrend and derivatives-context research demos
-- `example.py`, `example_custom_data.py`, `example_futures.py`, `example_fvg.py`, `example_synthetic_derivatives.py`, `example_automl.py`, `example_local_certification_automl.py`, `example_trade_ready_automl.py`: runnable end-to-end examples and smoke/integration demos
+- `example.py`, `example_custom_data.py`, `example_futures.py`, `example_fvg.py`, `example_synthetic_derivatives.py`, `example_automl.py`, `example_regime_bundle_automl.py`, `example_local_certification_automl.py`, `example_trade_ready_automl.py`: runnable end-to-end examples and smoke/integration demos
 - `example_drift_retraining_cycle.py`: deterministic champion/challenger drift orchestration example with rollback
 - `tests/`: regression coverage for validation, joins, execution semantics, AutoML governance, and futures behavior
 
@@ -107,15 +107,18 @@ The rest of the examples serve different purposes:
 - `example_mtf_fvg_futures.py`: futures-base variant of the MTF FVG workflow with WaveTrend, funding, non-level OI features, and the futures execution stack; add `--local-certification` to run the same case under the strict local certification runtime
 - `example_fvg.py`: Fair Value Gap feature example; useful as a feature smoke test and may legitimately abstain; add `--local-certification` when you want the same scenario to run under strict local certification runtime defaults
 - `example_synthetic_derivatives.py`: offline synthetic derivatives/integration example; may also abstain depending on the generated regime path
+- `example_regime_orchestration.py`: config-driven detector/router orchestration example that surfaces the selected detector runtime, router type, and specialist-library path without requiring AutoML
 - `example_local_certification_automl.py`: strict local certification path with locked holdout, replication, fail-closed data handling, an explicit `local_certification` monitoring profile, and an explicit `local_certification_surrogate` fallback when Nautilus is unavailable; intended for paper or pre-capital certification on consumer hardware, not live-capital release
 - `example_trade_ready_automl.py`: hardened AutoML certification profile with locked holdout, replication cohorts, DSR/PBO diagnostics, blocking pre-training feature-surface lookahead certification, and promotion-readiness reporting; the default run still fails closed if Nautilus is unavailable, while `--smoke` keeps a visibly reduced-power profile but still requires Nautilus. The printed summary now surfaces `oos_evidence.class`, `execution_evidence.class`, `funding_coverage_status`, and `capital_evidence_contract` before backtest metrics. Use `example_automl.py` for the safer research-only surrogate path, or `example_automl.py --research-demo` for the old fast unsafe smoke mode.
-- `example_drift_retraining_cycle.py`: deterministic registry and drift example showing scheduled retraining, a first-class paper-validation loop, a micro-capital kill-switch gate, challenger promotion, rollback, and the final operator deploy/hold decision
+- `example_regime_bundle_automl.py`: config-driven AutoML example that compares detector, specialist, and router bundles from `configs/btc_regime_bundle_automl.yaml` and prints the selected bundle lineage plus router-stability summary by default
+- `example_drift_retraining_cycle.py`: downstream maintenance/governance example showing review, challenger promotion, rollback, and deployment hold logic after a candidate has already been selected and certified
 - `example_automl.py`: research-only AutoML example that now keeps locked holdout separation, a lightweight holdout-focused selection policy, SPA-based post-selection inference, and a minimum statistical-power floor enabled by default while still using surrogate execution; any post-selection rebuild is explicitly labeled as a research refit artifact, not untouched OOS evidence. Pass `--research-demo` when you intentionally want the old fast unsafe smoke path with no holdout or selection gates.
 
 The end-to-end remediation program for making the repo trade-ready is tracked in `TRADE_READY_REMEDIATION_PLAN.md`.
 
 The user-facing entry points are now intentionally separated:
 
+- `example_regime_bundle_automl.py`: config-driven orchestration-bundle AutoML path that compares detector, specialist, and router bundles and prints the selected bundle lineage in the shared runner output
 - `example_automl.py`: research-only surrogate example with locked holdout separation, SPA-based post-selection inference, and a significance / confidence-bound floor by default; add `--research-demo` for the old unsafe smoke path
 - `example_local_certification_automl.py`: strict local certification on consumer hardware
 - `example_trade_ready_automl.py`: stricter operator-facing certification and promotion path
@@ -206,6 +209,12 @@ Run the active futures example:
 python example_active_futures.py
 ```
 
+Validate the orchestration-bundle AutoML config without running the full pipeline:
+
+```bash
+python run.py --config configs/btc_regime_bundle_automl.yaml --quick --validate-only
+```
+
 Run the baseline research example:
 
 ```bash
@@ -256,13 +265,25 @@ python example_local_certification_automl.py
 
 When strict local-certification gates reject every completed trial, the summary now prints `best reject` with the candidate's finite raw objective plus the gated rejection reasons instead of collapsing the entire study into opaque `-inf` trial output. The same path now also handles constant post-selection return vectors without NumPy divide warnings.
 
+Run the detector/router orchestration example:
+
+```bash
+python example_regime_orchestration.py --quick
+```
+
+Run the orchestration-bundle AutoML example:
+
+```bash
+python example_regime_bundle_automl.py --quick
+```
+
 Run the drift retraining example:
 
 ```bash
 python example_drift_retraining_cycle.py
 ```
 
-That example now includes the missing paper-trading validation loop, a finite champion TTL, and the live-capital kill switch: it aggregates paper observations into a calibration report, attaches that report to the current champion artifact, computes an operational-limits report with a default 10% drawdown threshold, and then evaluates deployment readiness with a default 28-day freshness ceiling on the promoted champion.
+Treat that script as a downstream maintenance demo, not a starting point. Start with `example_regime_orchestration.py`, `example_regime_bundle_automl.py`, or the certification AutoML entrypoints when you are still choosing or validating a strategy. The drift example now includes the missing paper-trading validation loop, a finite champion TTL, and the live-capital kill switch: it aggregates paper observations into a calibration report, attaches that report to the current champion artifact, computes an operational-limits report with a default 10% drawdown threshold, and then evaluates deployment readiness with a default 28-day freshness ceiling on the promoted champion.
 
 The same operator path now also treats retrain cadence as bounded instead of open-ended: drift monitoring defaults `max_bars_between_retrain` to 672 bars, so an hourly model is forced back into review after roughly four weeks even when new drift evidence is quiet.
 

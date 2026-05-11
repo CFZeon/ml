@@ -1,0 +1,102 @@
+import unittest
+
+from core.regimes import RegimeStateContract
+from core.routing import HardSwitchRouter, RoutingDecisionContract, WeightedRouter, build_router
+from core.specialists import SpecialistHealthContract, SpecialistLibrarySnapshot, SpecialistSpec
+
+
+def _make_active_specialist_library():
+    return SpecialistLibrarySnapshot(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        fallback_model_id="fallback_generalist",
+        specialists=[
+            SpecialistSpec(
+                model_id="fallback_generalist",
+                symbol="BTCUSDT",
+                timeframe="1h",
+                compatible_regimes=[],
+                estimator_family="logisticregression",
+                metadata={"fallback_only": True, "lifecycle_state": "active"},
+            ),
+            SpecialistSpec(
+                model_id="specialist::bull",
+                symbol="BTCUSDT",
+                timeframe="1h",
+                compatible_regimes=["bull"],
+                estimator_family="logisticregression",
+                metadata={"lifecycle_state": "active"},
+            ),
+            SpecialistSpec(
+                model_id="specialist::risk_off",
+                symbol="BTCUSDT",
+                timeframe="1h",
+                compatible_regimes=["risk_off"],
+                estimator_family="logisticregression",
+                metadata={"lifecycle_state": "active"},
+            ),
+        ],
+        health=[
+            SpecialistHealthContract(model_id="fallback_generalist", fallback_only=True, stability_score=0.55, decay_score=0.1),
+            SpecialistHealthContract(model_id="specialist::bull", compatible_regimes=["bull"], stability_score=0.82, decay_score=0.08),
+            SpecialistHealthContract(model_id="specialist::risk_off", compatible_regimes=["risk_off"], stability_score=0.76, decay_score=0.09),
+        ],
+    )
+
+
+class RouterRuntimeTest(unittest.TestCase):
+    def test_hard_switch_router_respects_persistence_and_cooldown(self):
+        router = HardSwitchRouter(hysteresis_margin=0.05, min_persistence_bars=2, cooldown_bars=1)
+        state = router.initialize(_make_active_specialist_library())
+
+        state, decision1 = router.select(
+            state,
+            RegimeStateContract(as_of="2026-05-09T00:00:00Z", available_at="2026-05-09T00:00:00Z", label="bull", confidence=0.9),
+        )
+        self.assertEqual(decision1.selected_model_id, "fallback_generalist")
+        self.assertEqual(decision1.route_reason, "persistence_hold")
+        self.assertEqual(state.pending_challenger_id, "specialist::bull")
+
+        state, decision2 = router.select(
+            state,
+            RegimeStateContract(as_of="2026-05-09T01:00:00Z", available_at="2026-05-09T01:00:00Z", label="bull", confidence=0.9),
+        )
+        self.assertEqual(decision2.selected_model_id, "specialist::bull")
+        self.assertEqual(state.active_model_id, "specialist::bull")
+
+        state, decision3 = router.select(
+            state,
+            RegimeStateContract(as_of="2026-05-09T02:00:00Z", available_at="2026-05-09T02:00:00Z", label="risk_off", confidence=0.95),
+        )
+        self.assertTrue(decision3.cooldown_active)
+        self.assertEqual(decision3.selected_model_id, "specialist::bull")
+        self.assertEqual(decision3.metadata["blocked_switch_reason"], "cooldown_active")
+
+    def test_weighted_router_returns_normalized_weights_and_diagnostics(self):
+        router = WeightedRouter(allocation_temperature=0.5, hysteresis_margin=0.0, min_persistence_bars=1, cooldown_bars=0)
+        state = router.initialize(_make_active_specialist_library())
+
+        state, decision = router.select(
+            state,
+            RegimeStateContract(as_of="2026-05-09T00:00:00Z", available_at="2026-05-09T00:00:00Z", label="bull", confidence=0.8),
+        )
+        roundtrip = RoutingDecisionContract.from_dict(decision.to_dict())
+
+        self.assertEqual(state.active_model_id, "specialist::bull")
+        self.assertEqual(decision.selected_model_id, "specialist::bull")
+        self.assertAlmostEqual(sum(decision.weights.values()), 1.0)
+        self.assertIn("fallback_generalist", decision.candidate_scores)
+        self.assertTrue(decision.components)
+        self.assertEqual(roundtrip.selected_model_id, "specialist::bull")
+
+    def test_build_router_supports_hard_switch_and_weighted_types(self):
+        hard_switch = build_router({"type": "hard_switch", "hysteresis_margin": 0.1})
+        weighted = build_router({"type": "confidence_weighted", "allocation_temperature": 0.7})
+
+        self.assertIsInstance(hard_switch, HardSwitchRouter)
+        self.assertIsInstance(weighted, WeightedRouter)
+        self.assertEqual(weighted.manifest().router_type, "confidence_weighted")
+
+
+if __name__ == "__main__":
+    unittest.main()

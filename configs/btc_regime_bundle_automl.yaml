@@ -1,0 +1,189 @@
+experiment:
+  name: btc_regime_bundle_automl
+  description: AutoML compares detector, specialist, and router bundles on spot BTC.
+data:
+  source: binance_bars
+  market: spot
+  symbol: BTCUSDT
+  interval: 1h
+  start: 2024-01-01
+  end: 2024-05-15
+  context_symbols: [ETHUSDT, SOLUSDT]
+indicators:
+  - kind: returns
+    params:
+      periods: [1, 3, 6]
+  - kind: volatility
+    params:
+      window: 24
+  - kind: rsi
+    params:
+      period: 14
+  - kind: range_position
+    params:
+      window: 20
+features:
+  schema_version: orchestration_bundle_v1
+signals:
+  policy_mode: validation_calibrated
+backtest:
+  engine: vectorbt
+  signal_delay_bars: 2
+automl:
+  enabled: true
+  seed: 42
+  n_trials: 3
+  objective: sharpe_ratio
+  policy_profile: legacy_permissive
+  storage: .cache/automl/btc_regime_bundle_automl.db
+  study_name: BTCUSDT_1h_regime_bundle_automl_v1
+  enable_pruning: false
+  locked_holdout_enabled: true
+  locked_holdout_fraction: 0.2
+  selection_policy:
+    enabled: true
+    gate_modes:
+      locked_holdout: blocking
+      locked_holdout_gap: blocking
+    max_generalization_gap: 0.35
+    min_validation_trade_count: 5
+    require_locked_holdout_pass: true
+    min_locked_holdout_score: 0.0
+  search_space:
+    orchestration:
+      bundle:
+        type: categorical
+        choices:
+          - name: trend_native_weighted
+            description: Native trend-state detector with confidence-weighted routing.
+            regime:
+              detectors:
+                - name: trend_native_primary
+                  type: trend_state
+                  primary: true
+                  warmup_bars: 240
+                  params:
+                    lower_quantile: 0.25
+                    upper_quantile: 0.75
+            feature_adaptation:
+              scaling:
+                mode: regime_conditioned
+                fallback: global
+              selection:
+                mode: per_regime_mask
+                min_regime_samples: 96
+              interaction_budget:
+                enabled: true
+                max_features: 6
+                max_regimes: 6
+              disable_incompatible_features: true
+            model_library:
+              fallback_model: global_generalist
+              min_samples_per_regime: 60
+              specialists:
+                - model_id: trend_model
+                  estimator: gbm
+                  compatible_regimes: [trend_up_low_vol, trend_up_high_vol]
+                  activation_floor: 0.55
+                - model_id: breakout_model
+                  estimator: rf
+                  compatible_regimes: [transition_high_vol, liquidity_shock]
+                  activation_floor: 0.60
+            router:
+              type: confidence_weighted
+              hysteresis_margin: 0.08
+              min_persistence_bars: 4
+              cooldown_bars: 8
+              fallback_confidence_floor: 0.45
+            model:
+              regime_aware:
+                enabled: true
+                strategy: specialist
+                min_samples_per_regime: 60
+          - name: filtered_hmm_guarded
+            description: Filtered-HMM detector with guarded hard-switch routing.
+            regime:
+              detectors:
+                - name: filtered_hmm_primary
+                  type: filtered_hmm
+                  primary: true
+                  warmup_bars: 336
+                  params:
+                    n_regimes: 3
+                    covariance_type: full
+            feature_adaptation:
+              scaling:
+                mode: regime_conditioned
+                fallback: global
+              selection:
+                mode: per_regime_mask
+                min_regime_samples: 120
+              disable_incompatible_features: true
+            model_library:
+              fallback_model: global_generalist
+              min_samples_per_regime: 72
+              specialists:
+                - model_id: trend_model
+                  estimator: gbm
+                  compatible_regimes: [trend_up_low_vol]
+                  activation_floor: 0.55
+                - model_id: defensive_model
+                  estimator: logistic
+                  compatible_regimes: [range_low_vol, range_normal_vol]
+                  activation_floor: 0.58
+            router:
+              type: hard_switch
+              hysteresis_margin: 0.12
+              min_persistence_bars: 6
+              cooldown_bars: 10
+            model:
+              regime_aware:
+                enabled: true
+                strategy: specialist
+                min_samples_per_regime: 72
+    features:
+      lags:
+        type: categorical
+        choices: ["1,3,6", "1,4,12"]
+      frac_diff_d:
+        type: categorical
+        choices: [0.4, 0.6]
+      rolling_window:
+        type: categorical
+        choices: [20, 28]
+      squeeze_quantile:
+        type: categorical
+        choices: [0.15, 0.2]
+    feature_selection:
+      enabled:
+        type: categorical
+        choices: [true]
+      max_features:
+        type: categorical
+        choices: [48, 64]
+      min_mi_threshold:
+        type: categorical
+        choices: [0.0, 0.0005]
+    labels:
+      min_return:
+        type: categorical
+        choices: [0.0005, 0.001]
+    model:
+      type:
+        type: categorical
+        choices: [gbm]
+      gap:
+        type: categorical
+        choices: [24]
+quick_overrides:
+  data:
+    end: 2024-02-15
+    context_symbols: [ETHUSDT]
+  automl:
+    n_trials: 1
+    storage: .cache/automl/btc_regime_bundle_automl_quick.db
+    locked_holdout_enabled: false
+    selection_policy:
+      enabled: false
+    overfitting_control:
+      enabled: false

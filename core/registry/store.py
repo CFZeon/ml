@@ -16,6 +16,14 @@ from ..promotion import (
     resolve_promotion_gate_mode,
     upsert_promotion_gate,
 )
+from ..specialists.library import (
+    apply_specialist_lifecycle_transition,
+    attach_specialist_artifact_refs,
+    normalize_specialist_library_snapshot,
+    project_specialist_library_snapshot,
+    resolve_specialist_lifecycle_transition,
+)
+from ..specialists.health import apply_specialist_health_update, normalize_specialist_health_update
 from ..storage import read_json, read_parquet_frame, write_json, write_parquet_frame
 from .manifest import build_feature_schema_hash, build_registry_manifest, flatten_registry_record
 
@@ -267,6 +275,8 @@ class LocalRegistryStore:
             "latest_paper_report",
             "latest_monitoring_report",
             "latest_promotion_report",
+            "latest_specialist_lifecycle_report",
+            "latest_specialist_health_report",
             "locked_holdout_score",
         ]
         if frame is None or frame.empty:
@@ -285,6 +295,12 @@ class LocalRegistryStore:
 
     def _manifest_path(self, symbol, version_id):
         return self._version_dir(symbol, version_id) / "version_manifest.json"
+
+    def _specialist_lifecycle_dir(self, symbol, version_id):
+        return self._version_dir(symbol, version_id) / "specialist_lifecycle"
+
+    def _specialist_health_dir(self, symbol, version_id):
+        return self._version_dir(symbol, version_id) / "specialist_health"
 
     def _write_immutable_manifest(self, manifest_path, payload):
         if Path(manifest_path).exists():
@@ -323,6 +339,73 @@ class LocalRegistryStore:
     def get_champion(self, symbol):
         versions = [row for row in self.list_versions(symbol=symbol) if row.get("current_status") == "champion"]
         return versions[0] if versions else None
+
+    def _resolve_specialist_library_snapshot(
+        self,
+        specialist_library,
+        training_summary,
+        *,
+        symbol,
+        version_id,
+        version_dir,
+        status,
+        primary_manifest_path,
+        meta_manifest_path=None,
+    ):
+        candidate = specialist_library
+        if not candidate:
+            candidate = dict(training_summary or {}).get("specialist_library") or None
+        snapshot = normalize_specialist_library_snapshot(candidate)
+        if snapshot is None:
+            return None
+
+        projected = project_specialist_library_snapshot(snapshot, registry_status=status)
+        return attach_specialist_artifact_refs(
+            projected,
+            artifact_uri="model",
+            meta_artifact_uri=("meta_model" if meta_manifest_path is not None else None),
+            artifact_type="registry_model_bundle",
+            metadata={
+                "version_id": str(version_id),
+                "symbol": str(symbol),
+                "initial_registry_status": str(status),
+                "version_dir": str(version_dir),
+                "artifact_manifest": str(primary_manifest_path.name),
+                "meta_artifact_manifest": (
+                    str(meta_manifest_path.name) if meta_manifest_path is not None else None
+                ),
+            },
+        )
+
+    def _read_specialist_lifecycle_events(self, version_id, *, symbol=None):
+        row = self._find_row(version_id, symbol=symbol)
+        if row is None:
+            raise FileNotFoundError(f"Registry version {version_id!r} was not found")
+        lifecycle_dir = self._specialist_lifecycle_dir(row.get("symbol"), version_id)
+        if not lifecycle_dir.exists():
+            return []
+        ordered_events = []
+        for path in lifecycle_dir.glob("*.json"):
+            payload = read_json(path)
+            if isinstance(payload, dict):
+                ordered_events.append((str(payload.get("recorded_at") or ""), str(path.name), payload))
+        ordered_events.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in ordered_events]
+
+    def _read_specialist_health_updates(self, version_id, *, symbol=None):
+        row = self._find_row(version_id, symbol=symbol)
+        if row is None:
+            raise FileNotFoundError(f"Registry version {version_id!r} was not found")
+        health_dir = self._specialist_health_dir(row.get("symbol"), version_id)
+        if not health_dir.exists():
+            return []
+        ordered_updates = []
+        for path in health_dir.glob("*.json"):
+            payload = read_json(path)
+            if isinstance(payload, dict):
+                ordered_updates.append((str(payload.get("recorded_at") or ""), str(path.name), payload))
+        ordered_updates.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in ordered_updates]
 
     def register_version(
         self,
@@ -371,6 +454,17 @@ class LocalRegistryStore:
                 feature_schema={"feature_order": [], "required_columns": []},
             )
 
+        resolved_specialist_library = self._resolve_specialist_library_snapshot(
+            specialist_library,
+            training_summary,
+            symbol=symbol,
+            version_id=version_id,
+            version_dir=version_dir,
+            status=status,
+            primary_manifest_path=primary_manifest_path,
+            meta_manifest_path=meta_manifest_path,
+        )
+
         manifest = build_registry_manifest(
             version_id=version_id,
             symbol=symbol,
@@ -385,7 +479,7 @@ class LocalRegistryStore:
             replication=replication,
             promotion_eligibility_report=promotion_eligibility_report,
             regime_contracts=regime_contracts,
-            specialist_library=specialist_library,
+            specialist_library=resolved_specialist_library,
             router_manifest=router_manifest,
             promotion_ready=(
                 dict(promotion_eligibility_report or {}).get("promotion_ready")
@@ -484,6 +578,48 @@ class LocalRegistryStore:
         self._write_index(index)
         return report_path
 
+    def attach_specialist_health_update(
+        self,
+        version_id,
+        update=None,
+        *,
+        symbol=None,
+        health=None,
+        performance_slices=None,
+        source="specialist_health_update",
+        metadata=None,
+        recorded_at=None,
+    ):
+        row = self._find_row(version_id, symbol=symbol)
+        if row is None:
+            raise FileNotFoundError(f"Registry version {version_id!r} was not found")
+
+        specialist_library = self.read_specialist_library(version_id, symbol=symbol)
+        if not specialist_library:
+            raise ValueError(f"Registry version {version_id!r} does not contain a specialist_library")
+
+        payload = normalize_specialist_health_update(
+            update
+            or {
+                "recorded_at": recorded_at or pd.Timestamp.now(tz="UTC").isoformat(),
+                "source": source,
+                "metadata": dict(metadata or {}),
+                "health": list(health or []),
+                "performance_slices": list(performance_slices or []),
+            }
+        )
+
+        health_dir = self._specialist_health_dir(row.get("symbol"), version_id)
+        health_dir.mkdir(parents=True, exist_ok=True)
+        report_path = health_dir / f"{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.json"
+        write_json(report_path, payload)
+
+        index = self._read_index()
+        mask = index["version_id"].astype(str) == str(version_id)
+        index.loc[mask, "latest_specialist_health_report"] = str(report_path)
+        self._write_index(index)
+        return payload
+
     def attach_paper_report(self, version_id, paper_report, *, symbol=None):
         row = self._find_row(version_id, symbol=symbol)
         if row is None:
@@ -500,6 +636,37 @@ class LocalRegistryStore:
         self._write_index(index)
         return report_path
 
+    def _activate_specialists_for_champion(self, version_id, *, symbol=None):
+        specialist_library = self.read_specialist_library(version_id, symbol=symbol)
+        if not specialist_library:
+            return []
+
+        selection_contract = dict((specialist_library.get("metadata") or {}).get("selection_contract") or {})
+        state_map = dict(selection_contract.get("lifecycle_state_by_model_id") or {})
+        fallback_model_id = specialist_library.get("fallback_model_id")
+        transitions = []
+
+        if fallback_model_id and str(state_map.get(str(fallback_model_id))) == "candidate":
+            transitions.append((str(fallback_model_id), "certified", "champion_fallback_certified"))
+            transitions.append((str(fallback_model_id), "active", "champion_fallback_activated"))
+
+        for model_id in list(selection_contract.get("certified_model_ids") or []):
+            if str(state_map.get(str(model_id))) == "certified":
+                transitions.append((str(model_id), "active", "champion_specialist_activated"))
+
+        recorded = []
+        for model_id, target_state, reason in transitions:
+            result = self.record_specialist_lifecycle_transition(
+                version_id,
+                model_id,
+                target_state,
+                symbol=symbol,
+                reason=reason,
+            )
+            if not result.get("skipped"):
+                recorded.append(result)
+        return recorded
+
     def record_promotion_decision(self, version_id, decision, *, symbol=None):
         row = self._find_row(version_id, symbol=symbol)
         if row is None:
@@ -514,6 +681,99 @@ class LocalRegistryStore:
         index.loc[mask, "promotion_ready"] = bool((decision or {}).get("approved", False))
         self._write_index(index)
         return report_path
+
+    def read_specialist_library(self, version_id, *, symbol=None):
+        row = self._find_row(version_id, symbol=symbol)
+        if row is None:
+            raise FileNotFoundError(f"Registry version {version_id!r} was not found")
+
+        manifest = self.read_version_manifest(version_id, symbol=symbol)
+        snapshot = normalize_specialist_library_snapshot(manifest.get("specialist_library") or {})
+        if snapshot is None:
+            return None
+
+        runtime_snapshot = project_specialist_library_snapshot(
+            snapshot,
+            registry_status=row.get("current_status"),
+        )
+        for event in self._read_specialist_lifecycle_events(version_id, symbol=symbol):
+            runtime_snapshot = apply_specialist_lifecycle_transition(
+                runtime_snapshot,
+                model_id=str(event.get("model_id")),
+                target_state=event.get("target_state"),
+                metadata={
+                    "lifecycle_reason": event.get("reason"),
+                    "lifecycle_recorded_at": event.get("recorded_at"),
+                },
+            )
+        for update in self._read_specialist_health_updates(version_id, symbol=symbol):
+            runtime_snapshot = apply_specialist_health_update(runtime_snapshot, update)
+        return runtime_snapshot.to_dict()
+
+    def get_active_specialist_library(self, symbol):
+        champion = self.get_champion(symbol)
+        if champion is None:
+            return None
+        return self.read_specialist_library(champion["version_id"], symbol=symbol)
+
+    def record_specialist_lifecycle_transition(
+        self,
+        version_id,
+        model_id,
+        target_state,
+        *,
+        symbol=None,
+        reason=None,
+        metadata=None,
+    ):
+        row = self._find_row(version_id, symbol=symbol)
+        if row is None:
+            raise FileNotFoundError(f"Registry version {version_id!r} was not found")
+
+        specialist_library = self.read_specialist_library(version_id, symbol=symbol)
+        if not specialist_library:
+            raise ValueError(f"Registry version {version_id!r} does not contain a specialist_library")
+
+        state_map = dict(
+            ((specialist_library.get("metadata") or {}).get("selection_contract") or {}).get(
+                "lifecycle_state_by_model_id"
+            )
+            or {}
+        )
+        current_state = state_map.get(str(model_id))
+        if current_state is None:
+            raise KeyError(f"Unknown specialist model_id {model_id!r}")
+
+        resolved_target_state = resolve_specialist_lifecycle_transition(current_state, target_state)
+        if str(current_state) == resolved_target_state.value:
+            return {
+                "skipped": True,
+                "model_id": str(model_id),
+                "current_state": str(current_state),
+                "target_state": resolved_target_state.value,
+            }
+
+        lifecycle_dir = self._specialist_lifecycle_dir(row.get("symbol"), version_id)
+        lifecycle_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = pd.Timestamp.now(tz="UTC")
+        payload = {
+            "recorded_at": timestamp.isoformat(),
+            "version_id": str(version_id),
+            "symbol": str(row.get("symbol")),
+            "model_id": str(model_id),
+            "previous_state": str(current_state),
+            "target_state": resolved_target_state.value,
+            "reason": None if reason is None else str(reason),
+            "metadata": dict(metadata or {}),
+        }
+        report_path = lifecycle_dir / f"{timestamp.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.json"
+        write_json(report_path, payload)
+
+        index = self._read_index()
+        mask = index["version_id"].astype(str) == str(version_id)
+        index.loc[mask, "latest_specialist_lifecycle_report"] = str(report_path)
+        self._write_index(index)
+        return payload
 
     def promote(self, version_id, stage="champion", *, symbol=None, decision=None):
         row = self._find_row(version_id, symbol=symbol)
@@ -533,6 +793,8 @@ class LocalRegistryStore:
         if stage == "champion":
             index.loc[target_mask, "promoted_at"] = pd.Timestamp.now(tz="UTC").isoformat()
         self._write_index(index)
+        if stage == "champion":
+            self._activate_specialists_for_champion(version_id, symbol=symbol)
         if decision is not None:
             self.record_promotion_decision(version_id, decision, symbol=symbol)
         return self._find_row(version_id, symbol=symbol)

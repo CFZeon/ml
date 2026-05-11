@@ -10,6 +10,7 @@ from core import (
     build_model,
     create_promotion_eligibility_report,
     evaluate_execution_realism_gate,
+    evaluate_router_stability_gate,
     evaluate_stress_realism_gate,
     evaluate_challenger_promotion,
     finalize_promotion_eligibility_report,
@@ -200,6 +201,83 @@ class PromotionGateBindingTest(unittest.TestCase):
         self.assertFalse(stress_realism["passed"])
         self.assertEqual(stress_realism["reason"], "unseen_regime_fallback_share_above_limit")
         self.assertEqual(stress_realism["failure_class"], "stressed_outcome_unacceptable")
+
+    def test_router_stability_gate_blocks_over_switching(self):
+        router_stability = evaluate_router_stability_gate(
+            {
+                "router_decision_count": 100,
+                "router_switch_count": 45,
+                "router_blocked_switch_reasons": {"persistence_requirement_not_met": 3},
+                "router_manifest": {
+                    "router_type": "hard_switch",
+                    "hysteresis_margin": 0.05,
+                    "min_persistence_bars": 2,
+                    "cooldown_bars": 1,
+                },
+            },
+            policy={
+                "min_router_decision_count": 25,
+                "max_router_switch_rate": 0.20,
+                "require_router_stability_controls": True,
+            },
+        )
+
+        self.assertFalse(router_stability["passed"])
+        self.assertEqual(router_stability["reason"], "router_switch_rate_above_limit")
+        self.assertEqual(router_stability["failure_class"], "router_over_switching")
+
+    def test_router_stability_gate_passes_not_applicable_without_router(self):
+        router_stability = evaluate_router_stability_gate({}, policy={"max_router_switch_rate": 0.20})
+
+        self.assertTrue(router_stability["passed"])
+        self.assertEqual(router_stability["status"], "not_applicable")
+        self.assertFalse(router_stability["applicable"])
+
+    def test_router_stability_gate_blocks_missing_controls_when_switching(self):
+        router_stability = evaluate_router_stability_gate(
+            {
+                "router_decision_count": 60,
+                "router_switch_count": 8,
+                "router_blocked_switch_reasons": {},
+                "router_manifest": {
+                    "router_type": "hard_switch",
+                    "hysteresis_margin": 0.0,
+                    "min_persistence_bars": 1,
+                    "cooldown_bars": 0,
+                },
+            },
+            policy={
+                "min_router_decision_count": 25,
+                "max_router_switch_rate": 0.30,
+                "require_router_stability_controls": True,
+            },
+        )
+
+        self.assertFalse(router_stability["passed"])
+        self.assertEqual(router_stability["reason"], "router_stability_controls_missing")
+
+    def test_router_stability_gate_accepts_stable_router_trace(self):
+        router_stability = evaluate_router_stability_gate(
+            {
+                "router_decision_count": 100,
+                "router_switch_count": 2,
+                "router_blocked_switch_reasons": {"persistence_requirement_not_met": 14},
+                "router_manifest": {
+                    "router_type": "hard_switch",
+                    "hysteresis_margin": 0.05,
+                    "min_persistence_bars": 2,
+                    "cooldown_bars": 1,
+                },
+            },
+            policy={
+                "min_router_decision_count": 25,
+                "max_router_switch_rate": 0.20,
+                "require_router_stability_controls": True,
+            },
+        )
+
+        self.assertTrue(router_stability["passed"])
+        self.assertEqual(router_stability["status"], "passed")
 
     def test_default_profile_locked_holdout_failure_blocks_promotion(self):
         selection_policy = _resolve_selection_policy({})

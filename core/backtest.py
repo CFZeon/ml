@@ -5,6 +5,7 @@ import pandas as pd
 
 from .data import _interval_timedelta
 from .evaluation_modes import resolve_evaluation_mode
+from .regimes.contracts import RegimeStateContract
 from .execution import (
     ExecutionAdapterUnavailableError,
     NautilusExecutionAdapter,
@@ -12,6 +13,7 @@ from .execution import (
     resolve_execution_policy,
     resolve_liquidity_inputs,
 )
+from .routing import replay_router_trace
 from .slippage import (
     _estimate_fill_event_costs,
     _estimate_slippage_rates,
@@ -126,6 +128,410 @@ def _annotate_backtest_engine_summary(
     payload["engine_fallback_used"] = bool(engine_fallback_used)
     payload["engine_fallback_reason"] = None if engine_fallback_reason is None else str(engine_fallback_reason)
     payload["backtest_warnings"] = list(dict.fromkeys(warnings))
+    return payload
+
+
+def _coerce_router_regime_states(regime_states):
+    if regime_states is None:
+        return []
+    if isinstance(regime_states, pd.DataFrame):
+        items = regime_states.to_dict(orient="records")
+    else:
+        items = list(regime_states or [])
+
+    normalized = []
+    for item in items:
+        if isinstance(item, RegimeStateContract):
+            normalized.append(RegimeStateContract.from_dict(item.to_dict()))
+        else:
+            normalized.append(RegimeStateContract.from_dict(item))
+    return normalized
+
+
+def _align_router_regime_states(regime_states, target_index):
+    normalized = _coerce_router_regime_states(regime_states)
+    if not normalized:
+        raise ValueError("router regime_states are required when router tracing is enabled")
+
+    target_index = pd.Index(target_index)
+    if len(normalized) == len(target_index):
+        return normalized, {
+            "mode": "positional",
+            "target_row_count": int(len(target_index)),
+            "source_row_count": int(len(normalized)),
+        }
+
+    by_timestamp = {}
+    for contract in normalized:
+        timestamp_value = contract.available_at if contract.available_at is not None else contract.as_of
+        if timestamp_value is None:
+            continue
+        by_timestamp[pd.Timestamp(timestamp_value)] = RegimeStateContract.from_dict(contract.to_dict())
+
+    aligned = []
+    missing = []
+    for timestamp in target_index:
+        key = pd.Timestamp(timestamp)
+        contract = by_timestamp.get(key)
+        if contract is None:
+            missing.append(str(key))
+        else:
+            aligned.append(contract)
+
+    if missing:
+        raise ValueError(
+            "router regime_states must either match the backtest length positionally or provide exact available_at/as_of timestamps"
+        )
+
+    return aligned, {
+        "mode": "timestamp_exact",
+        "target_row_count": int(len(target_index)),
+        "source_row_count": int(len(normalized)),
+    }
+
+
+def _build_router_trace_summary(
+    *,
+    router=None,
+    specialist_library=None,
+    regime_states=None,
+    target_index=None,
+    specialist_health_trace=None,
+    include_router_decision_trace=False,
+):
+    router_inputs_present = any(value is not None for value in (router, specialist_library, specialist_health_trace))
+    if not router_inputs_present:
+        return None
+    if router is None:
+        raise ValueError("router must be provided when router tracing inputs are supplied")
+    if specialist_library is None:
+        raise ValueError("specialist_library must be provided when router tracing is enabled")
+    if regime_states is None:
+        raise ValueError("regime_states must be provided when router tracing is enabled")
+    if target_index is None:
+        raise ValueError("target_index is required when router tracing is enabled")
+
+    aligned_regime_states, alignment_report = _align_router_regime_states(regime_states, target_index)
+    trace = replay_router_trace(
+        router,
+        specialist_library,
+        aligned_regime_states,
+        specialist_health_trace=specialist_health_trace,
+    )
+    summary = dict(trace.get("summary") or {})
+    summary["alignment"] = alignment_report
+    payload = {
+        "manifest": dict(trace.get("manifest") or {}),
+        "summary": summary,
+    }
+    if include_router_decision_trace:
+        payload["decision_trace"] = list(trace.get("decision_trace") or [])
+    return payload
+
+
+def _attach_router_trace_summary(summary, router_trace_summary, *, router_switching_cost_per_switch=None):
+    payload = dict(summary or {})
+    if router_trace_summary is None:
+        return payload
+
+    trace_summary = dict(router_trace_summary.get("summary") or {})
+    payload.update(
+        {
+            "router_manifest": dict(router_trace_summary.get("manifest") or {}),
+            "router_decision_count": int(trace_summary.get("decision_count", 0)),
+            "router_switch_count": int(trace_summary.get("switch_count", 0)),
+            "router_selected_model_ids": list(trace_summary.get("selected_model_ids") or []),
+            "router_route_reason_counts": dict(trace_summary.get("route_reason_counts") or {}),
+            "router_blocked_switch_reasons": dict(trace_summary.get("blocked_switch_reasons") or {}),
+            "router_alignment": dict(trace_summary.get("alignment") or {}),
+            "router_trace_summary": dict(router_trace_summary or {}),
+        }
+    )
+    if router_switching_cost_per_switch is not None:
+        cost_per_switch = float(router_switching_cost_per_switch)
+        if cost_per_switch < 0.0:
+            raise ValueError("router_switching_cost_per_switch must be non-negative")
+        if cost_per_switch > 0.0:
+            switch_count = int(trace_summary.get("switch_count", 0))
+            payload["router_switching_cost_report"] = {
+                "switch_count": switch_count,
+                "cost_per_switch": _round_metric(cost_per_switch, 6),
+                "estimated_cost": _round_metric(switch_count * cost_per_switch, 6),
+                "basis": "hypothetical_routing_decisions_not_executed",
+            }
+            payload["router_switching_cost_estimate"] = _round_metric(switch_count * cost_per_switch, 6)
+    payload["router_stability_report"] = _build_router_stability_report(payload)
+    if "decision_trace" in router_trace_summary:
+        payload["router_decision_trace"] = list(router_trace_summary.get("decision_trace") or [])
+    return payload
+
+
+def _build_router_stability_report(summary):
+    payload = dict(summary or {})
+    if "router_decision_count" not in payload:
+        return None
+
+    decision_count = int(payload.get("router_decision_count", 0) or 0)
+    switch_count = int(payload.get("router_switch_count", 0) or 0)
+    switch_opportunities = int(max(decision_count - 1, 0))
+    blocked_switch_reasons = {
+        str(reason): int(count)
+        for reason, count in dict(payload.get("router_blocked_switch_reasons") or {}).items()
+    }
+    blocked_switch_count = int(sum(blocked_switch_reasons.values()))
+    manifest = dict(payload.get("router_manifest") or {})
+    control_flags = {
+        "hysteresis": bool(float(manifest.get("hysteresis_margin") or 0.0) > 0.0),
+        "persistence": bool(int(manifest.get("min_persistence_bars") or 0) > 1),
+        "cooldown": bool(int(manifest.get("cooldown_bars") or 0) > 0),
+    }
+    switching_cost_estimate = payload.get("router_switching_cost_estimate")
+    starting_equity = payload.get("starting_equity")
+    switching_cost_share = None
+    try:
+        numeric_cost = None if switching_cost_estimate is None else float(switching_cost_estimate)
+        numeric_equity = None if starting_equity is None else float(starting_equity)
+        if numeric_cost is not None and numeric_equity is not None and numeric_equity > 0.0:
+            switching_cost_share = _round_metric(numeric_cost / numeric_equity, 6)
+    except (TypeError, ValueError):
+        switching_cost_share = None
+
+    return {
+        "enabled": True,
+        "applicable": bool(decision_count > 0),
+        "decision_count": decision_count,
+        "switch_opportunities": switch_opportunities,
+        "switch_count": switch_count,
+        "switch_rate": _round_metric(
+            float(switch_count / switch_opportunities) if switch_opportunities > 0 else 0.0,
+            4,
+        ),
+        "blocked_switch_count": blocked_switch_count,
+        "blocked_switch_rate": _round_metric(
+            float(blocked_switch_count / switch_opportunities) if switch_opportunities > 0 else 0.0,
+            4,
+        ),
+        "blocked_switch_reasons": blocked_switch_reasons,
+        "control_flags": control_flags,
+        "configured_control_count": int(sum(1 for enabled in control_flags.values() if enabled)),
+        "switching_cost_estimate": switching_cost_estimate,
+        "switching_cost_share_of_starting_equity": switching_cost_share,
+    }
+
+
+def _build_backtest_regime_segment_payload(
+    *,
+    regime_states=None,
+    target_index=None,
+    equity_curve=None,
+    position=None,
+    equity=None,
+    signal_delay_bars=0,
+    interval=None,
+):
+    if regime_states is None or target_index is None or equity_curve is None or position is None:
+        return None
+
+    aligned_regime_states, alignment_report = _align_router_regime_states(regime_states, target_index)
+    if not aligned_regime_states:
+        return None
+
+    index = pd.Index(target_index)
+    labels = pd.Series(
+        [
+            "unknown"
+            if contract.label is None or not str(contract.label).strip()
+            else str(contract.label)
+            for contract in aligned_regime_states
+        ],
+        index=index,
+        dtype="object",
+    )
+    confidences = pd.Series(
+        [np.nan if contract.confidence is None else float(contract.confidence) for contract in aligned_regime_states],
+        index=index,
+        dtype=float,
+    )
+    equity_curve = pd.Series(equity_curve, index=index, copy=False).astype(float)
+    position = pd.Series(position, index=index, copy=False).fillna(0.0).astype(float)
+    starting_equity = float(equity if equity is not None else equity_curve.iloc[0])
+    prev_equity = equity_curve.shift(1).fillna(starting_equity)
+    pnl = equity_curve - prev_equity
+    bar_returns = equity_curve.divide(prev_equity.replace(0.0, np.nan)).subtract(1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    active_mask = position.abs() > 1e-12
+    turnover = position.diff().abs().fillna(position.abs()).astype(float)
+    periods_per_year = _infer_periods_per_year(index, interval=interval)
+    annualization = np.sqrt(periods_per_year) if periods_per_year > 0 else 0.0
+    recognition_delay_bars = max(0, int(signal_delay_bars))
+
+    ordered_labels = list(dict.fromkeys(labels.tolist()))
+    label_distribution = {label: int(labels.eq(label).sum()) for label in ordered_labels}
+    segment_ids = labels.ne(labels.shift()).cumsum()
+    segment_counts = {}
+    transition_buckets = {}
+    previous_label = None
+
+    for _, segment_labels in labels.groupby(segment_ids):
+        label = str(segment_labels.iloc[0])
+        segment_counts[label] = int(segment_counts.get(label, 0)) + 1
+        segment_index = segment_labels.index
+        segment_returns = bar_returns.reindex(segment_index).fillna(0.0)
+        segment_pnl = pnl.reindex(segment_index).fillna(0.0)
+        segment_turnover = turnover.reindex(segment_index).fillna(0.0)
+        segment_confidence = confidences.reindex(segment_index).dropna()
+        if previous_label is not None:
+            transition_key = f"{previous_label}->{label}"
+            bucket = transition_buckets.setdefault(
+                transition_key,
+                {
+                    "occurrence_count": 0,
+                    "destination_bar_count": 0,
+                    "destination_net_profit": 0.0,
+                    "destination_turnover": 0.0,
+                    "destination_mean_bar_returns": [],
+                    "delay_window_returns": [],
+                    "post_delay_returns": [],
+                    "positive_cumulative_onset_lags": [],
+                    "no_positive_cumulative_onset_count": 0,
+                    "shorter_than_delay_count": 0,
+                    "confidence_values": [],
+                },
+            )
+            bucket["occurrence_count"] += 1
+            bucket["destination_bar_count"] += int(len(segment_index))
+            bucket["destination_net_profit"] += float(segment_pnl.sum())
+            bucket["destination_turnover"] += float(segment_turnover.sum())
+            bucket["destination_mean_bar_returns"].append(float(segment_returns.mean()) if len(segment_returns) > 0 else 0.0)
+            if recognition_delay_bars > 0:
+                delayed_slice = segment_returns.iloc[:recognition_delay_bars]
+                post_delay_slice = segment_returns.iloc[recognition_delay_bars:]
+                if len(segment_returns) <= recognition_delay_bars:
+                    bucket["shorter_than_delay_count"] += 1
+                bucket["delay_window_returns"].append(
+                    float((1.0 + delayed_slice).prod() - 1.0) if len(delayed_slice) > 0 else 0.0
+                )
+                bucket["post_delay_returns"].append(
+                    float((1.0 + post_delay_slice).prod() - 1.0) if len(post_delay_slice) > 0 else 0.0
+                )
+            else:
+                bucket["delay_window_returns"].append(0.0)
+                bucket["post_delay_returns"].append(float((1.0 + segment_returns).prod() - 1.0) if len(segment_returns) > 0 else 0.0)
+
+            cumulative_segment_return = (1.0 + segment_returns).cumprod() - 1.0
+            positive_cumulative = cumulative_segment_return.gt(0.0)
+            if positive_cumulative.any():
+                onset_position = int(np.flatnonzero(positive_cumulative.to_numpy(dtype=bool))[0])
+                bucket["positive_cumulative_onset_lags"].append(onset_position)
+            else:
+                bucket["no_positive_cumulative_onset_count"] += 1
+            if not segment_confidence.empty:
+                bucket["confidence_values"].append(float(segment_confidence.mean()))
+        previous_label = label
+
+    regime_segment_report = {
+        "enabled": True,
+        "alignment": alignment_report,
+        "row_count": int(len(index)),
+        "segment_count": int(sum(segment_counts.values())),
+        "transition_count": int(max(sum(segment_counts.values()) - 1, 0)),
+        "dominant_label": (
+            None
+            if not ordered_labels
+            else max(ordered_labels, key=lambda item: label_distribution.get(item, 0))
+        ),
+        "label_distribution": dict(label_distribution),
+        "by_label": {},
+    }
+    for label in ordered_labels:
+        mask = labels.eq(label)
+        label_returns = bar_returns[mask]
+        label_pnl = pnl[mask]
+        label_turnover = turnover[mask]
+        label_active_pnl = pnl[mask & active_mask]
+        label_confidence = confidences[mask].dropna()
+        regime_segment_report["by_label"][label] = {
+            "bar_count": int(mask.sum()),
+            "active_bar_count": int((mask & active_mask).sum()),
+            "segment_count": int(segment_counts.get(label, 0)),
+            "net_profit": _round_metric(float(label_pnl.sum()), 2),
+            "mean_bar_return": _round_metric(float(label_returns.mean()) if len(label_returns) > 0 else 0.0, 6),
+            "sharpe_ratio": _round_metric(_annualized_sharpe(label_returns.to_numpy(dtype=float), annualization), 2),
+            "active_bar_win_rate": _round_metric(float(label_active_pnl.gt(0).mean()) if len(label_active_pnl) > 0 else 0.0, 4),
+            "total_turnover": _round_metric(float(label_turnover.sum()), 4),
+            "mean_confidence": (
+                None
+                if label_confidence.empty
+                else _round_metric(float(label_confidence.mean()), 4)
+            ),
+        }
+
+    transition_segment_report = {
+        "enabled": True,
+        "alignment": alignment_report,
+        "row_count": int(len(index)),
+        "transition_count": int(sum(bucket["occurrence_count"] for bucket in transition_buckets.values())),
+        "by_transition": {},
+    }
+    for transition_key, bucket in transition_buckets.items():
+        mean_bar_returns = bucket.pop("destination_mean_bar_returns")
+        delay_window_returns = bucket.pop("delay_window_returns")
+        post_delay_returns = bucket.pop("post_delay_returns")
+        positive_cumulative_onset_lags = bucket.pop("positive_cumulative_onset_lags")
+        confidence_values = bucket.pop("confidence_values")
+        no_positive_cumulative_onset_count = int(bucket.pop("no_positive_cumulative_onset_count"))
+        shorter_than_delay_count = int(bucket.pop("shorter_than_delay_count"))
+        occurrence_count = int(bucket["occurrence_count"])
+        transition_segment_report["by_transition"][transition_key] = {
+            "occurrence_count": occurrence_count,
+            "destination_bar_count": int(bucket["destination_bar_count"]),
+            "destination_net_profit": _round_metric(float(bucket["destination_net_profit"]), 2),
+            "destination_mean_bar_return": _round_metric(
+                float(np.mean(mean_bar_returns)) if mean_bar_returns else 0.0,
+                6,
+            ),
+            "destination_turnover": _round_metric(float(bucket["destination_turnover"]), 4),
+            "recognition_delay_bars": int(recognition_delay_bars),
+            "mean_delay_window_return": _round_metric(
+                float(np.mean(delay_window_returns)) if delay_window_returns else 0.0,
+                6,
+            ),
+            "mean_post_delay_return": _round_metric(
+                float(np.mean(post_delay_returns)) if post_delay_returns else 0.0,
+                6,
+            ),
+            "mean_positive_cumulative_onset_lag_bars": (
+                None
+                if not positive_cumulative_onset_lags
+                else _round_metric(float(np.mean(positive_cumulative_onset_lags)), 2)
+            ),
+            "median_positive_cumulative_onset_lag_bars": (
+                None
+                if not positive_cumulative_onset_lags
+                else _round_metric(float(np.median(positive_cumulative_onset_lags)), 2)
+            ),
+            "no_positive_cumulative_onset_rate": _round_metric(
+                float(no_positive_cumulative_onset_count / occurrence_count) if occurrence_count > 0 else 0.0,
+                4,
+            ),
+            "shorter_than_delay_count": shorter_than_delay_count,
+            "mean_confidence": (
+                None
+                if not confidence_values
+                else _round_metric(float(np.mean(confidence_values)), 4)
+            ),
+        }
+
+    return {
+        "regime_segment_report": regime_segment_report,
+        "transition_segment_report": transition_segment_report,
+    }
+
+
+def _attach_backtest_regime_segment_payload(summary, regime_segment_payload):
+    payload = dict(summary or {})
+    if regime_segment_payload is None:
+        return payload
+    payload.update(regime_segment_payload)
     return payload
 
 
@@ -2606,6 +3012,9 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                  execution_price_fill_limit=None, valuation_price_policy="drop_rows",
                  valuation_price_fill_limit=None, futures_account=None,
                  liquidity_lag_bars=1, execution_policy=None,
+                 router=None, specialist_library=None, regime_states=None,
+                 specialist_health_trace=None, include_router_decision_trace=False,
+                 router_switching_cost_per_switch=None,
                  futures_contract=None, futures_leverage_brackets=None,
                  symbol_lifecycle=None, symbol_lifecycle_policy=None,
                  scenario_schedule=None, scenario_policy=None,
@@ -2638,6 +3047,12 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
     orderbook_depth  : pd.DataFrame|None – optional L2 depth frame for future order-book-aware slippage models
     liquidity_lag_bars : int – lag applied to bar-volume liquidity inputs before cost estimation
     execution_policy : dict|ExecutionPolicy|None – order submission and fill policy for the execution adapter
+    router           : BaseRouter|None – optional router runtime for replay-only route diagnostics
+    specialist_library : dict|SpecialistLibrarySnapshot|None – specialist library consumed by router tracing
+    regime_states    : sequence|pd.DataFrame|None – regime-state replay inputs aligned by length or exact timestamp; reused for additive regime/transition diagnostics and optional router replay
+    specialist_health_trace : sequence|None – optional per-step health payloads for router replay
+    include_router_decision_trace : bool – include full router decision trace in the summary payload
+    router_switching_cost_per_switch : float|None – optional flat account-currency cost assumption per router switch; reported as hypothetical routing overhead only
     symbol_lifecycle : pd.DataFrame|list[dict]|dict|None – optional symbol halt/delist lifecycle events aligned or alignable to the backtest index
     symbol_lifecycle_policy : dict|None – lifecycle actions such as {"halt_action": "freeze", "delist_action": "liquidate"}
     scenario_schedule : list[dict]|pd.DataFrame|None – venue-state events such as downtime, stale marks, halts, and deleveraging windows
@@ -2681,6 +3096,12 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
             "futures_account": futures_account,
             "liquidity_lag_bars": liquidity_lag_bars,
             "execution_policy": execution_policy,
+            "router": router,
+            "specialist_library": specialist_library,
+            "regime_states": regime_states,
+            "specialist_health_trace": specialist_health_trace,
+            "include_router_decision_trace": include_router_decision_trace,
+            "router_switching_cost_per_switch": router_switching_cost_per_switch,
             "futures_contract": futures_contract,
             "futures_leverage_brackets": futures_leverage_brackets,
             "symbol_lifecycle": symbol_lifecycle,
@@ -2893,6 +3314,14 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         contract_spec=futures_contract,
         leverage_brackets=futures_leverage_brackets,
     )
+    router_trace_summary = _build_router_trace_summary(
+        router=router,
+        specialist_library=specialist_library,
+        regime_states=regime_states,
+        target_index=executable_position.index,
+        specialist_health_trace=specialist_health_trace,
+        include_router_decision_trace=include_router_decision_trace,
+    )
     if resolved_futures_account is not None:
         summary = _run_futures_account_backtest(
             close=valuation_series,
@@ -2913,6 +3342,23 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
             orderbook_depth=orderbook_depth,
             execution_report=execution_report,
             interval=interval,
+        )
+        summary = _attach_backtest_regime_segment_payload(
+            summary,
+            _build_backtest_regime_segment_payload(
+                regime_states=regime_states,
+                target_index=executable_position.index,
+                equity_curve=summary.get("equity_curve"),
+                position=executable_position,
+                equity=equity,
+                signal_delay_bars=signal_delay_bars,
+                interval=interval,
+            ),
+        )
+        summary = _attach_router_trace_summary(
+            summary,
+            router_trace_summary,
+            router_switching_cost_per_switch=router_switching_cost_per_switch,
         )
         summary["funding_coverage_report"] = dict(funding_coverage_report)
         summary = _annotate_backtest_engine_summary(summary, requested_engine=requested_engine)
@@ -2946,6 +3392,23 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                 orderbook_depth=orderbook_depth,
                 execution_report=execution_report,
                 interval=interval,
+            )
+            summary = _attach_backtest_regime_segment_payload(
+                summary,
+                _build_backtest_regime_segment_payload(
+                    regime_states=regime_states,
+                    target_index=executable_position.index,
+                    equity_curve=summary.get("equity_curve"),
+                    position=executable_position,
+                    equity=equity,
+                    signal_delay_bars=signal_delay_bars,
+                    interval=interval,
+                ),
+            )
+            summary = _attach_router_trace_summary(
+                summary,
+                router_trace_summary,
+                router_switching_cost_per_switch=router_switching_cost_per_switch,
             )
             summary["funding_coverage_report"] = dict(funding_coverage_report)
             summary = _annotate_backtest_engine_summary(summary, requested_engine=requested_engine)
@@ -2986,6 +3449,23 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         orderbook_depth=orderbook_depth,
         execution_report=execution_report,
         interval=interval,
+    )
+    summary = _attach_backtest_regime_segment_payload(
+        summary,
+        _build_backtest_regime_segment_payload(
+            regime_states=regime_states,
+            target_index=executable_position.index,
+            equity_curve=summary.get("equity_curve"),
+            position=executable_position,
+            equity=equity,
+            signal_delay_bars=signal_delay_bars,
+            interval=interval,
+        ),
+    )
+    summary = _attach_router_trace_summary(
+        summary,
+        router_trace_summary,
+        router_switching_cost_per_switch=router_switching_cost_per_switch,
     )
     summary["funding_coverage_report"] = dict(funding_coverage_report)
     summary = _annotate_backtest_engine_summary(

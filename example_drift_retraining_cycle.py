@@ -1,4 +1,4 @@
-"""Deterministic drift-retraining demo with champion promotion and rollback.
+"""Deterministic maintenance-and-drift review demo with champion promotion and rollback.
 
 Usage
 -----
@@ -142,8 +142,13 @@ def _make_runtime_equity_curve(*, periods=24, final_drawdown=0.04):
 
 
 def main():
-    args = parse_example_args("Run the deterministic drift-retraining demo.", include_local_certification=False)
+    args = parse_example_args("Run the deterministic maintenance-and-drift review demo.", include_local_certification=False)
     sep = "=" * 60
+    if not args.quiet:
+        print(
+            "This example is a downstream maintenance demo. Start with example_regime_orchestration.py, "
+            "example_regime_bundle_automl.py, or a certification AutoML entrypoint when selecting a strategy."
+        )
     symbol = "BTCUSDT"
     registry_root = Path(".cache") / "registry" / "drift_cycle_demo"
     if registry_root.exists():

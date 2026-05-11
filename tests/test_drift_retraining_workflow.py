@@ -15,6 +15,7 @@ from core import (
     run_drift_retraining_cycle,
     upsert_promotion_gate,
 )
+from core.specialists import SpecialistHealthContract, SpecialistLibrarySnapshot, SpecialistPerformanceSlice, SpecialistSpec
 from core.storage import read_json
 
 
@@ -81,7 +82,84 @@ def _make_stable_drift_inputs(current_periods=240):
     return reference_features, current_features, reference_predictions, current_predictions, performance
 
 
-def _register_champion(store, symbol, score_value):
+def _make_discovery_drift_inputs(current_periods=240):
+    reference_index = pd.date_range("2026-10-01", periods=300, freq="1h", tz="UTC")
+    current_index = pd.date_range("2026-11-01", periods=current_periods, freq="1h", tz="UTC")
+    reference_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0, "regime": "range"}, index=reference_index)
+    current_features = pd.DataFrame({"alpha": 2.0, "beta": 2.0, "regime": "trend"}, index=current_index)
+    reference_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=reference_index)
+    current_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=current_index)
+    performance = pd.Series(np.zeros(len(current_index)), index=current_index)
+    return reference_features, current_features, reference_predictions, current_predictions, performance
+
+
+def _make_active_specialist_library(*, degraded=False):
+    if degraded:
+        specialist_health = SpecialistHealthContract(
+            model_id="specialist::bull",
+            compatible_regimes=["bull"],
+            stability_score=0.32,
+            decay_score=0.63,
+            failure_flags=["drawdown_watch"],
+        )
+        performance_slice = SpecialistPerformanceSlice(
+            model_id="specialist::bull",
+            regime_label="bull",
+            split_role="monitoring_window",
+            row_count=24,
+            metric_summary={"f1_macro": 0.41},
+        )
+    else:
+        specialist_health = SpecialistHealthContract(
+            model_id="specialist::bull",
+            compatible_regimes=["bull"],
+            stability_score=0.82,
+            decay_score=0.08,
+            failure_flags=[],
+        )
+        performance_slice = SpecialistPerformanceSlice(
+            model_id="specialist::bull",
+            regime_label="bull",
+            split_role="monitoring_window",
+            row_count=24,
+            metric_summary={"f1_macro": 0.71},
+        )
+
+    return SpecialistLibrarySnapshot(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        fallback_model_id="fallback_generalist",
+        specialists=[
+            SpecialistSpec(
+                model_id="fallback_generalist",
+                symbol="BTCUSDT",
+                timeframe="1h",
+                compatible_regimes=[],
+                estimator_family="logisticregression",
+                metadata={"fallback_only": True, "lifecycle_state": "active"},
+            ),
+            SpecialistSpec(
+                model_id="specialist::bull",
+                symbol="BTCUSDT",
+                timeframe="1h",
+                compatible_regimes=["bull"],
+                estimator_family="logisticregression",
+                metadata={"regime_label": "bull", "lifecycle_state": "active"},
+            ),
+        ],
+        health=[
+            SpecialistHealthContract(
+                model_id="fallback_generalist",
+                compatible_regimes=[],
+                fallback_only=True,
+            ),
+            specialist_health,
+        ],
+        performance_slices=[performance_slice],
+    )
+
+
+def _register_champion(store, symbol, score_value, *, specialist_library=None):
     model, feature_columns = _fit_logistic_model()
     report = _make_eligibility_report(score_value)
     version_id = store.register_version(
@@ -91,6 +169,7 @@ def _register_champion(store, symbol, score_value):
         training_summary={"avg_f1_macro": 0.75},
         validation_summary={"raw_objective_value": score_value, "promotion_ready": True},
         promotion_eligibility_report=report,
+        specialist_library=specialist_library,
     )
     store.promote(
         version_id,
@@ -176,6 +255,124 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             self.assertIn("cooldown_active", result["drift_guardrails"]["reasons"])
             self.assertEqual(build_calls, [])
 
+    def test_library_review_policy_recommends_review_for_degraded_active_specialist_library(self):
+        reference_features, current_features, reference_predictions, current_predictions, performance = _make_stable_drift_inputs()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(
+                store,
+                "BTCUSDT",
+                0.12,
+                specialist_library=_make_active_specialist_library(degraded=True),
+            )
+            build_calls = []
+
+            result = run_drift_retraining_cycle(
+                store=store,
+                symbol="BTCUSDT",
+                reference_features=reference_features,
+                current_features=current_features,
+                reference_predictions=reference_predictions,
+                current_predictions=current_predictions,
+                current_performance=performance,
+                bars_since_last_retrain=520,
+                scheduled_window_open=True,
+                train_challenger=lambda: build_calls.append("called"),
+                drift_config={"min_samples": 200, "min_drift_signals": 2, "max_bars_between_retrain": 672},
+                library_review_policy={
+                    "min_active_specialists": 1,
+                    "governance": {
+                        "degradation": {
+                            "min_stability_score": 0.5,
+                            "max_decay_score": 0.4,
+                            "min_monitoring_rows": 12,
+                            "metric_minimums": {"f1_macro": 0.5},
+                            "degrading_failure_flags": ["drawdown_watch"],
+                        }
+                    },
+                },
+            )
+
+            self.assertEqual(result["retrain_status"], "library_review_recommended")
+            self.assertEqual(build_calls, [])
+            self.assertTrue(result["library_review"]["recommended"])
+            self.assertEqual(result["library_review"]["action"], "review_library")
+            self.assertIn("blocked_specialists_present", result["library_review"]["reasons"])
+            self.assertIn("specialist::bull", result["library_review"]["blocked_model_ids"])
+
+    def test_router_recalibration_policy_recommends_router_action_before_retraining(self):
+        reference_features, current_features, reference_predictions, current_predictions, performance = _make_stable_drift_inputs()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.12)
+            build_calls = []
+
+            result = run_drift_retraining_cycle(
+                store=store,
+                symbol="BTCUSDT",
+                reference_features=reference_features,
+                current_features=current_features,
+                reference_predictions=reference_predictions,
+                current_predictions=current_predictions,
+                current_performance=performance,
+                current_router_stability_report={
+                    "enabled": True,
+                    "applicable": True,
+                    "decision_count": 80,
+                    "switch_count": 26,
+                    "switch_rate": 0.3291,
+                    "blocked_switch_count": 0,
+                    "blocked_switch_rate": 0.0,
+                    "configured_control_count": 1,
+                },
+                bars_since_last_retrain=520,
+                scheduled_window_open=True,
+                train_challenger=lambda: build_calls.append("called"),
+                drift_config={"min_samples": 200, "min_drift_signals": 2, "max_bars_between_retrain": 672},
+                router_recalibration_policy={
+                    "min_router_decision_count": 25,
+                    "max_router_switch_rate": 0.20,
+                    "require_router_stability_controls": True,
+                },
+            )
+
+            self.assertEqual(result["retrain_status"], "router_recalibration_recommended")
+            self.assertEqual(build_calls, [])
+            self.assertTrue(result["router_recalibration"]["recommended"])
+            self.assertEqual(result["router_recalibration"]["action"], "recalibrate_router")
+            self.assertIn("router_switch_rate_above_limit", result["router_recalibration"]["reasons"])
+
+    def test_non_structural_regime_shift_recommends_discovery_before_retraining(self):
+        reference_features, current_features, reference_predictions, current_predictions, performance = _make_discovery_drift_inputs()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.12)
+            build_calls = []
+
+            result = run_drift_retraining_cycle(
+                store=store,
+                symbol="BTCUSDT",
+                reference_features=reference_features,
+                current_features=current_features,
+                reference_predictions=reference_predictions,
+                current_predictions=current_predictions,
+                current_performance=performance,
+                bars_since_last_retrain=520,
+                scheduled_window_open=True,
+                train_challenger=lambda: build_calls.append("called"),
+                drift_config={"min_samples": 200, "min_drift_signals": 2, "max_bars_between_retrain": 672},
+            )
+
+            self.assertTrue(result["drift_guardrails"]["approved"])
+            self.assertFalse(result["structural_invalidation"]["retrain_recommended"])
+            self.assertTrue(result["structural_invalidation"]["discover_recommended"])
+            self.assertEqual(result["retrain_status"], "discovery_recommended")
+            self.assertEqual(result["action_report"]["recommended_action"], "discover")
+            self.assertEqual(build_calls, [])
+
     def test_model_ttl_expiry_can_promote_challenger_without_drift_signals(self):
         reference_features, current_features, reference_predictions, current_predictions, performance = _make_stable_drift_inputs()
 
@@ -199,6 +396,7 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
 
             self.assertTrue(result["drift_report"]["model_ttl_expired"])
             self.assertIn("model_ttl_expired", result["drift_guardrails"]["reasons"])
+            self.assertEqual(result["action_report"]["recommended_action"], "retrain")
             self.assertEqual(result["retrain_status"], "promoted")
             self.assertTrue(result["promotion_decision"]["approved"])
             self.assertTrue(result["post_retrain_warmup"]["required"])

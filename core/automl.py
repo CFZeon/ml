@@ -19,6 +19,7 @@ from .promotion import (
     build_promotion_gate_check_map,
     create_promotion_eligibility_report,
     evaluate_execution_realism_gate,
+    evaluate_router_stability_gate,
     evaluate_stress_realism_gate,
     finalize_promotion_eligibility_report,
     resolve_canonical_promotion_score,
@@ -108,6 +109,7 @@ _CLASSIFICATION_OBJECTIVES = {
     "calibration_error",
 }
 _THESIS_SPACE_PATHS = {
+    ("orchestration", "bundle"),
     ("features", "lags"),
     ("features", "frac_diff_d"),
     ("features", "rolling_window"),
@@ -258,6 +260,129 @@ def _clone_value(value):
     if isinstance(value, dict):
         return {key: _clone_value(item) for key, item in value.items()}
     return value
+
+
+def _normalize_orchestration_bundle_choice(bundle_choice):
+    if not isinstance(bundle_choice, dict):
+        raise ValueError("orchestration.bundle choices must be mappings")
+
+    choice = copy.deepcopy(bundle_choice)
+    bundle_name = str(
+        choice.pop("name", choice.pop("bundle_name", choice.pop("bundle_id", "orchestration_bundle")))
+    )
+    bundle_description = choice.pop("description", None)
+    bundle_overrides = copy.deepcopy(choice.pop("overrides", choice))
+    if not isinstance(bundle_overrides, dict):
+        raise ValueError("orchestration.bundle overrides must resolve to a mapping")
+
+    model_overrides = dict(bundle_overrides.get("model") or {})
+    regime_aware_overrides = dict(model_overrides.get("regime_aware") or {})
+    for section_name in ("feature_adaptation", "model_library", "router", "maintenance"):
+        section_payload = bundle_overrides.get(section_name)
+        if section_payload and section_name not in regime_aware_overrides:
+            regime_aware_overrides[section_name] = copy.deepcopy(section_payload)
+    if regime_aware_overrides:
+        model_overrides["regime_aware"] = regime_aware_overrides
+        bundle_overrides["model"] = model_overrides
+
+    experiment_overrides = dict(bundle_overrides.get("experiment") or {})
+    experiment_overrides.setdefault("bundle_name", bundle_name)
+    if bundle_description is not None:
+        experiment_overrides.setdefault("bundle_description", str(bundle_description))
+    if experiment_overrides:
+        bundle_overrides["experiment"] = experiment_overrides
+
+    return bundle_overrides
+
+
+def _sample_orchestration_bundle_choice(trial, name, spec):
+    if not isinstance(spec, dict) or spec.get("type") != "categorical":
+        raise TypeError("orchestration.bundle must use a categorical spec")
+
+    raw_choices = list(spec.get("choices") or [])
+    if not raw_choices:
+        raise ValueError("orchestration.bundle choices must not be empty")
+
+    label_to_choice = {}
+    labels = []
+    for index, choice in enumerate(raw_choices):
+        if not isinstance(choice, dict):
+            raise ValueError("orchestration.bundle choices must be mappings")
+        base_label = str(
+            choice.get("name", choice.get("bundle_name", choice.get("bundle_id", f"bundle_{index + 1}")))
+        ).strip()
+        if not base_label:
+            base_label = f"bundle_{index + 1}"
+        label = base_label
+        if label in label_to_choice:
+            label = f"{base_label}__{_stable_payload_hash(choice)[:8]}"
+        label_to_choice[label] = copy.deepcopy(choice)
+        labels.append(label)
+
+    selected_label = trial.suggest_categorical(name, labels)
+    return copy.deepcopy(label_to_choice[selected_label])
+
+
+def _extract_bundle_lineage(overrides):
+    payload = copy.deepcopy(overrides or {})
+    experiment = dict(payload.get("experiment") or {})
+    regime = dict(payload.get("regime") or {})
+    detectors = [
+        copy.deepcopy(detector)
+        for detector in list(regime.get("detectors") or [])
+        if isinstance(detector, dict)
+    ]
+    primary_detector = None
+    if detectors:
+        for detector in detectors:
+            if bool(detector.get("primary", False)):
+                primary_detector = detector
+                break
+        if primary_detector is None:
+            primary_detector = detectors[0]
+
+    regime_aware = dict((payload.get("model") or {}).get("regime_aware") or {})
+    model_library = dict(regime_aware.get("model_library") or payload.get("model_library") or {})
+    router = dict(regime_aware.get("router") or payload.get("router") or {})
+    specialist_model_ids = [
+        str(spec.get("model_id"))
+        for spec in list(model_library.get("specialists") or [])
+        if isinstance(spec, dict) and spec.get("model_id") not in (None, "")
+    ]
+
+    lineage = {
+        "bundle_name": experiment.get("bundle_name"),
+        "bundle_description": experiment.get("bundle_description"),
+        "primary_detector": (
+            None
+            if primary_detector is None
+            else {
+                "name": primary_detector.get("name"),
+                "type": primary_detector.get("type"),
+                "primary": bool(primary_detector.get("primary", False)),
+            }
+        ),
+        "specialist_model_ids": specialist_model_ids,
+        "router": (
+            {}
+            if not router
+            else {
+                "type": router.get("type"),
+                "policy_name": router.get("policy_name"),
+                "hysteresis_margin": router.get("hysteresis_margin"),
+                "min_persistence_bars": router.get("min_persistence_bars"),
+                "cooldown_bars": router.get("cooldown_bars"),
+            }
+        ),
+    }
+    if (
+        lineage["bundle_name"] is None
+        and lineage["primary_detector"] is None
+        and not lineage["specialist_model_ids"]
+        and not lineage["router"]
+    ):
+        return {}
+    return lineage
 
 
 def _json_ready(value):
@@ -1224,6 +1349,9 @@ def _summarize_training(training):
     feature_adaptation = _json_ready(
         primary_training.get("feature_adaptation") or training.get("feature_adaptation") or {}
     )
+    specialist_library = _json_ready(
+        primary_training.get("specialist_library") or training.get("specialist_library") or {}
+    )
     bootstrap = training.get("bootstrap") or {}
     feature_governance = training.get("feature_governance") or {}
     feature_portability_diagnostics = training.get("feature_portability_diagnostics") or {}
@@ -1259,6 +1387,7 @@ def _summarize_training(training):
             "avg_selected_features": feature_selection.get("avg_selected_features"),
         },
         "feature_adaptation": feature_adaptation,
+        "specialist_library": specialist_library,
         "bootstrap": {
             "model_type": bootstrap.get("model_type"),
             "used_in_any_fold": bootstrap.get("used_in_any_fold"),
@@ -1341,6 +1470,12 @@ def _summarize_backtest(backtest, *, evidence_class=None):
         "execution_adapter",
         "execution_backend",
         "execution_limitations",
+        "router_manifest",
+        "router_decision_count",
+        "router_switch_count",
+        "router_blocked_switch_reasons",
+        "router_switching_cost_estimate",
+        "router_stability_report",
     ]
     summary = {key: backtest.get(key) for key in keys}
     equity_curve = backtest.get("equity_curve")
@@ -2217,6 +2352,7 @@ _HARDENED_DEFAULT_SELECTION_GATE_MODES = {
     "locked_holdout_gap": "blocking",
     "replication": "blocking",
     "execution_realism": "blocking",
+    "router_stability": "blocking",
     "stress_realism": "blocking",
     "data_certification": "blocking",
     "regime_coverage": "blocking",
@@ -2342,6 +2478,10 @@ def _resolve_selection_policy(automl_config=None, evaluation_mode=None):
             "max_trials_per_model_family": int(1e9),
             "local_perturbation_limit": 0,
             "require_fold_stability_pass": False,
+            "min_router_decision_count": 0,
+            "max_router_switch_rate": None,
+            "max_router_switching_cost_share": None,
+            "require_router_stability_controls": False,
         }
     default_gate_modes = {}
     if apply_binding_defaults:
@@ -2370,6 +2510,20 @@ def _resolve_selection_policy(automl_config=None, evaluation_mode=None):
             policy.get("require_locked_holdout_pass", apply_binding_defaults)
         ),
         "require_fold_stability_pass": bool(policy.get("require_fold_stability_pass", apply_binding_defaults)),
+        "min_router_decision_count": int(policy.get("min_router_decision_count", 25)),
+        "max_router_switch_rate": (
+            None
+            if policy.get("max_router_switch_rate") is None
+            else float(policy.get("max_router_switch_rate"))
+        ),
+        "max_router_switching_cost_share": (
+            None
+            if policy.get("max_router_switching_cost_share") is None
+            else float(policy.get("max_router_switching_cost_share"))
+        ),
+        "require_router_stability_controls": bool(
+            policy.get("require_router_stability_controls", apply_binding_defaults)
+        ),
     })
     return resolved_policy
 
@@ -3562,6 +3716,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 "number": trial.number,
                 "params": _json_ready(trial.params),
                 "overrides": copy.deepcopy(record["overrides"]),
+                "bundle_lineage": _json_ready(_extract_bundle_lineage(record["overrides"])),
                 "training": record["training"],
                 "backtest": record["backtest"],
                 "raw_objective_value": float(record["raw_objective_value"]),
@@ -3677,6 +3832,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
             "trial_complexity_score": best_trial["trial_complexity_score"],
             "feature_count_ratio": best_trial.get("feature_count_ratio"),
             "generalization_gap": best_trial.get("generalization_gap"),
+            "bundle_lineage": best_trial.get("bundle_lineage"),
         },
         "pbo": pbo_report,
         "post_selection": post_selection_report,
@@ -3701,6 +3857,7 @@ def _build_top_trial_reports(selection_report):
                 "value": float(report["selection_value"]),
                 "raw_value": float(report["raw_objective_value"]),
                 "model_family": report.get("model_family"),
+                "bundle_lineage": report.get("bundle_lineage"),
                 "params": report["params"],
                 "training": report["training"],
                 "backtest": report["backtest"],
@@ -4171,6 +4328,11 @@ def compute_objective_value(objective_name, training, backtest, automl_config=No
 def _sample_trial_overrides(trial, search_space):
     overrides = {}
 
+    orchestration_space = search_space.get("orchestration", {})
+    if orchestration_space and "bundle" in orchestration_space:
+        bundle_choice = _sample_orchestration_bundle_choice(trial, "orchestration.bundle", orchestration_space["bundle"])
+        _deep_merge(overrides, _normalize_orchestration_bundle_choice(bundle_choice))
+
     feature_space = search_space.get("features", {})
     if feature_space:
         feature_overrides = {}
@@ -4190,7 +4352,7 @@ def _sample_trial_overrides(trial, search_space):
             if key in feature_space:
                 feature_overrides[key] = _sample_from_spec(trial, f"features.{key}", feature_space[key])
         if feature_overrides:
-            overrides["features"] = feature_overrides
+            _deep_merge(overrides, {"features": feature_overrides})
 
     selection_space = search_space.get("feature_selection", {})
     if selection_space:
@@ -4203,7 +4365,7 @@ def _sample_trial_overrides(trial, search_space):
                     selection_space[key],
                 )
         if selection_overrides:
-            overrides["feature_selection"] = selection_overrides
+            _deep_merge(overrides, {"feature_selection": selection_overrides})
 
     label_space = search_space.get("labels", {})
     if label_space:
@@ -4215,7 +4377,8 @@ def _sample_trial_overrides(trial, search_space):
         for key in ["max_holding", "min_return", "volatility_window", "barrier_tie_break"]:
             if key in label_space:
                 label_overrides[key] = _sample_from_spec(trial, f"labels.{key}", label_space[key])
-        overrides["labels"] = label_overrides
+        if label_overrides:
+            _deep_merge(overrides, {"labels": label_overrides})
 
     regime_space = search_space.get("regime", {})
     if regime_space:
@@ -4227,7 +4390,7 @@ def _sample_trial_overrides(trial, search_space):
                 regime_space["n_regimes"],
             )
         if regime_overrides:
-            overrides["regime"] = regime_overrides
+            _deep_merge(overrides, {"regime": regime_overrides})
 
     model_space = search_space.get("model", {})
     if model_space:
@@ -4252,7 +4415,7 @@ def _sample_trial_overrides(trial, search_space):
                 key: _sample_from_spec(trial, f"model.{model_type}.{key}", spec)
                 for key, spec in model_params_space.items()
             }
-        overrides["model"] = model_overrides
+        _deep_merge(overrides, {"model": model_overrides})
 
     return overrides
 
@@ -4436,6 +4599,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         trial.set_user_attr("feature_schema_hash", experiment_manifest["feature_schema_hash"])
         trial.set_user_attr("objective_hash", experiment_manifest["objective_hash"])
         trial.set_user_attr("search_space_hash", experiment_manifest["search_space_hash"])
+        trial.set_user_attr("bundle_lineage", _json_ready(_extract_bundle_lineage(overrides)))
         trial.set_user_attr("code_revision", experiment_manifest["code_revision"])
         trial.set_user_attr(
             "search_metrics",
@@ -4765,6 +4929,9 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     best_trial_number = int(best_trial_report["number"])
     best_overrides = copy.deepcopy(best_trial_report["overrides"])
     best_overrides_summary = _json_ready(_clone_value(best_overrides))
+    best_bundle_lineage = _json_ready(
+        copy.deepcopy(best_trial_report.get("bundle_lineage") or _extract_bundle_lineage(best_overrides))
+    )
     best_trial_report["selection_policy"]["frozen"] = True
     selection_snapshot = _build_selection_snapshot(best_trial_report)
     validation_contract = _resolve_validation_contract(
@@ -4941,6 +5108,22 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         reason=stress_realism.get("reason"),
         details=stress_realism,
     )
+    router_stability = evaluate_router_stability_gate(
+        post_selection_backtest,
+        policy=selection_policy,
+    )
+    best_trial_report["selection_policy"]["eligibility_checks"]["router_stability"] = bool(router_stability["passed"])
+    promotion_eligibility_report = upsert_promotion_gate(
+        promotion_eligibility_report,
+        group="post_selection",
+        name="router_stability",
+        passed=bool(router_stability["passed"]),
+        mode=resolve_promotion_gate_mode(selection_policy, "router_stability"),
+        measured=router_stability.get("switch_rate"),
+        threshold=router_stability.get("thresholds"),
+        reason=router_stability.get("reason"),
+        details=router_stability,
+    )
     lookahead_guard_gate = _resolve_lookahead_guard_gate(best_trial_report.get("training") or {})
     lookahead_guard = dict(lookahead_guard_gate["details"] or {})
     best_trial_report["selection_policy"]["eligibility_checks"]["lookahead_guard"] = bool(
@@ -4981,6 +5164,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         locked_holdout.get("evaluated_after_freeze", False)
     )
     selection_report["diagnostics"]["execution_realism"] = execution_realism
+    selection_report["diagnostics"]["router_stability"] = router_stability
     selection_report["diagnostics"]["stress_realism"] = stress_realism
     selection_report["diagnostics"]["replication"] = replication_report
     selection_report["diagnostics"]["promotion_ready"] = bool(best_trial_report["selection_policy"]["promotion_ready"])
@@ -5044,6 +5228,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         "optuna_best_trial_number": int(best_optuna_trial.number),
         "best_params": best_trial_report["params"],
         "best_overrides": best_overrides_summary,
+        "best_bundle_lineage": best_bundle_lineage,
         "best_backtest": best_trial_report["backtest"],
         "best_training": best_trial_report["training"],
         "best_overfitting": best_trial_report["overfitting"],
@@ -5128,6 +5313,7 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
                 "selection_freeze": selection_snapshot,
                 "best_params": summary["best_params"],
                 "best_overrides": summary["best_overrides"],
+                "best_bundle_lineage": summary.get("best_bundle_lineage"),
                 "data_lineage": data_lineage,
             },
             training_summary=_json_ready(_summarize_training(best_training)),
@@ -5140,8 +5326,10 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
             lineage={
                 "candidate_hash": selection_snapshot.get("candidate_hash"),
                 "selection_timestamp": selection_snapshot.get("selection_timestamp"),
+                "bundle_lineage": summary.get("best_bundle_lineage"),
                 "data_lineage": data_lineage,
             },
+            specialist_library=best_training.get("specialist_library"),
             status="challenger",
             meta_model=best_training.get("last_meta"),
         )

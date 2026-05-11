@@ -17,6 +17,7 @@ from .models import (
     train_model,
     walk_forward_split,
 )
+from .specialists.library import project_specialist_library_snapshot
 from .specialists.contracts import (
     SpecialistHealthContract,
     SpecialistLibrarySnapshot,
@@ -330,10 +331,22 @@ def _normalize_training_window(training_report):
     }
 
 
+def _resolve_initial_specialist_lifecycle_state(metadata=None):
+    configured = dict(metadata or {}).get("lifecycle_state")
+    if configured is None:
+        return SpecialistLifecycleState.CANDIDATE
+    normalized = str(configured).strip().lower()
+    for state in SpecialistLifecycleState:
+        if state.value == normalized:
+            return state
+    raise ValueError(f"Unknown specialist lifecycle_state {configured!r}")
+
+
 def build_specialist_specs_from_bundle(bundle, training_report=None, *, symbol="unknown", timeframe="unknown", metadata=None):
     training_report = dict(training_report or {})
     shared_metadata = dict(metadata or {})
     training_window = _normalize_training_window(training_report)
+    lifecycle_state = _resolve_initial_specialist_lifecycle_state(shared_metadata)
     specs = []
 
     if bundle.strategy == "feature":
@@ -351,7 +364,7 @@ def build_specialist_specs_from_bundle(bundle, training_report=None, *, symbol="
                     **shared_metadata,
                     "bundle_strategy": bundle.strategy,
                     "feature_column_count": int(len(bundle.feature_columns)),
-                    "lifecycle_state": SpecialistLifecycleState.ACTIVE.value,
+                    "lifecycle_state": lifecycle_state.value,
                 },
             )
         )
@@ -371,7 +384,7 @@ def build_specialist_specs_from_bundle(bundle, training_report=None, *, symbol="
                     **shared_metadata,
                     "bundle_strategy": bundle.strategy,
                     "fallback_only": True,
-                    "lifecycle_state": SpecialistLifecycleState.ACTIVE.value,
+                    "lifecycle_state": lifecycle_state.value,
                 },
             )
         )
@@ -391,7 +404,7 @@ def build_specialist_specs_from_bundle(bundle, training_report=None, *, symbol="
                     **shared_metadata,
                     "bundle_strategy": bundle.strategy,
                     "regime_label": regime_name,
-                    "lifecycle_state": SpecialistLifecycleState.ACTIVE.value,
+                    "lifecycle_state": lifecycle_state.value,
                 },
             )
         )
@@ -486,7 +499,7 @@ def build_specialist_library_snapshot(bundle, training_report=None, *, symbol="u
             )
         )
 
-    return SpecialistLibrarySnapshot(
+    snapshot = SpecialistLibrarySnapshot(
         symbol=str(symbol),
         timeframe=str(timeframe),
         fallback_model_id=("fallback_generalist" if bundle.fallback_model is not None and bundle.strategy == "specialist" else None),
@@ -501,6 +514,7 @@ def build_specialist_library_snapshot(bundle, training_report=None, *, symbol="u
             "skipped_regimes": {str(key): str(value) for key, value in dict(training_report.get("skipped_regimes") or {}).items()},
         },
     )
+    return project_specialist_library_snapshot(snapshot)
 
 
 def train_regime_aware_model(

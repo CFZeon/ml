@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from core import ResearchPipeline, cpcv_split
+from core.pipeline import _summarize_path_backtests
 from example_utils import print_training_summary
 
 
@@ -62,6 +63,53 @@ def _make_pipeline(raw, model_config):
 
 
 class CPCVValidationTest(unittest.TestCase):
+    def test_path_summary_aggregates_router_stability_diagnostics(self):
+        summary = _summarize_path_backtests(
+            [
+                {
+                    "backtest": {
+                        "router_stability_report": {
+                            "enabled": True,
+                            "applicable": True,
+                            "decision_count": 100,
+                            "switch_count": 12,
+                            "switch_rate": 0.12,
+                            "blocked_switch_count": 20,
+                            "blocked_switch_rate": 0.2,
+                            "blocked_switch_reasons": {"cooldown_active": 2},
+                            "configured_control_count": 3,
+                            "switching_cost_estimate": 18.0,
+                            "switching_cost_share_of_starting_equity": 0.0018,
+                        }
+                    }
+                },
+                {
+                    "backtest": {
+                        "router_stability_report": {
+                            "enabled": True,
+                            "applicable": True,
+                            "decision_count": 80,
+                            "switch_count": 8,
+                            "switch_rate": 0.1,
+                            "blocked_switch_count": 12,
+                            "blocked_switch_rate": 0.15,
+                            "blocked_switch_reasons": {"persistence_requirement_not_met": 3},
+                            "configured_control_count": 2,
+                            "switching_cost_estimate": 10.0,
+                            "switching_cost_share_of_starting_equity": 0.001,
+                        }
+                    }
+                },
+            ]
+        )
+
+        report = summary["router_stability_report"]
+        self.assertTrue(report["enabled"])
+        self.assertEqual(report["path_count"], 2)
+        self.assertEqual(report["applicable_path_count"], 2)
+        self.assertAlmostEqual(float(report["mean_switch_rate"]), 0.11, places=6)
+        self.assertEqual(report["blocked_switch_reasons"], {"cooldown_active": 2, "persistence_requirement_not_met": 3})
+
     def test_cpcv_split_generates_block_combinations_and_embargo(self):
         frame = pd.DataFrame({"feature": np.arange(12, dtype=float)})
 
@@ -110,6 +158,27 @@ class CPCVValidationTest(unittest.TestCase):
         self.assertEqual(backtest["diagnostic_validation_method"], "cpcv")
         self.assertEqual(int(backtest["diagnostic_validation"]["path_count"]), len(training["oos_paths"]))
         self.assertEqual(backtest["diagnostic_validation"]["summary"]["aggregate_mode"], "diagnostic_distribution")
+        self.assertTrue(backtest["diagnostic_validation"]["summary"]["regime_segment_report"]["enabled"])
+        self.assertEqual(
+            backtest["diagnostic_validation"]["summary"]["regime_segment_report"]["aggregate_mode"],
+            "path_diagnostics_only",
+        )
+        self.assertEqual(
+            int(backtest["diagnostic_validation"]["summary"]["regime_segment_report"]["path_count"]),
+            len(training["oos_paths"]),
+        )
+        self.assertTrue(backtest["diagnostic_validation"]["summary"]["regime_segment_report"]["label_distribution"])
+        self.assertTrue(backtest["diagnostic_validation"]["summary"]["transition_segment_report"]["enabled"])
+        self.assertEqual(
+            backtest["diagnostic_validation"]["summary"]["transition_segment_report"]["aggregate_mode"],
+            "path_diagnostics_only",
+        )
+        first_transition = next(
+            iter(backtest["diagnostic_validation"]["summary"]["transition_segment_report"]["by_transition"].values())
+        )
+        self.assertIn("mean_recognition_delay_bars", first_transition)
+        self.assertIn("mean_delay_window_return", first_transition)
+        self.assertIn("mean_positive_cumulative_onset_lag_bars", first_transition)
         self.assertIn("statistical_significance", backtest)
         self.assertTrue(backtest["statistical_significance"]["enabled"])
         self.assertFalse(backtest["diagnostic_validation"]["summary"]["statistical_significance"]["enabled"])

@@ -1,0 +1,58 @@
+import unittest
+
+from core.regimes import RegimeStateContract
+from core.routing import HardSwitchRouter, replay_router_trace
+from core.specialists import SpecialistHealthContract, SpecialistLibrarySnapshot, SpecialistSpec
+
+
+def _make_router_library():
+    return SpecialistLibrarySnapshot(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        fallback_model_id="fallback_generalist",
+        specialists=[
+            SpecialistSpec(
+                model_id="fallback_generalist",
+                symbol="BTCUSDT",
+                timeframe="1h",
+                compatible_regimes=[],
+                estimator_family="logisticregression",
+                metadata={"fallback_only": True, "lifecycle_state": "active"},
+            ),
+            SpecialistSpec(
+                model_id="specialist::bull",
+                symbol="BTCUSDT",
+                timeframe="1h",
+                compatible_regimes=["bull"],
+                estimator_family="logisticregression",
+                metadata={"lifecycle_state": "active"},
+            ),
+        ],
+        health=[
+            SpecialistHealthContract(model_id="fallback_generalist", fallback_only=True, stability_score=0.55, decay_score=0.05),
+            SpecialistHealthContract(model_id="specialist::bull", compatible_regimes=["bull"], stability_score=0.8, decay_score=0.08),
+        ],
+    )
+
+
+class RouterTraceReplayTest(unittest.TestCase):
+    def test_replay_router_trace_is_deterministic_and_summarizes_switches(self):
+        router = HardSwitchRouter(hysteresis_margin=0.05, min_persistence_bars=2, cooldown_bars=1)
+        regime_states = [
+            RegimeStateContract(as_of="2026-05-09T00:00:00Z", available_at="2026-05-09T00:00:00Z", label="bull", confidence=0.9),
+            RegimeStateContract(as_of="2026-05-09T01:00:00Z", available_at="2026-05-09T01:00:00Z", label="bull", confidence=0.9),
+            RegimeStateContract(as_of="2026-05-09T02:00:00Z", available_at="2026-05-09T02:00:00Z", label="flat", confidence=0.2),
+        ]
+
+        first = replay_router_trace(router, _make_router_library(), regime_states)
+        second = replay_router_trace(router, _make_router_library(), regime_states)
+
+        self.assertEqual(first["decision_trace"], second["decision_trace"])
+        self.assertEqual(first["summary"]["decision_count"], 3)
+        self.assertEqual(first["summary"]["switch_count"], 1)
+        self.assertEqual(first["summary"]["route_reason_counts"]["persistence_hold"], 1)
+        self.assertEqual(first["summary"]["selected_model_ids"][1], "specialist::bull")
+
+
+if __name__ == "__main__":
+    unittest.main()

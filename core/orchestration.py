@@ -7,7 +7,9 @@ import math
 import pandas as pd
 
 from .drift import DriftMonitor, _resolve_drift_policy, evaluate_drift_guardrails
+from .promotion import evaluate_router_stability_gate
 from .registry.store import evaluate_challenger_promotion
+from .specialists.governance import evaluate_specialist_library_governance
 
 
 _DEFAULT_CRITICAL_ROLLBACK_REASONS = {
@@ -188,6 +190,183 @@ def _evaluate_rollback_action(store, symbol, *, current_monitoring_report=None, 
     return rollback
 
 
+def _evaluate_library_review_policy(specialist_library, *, policy=None):
+    policy = dict(policy or {})
+    specialist_payload = dict(specialist_library or {})
+    if not specialist_payload or not list(specialist_payload.get("specialists") or []):
+        return {
+            "enabled": bool(policy),
+            "applicable": False,
+            "recommended": False,
+            "action": "not_applicable",
+            "reasons": [],
+            "active_model_ids": [],
+            "blocked_model_ids": [],
+            "transition_model_ids": [],
+            "nonfallback_active_specialist_count": 0,
+            "minimum_active_specialists": int(max(0, policy.get("min_active_specialists", 1) or 1)),
+            "governance": None,
+        }
+
+    governance_policy = dict(policy.get("governance") or {})
+    governance = evaluate_specialist_library_governance(specialist_payload, policy=governance_policy)
+    model_reports = dict(governance.get("model_reports") or {})
+    active_states = {"active", "degraded", "shadow_challenger"}
+    fallback_model_id = specialist_payload.get("fallback_model_id")
+    selection_contract = dict((specialist_payload.get("metadata") or {}).get("selection_contract") or {})
+    active_model_ids = [str(model_id) for model_id in list(selection_contract.get("active_model_ids") or [])]
+    nonfallback_active_model_ids = [
+        model_id
+        for model_id in active_model_ids
+        if fallback_model_id in (None, "") or str(model_id) != str(fallback_model_id)
+    ]
+
+    blocked_model_ids = sorted(
+        model_id
+        for model_id, report in model_reports.items()
+        if str(report.get("current_state") or "") in active_states and not bool(report.get("approved", False))
+    )
+    transition_model_ids = sorted(
+        {
+            str(transition.get("model_id"))
+            for transition in list(governance.get("recommended_transitions") or [])
+            if str(transition.get("current_state") or "") in active_states
+            or str(transition.get("target_state") or "") in {"degraded", "retired"}
+        }
+    )
+    minimum_active_specialists = int(max(0, policy.get("min_active_specialists", 1) or 1))
+
+    reasons = []
+    if len(nonfallback_active_model_ids) < minimum_active_specialists:
+        reasons.append("active_specialist_coverage_below_minimum")
+    if blocked_model_ids:
+        reasons.append("blocked_specialists_present")
+    if transition_model_ids:
+        reasons.append("governance_transitions_recommended")
+
+    recommended = bool(reasons)
+    return {
+        "enabled": True,
+        "applicable": True,
+        "recommended": recommended,
+        "action": "review_library" if recommended else "hold",
+        "reasons": reasons,
+        "active_model_ids": active_model_ids,
+        "blocked_model_ids": blocked_model_ids,
+        "transition_model_ids": transition_model_ids,
+        "nonfallback_active_specialist_count": int(len(nonfallback_active_model_ids)),
+        "minimum_active_specialists": minimum_active_specialists,
+        "governance": governance,
+    }
+
+
+def _evaluate_router_recalibration_policy(router_stability_report, *, policy=None):
+    policy = dict(policy or {})
+    if not router_stability_report:
+        return {
+            "enabled": bool(policy),
+            "applicable": False,
+            "recommended": False,
+            "action": "not_applicable",
+            "reasons": [],
+            "gate": None,
+        }
+
+    gate = evaluate_router_stability_gate(
+        {"router_stability_report": dict(router_stability_report or {})},
+        policy=policy,
+    )
+    recommended = bool(gate.get("applicable", False) and not gate.get("passed", True) and gate.get("status") == "failed")
+    reasons = []
+    if gate.get("reason"):
+        reasons.append(str(gate.get("reason")))
+    if gate.get("failure_class"):
+        reasons.append(str(gate.get("failure_class")))
+
+    return {
+        "enabled": True,
+        "applicable": bool(gate.get("applicable", False)),
+        "recommended": recommended,
+        "action": "recalibrate_router" if recommended else "hold",
+        "reasons": list(dict.fromkeys(reasons)),
+        "gate": gate,
+    }
+
+
+def _evaluate_structural_invalidation_policy(drift_report, drift_guardrails, *, policy=None):
+    policy = dict(policy or {})
+    report = dict(drift_report or {})
+    guardrails = dict(drift_guardrails or {})
+    approved = bool(guardrails.get("approved", False))
+
+    structural_reasons = []
+    if bool(policy.get("allow_model_ttl_expiry", True)) and bool(report.get("model_ttl_expired", False)):
+        structural_reasons.append("model_ttl_expired")
+    if bool(policy.get("allow_performance_drift", True)) and bool(report.get("performance_drift", False)):
+        structural_reasons.append("performance_drift_detected")
+    if (
+        bool(policy.get("treat_joint_feature_prediction_drift_as_structural", True))
+        and bool(report.get("feature_drift", False))
+        and bool(report.get("prediction_drift", False))
+    ):
+        structural_reasons.append("joint_feature_prediction_drift_detected")
+
+    discovery_reasons = []
+    if not structural_reasons:
+        if bool(policy.get("discover_on_regime_drift", True)) and bool(report.get("regime_drift", False)):
+            discovery_reasons.append("regime_drift_detected")
+        if bool(policy.get("discover_on_feature_drift", True)) and bool(report.get("feature_drift", False)):
+            discovery_reasons.append("feature_drift_detected")
+        if bool(policy.get("discover_on_prediction_drift", True)) and bool(report.get("prediction_drift", False)):
+            discovery_reasons.append("prediction_drift_detected")
+
+    retrain_recommended = bool(approved and structural_reasons)
+    discover_recommended = bool(approved and not retrain_recommended and discovery_reasons)
+
+    return {
+        "enabled": True,
+        "applicable": approved,
+        "retrain_recommended": retrain_recommended,
+        "discover_recommended": discover_recommended,
+        "action": "retrain" if retrain_recommended else "discover" if discover_recommended else "hold",
+        "reasons": list(structural_reasons if retrain_recommended else discovery_reasons),
+        "structural_reasons": structural_reasons,
+        "discovery_reasons": discovery_reasons,
+    }
+
+
+def _resolve_drift_action_report(*, library_review, router_recalibration, structural_invalidation):
+    if bool(library_review.get("recommended", False)):
+        return {
+            "recommended_action": "reroute",
+            "source": "library_review",
+            "reasons": list(library_review.get("reasons") or []),
+        }
+    if bool(router_recalibration.get("recommended", False)):
+        return {
+            "recommended_action": "recalibrate",
+            "source": "router_recalibration",
+            "reasons": list(router_recalibration.get("reasons") or []),
+        }
+    if bool(structural_invalidation.get("discover_recommended", False)):
+        return {
+            "recommended_action": "discover",
+            "source": "structural_invalidation",
+            "reasons": list(structural_invalidation.get("discovery_reasons") or []),
+        }
+    if bool(structural_invalidation.get("retrain_recommended", False)):
+        return {
+            "recommended_action": "retrain",
+            "source": "structural_invalidation",
+            "reasons": list(structural_invalidation.get("structural_reasons") or []),
+        }
+    return {
+        "recommended_action": "hold",
+        "source": None,
+        "reasons": [],
+    }
+
+
 def run_drift_retraining_cycle(
     *,
     store,
@@ -199,10 +378,14 @@ def run_drift_retraining_cycle(
     reference_regimes=None,
     current_regimes=None,
     current_performance=None,
+    current_router_stability_report=None,
     bars_since_last_retrain=None,
     scheduled_window_open=False,
     train_challenger=None,
     drift_config=None,
+    library_review_policy=None,
+    router_recalibration_policy=None,
+    structural_invalidation_policy=None,
     promotion_policy=None,
     current_monitoring_report=None,
     operational_limits=None,
@@ -211,6 +394,12 @@ def run_drift_retraining_cycle(
     resolved_drift_config = _resolve_drift_policy(drift_config)
     request_weight_guard = _evaluate_request_weight_guard(drift_config)
     champion = store.get_champion(symbol)
+    current_specialist_library = None
+    if champion is not None:
+        try:
+            current_specialist_library = store.read_specialist_library(champion["version_id"], symbol=symbol)
+        except Exception:
+            current_specialist_library = None
     monitor = DriftMonitor(
         reference_features,
         reference_predictions,
@@ -235,6 +424,24 @@ def run_drift_retraining_cycle(
         current_performance=current_performance,
     )
     drift_guardrails = evaluate_drift_guardrails(drift_report, policy=resolved_drift_config)
+    library_review = _evaluate_library_review_policy(
+        current_specialist_library,
+        policy=library_review_policy,
+    )
+    router_recalibration = _evaluate_router_recalibration_policy(
+        current_router_stability_report,
+        policy=router_recalibration_policy,
+    )
+    structural_invalidation = _evaluate_structural_invalidation_policy(
+        drift_report,
+        drift_guardrails,
+        policy=structural_invalidation_policy,
+    )
+    action_report = _resolve_drift_action_report(
+        library_review=library_review,
+        router_recalibration=router_recalibration,
+        structural_invalidation=structural_invalidation,
+    )
 
     if champion is not None:
         store.attach_drift_report(champion["version_id"], drift_report, symbol=symbol)
@@ -246,6 +453,10 @@ def run_drift_retraining_cycle(
         "scheduled_window_open": bool(scheduled_window_open),
         "drift_report": drift_report,
         "drift_guardrails": drift_guardrails,
+        "library_review": library_review,
+        "router_recalibration": router_recalibration,
+        "structural_invalidation": structural_invalidation,
+        "action_report": action_report,
         "request_weight_guard": request_weight_guard,
         "retrain_status": "not_recommended",
         "candidate_version_id": None,
@@ -266,6 +477,15 @@ def run_drift_retraining_cycle(
         },
     }
     if not drift_guardrails.get("approved", False):
+        if library_review.get("recommended", False):
+            result["retrain_status"] = "library_review_recommended"
+        elif router_recalibration.get("recommended", False):
+            result["retrain_status"] = "router_recalibration_recommended"
+        return result
+
+    if not structural_invalidation.get("retrain_recommended", False):
+        if structural_invalidation.get("discover_recommended", False):
+            result["retrain_status"] = "discovery_recommended"
         return result
 
     if not scheduled_window_open:
@@ -291,6 +511,7 @@ def run_drift_retraining_cycle(
         replication=challenger_payload.get("replication"),
         promotion_eligibility_report=challenger_payload.get("promotion_eligibility_report"),
         lineage=challenger_payload.get("lineage"),
+        specialist_library=challenger_payload.get("specialist_library"),
         status="challenger",
         meta_model=challenger_payload.get("meta_model"),
     )

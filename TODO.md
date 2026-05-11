@@ -31,9 +31,26 @@ is the execution-oriented checklist derived from that plan.
    training-summary propagation, explicit post-selection refit surfacing, and
    user-facing training summary output in the experiment runner and example
    helpers.
+- Phase 3 Slice 1 delivered a dedicated specialist-library runtime,
+   candidate-state snapshot generation in specialist training outputs,
+   registry-backed artifact ref enrichment, and additive lifecycle transition
+   events plus active-library reads without mutating immutable manifests.
+- Phase 5 is complete.
+- Phase 6 Slice 1 delivered bundle-centric AutoML search-space support,
+   bundle lineage propagation through study summaries and registry metadata,
+   and trade-ready thesis-space freeze coverage for `orchestration.bundle`.
+- Phase 6 Slice 2 delivered a config-driven orchestration-bundle AutoML
+   example, user-facing runner summaries for selected bundle lineage and router
+   stability, and focused config/runner regression coverage.
+- Phase 6 Slice 3 delivered orchestration-first example-guide cleanup,
+   explicit detector/router entrypoints in the docs, and a downstream
+   maintenance banner on the drift review example.
+- Phase 7 Slice 1 delivered an additive specialist-library review policy in
+   the drift maintenance path, allowing degraded active libraries to return an
+   explicit `library_review_recommended` outcome before retraining.
 - Default runtime behavior has not been switched to specialist-library or router
   execution yet.
-- The next required implementation slice is Phase 3 Slice 1.
+- The next required implementation slice is Phase 7 Slice 2.
 
 ## Phase Checklist
 
@@ -124,27 +141,44 @@ Acceptance criteria:
 
 Immediate next slice:
 
-1. Start Phase 3 by introducing specialist-library persistence and lifecycle
-   state transitions without changing default routing behavior.
-2. Define the first registry-backed specialist snapshot and fallback-generalist
-   selection contract so routing can be added in later slices without another
-   training-path refactor.
+1. Start Phase 5 by replaying detector and router state causally through the
+   validation and holdout path instead of relying on pooled backtest summaries.
+2. Reuse the canonical router replay diagnostics from Phase 4 rather than
+   reimplementing routing logic inside validation-specific code.
 
 ### Phase 3: Specialist Library
 
-Status: pending
+Status: completed 2026-05-09
 
 Objective:
 
 Replace the single-model assumption with a specialist library plus fallback
 generalist.
 
-Implementation targets:
+Delivered so far:
 
-1. Add specialist metadata and health tracking.
-2. Persist historical regime performance by model.
-3. Extend registry manifests to support multiple active specialists per symbol.
-4. Implement the specialist lifecycle state machine.
+1. Added `core/specialists/library.py` with specialist snapshot normalization,
+   selection-contract construction, registry-status projection, artifact-ref
+   attachment, and fail-closed lifecycle transition validation.
+2. Updated specialist training and post-selection refit outputs to surface
+   `specialist_library` in `training`, pipeline state, and refit artifacts.
+3. Extended `LocalRegistryStore` to auto-persist specialist libraries from
+   specialist training summaries, enrich them with registry artifact refs, and
+   expose `read_specialist_library(...)` / `get_active_specialist_library(...)`.
+4. Added additive `record_specialist_lifecycle_transition(...)` event storage
+   so runtime lifecycle state can evolve without rewriting immutable version
+   manifests.
+5. Added `core/specialists/health.py` plus append-only
+   `attach_specialist_health_update(...)` registry storage so specialist health
+   and regime performance history replay into runtime library reads without
+   mutating immutable manifests.
+6. Added `core/specialists/governance.py` with explicit certification and
+   degradation policy helpers, advisory/blocking gate support, and in-memory
+   lifecycle application over specialist snapshots.
+7. Tightened the Phase 3 lifecycle runtime so registry status is tracked as
+   library metadata rather than overwriting per-specialist states, and champion
+   promotion now auto-activates only the fallback generalist plus already
+   certified specialists through append-only lifecycle events.
 
 Acceptance criteria:
 
@@ -154,7 +188,7 @@ Acceptance criteria:
 
 ### Phase 4: Router Implementation
 
-Status: pending
+Status: completed 2026-05-09
 
 Objective:
 
@@ -166,6 +200,22 @@ Implementation targets:
 2. Add hysteresis, persistence, cooldown, and score diagnostics.
 3. Persist routing traces in backtests and live-like replay.
 
+Delivered so far:
+
+1. Added `core/routing/router.py` with deterministic `HardSwitchRouter` and
+   `WeightedRouter` implementations plus `build_router(...)` factory support.
+2. Added `core/routing/diagnostics.py` with deterministic
+   `replay_router_trace(...)` summaries over regime-state streams.
+3. Added focused regressions for hard-switch anti-flapping behavior, weighted
+   allocation normalization, factory/config routing, and replay determinism.
+4. Threaded optional router trace summaries through `run_backtest(...)` so
+   switch counts, route reasons, blocked-switch reasons, and decision traces
+   are exposed in user-facing backtest summaries without changing execution
+   math.
+5. Added optional router switching-cost reporting to backtest summaries as an
+   explicit hypothetical routing-overhead estimate rather than silently
+   treating it as realized execution cost.
+
 Acceptance criteria:
 
 1. Router decisions are deterministic under replay.
@@ -174,12 +224,34 @@ Acceptance criteria:
 
 ### Phase 5: Validation and Backtest Overhaul
 
-Status: pending
+Status: completed 2026-05-09
 
 Objective:
 
 Refactor evaluation to replay the full adaptive loop instead of relying on
 pooled aggregate metrics.
+
+Delivered so far:
+
+1. Extended `run_backtest(...)` with additive `regime_segment_report` and
+   `transition_segment_report` payloads driven by aligned `regime_states`,
+   without changing execution math or requiring a router runtime.
+2. Updated CPCV diagnostic path replay so fold-local regime states are carried
+   into per-path backtests and surfaced in
+   `diagnostic_validation["summary"]` as path-level regime and transition
+   diagnostics instead of pooled aggregate metrics alone.
+3. Hardened fold-local regime joins in `core/pipeline.py` so sparse regime
+   metadata flags do not invalidate otherwise usable CPCV fit/test rows.
+4. Added delayed-recognition and transition-lag diagnostics to
+   `transition_segment_report`, reusing `signal_delay_bars` as the simulated
+   recognition window and surfacing the aggregated fields through CPCV
+   `diagnostic_validation["summary"]`.
+5. Added fold-local unseen-regime degradation reporting, including fallback
+   exposure shares, affected-fold summaries, and additive backtest surfacing
+   via `unseen_regime_degradation_report`.
+6. Added router stability and over-switching diagnostics plus a promotion gate,
+   using replay-only router trace metrics and switching-cost estimates without
+   changing routing decisions or executable PnL.
 
 Implementation targets:
 
@@ -196,11 +268,42 @@ Acceptance criteria:
 
 ### Phase 6: AutoML and Experiment Redesign
 
-Status: pending
+Status: completed 2026-05-11
 
 Objective:
 
 Make studies explicit about regime detectors, specialists, and routing.
+
+Delivered so far:
+
+1. Added `orchestration.bundle` as a first-class AutoML search-space path in
+   `core/automl.py`, allowing studies to compare detector, specialist, and
+   router bundles through the existing override contract instead of only leaf
+   model hyperparameters.
+2. Preserved `best_bundle_lineage` and per-trial bundle lineage through study
+   summaries, best-trial diagnostics, and registry lineage/metadata outputs.
+3. Hardened bundle sampling so leaf-level search overrides deep-merge into the
+   sampled bundle rather than overwriting detector or router lineage.
+4. Added focused regression coverage proving trade-ready profiles reject
+   `orchestration.bundle` as thesis variation and that AutoML summaries surface
+   bundle lineage and normalized bundle overrides.
+5. Added `configs/btc_regime_bundle_automl.yaml` and
+   `example_regime_bundle_automl.py` so users can run bundle-centric AutoML
+   from the shared config-driven workflow instead of constructing nested
+   overrides by hand.
+6. Updated the config-driven experiment runner to print selected bundle lineage
+   and router-stability diagnostics when AutoML chooses an orchestration
+   bundle.
+7. Added focused config-loader and runner-output regressions for the new
+   orchestration-bundle user path.
+8. Validated the new config through `run.py --config ... --quick --validate-only`.
+9. Reordered the user-facing docs so `example_regime_orchestration.py` and
+   `example_regime_bundle_automl.py` are surfaced as primary orchestration
+   entrypoints ahead of maintenance flows.
+10. Reframed `example_drift_retraining_cycle.py` as a downstream maintenance
+    and drift-review example in the docs and in the script banner itself.
+11. Validated the updated maintenance example in quick mode after the entrypoint
+    banner change.
 
 Implementation targets:
 
@@ -217,11 +320,43 @@ Acceptance criteria:
 
 ### Phase 7: Maintenance and Governance
 
-Status: pending
+Status: completed 2026-05-11
 
 Objective:
 
 Refactor drift handling away from immediate retraining.
+
+Delivered so far:
+
+1. Added an additive `library_review` policy report to the drift maintenance
+   flow, using the active champion specialist library plus existing specialist
+   governance rules to recommend explicit review before retraining.
+2. Surfaced `library_review_recommended` as a first-class drift-cycle outcome
+   when the active specialist library is degraded but drift evidence does not
+   justify challenger training.
+3. Added explicit specialist retirement rules plus certified shadow
+   replacement recommendations in `core/specialists/governance.py`, so
+   terminally unhealthy specialists can move to `retired` and governed backups
+   can move to `shadow_challenger` through existing lifecycle transitions.
+4. Added an additive `router_recalibration` maintenance path in
+   `core/orchestration.py`, reusing the existing router-stability gate to
+   recommend router recalibration before challenger training when switching
+   behavior is unstable.
+5. Added an additive `structural_invalidation` policy split plus top-level
+   `action_report`, so approved drift evidence now resolves to explicit
+   `reroute`, `recalibrate`, `discover`, or `retrain` actions instead of
+   treating all approved drift as immediate retraining.
+6. Reserved challenger training for structural invalidation cases such as
+   model TTL expiry, performance drift, or joint feature/prediction shift,
+   while non-structural regime changes now surface `discovery_recommended`
+   without opening a retraining window.
+7. Tightened empty runtime specialist-library handling so missing specialist
+   libraries do not produce false-positive library-review recommendations.
+8. Added focused governance and drift workflow regressions covering
+   retirement-plus-replacement, router recalibration, non-structural discovery,
+   and preserved TTL-driven retraining.
+9. Validated the complete Phase 7 slice with focused maintenance and
+   governance suites.
 
 Implementation targets:
 

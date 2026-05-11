@@ -9,6 +9,7 @@ import pandas as pd
 import core.automl as automl_module
 from core import ResearchPipeline
 from core.automl import _summarize_training, run_automl_study
+from core.pipeline import _summarize_regime_coverage_folds
 
 
 def _make_market_frame(rows=280, seed=0):
@@ -97,6 +98,48 @@ def _build_pipeline(raw, *, automl=None, strategy="feature", feature_adaptation=
 
 
 class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
+    def test_regime_coverage_summary_surfaces_unseen_regime_degradation(self):
+        summary = _summarize_regime_coverage_folds(
+            [
+                {
+                    "fold": 0,
+                    "split_id": "fold_0",
+                    "fit": {"status": "passed"},
+                    "validation": {"status": "passed"},
+                    "test": {"status": "passed", "available_rows": 40},
+                    "training_report": {"trained_regimes": ["bull", "bear"], "skipped_regimes": {}},
+                    "inference_report": {"fallback_rows": 10, "unseen_regimes": ["crash"]},
+                },
+                {
+                    "fold": 1,
+                    "split_id": "fold_1",
+                    "fit": {"status": "passed"},
+                    "validation": {"status": "passed"},
+                    "test": {"status": "passed", "available_rows": 20},
+                    "training_report": {"trained_regimes": ["bull", "bear"], "skipped_regimes": {}},
+                    "inference_report": {"fallback_rows": 0, "unseen_regimes": []},
+                },
+            ],
+            coverage_config={"max_dominant_share": 1.0, "min_distinct_regimes": 1},
+            strategy="specialist",
+            fold_backtests=[
+                {"fold": 0, "split_id": "fold_0", "net_profit_pct": -2.0, "sharpe_ratio": -0.5, "max_drawdown": 0.08, "total_trades": 4},
+                {"fold": 1, "split_id": "fold_1", "net_profit_pct": 1.5, "sharpe_ratio": 0.4, "max_drawdown": 0.03, "total_trades": 3},
+            ],
+        )
+
+        report = summary["unseen_regime_degradation_report"]
+        self.assertTrue(report["enabled"])
+        self.assertEqual(report["affected_fold_count"], 1)
+        self.assertEqual(report["fallback_rows"], 10)
+        self.assertEqual(report["fallback_evidence_rows"], 60)
+        self.assertEqual(report["fallback_row_share"], 0.1667)
+        self.assertEqual(report["unseen_regimes"], ["crash"])
+        self.assertEqual(report["by_regime"]["crash"]["affected_fold_count"], 1)
+        self.assertEqual(report["affected_folds"][0]["split_id"], "fold_0")
+        self.assertEqual(report["affected_fold_metrics"]["mean_net_profit_pct"], -2.0)
+        self.assertEqual(report["clean_fold_metrics"]["mean_net_profit_pct"], 1.5)
+
     def test_train_models_supports_regime_aware_primary_path(self):
         pipeline = _build_pipeline(_make_market_frame(seed=17), strategy="feature")
 
@@ -118,6 +161,9 @@ class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
         self.assertIn("fit", coverage_summary["folds"][0])
         self.assertIn("validation", coverage_summary["folds"][0])
         self.assertIn("test", coverage_summary["folds"][0])
+        self.assertTrue(coverage_summary["unseen_regime_degradation_report"]["enabled"])
+        self.assertIn("unseen_regime_degradation_report", regime_summary)
+        self.assertIn("unseen_regime_degradation_report", backtest)
         self.assertEqual(list(signals["continuous_signals"].index), list(training["oos_predictions"].index))
         self.assertGreaterEqual(backtest["total_trades"], 0)
 
@@ -295,8 +341,39 @@ class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
         summary = _summarize_training(training)
 
         self.assertIn("feature_adaptation", summary)
+        self.assertIn("specialist_library", summary)
         self.assertEqual(summary["feature_adaptation"]["last_manifest"]["adapter_type"], "composite_feature_adaptation")
+        self.assertEqual(summary["specialist_library"]["fallback_model_id"], "fallback_generalist")
         json.dumps(automl_module._json_ready(summary["feature_adaptation"]))
+        json.dumps(automl_module._json_ready(summary["specialist_library"]))
+
+    def test_train_models_surfaces_specialist_library_for_specialist_strategy(self):
+        pipeline = _build_pipeline(
+            _make_market_frame(seed=49),
+            strategy="specialist",
+            feature_adaptation={
+                "selection": {
+                    "mode": "per_regime_mask",
+                    "fallback": "global",
+                    "min_regime_samples": 12,
+                    "min_feature_rows": 8,
+                    "min_active_share": 0.1,
+                },
+                "disable_incompatible_features": True,
+            },
+        )
+
+        pipeline.build_features()
+        pipeline.build_labels()
+        pipeline.align_data()
+        training = pipeline.train_models()
+
+        specialist_library = training["specialist_library"]
+        self.assertEqual(specialist_library["fallback_model_id"], "fallback_generalist")
+        selection_contract = specialist_library["metadata"]["selection_contract"]
+        self.assertTrue(selection_contract["candidate_model_ids"])
+        self.assertEqual(selection_contract["active_model_ids"], [])
+        self.assertEqual(pipeline.state["specialist_library"], specialist_library)
 
     def test_refit_artifact_surfaces_feature_adaptation(self):
         pipeline = _build_pipeline(
@@ -327,11 +404,13 @@ class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
         )
 
         self.assertIn("feature_adaptation", artifact)
+        self.assertIn("specialist_library", artifact)
         self.assertEqual(
             artifact["feature_adaptation"].get("last_manifest", {}).get("adapter_type"),
             "composite_feature_adaptation",
         )
         self.assertEqual(artifact["feature_adaptation"], artifact["training"].get("feature_adaptation"))
+        self.assertEqual(artifact["specialist_library"], artifact["training"].get("specialist_library"))
 
     def test_run_automl_study_preserves_regime_aware_trial_metadata(self):
         if automl_module.optuna is None:
@@ -398,6 +477,108 @@ class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
         self.assertTrue(summary["best_training"]["regime"]["regime_aware"]["enabled"])
         self.assertEqual(summary["best_training"]["regime"]["regime_aware"]["strategy"], "feature")
         self.assertIn("coverage_summary", summary["best_training"]["regime"])
+
+    def test_run_automl_study_surfaces_orchestration_bundle_lineage(self):
+        if automl_module.optuna is None:
+            self.skipTest("optuna is not installed")
+
+        raw = _make_market_frame(seed=71)
+        fd, storage_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(storage_path)
+        automl_config = {
+            "enabled": True,
+            "n_trials": 1,
+            "objective": "directional_accuracy",
+            "storage": str(storage_path),
+            "study_name": "automl_orchestration_bundle_test",
+            "policy_profile": "legacy_permissive",
+            "selection_policy": {"enabled": False},
+            "overfitting_control": {"enabled": False},
+            "search_space": {
+                "orchestration": {
+                    "bundle": {
+                        "type": "categorical",
+                        "choices": [
+                            {
+                                "name": "trend_native_weighted",
+                                "description": "Trend-state detector with weighted routing metadata.",
+                                "regime": {
+                                    "detectors": [
+                                        {
+                                            "name": "trend_native_primary",
+                                            "type": "trend_state",
+                                            "primary": True,
+                                            "warmup_bars": 120,
+                                        }
+                                    ]
+                                },
+                                "feature_adaptation": {
+                                    "scaling": {"mode": "identity", "fallback": "identity"},
+                                },
+                                "model_library": {
+                                    "fallback_model": "fallback_generalist",
+                                    "specialists": [
+                                        {
+                                            "model_id": "trend_model",
+                                            "estimator": "logistic",
+                                            "compatible_regimes": ["trend_up_low_vol"],
+                                        }
+                                    ],
+                                },
+                                "router": {
+                                    "type": "confidence_weighted",
+                                    "hysteresis_margin": 0.05,
+                                    "min_persistence_bars": 2,
+                                    "cooldown_bars": 4,
+                                },
+                                "model": {
+                                    "regime_aware": {
+                                        "enabled": True,
+                                        "strategy": "feature",
+                                        "min_samples_per_regime": 24,
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                },
+                "features": {
+                    "lags": {"type": "categorical", "choices": ["1,3,6"]},
+                    "frac_diff_d": {"type": "categorical", "choices": [0.4]},
+                    "rolling_window": {"type": "categorical", "choices": [20]},
+                    "squeeze_quantile": {"type": "categorical", "choices": [0.2]},
+                },
+                "feature_selection": {
+                    "enabled": {"type": "categorical", "choices": [True]},
+                    "max_features": {"type": "categorical", "choices": [12]},
+                    "min_mi_threshold": {"type": "categorical", "choices": [0.0]},
+                },
+                "model": {
+                    "type": {"type": "categorical", "choices": ["logistic"]},
+                    "gap": {"type": "categorical", "choices": [6]},
+                    "params": {
+                        "logistic": {
+                            "c": {"type": "categorical", "choices": [1.0]},
+                        }
+                    },
+                },
+            },
+        }
+        pipeline = _build_pipeline(raw, automl=automl_config, strategy="feature")
+
+        try:
+            summary = run_automl_study(pipeline, pipeline_class=ResearchPipeline, trial_step_classes=[])
+        finally:
+            if os.path.exists(storage_path):
+                os.remove(storage_path)
+
+        self.assertEqual(summary["best_bundle_lineage"]["bundle_name"], "trend_native_weighted")
+        self.assertEqual(summary["best_bundle_lineage"]["primary_detector"]["type"], "trend_state")
+        self.assertEqual(summary["best_bundle_lineage"]["specialist_model_ids"], ["trend_model"])
+        self.assertEqual(summary["best_bundle_lineage"]["router"]["type"], "confidence_weighted")
+        self.assertEqual(summary["best_overrides"]["experiment"]["bundle_name"], "trend_native_weighted")
+        self.assertEqual(summary["best_overrides"]["model"]["regime_aware"]["router"]["type"], "confidence_weighted")
 
 
 if __name__ == "__main__":
