@@ -29,6 +29,43 @@ def _make_raw(index):
 
 
 class FeatureAdmissionPolicyTest(unittest.TestCase):
+    def test_align_data_drops_non_numeric_features_before_training(self):
+        index = pd.date_range("2026-09-01", periods=140, freq="1h", tz="UTC")
+        raw_data = _make_raw(index)
+        features = pd.DataFrame(
+            {
+                "stable_alpha": raw_data["close"].pct_change().fillna(0.0).rolling(3, min_periods=1).mean(),
+                "semantic_regime": ["bull" if position % 2 == 0 else "bear" for position in range(len(index))],
+            },
+            index=index,
+        )
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "labels": {"kind": "fixed_horizon", "horizon": 3, "threshold": 0.0},
+            }
+        )
+        pipeline.state["raw_data"] = raw_data
+        pipeline.state["data"] = raw_data.copy()
+        pipeline.state["features"] = features
+        pipeline.state["feature_blocks"] = {"stable_alpha": "price_volume", "semantic_regime": "regime"}
+        pipeline.state["feature_families"] = {"stable_alpha": "endogenous_price", "semantic_regime": "regime"}
+        pipeline.state["feature_metadata"] = derive_feature_metadata(
+            feature_blocks=pipeline.state["feature_blocks"],
+            feature_families=pipeline.state["feature_families"],
+            columns=features.columns,
+        )
+
+        pipeline.build_labels()
+        aligned = pipeline.align_data()
+
+        self.assertIn("stable_alpha", aligned["X"].columns)
+        self.assertNotIn("semantic_regime", aligned["X"].columns)
+        self.assertEqual(
+            pipeline.state["feature_screening"]["alignment"]["dropped_non_numeric_columns"],
+            ["semantic_regime"],
+        )
+
     def test_stationary_feature_can_still_fail_stability_admission(self):
         rng = np.random.default_rng(42)
         index = pd.date_range("2026-09-01", periods=160, freq="1h", tz="UTC")

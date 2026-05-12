@@ -89,13 +89,63 @@ class RouterRuntimeTest(unittest.TestCase):
         self.assertTrue(decision.components)
         self.assertEqual(roundtrip.selected_model_id, "specialist::bull")
 
+    def test_warm_regime_state_routes_to_explicit_safe_fallback(self):
+        router = HardSwitchRouter(hysteresis_margin=0.0, min_persistence_bars=1, cooldown_bars=0, safe_mode_policy="fallback_only")
+        state = router.initialize(_make_active_specialist_library())
+
+        state, decision = router.select(
+            state,
+            RegimeStateContract(
+                as_of="2026-05-09T00:00:00Z",
+                available_at="2026-05-09T00:00:00Z",
+                label="bull",
+                confidence=0.95,
+                warm=False,
+            ),
+        )
+
+        self.assertEqual(decision.selected_model_id, "fallback_generalist")
+        self.assertEqual(decision.route_reason, "warm_safe_mode")
+        self.assertEqual(decision.metadata["regime_availability_state"], "warm")
+        self.assertEqual(decision.metadata["safe_mode_action"], "fallback_only")
+        self.assertEqual(state.active_model_id, "fallback_generalist")
+
+    def test_unavailable_regime_state_can_force_no_trade(self):
+        router = WeightedRouter(
+            allocation_temperature=0.5,
+            hysteresis_margin=0.0,
+            min_persistence_bars=1,
+            cooldown_bars=0,
+            safe_mode_policy="no_trade",
+        )
+        state = router.initialize(_make_active_specialist_library())
+
+        state, decision = router.select(
+            state,
+            RegimeStateContract(
+                as_of="2026-05-09T00:00:00Z",
+                available_at="2026-05-09T00:00:00Z",
+                label=0,
+                confidence=0.0,
+                warm=False,
+                detector_outputs={"unavailable": 1},
+            ),
+        )
+
+        self.assertIsNone(decision.selected_model_id)
+        self.assertEqual(decision.weights, {})
+        self.assertEqual(decision.route_reason, "unavailable_safe_mode")
+        self.assertEqual(decision.metadata["safe_mode_action"], "no_trade")
+        self.assertIsNone(state.active_model_id)
+
     def test_build_router_supports_hard_switch_and_weighted_types(self):
-        hard_switch = build_router({"type": "hard_switch", "hysteresis_margin": 0.1})
+        hard_switch = build_router({"type": "hard_switch", "hysteresis_margin": 0.1, "safe_mode_policy": "fallback_only"})
         weighted = build_router({"type": "confidence_weighted", "allocation_temperature": 0.7})
 
         self.assertIsInstance(hard_switch, HardSwitchRouter)
         self.assertIsInstance(weighted, WeightedRouter)
         self.assertEqual(weighted.manifest().router_type, "confidence_weighted")
+        self.assertEqual(hard_switch.manifest().metadata["safe_mode_policy"], "fallback_only")
 
 
 if __name__ == "__main__":

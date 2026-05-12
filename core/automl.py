@@ -17,6 +17,7 @@ from .automl_contracts import validate_summary_contract
 from .evaluation_modes import resolve_evaluation_mode
 from .promotion import (
     build_promotion_gate_check_map,
+    build_promotion_gate_status_map,
     create_promotion_eligibility_report,
     evaluate_execution_realism_gate,
     evaluate_router_stability_gate,
@@ -2644,14 +2645,28 @@ def _gs(name, passed, measured, threshold, failure_reason, details, mode=None):
     }
 
 
+def _resolve_router_stability_gate_mode(selection_policy, router_stability):
+    mode = resolve_promotion_gate_mode(selection_policy, "router_stability")
+    if (
+        mode == "blocking"
+        and str((router_stability or {}).get("status") or "").lower() == "unknown"
+        and not bool((selection_policy or {}).get("is_capital_facing", False))
+    ):
+        return "advisory"
+    return mode
+
+
 def _update_selection_policy_report(policy_report, promotion_eligibility_report, *, include_post_selection=False):
     report = finalize_promotion_eligibility_report(promotion_eligibility_report)
     checks = dict(policy_report.get("eligibility_checks") or {})
     checks.update(build_promotion_gate_check_map(report))
+    check_statuses = dict(policy_report.get("eligibility_check_statuses") or {})
+    check_statuses.update(build_promotion_gate_status_map(report))
     selection_group = dict((report.get("groups") or {}).get("selection") or {})
 
     policy_report["promotion_eligibility_report"] = report
     policy_report["eligibility_checks"] = checks
+    policy_report["eligibility_check_statuses"] = check_statuses
     policy_report["eligible_before_post_checks"] = bool(report.get("eligible_before_post_checks", False))
     policy_report["eligibility_reasons"] = list(selection_group.get("blocking_failures") or [])
     if include_post_selection:
@@ -5090,7 +5105,16 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
     if regime_coverage_summary:
         regime_aware_summary.setdefault("strategy", regime_coverage_summary.get("strategy"))
         regime_aware_summary.setdefault("fallback_rows", int(regime_coverage_summary.get("fallback_rows") or 0))
+        regime_aware_summary.setdefault(
+            "fallback_evidence_rows",
+            int(regime_coverage_summary.get("fallback_evidence_rows") or 0),
+        )
+        regime_aware_summary.setdefault("fallback_row_share", regime_coverage_summary.get("fallback_row_share"))
         regime_aware_summary.setdefault("unseen_regimes", list(regime_coverage_summary.get("unseen_regimes") or []))
+        regime_aware_summary.setdefault(
+            "candidate_classification",
+            regime_coverage_summary.get("candidate_classification"),
+        )
     stress_realism = evaluate_stress_realism_gate(
         post_selection_backtest,
         policy=selection_policy,
@@ -5113,12 +5137,15 @@ def run_automl_study(base_pipeline, pipeline_class, trial_step_classes):
         policy=selection_policy,
     )
     best_trial_report["selection_policy"]["eligibility_checks"]["router_stability"] = bool(router_stability["passed"])
+    best_trial_report["selection_policy"].setdefault("eligibility_check_statuses", {})[
+        "router_stability"
+    ] = str(router_stability.get("status") or ("pass" if router_stability.get("passed") else "fail"))
     promotion_eligibility_report = upsert_promotion_gate(
         promotion_eligibility_report,
         group="post_selection",
         name="router_stability",
         passed=bool(router_stability["passed"]),
-        mode=resolve_promotion_gate_mode(selection_policy, "router_stability"),
+        mode=_resolve_router_stability_gate_mode(selection_policy, router_stability),
         measured=router_stability.get("switch_rate"),
         threshold=router_stability.get("thresholds"),
         reason=router_stability.get("reason"),

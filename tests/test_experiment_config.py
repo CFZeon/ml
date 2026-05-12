@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from example_utils import build_spot_research_config
 from experiments import load_experiment_config
 
 
@@ -43,6 +44,55 @@ quick_overrides:
         self.assertEqual(resolved.config["model"]["cv_method"], "walk_forward")
         self.assertEqual(resolved.config["indicators"][0]["kind"], "returns")
         self.assertEqual(resolved.config["indicators"][0]["params"]["periods"], [1, 2])
+
+    def test_load_experiment_config_quick_smoke_caps_context_and_respects_gap_floor(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "quick_smoke.yaml"
+            config_path.write_text(
+                """
+experiment:
+  name: btc_quick_smoke
+data:
+  symbol: BTCUSDT
+  interval: 1h
+  start: 2024-01-01
+  end: 2024-04-01
+  context_symbols: [ETHUSDT, SOLUSDT, BNBUSDT]
+indicators:
+  - kind: returns
+features:
+  lags: [1, 3, 6]
+model:
+  cv_method: walk_forward
+  n_splits: 4
+  train_size: 720
+  test_size: 168
+  gap: 3
+""".strip(),
+                encoding="utf-8",
+            )
+
+            resolved = load_experiment_config(config_path, quick=True)
+
+        self.assertEqual(resolved.config["data"]["cross_asset_context"]["symbols"], ["ETHUSDT"])
+        self.assertEqual(resolved.config["model"]["n_splits"], 1)
+        self.assertEqual(resolved.config["model"]["train_size"], 240)
+        self.assertEqual(resolved.config["model"]["test_size"], 48)
+        self.assertEqual(resolved.config["model"]["gap"], 6)
+
+    def test_load_experiment_config_quick_smoke_caps_context_for_mapping_configs(self):
+        config = build_spot_research_config(
+            symbol="BTCUSDT",
+            interval="1h",
+            start="2024-01-01",
+            end="2024-04-01",
+            indicators=[{"kind": "returns"}],
+            context_symbols=["ETHUSDT", "BNBUSDT"],
+        )
+
+        resolved = load_experiment_config(config, quick=True)
+
+        self.assertEqual(resolved.config["data"]["cross_asset_context"]["symbols"], ["ETHUSDT"])
 
     def test_load_experiment_config_derives_legacy_regime_aware_fields_from_orchestration_shape(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

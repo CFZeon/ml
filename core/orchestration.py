@@ -305,11 +305,11 @@ def _evaluate_structural_invalidation_policy(drift_report, drift_guardrails, *, 
     if bool(policy.get("allow_performance_drift", True)) and bool(report.get("performance_drift", False)):
         structural_reasons.append("performance_drift_detected")
     if (
-        bool(policy.get("treat_joint_feature_prediction_drift_as_structural", True))
+        bool(policy.get("treat_joint_feature_action_drift_as_structural", True))
         and bool(report.get("feature_drift", False))
-        and bool(report.get("prediction_drift", False))
+        and bool(report.get("action_drift", False))
     ):
-        structural_reasons.append("joint_feature_prediction_drift_detected")
+        structural_reasons.append("joint_feature_action_drift_detected")
 
     discovery_reasons = []
     if not structural_reasons:
@@ -317,21 +317,56 @@ def _evaluate_structural_invalidation_policy(drift_report, drift_guardrails, *, 
             discovery_reasons.append("regime_drift_detected")
         if bool(policy.get("discover_on_feature_drift", True)) and bool(report.get("feature_drift", False)):
             discovery_reasons.append("feature_drift_detected")
-        if bool(policy.get("discover_on_prediction_drift", True)) and bool(report.get("prediction_drift", False)):
-            discovery_reasons.append("prediction_drift_detected")
+
+    calibration_reasons = []
+    if not structural_reasons and not discovery_reasons:
+        if bool(policy.get("recalibrate_on_score_drift", True)) and bool(report.get("score_drift", False)):
+            calibration_reasons.append("score_drift_detected")
+        if bool(policy.get("recalibrate_on_action_drift", True)) and bool(report.get("action_drift", False)):
+            calibration_reasons.append("action_drift_detected")
+
+    observe_reasons = []
+    if not structural_reasons and not discovery_reasons and not calibration_reasons and int(report.get("evidence_count") or 0) > 0:
+        observe_reasons.append("drift_observe_only")
 
     retrain_recommended = bool(approved and structural_reasons)
     discover_recommended = bool(approved and not retrain_recommended and discovery_reasons)
+    recalibrate_recommended = bool(approved and not retrain_recommended and not discover_recommended and calibration_reasons)
+    observe_recommended = bool(
+        approved and not retrain_recommended and not discover_recommended and not recalibrate_recommended and observe_reasons
+    )
 
     return {
         "enabled": True,
         "applicable": approved,
         "retrain_recommended": retrain_recommended,
         "discover_recommended": discover_recommended,
-        "action": "retrain" if retrain_recommended else "discover" if discover_recommended else "hold",
-        "reasons": list(structural_reasons if retrain_recommended else discovery_reasons),
+        "recalibrate_recommended": recalibrate_recommended,
+        "observe_recommended": observe_recommended,
+        "action": (
+            "retrain"
+            if retrain_recommended
+            else "discover"
+            if discover_recommended
+            else "recalibrate"
+            if recalibrate_recommended
+            else "observe"
+            if observe_recommended
+            else "hold"
+        ),
+        "reasons": list(
+            structural_reasons
+            if retrain_recommended
+            else discovery_reasons
+            if discover_recommended
+            else calibration_reasons
+            if recalibrate_recommended
+            else observe_reasons
+        ),
         "structural_reasons": structural_reasons,
         "discovery_reasons": discovery_reasons,
+        "calibration_reasons": calibration_reasons,
+        "observe_reasons": observe_reasons,
     }
 
 
@@ -354,11 +389,23 @@ def _resolve_drift_action_report(*, library_review, router_recalibration, struct
             "source": "structural_invalidation",
             "reasons": list(structural_invalidation.get("discovery_reasons") or []),
         }
+    if bool(structural_invalidation.get("recalibrate_recommended", False)):
+        return {
+            "recommended_action": "recalibrate",
+            "source": "structural_invalidation",
+            "reasons": list(structural_invalidation.get("calibration_reasons") or []),
+        }
     if bool(structural_invalidation.get("retrain_recommended", False)):
         return {
             "recommended_action": "retrain",
             "source": "structural_invalidation",
             "reasons": list(structural_invalidation.get("structural_reasons") or []),
+        }
+    if bool(structural_invalidation.get("observe_recommended", False)):
+        return {
+            "recommended_action": "observe",
+            "source": "structural_invalidation",
+            "reasons": list(structural_invalidation.get("observe_reasons") or []),
         }
     return {
         "recommended_action": "hold",

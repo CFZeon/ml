@@ -31,6 +31,8 @@ def replay_router_trace(router, specialists, regime_states: Sequence[Any] | None
     selected_model_ids = []
     blocked_switch_reasons = {}
     route_reason_counts = {}
+    regime_availability_counts = {}
+    safe_mode_action_counts = {}
     switch_count = 0
     previous_active_model_id = state.active_model_id
 
@@ -50,6 +52,12 @@ def replay_router_trace(router, specialists, regime_states: Sequence[Any] | None
         states.append(RouterStateSnapshot.from_dict(state.to_dict()).to_dict())
         selected_model_ids.append(decision.selected_model_id)
         route_reason_counts[str(decision.route_reason)] = int(route_reason_counts.get(str(decision.route_reason), 0)) + 1
+        availability_state = str((decision.metadata or {}).get("regime_availability_state") or "known")
+        regime_availability_counts[availability_state] = int(regime_availability_counts.get(availability_state, 0)) + 1
+        safe_mode_action = (decision.metadata or {}).get("safe_mode_action")
+        if safe_mode_action:
+            safe_mode_action = str(safe_mode_action)
+            safe_mode_action_counts[safe_mode_action] = int(safe_mode_action_counts.get(safe_mode_action, 0)) + 1
         blocked_reason = (decision.metadata or {}).get("blocked_switch_reason")
         if blocked_reason:
             blocked_switch_reasons[str(blocked_reason)] = int(blocked_switch_reasons.get(str(blocked_reason), 0)) + 1
@@ -68,6 +76,8 @@ def replay_router_trace(router, specialists, regime_states: Sequence[Any] | None
             "selected_model_ids": selected_model_ids,
             "route_reason_counts": route_reason_counts,
             "blocked_switch_reasons": blocked_switch_reasons,
+            "regime_availability_counts": regime_availability_counts,
+            "safe_mode_action_counts": safe_mode_action_counts,
         },
     }
 

@@ -109,6 +109,7 @@ from .regime_training import (
     summarize_regime_coverage,
     train_regime_aware_model,
 )
+from .routing import RoutingDecisionContract, build_router, replay_router_trace
 from .slippage import (
     DepthCurveImpactModel,
     FillAwareCostModel,
@@ -382,6 +383,271 @@ def _predict_primary_model_outputs(model, X, regime_data=None):
     prediction_series = pd.Series(model.predict(X), index=X.index)
     probability_frame = predict_probability_frame(model, X)
     return prediction_series, probability_frame, {}
+
+
+def _resolve_pipeline_router_config(pipeline):
+    top_level = pipeline.section("router")
+    model_regime_aware = dict((pipeline.section("model") or {}).get("regime_aware") or {})
+    nested = model_regime_aware.get("router")
+
+    resolved = {}
+    if isinstance(top_level, dict):
+        resolved.update(copy.deepcopy(top_level))
+    if isinstance(nested, dict):
+        resolved.update(copy.deepcopy(nested))
+
+    if not resolved or not bool(resolved.get("enabled", True)):
+        return {}
+    return resolved
+
+
+def _as_float_series(value, index, fill_value=0.0):
+    if value is None:
+        return pd.Series(float(fill_value), index=index, dtype=float)
+    return pd.Series(value, copy=False).reindex(index).fillna(fill_value).astype(float)
+
+
+def _build_specialist_signal_surfaces(
+    model,
+    X,
+    *,
+    meta_model,
+    primary_calibrator=None,
+    meta_calibrator=None,
+    meta_context_frame=None,
+    signal_config=None,
+    avg_win=0.02,
+    avg_loss=0.02,
+    holding_bars=1,
+    kelly_trade_count=None,
+    inference_latencies_ms=None,
+):
+    if not _is_regime_aware_model(model) or getattr(model, "strategy", None) != "specialist":
+        return {}
+
+    X_frame = pd.DataFrame(X).copy()
+    if X_frame.empty or meta_model is None:
+        return {}
+
+    model_X = X_frame.loc[:, model.feature_columns] if getattr(model, "feature_columns", None) else X_frame
+    resolved_context = None
+    if meta_context_frame is not None:
+        resolved_context = pd.DataFrame(meta_context_frame).reindex(X_frame.index)
+
+    runtime_models = []
+    if getattr(model, "fallback_model", None) is not None:
+        runtime_models.append(("fallback_generalist", model.fallback_model))
+    for regime_value, specialist_model in dict(getattr(model, "specialist_models", {}) or {}).items():
+        runtime_models.append((f"specialist::{regime_value}", specialist_model))
+
+    surfaces = {}
+    for model_id, estimator in runtime_models:
+        predictions = pd.Series(estimator.predict(model_X), index=X_frame.index)
+        probability_frame_raw = predict_probability_frame(
+            estimator,
+            model_X,
+            ordered_classes=getattr(model, "ordered_classes", (-1, 0, 1)),
+        )
+        probability_frame = _apply_primary_probability_calibrator(probability_frame_raw, primary_calibrator)
+        X_meta = build_meta_feature_frame(predictions, probability_frame_raw, context=resolved_context)
+        if inference_latencies_ms is None:
+            meta_prob_raw = pd.Series(_positive_class_probability(meta_model, X_meta), index=X_frame.index)
+        else:
+            meta_prob_raw = pd.Series(
+                _timed_inference_call(
+                    inference_latencies_ms,
+                    _positive_class_probability,
+                    meta_model,
+                    X_meta,
+                ),
+                index=X_frame.index,
+            )
+        meta_prob = pd.Series(
+            apply_binary_probability_calibrator(meta_calibrator, meta_prob_raw.to_numpy()),
+            index=X_frame.index,
+            dtype=float,
+        ).clip(0.0, 1.0) if meta_calibrator is not None else meta_prob_raw.clip(0.0, 1.0)
+        signal_state = _build_signal_state(
+            predictions,
+            probability_frame,
+            meta_prob,
+            signal_config,
+            avg_win,
+            avg_loss,
+            holding_bars,
+            kelly_trade_count=kelly_trade_count,
+        )
+        surfaces[str(model_id)] = {
+            "event_signals": signal_state["event_signals"],
+            "continuous_signals": signal_state["continuous_signals"],
+            "signals": signal_state["signals"],
+            "position_size": signal_state["position_size"],
+            "meta_prob": signal_state["meta_prob"],
+            "profitability_prob": signal_state["profitability_prob"],
+            "direction_edge": signal_state["direction_edge"],
+            "confidence": signal_state["confidence"],
+            "expected_trade_edge": signal_state["expected_trade_edge"],
+        }
+    return surfaces
+
+
+def _route_signal_state_with_router(
+    base_signal_state,
+    specialist_signal_surfaces,
+    *,
+    router,
+    specialist_library,
+    regime_states,
+    include_decision_trace=False,
+):
+    if (
+        router is None
+        or not specialist_library
+        or not specialist_signal_surfaces
+        or regime_states is None
+    ):
+        return base_signal_state, None
+
+    base_continuous = pd.Series(base_signal_state.get("continuous_signals"), copy=False)
+    index = pd.Index(base_continuous.index)
+    if len(index) == 0:
+        return base_signal_state, None
+
+    fields = (
+        "event_signals",
+        "continuous_signals",
+        "position_size",
+        "meta_prob",
+        "profitability_prob",
+        "direction_edge",
+        "confidence",
+        "expected_trade_edge",
+    )
+    prepared_surfaces = {}
+    for model_id, payload in dict(specialist_signal_surfaces or {}).items():
+        if not isinstance(payload, dict):
+            continue
+        prepared_surfaces[str(model_id)] = {
+            field_name: _as_float_series(payload.get(field_name), index)
+            for field_name in fields
+            if payload.get(field_name) is not None
+        }
+    if not prepared_surfaces:
+        return base_signal_state, None
+
+    trace = replay_router_trace(router, specialist_library, regime_states)
+    decision_trace = list(trace.get("decision_trace") or [])
+    if len(decision_trace) != len(index):
+        return base_signal_state, None
+
+    base_series = {field_name: _as_float_series(base_signal_state.get(field_name), index) for field_name in fields}
+    routed = {field_name: pd.Series(0.0, index=index, dtype=float) for field_name in fields}
+    missing_surface_rows = 0
+    weighted_rows = 0
+
+    for loc, decision_payload in enumerate(decision_trace):
+        decision = (
+            decision_payload
+            if isinstance(decision_payload, RoutingDecisionContract)
+            else RoutingDecisionContract.from_dict(decision_payload)
+        )
+        safe_mode_action = str((decision.metadata or {}).get("safe_mode_action") or "")
+        safe_mode_active = bool((decision.metadata or {}).get("safe_mode_active", False))
+        if safe_mode_action == "no_trade":
+            continue
+
+        weights = {
+            str(model_id): float(weight)
+            for model_id, weight in dict(decision.weights or {}).items()
+            if float(weight) != 0.0
+        }
+        if weights:
+            used_any = False
+            for model_id, weight in weights.items():
+                payload = prepared_surfaces.get(model_id)
+                if payload is None:
+                    continue
+                for field_name in fields:
+                    if field_name in payload:
+                        routed[field_name].iloc[loc] += float(payload[field_name].iloc[loc]) * float(weight)
+                used_any = True
+            if used_any:
+                weighted_rows += 1
+                continue
+
+        selected_model_id = None if decision.selected_model_id is None else str(decision.selected_model_id)
+        selected_payload = prepared_surfaces.get(selected_model_id)
+        if selected_payload is None:
+            missing_surface_rows += 1
+            if safe_mode_active:
+                continue
+            for field_name in fields:
+                routed[field_name].iloc[loc] = float(base_series[field_name].iloc[loc])
+            continue
+
+        for field_name in fields:
+            if field_name in selected_payload:
+                routed[field_name].iloc[loc] = float(selected_payload[field_name].iloc[loc])
+            else:
+                routed[field_name].iloc[loc] = float(base_series[field_name].iloc[loc])
+
+    routed_state = dict(base_signal_state)
+    for field_name in fields:
+        routed_state[field_name] = routed[field_name]
+    routed_state["signals"] = routed["continuous_signals"].apply(
+        lambda value: 1 if value > 1e-12 else (-1 if value < -1e-12 else 0)
+    )
+    routed_state["router_bound"] = True
+    routed_state["router_binding_mode"] = "fold_local_executed_routing"
+    routed_state["routed_signal_surfaces"] = {
+        model_id: payload.get("continuous_signals")
+        for model_id, payload in prepared_surfaces.items()
+        if payload.get("continuous_signals") is not None
+    }
+    routed_state["router_trace_summary"] = {
+        "manifest": dict(trace.get("manifest") or {}),
+        "summary": {
+            **dict(trace.get("summary") or {}),
+            "binding_mode": "executed_signals",
+            "missing_surface_rows": int(missing_surface_rows),
+            "weighted_rows": int(weighted_rows),
+        },
+    }
+    if include_decision_trace:
+        routed_state["router_trace_summary"]["decision_trace"] = decision_trace
+    return routed_state, routed_state["router_trace_summary"]
+
+
+def _resolve_backtest_router_runtime_kwargs(pipeline, backtest_config, *, signal_state=None):
+    router_config = _resolve_pipeline_router_config(pipeline)
+    if not router_config:
+        return {}
+
+    resolved_signal_state = dict(signal_state or pipeline.state.get("signals") or {})
+    specialist_library = (
+        resolved_signal_state.get("specialist_library")
+        or (pipeline.state.get("training") or {}).get("specialist_library")
+        or pipeline.state.get("specialist_library")
+    )
+    if not specialist_library:
+        return {}
+    if resolved_signal_state.get("router_bound", False) and not resolved_signal_state.get("router_diagnostics_enabled", False):
+        return {}
+
+    return {
+        "router": build_router(router_config),
+        "specialist_library": copy.deepcopy(specialist_library),
+        "include_router_decision_trace": bool(
+            resolved_signal_state.get(
+                "router_diagnostics_include_decision_trace",
+                router_config.get("include_router_decision_trace", False),
+            )
+        ),
+        "router_switching_cost_per_switch": router_config.get(
+            "switching_cost_per_switch",
+            backtest_config.get("router_switching_cost_per_switch"),
+        ),
+    }
 
 
 def _resolve_signal_holding_bars(pipeline, signal_config):
@@ -1060,6 +1326,7 @@ def _resolve_lookahead_guard_config(pipeline):
     configured = copy.deepcopy(features_config.get("lookahead_guard") or {})
 
     automl_enabled = bool(automl_config.get("enabled", False))
+    full_causal_surface = bool(evaluation_mode.is_capital_facing or automl_enabled)
     default_enabled = True
     enabled = bool(configured.get("enabled", default_enabled))
     default_mode = "blocking" if default_enabled else "advisory"
@@ -1069,6 +1336,32 @@ def _resolve_lookahead_guard_config(pipeline):
     if mode not in {"blocking", "advisory"}:
         mode = default_mode
 
+    default_step_names = ["build_features"]
+    default_artifact_names = ["features"]
+    default_audit_scope = "pre_training_causal_surface"
+    if full_causal_surface:
+        default_step_names = [
+            "build_features",
+            "detect_regimes",
+            "build_labels",
+            "align_data",
+            "train_models",
+            "generate_signals",
+        ]
+        default_artifact_names = [
+            "features",
+            "regimes",
+            "labels",
+            "aligned_labels",
+            "oos_probabilities",
+            "oos_meta_prob",
+            "signals",
+            "continuous_signals",
+            "execution_prices",
+            "execution_volume",
+        ]
+        default_audit_scope = "full_causal_surface"
+
     return {
         "enabled": enabled,
         "mode": mode,
@@ -1076,13 +1369,13 @@ def _resolve_lookahead_guard_config(pipeline):
         "min_prefix_rows": max(1, int(configured.get("min_prefix_rows", 128))),
         "step_names": list(
             configured.get("step_names")
-            or ["build_features"]
+            or default_step_names
         ),
         "artifact_names": list(
             configured.get("artifact_names")
-            or ["features"]
+            or default_artifact_names
         ),
-        "audit_scope": str(configured.get("audit_scope", "pre_training_causal_surface")),
+        "audit_scope": str(configured.get("audit_scope", default_audit_scope)),
         "builders_present": bool(builders),
         "builder_count": int(len(builders)),
         "trade_ready_mode": evaluation_mode.is_capital_facing,
@@ -1105,6 +1398,9 @@ def _run_pipeline_lookahead_guard(pipeline):
         "skipped_timestamps": [],
         "artifact_report": {},
         "artifact_reports": {},
+        "requested_step_names": list(guard_config.get("step_names") or []),
+        "requested_artifact_names": list(guard_config.get("artifact_names") or []),
+        "stage_coverage": {},
     }
     if not guard_config["enabled"]:
         report["status"] = "disabled"
@@ -1130,6 +1426,14 @@ def _run_pipeline_lookahead_guard(pipeline):
             f"lookahead_step_unavailable:{step_name}"
             for step_name in missing_step_names
         ]
+    report["stage_coverage"] = {
+        "requested_steps": list(report["requested_step_names"]),
+        "available_steps": list(available_step_names),
+        "missing_steps": list(missing_step_names),
+        "requested_artifacts": list(report["requested_artifact_names"]),
+        "available_artifacts": [],
+        "missing_artifacts": [],
+    }
     if not available_step_names:
         report["audit_skipped"] = True
         report["status"] = "skipped"
@@ -1156,6 +1460,10 @@ def _run_pipeline_lookahead_guard(pipeline):
     artifact_report = dict(artifact_reports.get(primary_artifact_name) or {}) if primary_artifact_name else artifact_reports
 
     failure_reasons = []
+    coverage_reasons = [
+        f"lookahead_guard_stage_unavailable:{step_name}"
+        for step_name in missing_step_names
+    ]
     if audit.get("has_bias", False):
         failure_reasons.append("lookahead_guard_failed")
         for entry in biased_entries:
@@ -1165,12 +1473,29 @@ def _run_pipeline_lookahead_guard(pipeline):
                 detail = ":".join(str(value) for value in [artifact, column] if value is not None)
                 failure_reasons.append(f"lookahead_guard_failed:{detail}")
 
+    available_artifact_names = sorted(artifact_reports)
+    missing_artifact_names = [
+        artifact_name
+        for artifact_name in list(guard_config.get("artifact_names") or [])
+        if artifact_name not in artifact_reports
+    ]
+    coverage_reasons.extend(
+        f"lookahead_guard_artifact_unavailable:{artifact_name}"
+        for artifact_name in missing_artifact_names
+    )
+    stage_coverage = dict(report.get("stage_coverage") or {})
+    stage_coverage["available_artifacts"] = list(available_artifact_names)
+    stage_coverage["missing_artifacts"] = list(missing_artifact_names)
+
+    coverage_blocks = bool(guard_config.get("trade_ready_mode", False) and coverage_reasons)
+    has_bias = bool(audit.get("has_bias", False))
+
     report.update(
         {
-            "status": "failed" if bool(audit.get("has_bias", False)) else "passed",
-            "has_bias": bool(audit.get("has_bias", False)),
-            "promotion_pass": not bool(audit.get("has_bias", False)),
-            "reasons": failure_reasons,
+            "status": "failed" if has_bias else ("unavailable" if coverage_reasons else "passed"),
+            "has_bias": has_bias,
+            "promotion_pass": not has_bias and not coverage_blocks,
+            "reasons": [*coverage_reasons, *failure_reasons],
             "biased_columns": sorted(
                 {
                     str(entry.get("column"))
@@ -1190,6 +1515,9 @@ def _run_pipeline_lookahead_guard(pipeline):
             "skipped_timestamps": list(audit.get("skipped_timestamps") or []),
             "artifact_report": artifact_report,
             "artifact_reports": artifact_reports,
+            "available_artifact_names": available_artifact_names,
+            "missing_artifact_names": missing_artifact_names,
+            "stage_coverage": stage_coverage,
             "audit": audit,
         }
     )
@@ -1686,7 +2014,7 @@ def _resolve_backtest_futures_account(pipeline):
     return configured
 
 
-def _resolve_backtest_runtime_kwargs(pipeline, index):
+def _resolve_backtest_runtime_kwargs(pipeline, index, *, signal_state=None):
     backtest_config = pipeline.section("backtest")
     market = _resolve_backtest_market(pipeline)
     raw_data = pipeline.require("raw_data")
@@ -1715,7 +2043,7 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
 
     futures_account = _resolve_backtest_futures_account(pipeline)
 
-    return {
+    runtime_kwargs = {
         "engine": backtest_config.get("engine", "vectorbt"),
         "market": market,
         "leverage": float(backtest_config.get("leverage", 1.0)),
@@ -1747,6 +2075,14 @@ def _resolve_backtest_runtime_kwargs(pipeline, index):
         "evaluation_mode": backtest_config.get("evaluation_mode", "research_only"),
         "required_stress_scenarios": backtest_config.get("required_stress_scenarios"),
     }
+    runtime_kwargs.update(
+        _resolve_backtest_router_runtime_kwargs(
+            pipeline,
+            backtest_config,
+            signal_state=signal_state,
+        )
+    )
+    return runtime_kwargs
 
 
 def _resolve_backtest_significance_config(backtest_config):
@@ -1948,6 +2284,8 @@ def _build_cpcv_path_results(training, pipeline, config, validation_method):
                 "tuned_params": path.get("signal_params", {}),
                 "signal_policy": path.get("signal_policy"),
                 "regime_states": copy.deepcopy(path.get("regime_states")),
+                "router_bound": bool(path.get("router_bound", False)),
+                "router_trace_summary": copy.deepcopy(path.get("router_trace_summary") or {}),
             }
         )
     return path_results
@@ -1955,7 +2293,7 @@ def _build_cpcv_path_results(training, pipeline, config, validation_method):
 
 def _build_signal_result_from_training_payload(training_payload, pipeline, config, fallback_scope, signal_source):
     break_even_prob, profitability_threshold = _resolve_signal_profitability_threshold(training_payload, config)
-    return {
+    result = {
         "predictions": training_payload["oos_predictions"],
         "primary_probabilities": training_payload["oos_probabilities"],
         "meta_prob": training_payload["oos_meta_prob"],
@@ -1983,6 +2321,9 @@ def _build_signal_result_from_training_payload(training_payload, pipeline, confi
         "fallback_scope": fallback_scope,
         "validation_method": training_payload.get("validation", {}).get("method", "walk_forward"),
     }
+    if training_payload.get("oos_router_bound", False):
+        result["router_bound"] = True
+    return result
 
 
 def _run_path_backtests(pipeline, config, path_entries):
@@ -1991,7 +2332,7 @@ def _run_path_backtests(pipeline, config, path_entries):
         positions = path["continuous_signals"] if config.get("use_continuous_positions", True) else path["signals"]
         valuation_close = _resolve_backtest_valuation_close(pipeline, positions.index)
         execution_prices = _resolve_backtest_execution_prices(pipeline, positions.index)
-        runtime_kwargs = dict(_resolve_backtest_runtime_kwargs(pipeline, positions.index) or {})
+        runtime_kwargs = dict(_resolve_backtest_runtime_kwargs(pipeline, positions.index, signal_state=path) or {})
         if path.get("regime_states") is not None:
             runtime_kwargs["regime_states"] = copy.deepcopy(path.get("regime_states"))
         path_backtest = run_backtest(
@@ -2370,6 +2711,33 @@ def _drop_all_nan_feature_columns(X, feature_blocks=None, feature_families=None)
         if column in filtered_X.columns
     }
     return filtered_X, filtered_blocks, filtered_families, all_nan_columns
+
+
+def _drop_non_numeric_feature_columns(X, feature_blocks=None, feature_families=None):
+    if X is None or X.empty:
+        return X, dict(feature_blocks or {}), dict(feature_families or {}), []
+
+    retained_columns = [
+        column
+        for column in X.columns
+        if pd.api.types.is_numeric_dtype(X[column]) or pd.api.types.is_bool_dtype(X[column])
+    ]
+    dropped_columns = [column for column in X.columns if column not in retained_columns]
+    if not dropped_columns:
+        return X, dict(feature_blocks or {}), dict(feature_families or {}), []
+
+    filtered_X = X.loc[:, retained_columns].copy()
+    filtered_blocks = {
+        column: block_name
+        for column, block_name in dict(feature_blocks or {}).items()
+        if column in filtered_X.columns
+    }
+    filtered_families = {
+        column: family_name
+        for column, family_name in dict(feature_families or {}).items()
+        if column in filtered_X.columns
+    }
+    return filtered_X, filtered_blocks, filtered_families, dropped_columns
 
 
 def _summarize_fold_family_selection(fold_feature_selection):
@@ -3553,6 +3921,7 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None,
     specialist_shortfalls = {}
     fallback_rows = 0
     fallback_evidence_rows = 0
+    trained_regimes = set()
     backtests_by_key = {}
     for row in list(fold_backtests or []):
         backtests_by_key[(int(row.get("fold", -1)), str(row.get("split_id")))] = dict(row)
@@ -3574,6 +3943,8 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None,
         )
         unseen_regimes.update(fold_unseen_regimes)
         training_report = dict(fold.get("training_report") or {})
+        for regime_name in list(training_report.get("trained_regimes") or []):
+            trained_regimes.add(str(regime_name))
         for regime_name, reason in dict(training_report.get("skipped_regimes") or {}).items():
             specialist_shortfalls[str(regime_name)] = reason
         test_report = dict(fold.get("test") or {})
@@ -3679,6 +4050,12 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None,
             ),
         }
 
+    candidate_classification = "generalist_only"
+    if str(strategy) == "specialist" and trained_regimes:
+        candidate_classification = (
+            "specialist_degraded_to_fallback" if fallback_rows > 0 else "specialist_effective"
+        )
+
     return {
         "status": status,
         "promotion_pass": status == "passed",
@@ -3705,9 +4082,16 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None,
         "max_dominant_share_validation": _stage_max_dominant("validation"),
         "max_dominant_share_test": _stage_max_dominant("test"),
         "fallback_rows": int(fallback_rows),
+        "fallback_evidence_rows": int(fallback_evidence_rows),
+        "fallback_row_share": (
+            None
+            if fallback_evidence_rows <= 0
+            else round(float(fallback_rows / fallback_evidence_rows), 4)
+        ),
         "unseen_regimes": sorted(unseen_regimes),
         "specialist_shortfalls": specialist_shortfalls,
         "unseen_regime_degradation_report": unseen_regime_degradation_report,
+        "candidate_classification": candidate_classification,
         "strategy": strategy,
     }
 
@@ -4623,6 +5007,11 @@ class AlignDataStep(PipelineStep):
             feature_blocks,
             feature_families,
         )
+        X, feature_blocks, feature_families, dropped_non_numeric_columns = _drop_non_numeric_feature_columns(
+            X,
+            feature_blocks,
+            feature_families,
+        )
 
         mask = X.notna().all(axis=1) & y.notna()
         X = X.loc[mask]
@@ -4642,11 +5031,15 @@ class AlignDataStep(PipelineStep):
         pipeline.state["feature_metadata"] = filter_feature_metadata(feature_metadata, X.columns)
         pipeline.state["feature_family_summary"] = summarize_feature_families(feature_blocks, columns=X.columns)
         pipeline.state["feature_retirement"] = retirement_report
-        if dropped_columns:
+        if dropped_columns or dropped_non_numeric_columns:
             report = dict(pipeline.state.get("feature_screening", {}))
-            report.setdefault("alignment", {})["dropped_all_nan_columns"] = dropped_columns
+            alignment_report = report.setdefault("alignment", {})
+            if dropped_columns:
+                alignment_report["dropped_all_nan_columns"] = dropped_columns
+            if dropped_non_numeric_columns:
+                alignment_report["dropped_non_numeric_columns"] = dropped_non_numeric_columns
             if retirement_report.get("dropped_columns"):
-                report.setdefault("alignment", {})["retired_columns"] = retirement_report.get("dropped_columns")
+                alignment_report["retired_columns"] = retirement_report.get("dropped_columns")
             pipeline.state["feature_screening"] = report
         elif retirement_report.get("dropped_columns"):
             report = dict(pipeline.state.get("feature_screening", {}))
@@ -4818,6 +5211,7 @@ class TrainModelsStep(PipelineStep):
         last_avg_win = default_avg_win
         last_avg_loss = default_avg_loss
         last_kelly_trade_count = 0
+        router_config = _resolve_pipeline_router_config(pipeline)
         oos_predictions = []
         oos_probabilities = []
         oos_meta_prob = []
@@ -4828,6 +5222,7 @@ class TrainModelsStep(PipelineStep):
         oos_event_signals = []
         oos_continuous_signals = []
         oos_signals = []
+        oos_router_bound = []
         oos_trade_outcomes = []
         oos_paths = []
         signal_decay_segments = []
@@ -4963,6 +5358,10 @@ class TrainModelsStep(PipelineStep):
                     combined_split_frame,
                     fold_feature_blocks,
                 )
+                combined_split_frame, fold_feature_blocks, _, _ = _drop_non_numeric_feature_columns(
+                    combined_split_frame,
+                    fold_feature_blocks,
+                )
                 retained_columns = list(combined_split_frame.columns)
                 X_fit = X_fit.reindex(columns=retained_columns)
                 X_val = X_val.reindex(columns=retained_columns) if X_val is not None else None
@@ -5003,6 +5402,18 @@ class TrainModelsStep(PipelineStep):
             last_feature_adapter = adaptation_result.adapter
             last_feature_adaptation_policy = adaptation_result.fit_policy.to_dict()
             last_feature_adaptation_manifest = dict(adaptation_result.manifest or {})
+
+            post_adaptation_frames = [frame for frame in [X_fit, X_val, X_test] if frame is not None]
+            if post_adaptation_frames:
+                combined_post_adaptation, fold_feature_blocks, _, _ = _drop_non_numeric_feature_columns(
+                    pd.concat(post_adaptation_frames, axis=0),
+                    fold_feature_blocks,
+                )
+                retained_post_adaptation_columns = list(combined_post_adaptation.columns)
+                X_fit = X_fit.reindex(columns=retained_post_adaptation_columns)
+                X_val = X_val.reindex(columns=retained_post_adaptation_columns) if X_val is not None else None
+                X_test = X_test.reindex(columns=retained_post_adaptation_columns)
+
             fold_feature_adaptation.append(
                 {
                     "fold": fold,
@@ -5184,6 +5595,30 @@ class TrainModelsStep(PipelineStep):
                     sampling_metadata=sampling_metadata,
                     return_report=True,
                 )
+            current_specialist_library = None
+            if (
+                regime_aware_config.get("enabled")
+                and regime_aware_config.get("strategy") == "specialist"
+                and hasattr(model, "specialist_models")
+            ):
+                regime_detection = dict(pipeline.state.get("regime_detection") or {})
+                detector_manifests = list(regime_detection.get("detector_manifests") or [])
+                primary_manifest = detector_manifests[0] if detector_manifests else None
+                if hasattr(primary_manifest, "to_dict"):
+                    primary_manifest = primary_manifest.to_dict()
+                manifest_metadata = dict((primary_manifest or {}).get("metadata") or {})
+                current_specialist_library = build_specialist_library_snapshot(
+                    model,
+                    last_regime_training_report,
+                    symbol=pipeline.section("data").get("symbol", "unknown"),
+                    timeframe=pipeline.section("data").get("interval", "unknown"),
+                    metadata={
+                        "source": "train_models",
+                        "validation_method": validation_method,
+                        "regime_semantic_schema_version": manifest_metadata.get("semantic_schema_version"),
+                        "regime_semantic_state_map": copy.deepcopy(manifest_metadata.get("semantic_state_map") or {}),
+                    },
+                ).to_dict()
             fold_bootstrap.append(
                 {
                     "fold": fold,
@@ -5399,6 +5834,41 @@ class TrainModelsStep(PipelineStep):
                     holding_bars,
                     kelly_trade_count=active_kelly_trade_count,
                 )
+                if (
+                    router_config
+                    and current_specialist_library
+                    and not val_regime_view.empty
+                    and regime_aware_config.get("enabled")
+                    and regime_aware_config.get("strategy") == "specialist"
+                ):
+                    val_regime_states = build_regime_state_contracts(val_regime_view)
+                    val_specialist_signal_surfaces = _build_specialist_signal_surfaces(
+                        model,
+                        X_val_model,
+                        meta_model=meta_model,
+                        primary_calibrator=primary_calibrator,
+                        meta_calibrator=meta_calibrator,
+                        meta_context_frame=(
+                            meta_context_frame.reindex(X_val_model.index)
+                            if meta_context_frame is not None
+                            else None
+                        ),
+                        signal_config={**signal_config, **tuned_signal_params},
+                        avg_win=fold_avg_win,
+                        avg_loss=fold_avg_loss,
+                        holding_bars=holding_bars,
+                        kelly_trade_count=active_kelly_trade_count,
+                        inference_latencies_ms=inference_latencies_ms,
+                    )
+                    val_signal_state, _ = _route_signal_state_with_router(
+                        val_signal_state,
+                        val_specialist_signal_surfaces,
+                        router=build_router(router_config),
+                        specialist_library=current_specialist_library,
+                        regime_states=val_regime_states,
+                    )
+                    val_signal_state["specialist_library"] = copy.deepcopy(current_specialist_library)
+                    val_signal_state["router_diagnostics_enabled"] = True
                 val_close_for_bt = _resolve_backtest_valuation_close(pipeline, X_val_model.index)
                 if val_close_for_bt is not None and len(val_close_for_bt) > 0:
                     policy_backtest = run_backtest(
@@ -5415,7 +5885,7 @@ class TrainModelsStep(PipelineStep):
                             if _resolve_backtest_execution_prices(pipeline, X_val_model.index) is not None
                             else None
                         ),
-                        **(_resolve_backtest_runtime_kwargs(pipeline, X_val_model.index) or {}),
+                        **(_resolve_backtest_runtime_kwargs(pipeline, X_val_model.index, signal_state=val_signal_state) or {}),
                     )
             elif not prior_oos_trade_outcomes.empty:
                 sizing_trade_outcomes = prior_oos_trade_outcomes
@@ -5519,11 +5989,52 @@ class TrainModelsStep(PipelineStep):
                 holding_bars,
                 kelly_trade_count=active_kelly_trade_count,
             )
+            test_regime_states = None
+            if not test_regime_view.empty:
+                test_regime_states = build_regime_state_contracts(test_regime_view)
+            if (
+                router_config
+                and current_specialist_library
+                and test_regime_states is not None
+                and regime_aware_config.get("enabled")
+                and regime_aware_config.get("strategy") == "specialist"
+            ):
+                test_specialist_signal_surfaces = _build_specialist_signal_surfaces(
+                    model,
+                    X_test_model,
+                    meta_model=meta_model,
+                    primary_calibrator=primary_calibrator,
+                    meta_calibrator=meta_calibrator,
+                    meta_context_frame=(
+                        meta_context_frame.reindex(X_test_model.index)
+                        if meta_context_frame is not None
+                        else None
+                    ),
+                    signal_config=fold_signal_config,
+                    avg_win=fold_avg_win,
+                    avg_loss=fold_avg_loss,
+                    holding_bars=holding_bars,
+                    kelly_trade_count=active_kelly_trade_count,
+                    inference_latencies_ms=inference_latencies_ms,
+                )
+                signal_state, _ = _route_signal_state_with_router(
+                    signal_state,
+                    test_specialist_signal_surfaces,
+                    router=build_router(router_config),
+                    specialist_library=current_specialist_library,
+                    regime_states=test_regime_states,
+                )
+                signal_state["specialist_library"] = copy.deepcopy(current_specialist_library)
+                signal_state["router_diagnostics_enabled"] = True
 
             fold_backtest = None
             fold_close = _resolve_backtest_valuation_close(pipeline, X_test_model.index)
             fold_execution_prices = _resolve_backtest_execution_prices(pipeline, X_test_model.index)
-            fold_runtime_kwargs = _resolve_backtest_runtime_kwargs(pipeline, X_test_model.index) or {}
+            fold_runtime_kwargs = _resolve_backtest_runtime_kwargs(
+                pipeline,
+                X_test_model.index,
+                signal_state=signal_state,
+            ) or {}
             if fold_close is not None and len(fold_close) > 0:
                 fold_backtest = run_backtest(
                     close=fold_close.loc[signal_state["continuous_signals"].index],
@@ -5602,10 +6113,10 @@ class TrainModelsStep(PipelineStep):
                 )
             )
             path_regime_states = None
-            if not test_regime_view.empty:
+            if test_regime_states is not None:
                 path_regime_states = [
                     contract.to_dict()
-                    for contract in build_regime_state_contracts(test_regime_view)
+                    for contract in test_regime_states
                 ]
             oos_paths.append(
                 {
@@ -5638,6 +6149,10 @@ class TrainModelsStep(PipelineStep):
                     "calibration_policy": signal_policy_context.get("calibration_policy"),
                     "cross_fold_borrowing_allowed": signal_policy_context.get("cross_fold_borrowing_allowed"),
                     "regime_states": path_regime_states,
+                    "specialist_library": copy.deepcopy(current_specialist_library or {}),
+                    "router_bound": bool(signal_state.get("router_bound", False)),
+                    "router_diagnostics_enabled": bool(signal_state.get("router_bound", False)),
+                    "router_trace_summary": copy.deepcopy(signal_state.get("router_trace_summary") or {}),
                 }
             )
             last_model = model
@@ -5647,21 +6162,8 @@ class TrainModelsStep(PipelineStep):
             last_selected_columns = list(selected_columns)
             last_regime_fit_index = X_fit.index.copy()
             last_test_index = X_test_model.index.copy()
-            if (
-                regime_aware_config.get("enabled")
-                and regime_aware_config.get("strategy") == "specialist"
-                and hasattr(model, "specialist_models")
-            ):
-                last_specialist_library = build_specialist_library_snapshot(
-                    model,
-                    last_regime_training_report,
-                    symbol=pipeline.section("data").get("symbol", "unknown"),
-                    timeframe=pipeline.section("data").get("interval", "unknown"),
-                    metadata={
-                        "source": "train_models",
-                        "validation_method": validation_method,
-                    },
-                ).to_dict()
+            if current_specialist_library is not None:
+                last_specialist_library = copy.deepcopy(current_specialist_library)
             last_signal_params = {**fold_signal_config}
             last_signal_policy = dict(signal_policy_report["policy_quality"])
             last_avg_win = fold_avg_win
@@ -5677,6 +6179,7 @@ class TrainModelsStep(PipelineStep):
             oos_event_signals.append(signal_state["event_signals"])
             oos_continuous_signals.append(signal_state["continuous_signals"])
             oos_signals.append(signal_state["signals"])
+            oos_router_bound.append(bool(signal_state.get("router_bound", False)))
             oos_trade_outcomes.append(test_trade_outcomes)
 
         if last_model is None or last_meta is None:
@@ -5781,10 +6284,12 @@ class TrainModelsStep(PipelineStep):
                 {
                     "fallback_rows": int((regime_coverage_summary or {}).get("fallback_rows", 0) or 0),
                     "fallback_evidence_rows": int(fallback_evidence_rows),
+                    "fallback_row_share": (regime_coverage_summary or {}).get("fallback_row_share"),
                     "unseen_regimes": list((regime_coverage_summary or {}).get("unseen_regimes") or []),
                     "unseen_regime_degradation_report": copy.deepcopy(
                         (regime_coverage_summary or {}).get("unseen_regime_degradation_report") or {}
                     ),
+                    "candidate_classification": (regime_coverage_summary or {}).get("candidate_classification"),
                     "trained_regimes": sorted(trained_regimes),
                     "trained_rows_by_regime": trained_rows_by_regime,
                 }
@@ -5905,6 +6410,7 @@ class TrainModelsStep(PipelineStep):
             "oos_event_signals": oos_event_signals,
             "oos_continuous_signals": oos_continuous_signals,
             "oos_signals": oos_signals,
+            "oos_router_bound": bool(any(oos_router_bound)),
             "feature_block_diagnostics": feature_diagnostics,
             "feature_family_diagnostics": feature_family_diagnostics,
             "feature_portability_diagnostics": feature_portability_diagnostics,
@@ -6162,6 +6668,36 @@ class SignalsStep(PipelineStep):
             holding_bars,
             kelly_trade_count=int(training.get("oos_trade_count", 0)),
         )
+        router_config = _resolve_pipeline_router_config(pipeline)
+        specialist_library = copy.deepcopy(training.get("specialist_library") or pipeline.state.get("specialist_library") or {})
+        if (
+            router_config
+            and specialist_library
+            and _is_regime_aware_model(training.get("last_model"))
+            and getattr(training.get("last_model"), "strategy", None) == "specialist"
+            and regime_frame is not None
+            and not regime_frame.empty
+        ):
+            specialist_signal_surfaces = _build_specialist_signal_surfaces(
+                training.get("last_model"),
+                X_model,
+                meta_model=training.get("last_meta"),
+                primary_calibrator=training.get("last_primary_calibrator"),
+                meta_calibrator=training.get("last_meta_calibrator"),
+                meta_context_frame=signals_context_frame,
+                signal_config=signal_config,
+                avg_win=avg_win,
+                avg_loss=avg_loss,
+                holding_bars=holding_bars,
+                kelly_trade_count=int(training.get("oos_trade_count", 0)),
+            )
+            result, _ = _route_signal_state_with_router(
+                result,
+                specialist_signal_surfaces,
+                router=build_router(router_config),
+                specialist_library=specialist_library,
+                regime_states=build_regime_state_contracts(regime_frame),
+            )
         result["signal_source"] = signal_source
         result["fallback_scope"] = fallback_scope
         result["signal_policy"] = training.get("signal_policy")
@@ -6225,7 +6761,7 @@ class BacktestStep(PipelineStep):
             slippage_rate=config.get("slippage_rate", 0.0),
             signal_delay_bars=_resolve_signal_delay_bars(config),
             execution_prices=execution_prices,
-            **_resolve_backtest_runtime_kwargs(pipeline, positions.index),
+            **_resolve_backtest_runtime_kwargs(pipeline, positions.index, signal_state=signal_state),
         )
         backtest["validation_method"] = signal_state.get("primary_validation_method", signal_state.get("validation_method", "walk_forward"))
         if signal_state.get("primary_validation_method") is not None and signal_state.get("validation_method") is not None:

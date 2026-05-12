@@ -2,397 +2,399 @@
 
 ## Purpose
 
-This file tracks the remaining upgrade phases for the regime-orchestrated
-framework redesign.
-
-Source of truth for the detailed architecture remains `UPGRADES.md`. This file
-is the execution-oriented checklist derived from that plan.
-
-## Current Status
-
-- Phase 0 is complete.
-- Phase 0 delivered additive contracts, compatibility facades, optional
-  registry payload support, and example-level Phase 0 summaries.
-- Phase 1 is complete.
-- Phase 2 is complete.
-- Phase 2 Slice 1 delivered typed feature-adaptation contracts, an identity
-   adapter seam in `TrainModelsStep`, additive training metadata, and focused
-   runtime and pipeline tests.
-- Phase 2 Slice 2 delivered a frozen global and per-regime scaling bank,
-   explicit fail-closed guards for `model.regime_aware.strategy == "feature"`,
-   and fallback-inference parity through the stored final adapter.
-- Phase 2 Slice 3 delivered frozen per-regime masking, a composite
-   `scale -> mask` adapter runtime, fold-local policy-disabled column gating,
-   and fallback-inference parity for masking through the stored final adapter.
-- Phase 2 Slice 4 delivered a dedicated feature-strategy adapter, bounded
-   `interaction_budget` generation, and frozen adapter reuse in
-   `RegimeAwareModelBundle` fit and inference paths.
-- Phase 2 Slice 5 delivered feature-adaptation config validation, AutoML
-   training-summary propagation, explicit post-selection refit surfacing, and
-   user-facing training summary output in the experiment runner and example
-   helpers.
-- Phase 3 Slice 1 delivered a dedicated specialist-library runtime,
-   candidate-state snapshot generation in specialist training outputs,
-   registry-backed artifact ref enrichment, and additive lifecycle transition
-   events plus active-library reads without mutating immutable manifests.
-- Phase 5 is complete.
-- Phase 6 Slice 1 delivered bundle-centric AutoML search-space support,
-   bundle lineage propagation through study summaries and registry metadata,
-   and trade-ready thesis-space freeze coverage for `orchestration.bundle`.
-- Phase 6 Slice 2 delivered a config-driven orchestration-bundle AutoML
-   example, user-facing runner summaries for selected bundle lineage and router
-   stability, and focused config/runner regression coverage.
-- Phase 6 Slice 3 delivered orchestration-first example-guide cleanup,
-   explicit detector/router entrypoints in the docs, and a downstream
-   maintenance banner on the drift review example.
-- Phase 7 Slice 1 delivered an additive specialist-library review policy in
-   the drift maintenance path, allowing degraded active libraries to return an
-   explicit `library_review_recommended` outcome before retraining.
-- Default runtime behavior has not been switched to specialist-library or router
-  execution yet.
-- The next required implementation slice is Phase 7 Slice 2.
-
-## Phase Checklist
-
-### Phase 0: Contracts and Compatibility Scaffolding
-
-Status: completed
-
-Delivered:
-
-1. Added typed regime, specialist, and router contracts.
-2. Kept `core/regime.py` and `core/regime_training.py` as public facades.
-3. Added optional registry manifest support for Phase 0 payload sections.
-4. Re-exported the new contracts from `core`.
-5. Updated examples to print Phase 0 summaries where applicable.
-
-Completion criteria met:
-
-1. Contracts serialize to JSON-ready dicts and round-trip cleanly.
-2. Registry manifests accept both legacy and Phase 0 payload shapes.
-3. No router behavior or specialist-library behavior is enabled by default.
-
-### Phase 1: Online Regime Detection Layer
-
-Status: completed
-
-Objective:
-
-Move regime detection behind the new detector interfaces and make regime traces
-causal, replayable, and explicit.
-
-Delivered:
-
-1. Canonical regime observation building in `core/regimes/observations.py`.
-2. Canonical replay runtime in `core/regimes/online_state.py`.
-3. Compatibility, native score-based, and filtered-HMM detectors in
-   `core/regimes/detectors.py`.
-4. Config normalization for native-primary and compatibility detector shapes.
-5. Detector manifests, replay metadata, and trace summaries surfaced in
-   `pipeline.state["regime_detection"]`.
-6. Example propagation for native detector and filtered-HMM paths plus focused
-   replay/runtime tests.
-
-Implementation targets:
-
-1. Port current default regime feature construction into
-   `core/regimes/observations.py`.
-2. Implement volatility, trend, liquidity, and break detectors.
-3. Move HMM handling behind a filtered online interface.
-4. Add detector ensemble and confidence logic.
-
-Acceptance criteria met:
-
-1. Regime traces are reproducible under walk-forward replay.
-2. No detector uses future data.
-3. Detector disagreement and warm-up states are visible in outputs.
+This file replaces the prior phase-only backlog with the current execution plan
+for the 2026-05-11 adversarial audit issues.
 
-### Phase 2: Feature Adaptation Layer
+The scope of this plan is narrow and binding:
 
-Status: completed
+1. Convert each audited issue into a concrete implementation workstream.
+2. Keep research and promotion paths causally aligned.
+3. Use fail-closed semantics in capital-facing modes.
+4. Stay realistic for a retail operator on consumer hardware.
 
-Objective:
+## Global Delivery Rules
 
-Insert an explicit feature adaptation step between regime detection and model
-training.
+1. Fix the controlling abstraction, not only the downstream report.
+2. Treat `unknown` and `insufficient_evidence` as blocking in capital-facing paths.
+3. Keep one authoritative execution path for research evidence and promotion evidence.
+4. Prefer deterministic, CPU-cheap runtime logic over additional model complexity.
+5. Add or extend focused regression tests alongside each workstream.
 
-Delivered so far:
+## Implementation Order
 
-1. Added `core/feature_adaptation/` with `FeaturePolicyContract`,
-   `BaseFeatureAdapter`, and the Slice 1 identity runtime.
-2. Routed fold-local fit/validation/test frames through the feature-adaptation
-   seam in `TrainModelsStep` without changing model behavior.
-3. Added additive JSON-safe `training["feature_adaptation"]` and
-   `pipeline.state["feature_adaptation"]` payloads.
-4. Added focused coverage in `tests/test_feature_adaptation_runtime.py` and
-   extended `tests/test_automl_regime_aware_training.py`.
+Implement the issues in this order:
 
-Implementation targets:
+1. Issue 1: Bind router decisions into executed PnL.
+2. Issue 3: Make sparse-evidence router gates fail closed.
+3. Issue 2: Treat warm and unavailable regime states as safe-mode inputs.
+4. Issue 4: Expand lookahead certification to the full causal surface.
+5. Issue 5: Treat specialist fallback share as concentration risk.
+6. Issue 6: Replace ordinal regime IDs with stable semantic contracts.
+7. Issue 7: Upgrade drift monitoring from mean-probability KL to decision-aware drift.
 
-1. Implement regime-conditioned scaling and masks.
-2. Log applied feature policy per fold and per backtest step.
-3. Add deterministic fallback behavior under low confidence and sparse support.
+This order is intentional:
 
-Acceptance criteria:
+1. Router-to-PnL binding is the foundation for any honest routing gate.
+2. Sparse-evidence and warm-state handling must be corrected before routing evidence is trusted.
+3. Lookahead certification must then cover the entire capital path.
+4. Fallback-share and semantic-regime work should build on the corrected routing/runtime surface.
+5. Drift upgrades should consume the hardened runtime semantics instead of locking in the current coarse contracts.
 
-1. Feature transforms are prefix-invariant at cutoffs.
-2. Per-regime masks do not leak future occupancy.
-3. Fallback behavior is explicit and tested.
+## Issue 1: Bind Router Decisions Into Executed PnL
 
-Immediate next slice:
+Status: not started
 
-1. Start Phase 5 by replaying detector and router state causally through the
-   validation and holdout path instead of relying on pooled backtest summaries.
-2. Reuse the canonical router replay diagnostics from Phase 4 rather than
-   reimplementing routing logic inside validation-specific code.
+### Objective
 
-### Phase 3: Specialist Library
+Make routing decisions part of the executed backtest path instead of a replay-only diagnostic attached after returns are computed.
 
-Status: completed 2026-05-09
+### Controlling Files
 
-Objective:
-
-Replace the single-model assumption with a specialist library plus fallback
-generalist.
+1. `core/pipeline.py`
+2. `core/backtest.py`
+3. `core/routing/router.py`
+4. `core/routing/diagnostics.py`
+5. `core/promotion.py`
 
-Delivered so far:
+### Existing Regression Surfaces
 
-1. Added `core/specialists/library.py` with specialist snapshot normalization,
-   selection-contract construction, registry-status projection, artifact-ref
-   attachment, and fail-closed lifecycle transition validation.
-2. Updated specialist training and post-selection refit outputs to surface
-   `specialist_library` in `training`, pipeline state, and refit artifacts.
-3. Extended `LocalRegistryStore` to auto-persist specialist libraries from
-   specialist training summaries, enrich them with registry artifact refs, and
-   expose `read_specialist_library(...)` / `get_active_specialist_library(...)`.
-4. Added additive `record_specialist_lifecycle_transition(...)` event storage
-   so runtime lifecycle state can evolve without rewriting immutable version
-   manifests.
-5. Added `core/specialists/health.py` plus append-only
-   `attach_specialist_health_update(...)` registry storage so specialist health
-   and regime performance history replay into runtime library reads without
-   mutating immutable manifests.
-6. Added `core/specialists/governance.py` with explicit certification and
-   degradation policy helpers, advisory/blocking gate support, and in-memory
-   lifecycle application over specialist snapshots.
-7. Tightened the Phase 3 lifecycle runtime so registry status is tracked as
-   library metadata rather than overwriting per-specialist states, and champion
-   promotion now auto-activates only the fallback generalist plus already
-   certified specialists through append-only lifecycle events.
+1. `tests/test_router_trace_replay.py`
+2. `tests/test_router_hard_switch_weighted.py`
+3. `tests/test_promotion_gate_binding.py`
 
-Acceptance criteria:
+### Implementation Steps
 
-1. One symbol can carry multiple certified specialists plus fallback.
-2. Each specialist records compatible regimes and failure flags.
-3. Rollback and retirement work without mutating history.
+1. Extend `core/pipeline.py::_resolve_backtest_runtime_kwargs(...)` so the runtime path can pass the active router and specialist library, not only `regime_states`.
+2. Add a single execution-bound router path inside `core/backtest.py::run_backtest(...)` that:
+   - consumes `router`, `specialist_library`, and aligned `regime_states`
+   - chooses the active model at each decision timestamp
+   - applies the selected model's requested position to the executed position stream
+3. Keep `replay_router_trace(...)` as an audit helper, but stop using replay-only trace summaries as the primary evidence for routing behavior when executable routing objects are available.
+4. Replace the current purely hypothetical routing-overhead payload with an explicit split:
+   - `diagnostic_router_switching_cost_report` for replay-only studies
+   - `realized_router_switching_cost_report` when routing is actually executed in the backtest path
+5. Update promotion and backtest summaries so routing gates read the execution-bound routing payload first and downgrade to diagnostic-only status when routing was not executed.
+6. Ensure the router decision trace and executed equity curve share the same timestamps and state transitions.
 
-### Phase 4: Router Implementation
+### Test Plan
 
-Status: completed 2026-05-09
+1. Extend `tests/test_router_trace_replay.py` to prove that the bound execution path and replay trace remain consistent on the same regime stream.
+2. Add a focused backtest test showing that enabling the router changes both the decision trace and the resulting equity curve.
+3. Extend `tests/test_promotion_gate_binding.py` to ensure routing claims are blocking only when execution-bound routing evidence exists.
 
-Objective:
-
-Introduce explicit router policies and anti-flapping controls.
-
-Implementation targets:
-
-1. Implement hard-switch and weighted router policies.
-2. Add hysteresis, persistence, cooldown, and score diagnostics.
-3. Persist routing traces in backtests and live-like replay.
-
-Delivered so far:
-
-1. Added `core/routing/router.py` with deterministic `HardSwitchRouter` and
-   `WeightedRouter` implementations plus `build_router(...)` factory support.
-2. Added `core/routing/diagnostics.py` with deterministic
-   `replay_router_trace(...)` summaries over regime-state streams.
-3. Added focused regressions for hard-switch anti-flapping behavior, weighted
-   allocation normalization, factory/config routing, and replay determinism.
-4. Threaded optional router trace summaries through `run_backtest(...)` so
-   switch counts, route reasons, blocked-switch reasons, and decision traces
-   are exposed in user-facing backtest summaries without changing execution
-   math.
-5. Added optional router switching-cost reporting to backtest summaries as an
-   explicit hypothetical routing-overhead estimate rather than silently
-   treating it as realized execution cost.
-
-Acceptance criteria:
-
-1. Router decisions are deterministic under replay.
-2. Switching costs appear in backtest summaries.
-3. Route reasons and blocked-switch reasons are visible.
-
-### Phase 5: Validation and Backtest Overhaul
-
-Status: completed 2026-05-09
-
-Objective:
-
-Refactor evaluation to replay the full adaptive loop instead of relying on
-pooled aggregate metrics.
+### Exit Criteria
 
-Delivered so far:
-
-1. Extended `run_backtest(...)` with additive `regime_segment_report` and
-   `transition_segment_report` payloads driven by aligned `regime_states`,
-   without changing execution math or requiring a router runtime.
-2. Updated CPCV diagnostic path replay so fold-local regime states are carried
-   into per-path backtests and surfaced in
-   `diagnostic_validation["summary"]` as path-level regime and transition
-   diagnostics instead of pooled aggregate metrics alone.
-3. Hardened fold-local regime joins in `core/pipeline.py` so sparse regime
-   metadata flags do not invalidate otherwise usable CPCV fit/test rows.
-4. Added delayed-recognition and transition-lag diagnostics to
-   `transition_segment_report`, reusing `signal_delay_bars` as the simulated
-   recognition window and surfacing the aggregated fields through CPCV
-   `diagnostic_validation["summary"]`.
-5. Added fold-local unseen-regime degradation reporting, including fallback
-   exposure shares, affected-fold summaries, and additive backtest surfacing
-   via `unseen_regime_degradation_report`.
-6. Added router stability and over-switching diagnostics plus a promotion gate,
-   using replay-only router trace metrics and switching-cost estimates without
-   changing routing decisions or executable PnL.
-
-Implementation targets:
-
-1. Add regime-segmented and transition-segmented metrics.
-2. Add delayed recognition simulation.
-3. Add unseen-regime degradation reports.
-4. Add router stability and over-switching gates.
-
-Acceptance criteria:
-
-1. Validation summaries no longer rely on pooled aggregate metrics alone.
-2. The holdout path replays detector plus router causally.
-3. Unseen regime behavior is observable and gated.
-
-### Phase 6: AutoML and Experiment Redesign
-
-Status: completed 2026-05-11
-
-Objective:
-
-Make studies explicit about regime detectors, specialists, and routing.
-
-Delivered so far:
-
-1. Added `orchestration.bundle` as a first-class AutoML search-space path in
-   `core/automl.py`, allowing studies to compare detector, specialist, and
-   router bundles through the existing override contract instead of only leaf
-   model hyperparameters.
-2. Preserved `best_bundle_lineage` and per-trial bundle lineage through study
-   summaries, best-trial diagnostics, and registry lineage/metadata outputs.
-3. Hardened bundle sampling so leaf-level search overrides deep-merge into the
-   sampled bundle rather than overwriting detector or router lineage.
-4. Added focused regression coverage proving trade-ready profiles reject
-   `orchestration.bundle` as thesis variation and that AutoML summaries surface
-   bundle lineage and normalized bundle overrides.
-5. Added `configs/btc_regime_bundle_automl.yaml` and
-   `example_regime_bundle_automl.py` so users can run bundle-centric AutoML
-   from the shared config-driven workflow instead of constructing nested
-   overrides by hand.
-6. Updated the config-driven experiment runner to print selected bundle lineage
-   and router-stability diagnostics when AutoML chooses an orchestration
-   bundle.
-7. Added focused config-loader and runner-output regressions for the new
-   orchestration-bundle user path.
-8. Validated the new config through `run.py --config ... --quick --validate-only`.
-9. Reordered the user-facing docs so `example_regime_orchestration.py` and
-   `example_regime_bundle_automl.py` are surfaced as primary orchestration
-   entrypoints ahead of maintenance flows.
-10. Reframed `example_drift_retraining_cycle.py` as a downstream maintenance
-    and drift-review example in the docs and in the script banner itself.
-11. Validated the updated maintenance example in quick mode after the entrypoint
-    banner change.
-
-Implementation targets:
-
-1. Redesign the AutoML search space around detector, specialist, and router
-   bundles.
-2. Add new configs and example entrypoints.
-3. De-emphasize retraining-focused examples.
-
-Acceptance criteria:
-
-1. AutoML can compare regime bundles, not only model hyperparameters.
-2. Experiment manifests capture detector and router lineage.
-3. Examples produce routing and regime diagnostics by default.
-
-### Phase 7: Maintenance and Governance
-
-Status: completed 2026-05-11
-
-Objective:
-
-Refactor drift handling away from immediate retraining.
-
-Delivered so far:
-
-1. Added an additive `library_review` policy report to the drift maintenance
-   flow, using the active champion specialist library plus existing specialist
-   governance rules to recommend explicit review before retraining.
-2. Surfaced `library_review_recommended` as a first-class drift-cycle outcome
-   when the active specialist library is degraded but drift evidence does not
-   justify challenger training.
-3. Added explicit specialist retirement rules plus certified shadow
-   replacement recommendations in `core/specialists/governance.py`, so
-   terminally unhealthy specialists can move to `retired` and governed backups
-   can move to `shadow_challenger` through existing lifecycle transitions.
-4. Added an additive `router_recalibration` maintenance path in
-   `core/orchestration.py`, reusing the existing router-stability gate to
-   recommend router recalibration before challenger training when switching
-   behavior is unstable.
-5. Added an additive `structural_invalidation` policy split plus top-level
-   `action_report`, so approved drift evidence now resolves to explicit
-   `reroute`, `recalibrate`, `discover`, or `retrain` actions instead of
-   treating all approved drift as immediate retraining.
-6. Reserved challenger training for structural invalidation cases such as
-   model TTL expiry, performance drift, or joint feature/prediction shift,
-   while non-structural regime changes now surface `discovery_recommended`
-   without opening a retraining window.
-7. Tightened empty runtime specialist-library handling so missing specialist
-   libraries do not produce false-positive library-review recommendations.
-8. Added focused governance and drift workflow regressions covering
-   retirement-plus-replacement, router recalibration, non-structural discovery,
-   and preserved TTL-driven retraining.
-9. Validated the complete Phase 7 slice with focused maintenance and
-   governance suites.
-
-Implementation targets:
-
-1. Add a library review policy.
-2. Add specialist retirement and replacement rules.
-3. Add a router recalibration path.
-4. Reserve retraining for structural invalidation cases.
-
-Acceptance criteria:
-
-1. Drift action reports distinguish reroute, recalibrate, discover, and
-   retrain.
-2. Retraining is no longer the default response to short-term degradation.
-
-## Required Order
-
-Implement the remaining phases in this sequence:
-
-1. Phase 2: Feature adaptation layer
-2. Phase 3: Specialist library
-3. Phase 4: Router implementation
-4. Phase 5: Validation and backtest overhaul
-5. Phase 6: AutoML and experiment redesign
-6. Phase 7: Maintenance and governance
+1. Disabling the router changes the equity curve when the routed path would have selected different specialists.
+2. Routing switch costs can affect realized PnL.
+3. Promotion cannot treat replay-only routing summaries as equivalent to executed routing evidence.
+
+## Issue 3: Make Sparse-Evidence Router Gates Fail Closed
+
+Status: not started
+
+### Objective
+
+Change router-stability governance so thin evidence resolves to `unknown` or blocked instead of `passed`.
+
+### Controlling Files
+
+1. `core/promotion.py`
+2. `core/automl.py`
+3. `core/pipeline.py`
+
+### Existing Regression Surfaces
+
+1. `tests/test_promotion_gate_binding.py`
+2. `tests/test_router_trace_replay.py`
+
+### Implementation Steps
+
+1. Refactor router-stability gate outputs in `core/promotion.py` from boolean-only semantics to a tri-state contract:
+   - `passed`
+   - `failed`
+   - `unknown`
+2. Treat `decision_count < min_router_decision_count` as `unknown`, not pass.
+3. Keep `not_applicable` reserved for cases where routing is explicitly disabled or absent by policy.
+4. Thread the tri-state result into `core/automl.py` selection summaries, promotion eligibility payloads, and user-facing reports.
+5. In capital-facing modes, treat `unknown` router-stability evidence as blocking.
+6. In research-only mode, surface `unknown` as advisory without promoting it to `passed_with_warning`.
+
+### Test Plan
+
+1. Extend `tests/test_promotion_gate_binding.py` with a case where sparse routing evidence blocks trade-ready promotion.
+2. Add a case where routing disabled by config reports `not_applicable` rather than `unknown`.
+3. Add a case where sufficient routing evidence passes without semantic changes to the existing stable path.
+
+### Exit Criteria
+
+1. Thin routing evidence never produces a green gate in capital-facing modes.
+2. User-facing summaries distinguish `unknown` from `passed`.
+3. Promotion behavior matches the gate semantics exactly.
+
+## Issue 2: Treat Warm And Unavailable Regime States As Safe-Mode Inputs
+
+Status: not started
+
+### Objective
+
+Prevent the router from treating detector warmup, missing observations, or unavailable state as ordinary routing inputs.
+
+### Controlling Files
+
+1. `core/regimes/detectors.py`
+2. `core/routing/router.py`
+3. `core/pipeline.py`
+4. `core/backtest.py`
+
+### Existing Regression Surfaces
+
+1. `tests/test_regime_online_detection.py`
+2. `tests/test_regime_detectors.py`
+3. `tests/test_router_hard_switch_weighted.py`
+
+### Implementation Steps
+
+1. Standardize regime-state availability semantics in the detector/runtime contract:
+   - `known`
+   - `warm`
+   - `unavailable`
+2. Update `core/routing/router.py` so candidate scoring first checks regime-state availability before compatibility and confidence weighting.
+3. Add a config-controlled safe-mode routing policy, for example:
+   - `fallback_only`
+   - `no_trade`
+4. Replace deterministic model-id tie resolution in warm or unavailable states with an explicit safe-priority resolution path.
+5. Surface warm-state decision counts, unavailable-state decision counts, and fallback/no-trade counts in the router trace summary and backtest payloads.
+
+### Test Plan
+
+1. Extend `tests/test_regime_online_detection.py` to assert explicit warm and unavailable state contracts.
+2. Extend `tests/test_router_hard_switch_weighted.py` to verify safe-mode behavior under warm and unavailable states.
+3. Add a regression proving warm-state routing cannot trigger an uncertified specialist switch.
+
+### Exit Criteria
+
+1. Warm or unavailable states never route implicitly by model-id ordering.
+2. The chosen safe-mode policy is explicit in both config and runtime output.
+3. Router traces quantify the share of decisions made under degraded regime-state availability.
+
+## Issue 4: Expand Lookahead Certification To The Full Causal Surface
+
+Status: not started
+
+### Objective
+
+Extend the lookahead guard so it certifies the full capital-relevant pipeline surface rather than only the pre-training feature artifact.
+
+### Controlling Files
+
+1. `core/pipeline.py`
+2. `core/lookahead.py`
+3. `core/regime.py`
+4. `core/regime_training.py`
+5. `core/labeling.py`
+
+### Existing Regression Surfaces
+
+1. `tests/test_global_lookahead_guard_default.py`
+2. `tests/test_pipeline_lookahead_guard_wiring.py`
+3. `tests/test_lookahead_provocation.py`
+4. `tests/test_regime_leakage_controls.py`
+
+### Implementation Steps
+
+1. Expand the default lookahead guard scope in `core/pipeline.py::_resolve_lookahead_guard_config(...)` to include, at minimum:
+   - regime observation or regime state artifacts
+   - labels
+   - signal outputs
+   - sizing inputs derived from trade outcomes or pooled OOS history
+2. Add stage-level coverage reporting so the guard records:
+   - requested stages
+   - available stages
+   - skipped stages
+   - blocking reason when a required stage is unavailable
+3. Reuse fold-local helpers during lookahead replay rather than global preview artifacts wherever a stage is trained or generated fold-locally.
+4. Teach `core/lookahead.py` to compare deterministic sampled prefixes across multiple artifact types without materializing duplicate full-frame copies.
+5. In capital-facing modes, treat missing required stage coverage as blocking.
+
+### Test Plan
+
+1. Extend `tests/test_pipeline_lookahead_guard_wiring.py` to assert the widened default stage set.
+2. Extend `tests/test_lookahead_provocation.py` with at least one violation in regime, label, or signal surfaces that the old guard would have missed.
+3. Extend `tests/test_regime_leakage_controls.py` to ensure fold-local regime artifacts participate in lookahead certification.
+
+### Exit Criteria
+
+1. A passed lookahead report means the audited stage set actually covers the capital path used for selection and backtesting.
+2. Missing audit stages block capital-facing promotion.
+3. The guard remains cheap enough to run on sampled fold prefixes on consumer hardware.
+
+## Issue 5: Treat Specialist Fallback Share As Concentration Risk
+
+Status: not started
+
+### Objective
+
+Make high fallback share a binding governance metric instead of a passive report field.
+
+### Controlling Files
+
+1. `core/regime_training.py`
+2. `core/promotion.py`
+3. `core/pipeline.py`
+4. `core/automl.py`
+
+### Existing Regression Surfaces
+
+1. `tests/test_regime_aware_training.py`
+2. `tests/test_automl_regime_aware_training.py`
+3. `tests/test_regime_coverage_gate.py`
+
+### Implementation Steps
+
+1. Make unseen-regime fallback share a first-class summary field in training, validation, and post-selection outputs.
+2. In capital-facing modes, default `require_unseen_regime_fallback_bound = true` unless explicitly overridden by a stricter profile.
+3. Compute fallback share at multiple levels:
+   - per fold
+   - aggregate validation or holdout window
+   - by unseen-regime label when available
+4. Add candidate classification fields that distinguish:
+   - `specialist_effective`
+   - `specialist_degraded_to_fallback`
+   - `generalist_only`
+5. Bind promotion readiness to the fallback-share gate rather than only surfacing fallback rows in diagnostics.
+
+### Test Plan
+
+1. Extend `tests/test_regime_aware_training.py` to assert stable fallback-share summaries.
+2. Extend `tests/test_automl_regime_aware_training.py` so specialist trials surface fallback-share metrics in their trial summaries.
+3. Extend `tests/test_regime_coverage_gate.py` with a case where high fallback share blocks capital-facing promotion.
+
+### Exit Criteria
+
+1. A specialist candidate with excessive fallback usage cannot become promotion-ready.
+2. Reports show whether the deployed object is effectively specialist or effectively fallback-driven.
+3. Fallback-share gating is on by default in capital-facing modes.
+
+## Issue 6: Replace Ordinal Regime IDs With Stable Semantic Contracts
+
+Status: not started
+
+### Objective
+
+Stop keying live specialist compatibility and routing logic to unstable ordinal latent-state ids.
+
+### Controlling Files
+
+1. `core/regime.py`
+2. `core/regimes/detectors.py`
+3. `core/specialists/library.py`
+4. `core/routing/router.py`
+5. `core/pipeline.py`
+
+### Existing Regression Surfaces
+
+1. `tests/test_regime_compatibility_replay.py`
+2. `tests/test_regime_hmm_filtered.py`
+3. `tests/test_regime_detectors.py`
+4. `tests/test_regime_aware_training.py`
+
+### Implementation Steps
+
+1. Define a semantic regime contract that is versioned and persisted in detector manifests.
+2. Update native detectors to emit semantic labels directly where possible.
+3. For filtered-HMM or other latent detectors, add an explicit semantic mapping layer based on observable characteristics rather than relying on sorted latent indices alone.
+4. Update specialist compatibility and router policy logic to match on semantic labels plus detector schema version, not raw integer ids.
+5. Persist the mapping in pipeline summaries, registry metadata, and specialist-library snapshots so a retrain does not silently rebind specialist meaning.
+6. Keep latent ids available for research diagnostics, but make them secondary to the semantic label in capital-facing paths.
+
+### Test Plan
+
+1. Extend `tests/test_regime_compatibility_replay.py` to assert semantic compatibility survives retraining when market-state meaning is unchanged.
+2. Extend `tests/test_regime_hmm_filtered.py` to assert semantic mapping is persisted and exposed even when latent ordering changes.
+3. Extend `tests/test_regime_aware_training.py` so specialist compatibility keys off semantic labels rather than raw ids.
+
+### Exit Criteria
+
+1. Specialist compatibility remains stable across retrains when the same semantic market state recurs.
+2. Detector manifests expose raw model details and semantic mapping details.
+3. Capital-facing routing no longer depends on bare ordinal regime ids.
+
+## Issue 7: Upgrade Drift Monitoring From Mean-Probability KL To Decision-Aware Drift
+
+Status: not started
+
+### Objective
+
+Replace coarse mean-probability divergence with a multi-signal drift report that can distinguish input drift, score drift, action drift, and realized performance drift.
+
+### Controlling Files
+
+1. `core/drift.py`
+2. `core/orchestration.py`
+3. `core/monitoring.py`
+4. `core/readiness.py`
+
+### Existing Regression Surfaces
+
+1. `tests/test_drift_monitoring.py`
+2. `tests/test_drift_retraining_workflow.py`
+
+### Implementation Steps
+
+1. Replace `_kl_divergence(...)` as the primary score-drift metric with fixed-bin or bounded divergence metrics over:
+   - predicted class distribution
+   - confidence or maximum probability
+   - class margin or direction edge
+   - action rate or abstain rate
+2. Keep feature-drift metrics separate from score-drift metrics in the public report.
+3. Add action-drift reporting based on executed signal behavior, not only raw prediction probabilities.
+4. Add calibration-drift or realized-outcome drift fields when labels or trade outcomes are available.
+5. Update orchestration and maintenance reports so drift can recommend distinct actions such as:
+   - observe
+   - recalibrate
+   - reroute
+   - retrain
+6. Normalize default thresholds using bar frequency and realized trade frequency where practical so 5m, 1h, and 4h systems do not share the same raw sample assumptions.
+
+### Test Plan
+
+1. Extend `tests/test_drift_monitoring.py` with cases that isolate input drift, score drift, action drift, and performance drift.
+2. Extend `tests/test_drift_retraining_workflow.py` so maintenance actions differ based on which drift family fired.
+3. Add a regression showing that benign probability-mean movement without action or performance change does not force retraining.
+
+### Exit Criteria
+
+1. Drift reports explain which layer moved and why the chosen maintenance action was recommended.
+2. Retraining is no longer triggered primarily by mean-probability movement.
+3. The drift stack remains lightweight enough for scheduled retail operation on consumer hardware.
+
+## Cross-Cutting Validation Pass
+
+Run these focused checks after each completed workstream and again after the full stack lands:
+
+1. `tests/test_router_trace_replay.py`
+2. `tests/test_router_hard_switch_weighted.py`
+3. `tests/test_promotion_gate_binding.py`
+4. `tests/test_regime_online_detection.py`
+5. `tests/test_regime_detectors.py`
+6. `tests/test_regime_leakage_controls.py`
+7. `tests/test_global_lookahead_guard_default.py`
+8. `tests/test_pipeline_lookahead_guard_wiring.py`
+9. `tests/test_lookahead_provocation.py`
+10. `tests/test_regime_aware_training.py`
+11. `tests/test_automl_regime_aware_training.py`
+12. `tests/test_regime_coverage_gate.py`
+13. `tests/test_regime_compatibility_replay.py`
+14. `tests/test_drift_monitoring.py`
+15. `tests/test_drift_retraining_workflow.py`
 
 ## Definition Of Done
 
-The upgrade backlog is complete only when:
+This plan is complete only when:
 
-1. Regime detection is causal, online, replayable, and explicit.
-2. Feature adaptation is a first-class runtime layer with deterministic
-   fallback policies.
-3. Each symbol can run a specialist library plus fallback generalist.
-4. Router decisions are explicit, deterministic, and backtest-replayable.
-5. Validation and holdout paths replay detector, adaptation, and routing
-   causally.
-6. AutoML compares full regime bundles rather than only model hyperparameters.
-7. Drift handling prefers reroute, recalibrate, discover, and retire before
-   retrain.
+1. Routing claims are backed by executed routing paths, not replay-only summaries.
+2. Warm, unavailable, sparse-evidence, and fallback-heavy states are fail-closed in capital-facing modes.
+3. Lookahead certification covers the entire capital-relevant causal surface.
+4. Specialist compatibility is stable across retrains because regime semantics are explicit and versioned.
+5. Drift reports distinguish input, score, action, and realized-outcome degradation.
+6. The resulting controls remain deterministic and feasible on consumer hardware.

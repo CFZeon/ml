@@ -77,6 +77,13 @@ def _resolve_drift_policy(config=None):
         "psi_feature_share_threshold": 0.3,
         "ks_significance": 0.05,
         "prediction_kl_threshold": 0.1,
+        "score_distribution_tv_threshold": 0.25,
+        "confidence_psi_threshold": 0.2,
+        "confidence_ks_threshold": 0.25,
+        "margin_psi_threshold": 0.2,
+        "margin_ks_threshold": 0.25,
+        "action_rate_delta_threshold": 0.15,
+        "abstain_rate_delta_threshold": 0.10,
         "regime_psi_threshold": 0.2,
         "regime_total_variation_threshold": 0.25,
         "regime_transition_threshold": 0.2,
@@ -204,6 +211,60 @@ def _kl_divergence(reference, current, epsilon=1e-6):
     ref = ref / ref.sum()
     cur = cur / cur.sum()
     return float(np.sum(cur * np.log(cur / ref)))
+
+
+def _normalize_probability_columns(frame):
+    resolved = _safe_frame(frame)
+    if resolved.empty:
+        return resolved
+    numeric = resolved.apply(pd.to_numeric, errors="coerce")
+    numeric = numeric.dropna(axis=1, how="all")
+    return numeric
+
+
+def _prediction_label_series(frame):
+    probabilities = _normalize_probability_columns(frame)
+    if probabilities.empty:
+        return pd.Series(dtype=object)
+    labels = probabilities.idxmax(axis=1)
+    return pd.Series(labels, index=probabilities.index, copy=False)
+
+
+def _prediction_confidence_series(frame):
+    probabilities = _normalize_probability_columns(frame)
+    if probabilities.empty:
+        return pd.Series(dtype=float)
+    return probabilities.max(axis=1).astype(float)
+
+
+def _prediction_margin_series(frame):
+    probabilities = _normalize_probability_columns(frame)
+    if probabilities.empty:
+        return pd.Series(dtype=float)
+    sorted_probs = np.sort(probabilities.to_numpy(dtype=float), axis=1)
+    if sorted_probs.shape[1] == 1:
+        margins = sorted_probs[:, 0]
+    else:
+        margins = sorted_probs[:, -1] - sorted_probs[:, -2]
+    return pd.Series(margins, index=probabilities.index, dtype=float)
+
+
+def _label_distribution(series):
+    labels = _safe_series(series).dropna()
+    if labels.empty:
+        return {}
+    distribution = labels.value_counts(normalize=True, dropna=True)
+    return {str(key): float(value) for key, value in distribution.items()}
+
+
+def _infer_action_state(series):
+    labels = _safe_series(series)
+    if labels.empty:
+        return pd.DataFrame(columns=["active", "abstain"])
+    normalized = labels.astype(str).str.strip().str.lower()
+    abstain_mask = normalized.isin({"0", "0.0", "abstain", "no_trade", "hold", "flat", "neutral"})
+    active_mask = (~abstain_mask) & normalized.ne("nan")
+    return pd.DataFrame({"active": active_mask.astype(float), "abstain": abstain_mask.astype(float)}, index=labels.index)
 
 
 def _distribution_total_variation(reference_distribution, current_distribution):
@@ -366,7 +427,47 @@ class DriftMonitor:
         feature_drift = bool(feature_drift_share >= float(self.config["psi_feature_share_threshold"]))
 
         prediction_kl = _kl_divergence(self.reference_predictions, current_predictions)
-        prediction_drift = bool(prediction_kl is not None and prediction_kl >= float(self.config["prediction_kl_threshold"]))
+        reference_labels = _prediction_label_series(self.reference_predictions)
+        current_labels = _prediction_label_series(current_predictions)
+        class_distribution_tv = _distribution_total_variation(
+            _label_distribution(reference_labels),
+            _label_distribution(current_labels),
+        )
+        reference_confidence = _prediction_confidence_series(self.reference_predictions)
+        current_confidence = _prediction_confidence_series(current_predictions)
+        confidence_psi = _population_stability_index(reference_confidence, current_confidence)
+        confidence_ks, confidence_ks_p = _ks_statistic(reference_confidence, current_confidence)
+        reference_margin = _prediction_margin_series(self.reference_predictions)
+        current_margin = _prediction_margin_series(current_predictions)
+        margin_psi = _population_stability_index(reference_margin, current_margin)
+        margin_ks, margin_ks_p = _ks_statistic(reference_margin, current_margin)
+
+        score_drift = bool(
+            (prediction_kl is not None and prediction_kl >= float(self.config["prediction_kl_threshold"]))
+            or (class_distribution_tv is not None and class_distribution_tv >= float(self.config["score_distribution_tv_threshold"]))
+            or (confidence_psi is not None and confidence_psi >= float(self.config["confidence_psi_threshold"]))
+            or (confidence_ks is not None and confidence_ks >= float(self.config["confidence_ks_threshold"]))
+            or (margin_psi is not None and margin_psi >= float(self.config["margin_psi_threshold"]))
+            or (margin_ks is not None and margin_ks >= float(self.config["margin_ks_threshold"]))
+        )
+        prediction_drift = score_drift
+
+        reference_action_state = _infer_action_state(reference_labels)
+        current_action_state = _infer_action_state(current_labels)
+        reference_action_rate = None if reference_action_state.empty else float(reference_action_state["active"].mean())
+        current_action_rate = None if current_action_state.empty else float(current_action_state["active"].mean())
+        reference_abstain_rate = None if reference_action_state.empty else float(reference_action_state["abstain"].mean())
+        current_abstain_rate = None if current_action_state.empty else float(current_action_state["abstain"].mean())
+        action_rate_delta = None
+        abstain_rate_delta = None
+        if reference_action_rate is not None and current_action_rate is not None:
+            action_rate_delta = float(current_action_rate - reference_action_rate)
+        if reference_abstain_rate is not None and current_abstain_rate is not None:
+            abstain_rate_delta = float(current_abstain_rate - reference_abstain_rate)
+        action_drift = bool(
+            (action_rate_delta is not None and abs(action_rate_delta) >= float(self.config["action_rate_delta_threshold"]))
+            or (abstain_rate_delta is not None and abs(abstain_rate_delta) >= float(self.config["abstain_rate_delta_threshold"]))
+        )
 
         regime_distribution = _categorical_distribution_shift(inferred_reference_regimes, inferred_current_regimes)
         reference_transition = _categorical_transition_distribution(inferred_reference_regimes)
@@ -404,13 +505,17 @@ class DriftMonitor:
             and not model_ttl_expired
         )
         enough_samples = sample_count >= int(self.config["min_samples"])
-        evidence_count = int(feature_drift) + int(prediction_drift) + int(regime_drift) + int(performance_drift)
+        evidence_count = int(feature_drift) + int(score_drift) + int(action_drift) + int(regime_drift) + int(performance_drift)
         sufficient_evidence = evidence_count >= int(self.config["min_drift_signals"])
         should_retrain = bool(enough_samples and not cooldown_active and (sufficient_evidence or model_ttl_expired))
 
         reasons = []
         if model_ttl_expired:
             reasons.append("model_ttl_expired")
+        if score_drift:
+            reasons.append("score_drift_detected")
+        if action_drift:
+            reasons.append("action_drift_detected")
         if not enough_samples:
             reasons.append("minimum_samples_not_met")
         if cooldown_active:
@@ -427,7 +532,29 @@ class DriftMonitor:
             "feature_drift_share": feature_drift_share,
             "feature_drift": feature_drift,
             "prediction_kl_divergence": prediction_kl,
+            "score_report": {
+                "mean_probability_kl_divergence": prediction_kl,
+                "class_distribution_total_variation": class_distribution_tv,
+                "confidence_psi": confidence_psi,
+                "confidence_ks_statistic": confidence_ks,
+                "confidence_ks_p_value": confidence_ks_p,
+                "margin_psi": margin_psi,
+                "margin_ks_statistic": margin_ks,
+                "margin_ks_p_value": margin_ks_p,
+            },
+            "score_drift": score_drift,
             "prediction_drift": prediction_drift,
+            "action_report": {
+                "reference_class_distribution": _label_distribution(reference_labels),
+                "current_class_distribution": _label_distribution(current_labels),
+                "reference_action_rate": reference_action_rate,
+                "current_action_rate": current_action_rate,
+                "action_rate_delta": action_rate_delta,
+                "reference_abstain_rate": reference_abstain_rate,
+                "current_abstain_rate": current_abstain_rate,
+                "abstain_rate_delta": abstain_rate_delta,
+            },
+            "action_drift": action_drift,
             "regime_report": {
                 "distribution": regime_distribution,
                 "reference_transition_distribution": reference_transition,

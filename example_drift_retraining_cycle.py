@@ -25,10 +25,12 @@ from core import (
 )
 from example_entrypoints import parse_example_args
 from example_utils import (
+    build_spot_research_config,
     print_deployment_readiness_summary,
     print_operational_limits_summary,
     print_paper_calibration_summary,
     print_section,
+    seed_offline_pipeline_state,
 )
 
 
@@ -156,17 +158,40 @@ def main():
     registry_root.mkdir(parents=True, exist_ok=True)
 
     reference_features, current_features, reference_predictions, current_predictions, performance = _make_drift_inputs(
-        current_periods=120 if args.quick else 240
+        current_periods=200 if args.quick else 240
     )
     store = LocalRegistryStore(root_dir=registry_root)
     champion_id = _register_champion(store, symbol, 0.12)
     symbol_filters = {"tick_size": 0.1, "step_size": 0.001, "min_notional": 10.0}
 
-    pipeline = ResearchPipeline({"data": {"symbol": symbol, "interval": "1h"}})
-    pipeline.state["X"] = current_features
-    pipeline.state["training"] = {"oos_probabilities": current_predictions}
-    pipeline.state["backtest"] = {"equity_curve": (1.0 + performance).cumprod()}
-    pipeline.state["operational_monitoring"] = {"healthy": True, "reasons": []}
+    pipeline = ResearchPipeline(
+        build_spot_research_config(
+            symbol=symbol,
+            interval="1h",
+            start="2026-10-01",
+            end="2026-11-15",
+            indicators=[],
+            context_symbols=[],
+            config_overrides={
+                "experiment": {
+                    "name": "drift_retraining_cycle_demo",
+                    "description": "Deterministic maintenance-and-drift review demo with champion promotion and rollback.",
+                },
+                "data": {"futures_context": {"enabled": False}},
+            },
+        )
+    )
+    seed_offline_pipeline_state(
+        pipeline,
+        raw_data=current_features,
+        data=current_features,
+        extra_state={
+            "X": current_features,
+            "training": {"oos_probabilities": current_predictions},
+            "backtest": {"equity_curve": (1.0 + performance).cumprod()},
+            "operational_monitoring": {"healthy": True, "reasons": []},
+        },
+    )
 
     print_section(sep, 1, "Promoting an approved challenger")
     promoted = pipeline.run_drift_retraining_cycle(
@@ -248,6 +273,7 @@ def main():
     )
     print_operational_limits_summary(breached_limits)
     pipeline.state["operational_monitoring"] = {"healthy": True, "reasons": []}
+    pipeline.state["operational_limits"] = breached_limits
     rollback_result = pipeline.run_drift_retraining_cycle(
         store=store,
         reference_features=reference_features,
@@ -255,6 +281,7 @@ def main():
         bars_since_last_retrain=900,
         scheduled_window_open=True,
         train_challenger=lambda: _make_challenger_payload(0.08),
+        current_monitoring_report={"healthy": False, "reasons": ["kill_switch_triggered"]},
         rollback_policy={"mode": "hybrid"},
     )
     print(f"  retrain status    : {rollback_result['retrain_status']}")

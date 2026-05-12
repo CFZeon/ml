@@ -3,7 +3,7 @@ import unittest
 
 import pandas as pd
 
-from core.automl import _resolve_overfitting_control, _resolve_selection_policy
+from core.automl import _resolve_overfitting_control, _resolve_router_stability_gate_mode, _resolve_selection_policy
 from core.promotion import resolve_promotion_gate_mode
 from core import (
     LocalRegistryStore,
@@ -202,6 +202,34 @@ class PromotionGateBindingTest(unittest.TestCase):
         self.assertEqual(stress_realism["reason"], "unseen_regime_fallback_share_above_limit")
         self.assertEqual(stress_realism["failure_class"], "stressed_outcome_unacceptable")
 
+    def test_trade_ready_specialist_defaults_to_binding_fallback_share_limit(self):
+        stress_realism = evaluate_stress_realism_gate(
+            {
+                "evaluation_mode": "trade_ready",
+                "stress_matrix": {
+                    "configured": True,
+                    "scenario_names": ["downtime", "stale_mark", "halt"],
+                    "worst_max_drawdown": -0.05,
+                    "worst_fill_ratio": 0.95,
+                    "worst_trade_count": 3,
+                },
+            },
+            regime_aware_summary={
+                "enabled": True,
+                "strategy": "specialist",
+                "candidate_classification": "specialist_degraded_to_fallback",
+                "fallback_rows": 45,
+                "fallback_evidence_rows": 100,
+                "fallback_row_share": 0.45,
+                "unseen_regimes": ["crash"],
+            },
+        )
+
+        self.assertFalse(stress_realism["passed"])
+        self.assertTrue(stress_realism["thresholds"]["require_unseen_regime_fallback_bound"])
+        self.assertEqual(stress_realism["reason"], "unseen_regime_fallback_share_above_limit")
+        self.assertEqual(stress_realism["regime_fallback"]["candidate_classification"], "specialist_degraded_to_fallback")
+
     def test_router_stability_gate_blocks_over_switching(self):
         router_stability = evaluate_router_stability_gate(
             {
@@ -232,6 +260,88 @@ class PromotionGateBindingTest(unittest.TestCase):
         self.assertTrue(router_stability["passed"])
         self.assertEqual(router_stability["status"], "not_applicable")
         self.assertFalse(router_stability["applicable"])
+
+    def test_router_stability_gate_marks_sparse_evidence_unknown(self):
+        router_stability = evaluate_router_stability_gate(
+            {
+                "router_decision_count": 10,
+                "router_switch_count": 1,
+                "router_blocked_switch_reasons": {},
+                "router_manifest": {
+                    "router_type": "hard_switch",
+                    "hysteresis_margin": 0.05,
+                    "min_persistence_bars": 2,
+                    "cooldown_bars": 1,
+                },
+            },
+            policy={
+                "min_router_decision_count": 25,
+                "max_router_switch_rate": 0.20,
+                "require_router_stability_controls": True,
+            },
+        )
+
+        self.assertFalse(router_stability["passed"])
+        self.assertEqual(router_stability["status"], "unknown")
+        self.assertEqual(router_stability["reason"], "router_stability_insufficient_evidence")
+
+    def test_router_stability_unknown_blocks_trade_ready_promotion(self):
+        report = _make_report(0.15)
+        router_stability = evaluate_router_stability_gate(
+            {
+                "router_decision_count": 10,
+                "router_switch_count": 1,
+                "router_blocked_switch_reasons": {},
+                "router_manifest": {
+                    "router_type": "hard_switch",
+                    "hysteresis_margin": 0.05,
+                    "min_persistence_bars": 2,
+                    "cooldown_bars": 1,
+                },
+                "evaluation_mode": "trade_ready",
+            },
+            policy={
+                "evaluation_mode": "trade_ready",
+                "min_router_decision_count": 25,
+                "max_router_switch_rate": 0.20,
+                "require_router_stability_controls": True,
+            },
+        )
+        report = upsert_promotion_gate(
+            report,
+            group="post_selection",
+            name="router_stability",
+            passed=bool(router_stability["passed"]),
+            mode="blocking",
+            measured=router_stability.get("switch_rate"),
+            threshold=router_stability.get("thresholds"),
+            reason=router_stability.get("reason"),
+            details=router_stability,
+        )
+        report = finalize_promotion_eligibility_report(report)
+
+        decision = evaluate_challenger_promotion(
+            {
+                "promotion_eligibility_report": report,
+                "selection_value": 0.15,
+                "sample_count": 500,
+            }
+        )
+
+        self.assertFalse(decision["approved"])
+        self.assertEqual(
+            decision["promotion_eligibility_report"]["gate_status"]["router_stability"]["status"],
+            "unknown",
+        )
+        self.assertIn("router_stability_insufficient_evidence", decision["promotion_eligibility_report"]["blocking_failures"])
+
+    def test_router_stability_unknown_downgrades_to_advisory_in_research_mode(self):
+        mode = _resolve_router_stability_gate_mode(
+            {"is_capital_facing": False, "gate_modes": {}},
+            {"status": "unknown", "passed": False},
+        )
+
+        self.assertEqual(mode, "advisory")
 
     def test_router_stability_gate_blocks_missing_controls_when_switching(self):
         router_stability = evaluate_router_stability_gate(

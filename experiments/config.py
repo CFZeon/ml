@@ -341,6 +341,66 @@ def _normalize_special_values(config: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
+def _build_shared_quick_smoke_overrides(config: Mapping[str, Any]) -> dict[str, Any]:
+    working = _clone_mapping(config)
+    data = _clone_mapping(working.get("data") or {})
+    features = _clone_mapping(working.get("features") or {})
+    configured_lags = features.get("lags") or [1, 3, 6]
+    try:
+        feature_lag_bars = max(int(value) for value in configured_lags)
+    except (TypeError, ValueError):
+        feature_lag_bars = 6
+    overrides: dict[str, Any] = {
+        "features": {
+            "lookahead_guard": {"enabled": False},
+        },
+        "feature_selection": {
+            "enabled": False,
+        },
+        "feature_governance": {
+            "enabled": False,
+        },
+    }
+
+    context_symbols = list(
+        data.get("context_symbols")
+        or (_clone_mapping(data.get("cross_asset_context") or {}).get("symbols") or [])
+    )
+    if len(context_symbols) > 1:
+        overrides["data"] = {"context_symbols": context_symbols[:1]}
+
+    context_timeframes = list(features.get("context_timeframes") or [])
+    if len(context_timeframes) > 1:
+        overrides["features"]["context_timeframes"] = context_timeframes[:1]
+
+    model = _clone_mapping(working.get("model") or {})
+    cv_method = str(model.get("cv_method", "") or "").strip().lower()
+    model_overrides: dict[str, Any] = {}
+    if cv_method == "walk_forward":
+        model_overrides.update(
+            {
+                "n_splits": 1,
+                "train_size": min(int(model.get("train_size", 240) or 240), 240),
+                "test_size": min(int(model.get("test_size", 48) or 48), 48),
+                "gap": max(feature_lag_bars, min(int(model.get("gap", feature_lag_bars) or feature_lag_bars), 6)),
+            }
+        )
+    elif cv_method == "cpcv":
+        model_overrides.update(
+            {
+                "n_blocks": min(int(model.get("n_blocks", 2) or 2), 2),
+                "test_blocks": 1,
+                "validation_fraction": min(float(model.get("validation_fraction", 0.1) or 0.1), 0.1),
+            }
+        )
+    if model.get("meta_n_splits") is not None:
+        model_overrides["meta_n_splits"] = min(int(model.get("meta_n_splits", 2) or 2), 2)
+    if model_overrides:
+        overrides["model"] = model_overrides
+
+    return overrides
+
+
 def load_experiment_config(config_source: str | Path | Mapping[str, Any], *, quick: bool = False) -> ResolvedExperimentConfig:
     """Load, validate, and expand a user-facing experiment config."""
 
@@ -348,6 +408,11 @@ def load_experiment_config(config_source: str | Path | Mapping[str, Any], *, qui
     working_config = _clone_mapping(raw_config)
     if quick:
         working_config = clone_config_with_overrides(working_config, _clone_mapping(working_config.get("quick_overrides") or {}))
+        if not bool((_clone_mapping(working_config.get("automl") or {})).get("enabled", False)):
+            working_config = clone_config_with_overrides(
+                working_config,
+                _build_shared_quick_smoke_overrides(working_config),
+            )
     user_config = _clone_any(working_config)
     working_config = _apply_regime_orchestration_compatibility(working_config)
 
@@ -371,6 +436,10 @@ def load_experiment_config(config_source: str | Path | Mapping[str, Any], *, qui
         or (data_section.get("cross_asset_context") or {}).get("symbols")
         or []
     )
+    cross_asset_context = _clone_mapping(data_section.get("cross_asset_context") or {})
+    if cross_asset_context or context_symbols:
+        cross_asset_context["symbols"] = [str(context_symbol) for context_symbol in context_symbols]
+        data_section["cross_asset_context"] = cross_asset_context
     indicator_specs = _normalize_indicator_specs(working_config.get("indicators"))
 
     if market == "spot":

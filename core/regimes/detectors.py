@@ -140,7 +140,7 @@ def _score_row_with_frozen_stats(
     if not columns:
         return 0.0, False
     numeric = _to_numeric_series(row, columns)
-    standardized = numeric.sub(means, fill_value=0.0).div(stds.replace(0, 1), fill_value=1.0)
+    standardized = numeric.sub(means.reindex(numeric.index)).div(stds.reindex(numeric.index).replace(0, 1).fillna(1.0))
     has_data = bool(standardized.notna().any())
     if not has_data:
         return 0.0, False
@@ -270,6 +270,55 @@ def _deterministic_hmm_state_order(means: np.ndarray) -> tuple[np.ndarray, np.nd
     for ordered_label, raw_label in enumerate(ordered_state_indices):
         raw_to_ordered[int(raw_label)] = int(ordered_label)
     return ordered_state_indices.astype(int), raw_to_ordered.astype(int)
+
+
+def _sanitize_semantic_feature_name(name: Any) -> str:
+    text = str(name or "feature").strip().lower()
+    cleaned = "".join(character if character.isalnum() else "_" for character in text).strip("_")
+    return cleaned or "feature"
+
+
+def _bucket_semantic_state_value(value: float, all_values: np.ndarray) -> str:
+    values = np.asarray(all_values, dtype=float)
+    if values.size <= 1 or np.allclose(values, values[0]):
+        return "neutral"
+    lower = float(np.quantile(values, 1.0 / 3.0))
+    upper = float(np.quantile(values, 2.0 / 3.0))
+    if value <= lower:
+        return "low"
+    if value >= upper:
+        return "high"
+    return "mid"
+
+
+def _build_hmm_semantic_state_map(ordered_means: np.ndarray, feature_names: Sequence[str]) -> dict[int, dict[str, Any]]:
+    means = np.asarray(ordered_means, dtype=float)
+    if means.ndim != 2 or means.size == 0:
+        return {}
+
+    resolved_names = [
+        _sanitize_semantic_feature_name(feature_names[index] if index < len(feature_names) else f"feature_{index}")
+        for index in range(means.shape[1])
+    ]
+    state_map = {}
+    seen_labels = {}
+    for state_index in range(means.shape[0]):
+        feature_signature = {}
+        label_parts = []
+        for feature_index, feature_name in enumerate(resolved_names):
+            bucket = _bucket_semantic_state_value(float(means[state_index, feature_index]), means[:, feature_index])
+            feature_signature[feature_name] = bucket
+            label_parts.append(f"{feature_name}_{bucket}")
+        semantic_label = "hmm__" + "__".join(label_parts)
+        duplicate_count = seen_labels.get(semantic_label, 0)
+        seen_labels[semantic_label] = duplicate_count + 1
+        if duplicate_count > 0:
+            semantic_label = f"{semantic_label}__variant_{duplicate_count}"
+        state_map[int(state_index)] = {
+            "semantic_label": semantic_label,
+            "feature_signature": feature_signature,
+        }
+    return state_map
 
 
 def _forward_filter_step(
@@ -472,13 +521,29 @@ class _NativeScoreRegimeDetector:
         for key, value in self._thresholds.items():
             detector_outputs[str(key)] = float(value)
 
+        availability_state = "known" if warm else "warm"
+        availability_reason = None
+        confidence = None if not warm else 1.0
+        probabilities = {} if not warm else {str(int(label)): 1.0}
+        if selected_column_count <= 0:
+            availability_state = "unavailable"
+            availability_reason = "no_selected_columns"
+            detector_outputs["unavailable"] = 1
+            confidence = 0.0
+        elif not has_data:
+            availability_reason = "missing_observation"
+            detector_outputs["missing_observation"] = 1
+        elif not self._thresholds:
+            availability_reason = "thresholds_unavailable"
+            detector_outputs["thresholds_unavailable"] = 1
+
         runtime_state["position"] = int(runtime_state.get("position", 0)) + 1
         return runtime_state, RegimeStateContract(
             as_of=observation.as_of,
             available_at=observation.available_at,
             label=int(label),
-            probabilities=({} if not warm else {str(int(label)): 1.0}),
-            confidence=(None if not warm else 1.0),
+            probabilities=probabilities,
+            confidence=confidence,
             detector_outputs=detector_outputs,
             warm=bool(warm),
             metadata={
@@ -486,6 +551,8 @@ class _NativeScoreRegimeDetector:
                 "detector_type": self.detector_type,
                 "selected_columns": list(self._selected_columns),
                 "negative_columns": list(self._negative_columns),
+                "availability_state": availability_state,
+                **({"reason": availability_reason} if availability_reason else {}),
             },
         )
 
@@ -576,6 +643,8 @@ class FilteredHMMDetector:
     _state_count: int = field(default=0, init=False, repr=False)
     _clean_fit_rows: int = field(default=0, init=False, repr=False)
     _covariance_type: str = field(default="diag", init=False, repr=False)
+    _semantic_state_map: dict[int, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+    _semantic_schema_version: str = field(default="filtered_hmm.semantic.v1", init=False, repr=False)
 
     @property
     def params(self) -> dict[str, Any]:
@@ -591,6 +660,10 @@ class FilteredHMMDetector:
         self._covars = np.ones((1, len(self._selected_columns)), dtype=float)
         self._ordered_state_indices = np.array([0], dtype=int)
         self._raw_to_ordered = np.array([0], dtype=int)
+        self._semantic_state_map = _build_hmm_semantic_state_map(
+            self._means[self._ordered_state_indices],
+            self._selected_columns,
+        )
         return self
 
     def fit(self, observations: Any) -> "FilteredHMMDetector":
@@ -665,6 +738,10 @@ class FilteredHMMDetector:
         self._means = np.asarray(hmm_model.means_, dtype=float)
         self._covars = np.asarray(hmm_model.covars_, dtype=float)
         self._ordered_state_indices, self._raw_to_ordered = _deterministic_hmm_state_order(self._means)
+        self._semantic_state_map = _build_hmm_semantic_state_map(
+            self._means[self._ordered_state_indices],
+            self._selected_columns,
+        )
         return self
 
     def initialize(self, observations: Any | None = None) -> dict[str, Any]:
@@ -679,7 +756,6 @@ class FilteredHMMDetector:
         reason: str,
     ) -> tuple[dict[str, Any], RegimeStateContract]:
         detector_outputs = {
-            self.column_name: 0,
             "regime_confidence": 0.0,
             "selected_column_count": int(len(self._selected_columns)),
             "warm": 0,
@@ -693,7 +769,7 @@ class FilteredHMMDetector:
         return runtime_state, RegimeStateContract(
             as_of=observation.as_of,
             available_at=observation.available_at,
-            label=0,
+            label=None,
             probabilities={},
             confidence=0.0,
             detector_outputs=detector_outputs,
@@ -702,6 +778,7 @@ class FilteredHMMDetector:
                 "detector_name": self.detector_name,
                 "detector_type": "filtered_hmm",
                 "posterior_mode": self._posterior_mode,
+                "semantic_schema_version": self._semantic_schema_version,
                 "reason": reason,
                 "selected_columns": list(self._selected_columns),
             },
@@ -722,28 +799,36 @@ class FilteredHMMDetector:
         if self._fit_status == "fallback":
             position = int(runtime_state.get("position", 0))
             warm = warmup_bars is None or position + 1 >= int(warmup_bars)
+            semantic_state = dict(self._semantic_state_map.get(0) or {})
+            semantic_label = semantic_state.get("semantic_label", "hmm__fallback_state")
             detector_outputs = {
-                self.column_name: 0,
                 "regime_confidence": 1.0,
                 "selected_column_count": int(selected_column_count),
                 "warm": int(warm),
                 "degenerate_fallback": 1,
+                "latent_regime_id": 0,
+                "semantic_regime": semantic_label,
                 "prob_state_0": 1.0,
             }
+            if warm:
+                detector_outputs[self.column_name] = semantic_label
             runtime_state["position"] = position + 1
             runtime_state["filtered_log_prob"] = np.array([0.0], dtype=float)
             return runtime_state, RegimeStateContract(
                 as_of=observation.as_of,
                 available_at=observation.available_at,
-                label=0,
-                probabilities={"0": 1.0},
-                confidence=1.0,
+                label=(semantic_label if warm else None),
+                probabilities=({semantic_label: 1.0} if warm else {}),
+                confidence=(1.0 if warm else None),
                 detector_outputs=detector_outputs,
                 warm=bool(warm),
                 metadata={
                     "detector_name": self.detector_name,
                     "detector_type": "filtered_hmm",
                     "posterior_mode": self._posterior_mode,
+                    "semantic_schema_version": self._semantic_schema_version,
+                    "semantic_label": semantic_label,
+                    "semantic_signature": dict(semantic_state.get("feature_signature") or {}),
                     "reason": self._fallback_reason,
                     "selected_columns": list(self._selected_columns),
                 },
@@ -766,34 +851,44 @@ class FilteredHMMDetector:
 
         raw_probabilities = np.exp(filtered_log_prob)
         ordered_probabilities = raw_probabilities[self._ordered_state_indices]
-        label = int(np.argmax(ordered_probabilities)) if ordered_probabilities.size else 0
-        confidence = float(ordered_probabilities[label]) if ordered_probabilities.size else 0.0
+        ordered_state_id = int(np.argmax(ordered_probabilities)) if ordered_probabilities.size else 0
+        confidence = float(ordered_probabilities[ordered_state_id]) if ordered_probabilities.size else 0.0
         warm = warmup_bars is None or int(runtime_state["position"]) >= int(warmup_bars)
+        semantic_state = dict(self._semantic_state_map.get(ordered_state_id) or {})
+        semantic_label = semantic_state.get("semantic_label", f"hmm__state_{ordered_state_id}")
         detector_outputs = {
-            self.column_name: int(label),
             "regime_confidence": float(confidence),
             "selected_column_count": int(selected_column_count),
             "warm": int(warm),
             "log_evidence": float(_logsumexp(emission_log_likelihood)),
             "degenerate_fallback": 0,
+            "latent_regime_id": int(ordered_state_id),
+            "semantic_regime": semantic_label,
         }
+        if warm:
+            detector_outputs[self.column_name] = semantic_label
         probability_payload = {}
         for state_label, probability in enumerate(ordered_probabilities):
+            semantic_entry = dict(self._semantic_state_map.get(int(state_label)) or {})
+            semantic_key = str(semantic_entry.get("semantic_label", f"hmm__state_{int(state_label)}"))
             detector_outputs[f"prob_state_{state_label}"] = float(probability)
-            probability_payload[str(state_label)] = float(probability)
+            probability_payload[semantic_key] = float(probability)
 
         return runtime_state, RegimeStateContract(
             as_of=observation.as_of,
             available_at=observation.available_at,
-            label=int(label),
+            label=(semantic_label if warm else None),
             probabilities=probability_payload,
-            confidence=float(confidence),
+            confidence=(float(confidence) if warm else None),
             detector_outputs=detector_outputs,
             warm=bool(warm),
             metadata={
                 "detector_name": self.detector_name,
                 "detector_type": "filtered_hmm",
                 "posterior_mode": self._posterior_mode,
+                "semantic_schema_version": self._semantic_schema_version,
+                "semantic_label": semantic_label,
+                "semantic_signature": dict(semantic_state.get("feature_signature") or {}),
                 "selected_columns": list(self._selected_columns),
             },
         )
@@ -806,6 +901,14 @@ class FilteredHMMDetector:
             "fallback_reason": self._fallback_reason,
             "selected_columns": list(self._selected_columns),
             "selected_source_counts": dict(self._selected_source_counts),
+            "semantic_schema_version": self._semantic_schema_version,
+            "semantic_state_map": {
+                str(int(state_index)): {
+                    "semantic_label": str(payload.get("semantic_label")),
+                    "feature_signature": dict(payload.get("feature_signature") or {}),
+                }
+                for state_index, payload in dict(self._semantic_state_map or {}).items()
+            },
             "state_remap": {
                 str(int(raw_state)): int(ordered_state)
                 for raw_state, ordered_state in enumerate(self._raw_to_ordered.tolist() if self._raw_to_ordered.size else [])

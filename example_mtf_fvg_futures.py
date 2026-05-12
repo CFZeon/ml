@@ -247,6 +247,18 @@ def main():
                 "use_open_execution": True,
                 "signal_delay_bars": 2,
             },
+            "quick_overrides": {
+                "regime": {"enabled": False},
+                "features": {"context_timeframes": []},
+                "model": {
+                    "type": "logistic",
+                    "cv_method": "walk_forward",
+                    "n_splits": 1,
+                    "train_size": 240,
+                    "test_size": 48,
+                    "gap": 6,
+                },
+            },
         },
     )
     config["data"]["custom_data"] = [efvg_entry, sma200_entry]

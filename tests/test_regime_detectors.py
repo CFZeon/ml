@@ -12,6 +12,7 @@ from core.regimes.detectors import (
     is_native_regime_detector_spec,
     resolve_authoritative_regime_detector_spec,
 )
+from core.regimes import RegimeObservationContract
 from core.regimes.online_state import replay_regime_detector_trace
 
 
@@ -82,6 +83,37 @@ class RegimeDetectorsTest(unittest.TestCase):
         self.assertTrue((replayed["state_frame"]["trend_regime"] == 0).all())
         self.assertTrue((replayed["state_frame"]["warm"] == 0).all())
         self.assertEqual(replayed["detector_manifests"][0].metadata["selected_columns"], [])
+        self.assertTrue(all(not contract.warm for contract in replayed["state_contracts"]))
+        self.assertTrue(all(int(contract.detector_outputs.get("unavailable", 0)) == 1 for contract in replayed["state_contracts"]))
+        self.assertTrue(all(float(contract.confidence or 0.0) == 0.0 for contract in replayed["state_contracts"]))
+        self.assertTrue(all(contract.metadata.get("availability_state") == "unavailable" for contract in replayed["state_contracts"]))
+
+    def test_native_detector_emits_explicit_warm_state_when_observation_is_missing(self):
+        index = pd.date_range("2026-08-01", periods=12, freq="1h", tz="UTC")
+        observations = _make_observations(index)
+        detector = build_regime_detector(
+            {"name": "trend_native", "type": "trend_state"},
+            config={"column_name": "regime", "lower_quantile": 0.3, "upper_quantile": 0.7},
+        )
+        detector.fit(observations)
+        runtime_state = detector.initialize(observations)
+        runtime_state, first_contract = detector.update(
+            runtime_state,
+            RegimeObservationContract(
+                as_of=index[0],
+                available_at=index[0],
+                values={},
+                source_map={column: "instrument_state" for column in observations.columns},
+            ),
+        )
+
+        self.assertFalse(first_contract.warm)
+        self.assertEqual(first_contract.label, 0)
+        self.assertEqual(first_contract.metadata.get("availability_state"), "warm")
+        self.assertEqual(first_contract.metadata.get("reason"), "missing_observation")
+        self.assertEqual(int(first_contract.detector_outputs.get("missing_observation", 0)), 1)
+        self.assertNotIn("unavailable", first_contract.detector_outputs)
+        self.assertIsNone(first_contract.confidence)
 
     def test_resolve_authoritative_regime_detector_spec_prefers_primary_and_rejects_multiple_native(self):
         config = {

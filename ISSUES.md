@@ -222,3 +222,33 @@
 - The invalidating weakness is that too many of those controls are still fail-open, mode-dependent, or contradicted by shipped entrypoints.
 
 - That combination can easily produce outputs that look statistically respectable while still overstating deployable edge for a retail trader.
+
+---
+
+## Audit #3 — 2026-05-11
+
+- Scope: targeted adversarial audit of the regime detection layer, regime-aware routing, specialist model architecture, and drift-triggered adaptation path.
+- Industry baseline: single authoritative execution path for research and promotion evidence, fail-closed uncertainty handling, stable regime semantics across retrains, and drift governance that separates data drift, score drift, action drift, and realised performance decay.
+- Bottom line: the system now contains materially better regime and routing infrastructure than the earlier audits covered, but several of the new controls remain diagnostic, fail-open under sparse evidence, or semantically unstable across refits. That is enough to overstate deployable robustness.
+
+## Highest-Impact Findings
+
+- Critical: router sophistication is still only weakly bound to executed PnL in the default pipeline path. `core/pipeline.py::_resolve_backtest_runtime_kwargs()` supplies `regime_states` to the backtest, but not the router or specialist library, while `core/backtest.py::_build_router_trace_summary()` only attaches routing behaviour when those objects are explicitly passed. The result is a system that can report regime-aware routing diagnostics without necessarily pricing those routing decisions into the equity curve.
+
+- High: router choice can be driven by low-information or warmup states as if they were production-ready states. The filtered-HMM detector emits `warm` alongside labels and confidence, but `core/routing/router.py` scores candidates off regime confidence and compatibility without explicitly suppressing warm or unavailable states. In edge cases, tie-breaking falls back to deterministic model-id ordering rather than a governance-approved safe default.
+
+- High: the router stability gate is fail-open on sparse evidence. `core/promotion.py` returns `status="insufficient_evidence"` but still sets `passed = True` when router decision count is below threshold. That means the capital-facing gate can clear without meaningful evidence that switching behaviour is stable.
+
+- High: the lookahead guard default scope is narrower than the system it is meant to certify. `core/pipeline.py::_resolve_lookahead_guard_config()` defaults to auditing only `build_features` and the `features` artifact, while fold-local regime state, label generation, downstream signal logic, and sizing surfaces are constructed later. A passed lookahead report therefore does not certify the full causal surface actually used for model selection and backtesting.
+
+- High: specialist fallback can hide regime-specific failure under a seemingly healthy aggregate result. `core/regime_training.py::RegimeAwareModelBundle.predict_with_probability_report()` silently routes unseen or missing regimes into the fallback generalist and only records counts in the report. `core/promotion.py` can enforce a fallback-share limit, but that control is opt-in rather than a hard default.
+
+- Medium-High: regime labels are not semantically stable across retrains when the HMM path is used. Both `core/regime.py` and `core/regimes/detectors.py` reorder latent states by mean-vector norm, which makes integer labels deterministic within a fit but not semantically invariant across versions. A specialist keyed to regime `1` can therefore be attached to a different market state after retraining while all diagnostics still look internally consistent.
+
+- Medium: prediction drift measurement is too coarse to be relied upon as a primary institutional control. `core/drift.py::_kl_divergence()` collapses each prediction column to its mean and computes divergence on that vector. That loses distribution shape, boundary crowding, and action-rate information, so the system can miss meaningful degradation or trigger retrains on benign calibration drift.
+
+## Structural Failure Pattern
+
+- The dominant pattern in this slice is false binding: the codebase now has the right nouns (`router`, `specialist_library`, `regime_state_frame`, `drift_monitor`), but several of the new controls remain attached as summaries, warnings, or optional gates rather than as the single path that determines capital-relevant outcomes.
+
+- For a retail operator, that is the dangerous middle ground. The system looks institutionally aware, but some of the highest-value protections still behave like advisory analytics.

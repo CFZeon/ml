@@ -139,6 +139,9 @@ class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
         self.assertEqual(report["affected_folds"][0]["split_id"], "fold_0")
         self.assertEqual(report["affected_fold_metrics"]["mean_net_profit_pct"], -2.0)
         self.assertEqual(report["clean_fold_metrics"]["mean_net_profit_pct"], 1.5)
+        self.assertEqual(summary["fallback_evidence_rows"], 60)
+        self.assertEqual(summary["fallback_row_share"], 0.1667)
+        self.assertEqual(summary["candidate_classification"], "specialist_degraded_to_fallback")
 
     def test_train_models_supports_regime_aware_primary_path(self):
         pipeline = _build_pipeline(_make_market_frame(seed=17), strategy="feature")

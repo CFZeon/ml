@@ -45,7 +45,7 @@ def main():
     interval = "1h"
     start = "2024-01-01"
     end = "2024-03-01" if args.quick else "2024-05-01"
-    context_symbols = ["ETHUSDT", "BNBUSDT"]
+    context_symbols = [] if args.quick else ["ETHUSDT", "BNBUSDT"]
 
     print_section(sep, 1, "Building delayed custom data feed")
     base_bars, custom_feed = build_custom_feed(symbol=symbol, interval=interval, start=start, end=end)
@@ -109,12 +109,28 @@ def main():
                 "slippage_rate": 0.0003,
                 "signal_delay_bars": 1,
             },
+            "quick_overrides": {
+                "data": {
+                    "end": "2024-02-15",
+                    "cross_asset_context": {"symbols": []},
+                },
+                "regime": {"enabled": False},
+                "model": {
+                    "type": "logistic",
+                    "cv_method": "walk_forward",
+                    "n_splits": 1,
+                    "train_size": 240,
+                    "test_size": 48,
+                    "gap": 6,
+                },
+            },
         },
     )
     run_example(
         config,
         market="spot",
         local_certification=args.local_certification,
+        quick=args.quick,
         quiet=args.quiet,
         nautilus_available=NAUTILUS_AVAILABLE,
         example_name="example_custom_data.py",

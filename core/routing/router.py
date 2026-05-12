@@ -14,6 +14,9 @@ from ..specialists import (
 from .contracts import RouterManifest, RouterStateSnapshot, RoutingDecisionContract, RoutingScoreComponent
 
 
+_VALID_SAFE_MODE_POLICIES = {"fallback_only", "no_trade"}
+
+
 def _coerce_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -39,6 +42,27 @@ def _normalize_regime_state(regime_state: Any, *, timestamp: Any) -> RegimeState
     if isinstance(regime_state, Mapping):
         return RegimeStateContract.from_dict(regime_state)
     return RegimeStateContract(as_of=timestamp, available_at=timestamp)
+
+
+def _normalize_safe_mode_policy(value: Any) -> str:
+    policy = str(value or "fallback_only").strip().lower()
+    if policy not in _VALID_SAFE_MODE_POLICIES:
+        return "fallback_only"
+    return policy
+
+
+def _classify_regime_availability(regime_state: RegimeStateContract) -> str:
+    detector_outputs = dict(regime_state.detector_outputs or {})
+    metadata = dict(regime_state.metadata or {})
+    reason = str(metadata.get("reason") or "").strip().lower()
+
+    if bool(detector_outputs.get("unavailable", 0)) or reason in {"unfitted", "missing_observation"}:
+        return "unavailable"
+    if regime_state.label is None and not detector_outputs and regime_state.confidence is None:
+        return "unavailable"
+    if not bool(regime_state.warm):
+        return "warm"
+    return "known"
 
 
 def _normalize_specialist_health_map(
@@ -78,6 +102,7 @@ class _BaseSpecialistRouter:
         decay_weight: float = 0.15,
         failure_flag_penalty: float = 0.2,
         missing_health_score: float = 0.5,
+        safe_mode_policy: str = "fallback_only",
     ):
         self.policy_name = None if policy_name is None else str(policy_name)
         self.hysteresis_margin = float(max(0.0, hysteresis_margin))
@@ -88,6 +113,7 @@ class _BaseSpecialistRouter:
         self.decay_weight = float(decay_weight)
         self.failure_flag_penalty = float(failure_flag_penalty)
         self.missing_health_score = float(missing_health_score)
+        self.safe_mode_policy = _normalize_safe_mode_policy(safe_mode_policy)
         self._snapshot = None
 
     @property
@@ -128,6 +154,7 @@ class _BaseSpecialistRouter:
                 "stability_weight": self.stability_weight,
                 "decay_weight": self.decay_weight,
                 "failure_flag_penalty": self.failure_flag_penalty,
+                "safe_mode_policy": self.safe_mode_policy,
             },
         )
 
@@ -139,8 +166,17 @@ class _BaseSpecialistRouter:
     def _candidate_model_ids(self) -> list[str]:
         selection_contract = self._selection_contract()
         candidate_model_ids = [str(item) for item in list(selection_contract.get("active_model_ids") or [])]
-        if not candidate_model_ids and self._snapshot and self._snapshot.fallback_model_id is not None:
-            candidate_model_ids = [str(self._snapshot.fallback_model_id)]
+        if not candidate_model_ids:
+            candidate_model_ids = [str(item) for item in list(selection_contract.get("certified_model_ids") or [])]
+        if not candidate_model_ids:
+            candidate_model_ids = [str(item) for item in list(selection_contract.get("candidate_model_ids") or [])]
+        if not candidate_model_ids:
+            candidate_model_ids = [str(item) for item in list(selection_contract.get("degraded_model_ids") or [])]
+
+        if self._snapshot and self._snapshot.fallback_model_id is not None:
+            fallback_model_id = str(self._snapshot.fallback_model_id)
+            if fallback_model_id not in candidate_model_ids:
+                candidate_model_ids.append(fallback_model_id)
         return candidate_model_ids
 
     def _score_model(
@@ -198,6 +234,50 @@ class _BaseSpecialistRouter:
             ),
         ]
         return float(total_score), components
+
+    def _resolve_safe_mode_target(self) -> tuple[str | None, str]:
+        fallback_model_id = None
+        if self._snapshot and self._snapshot.fallback_model_id is not None:
+            fallback_model_id = str(self._snapshot.fallback_model_id)
+        if self.safe_mode_policy == "fallback_only" and fallback_model_id is not None:
+            return fallback_model_id, "fallback_only"
+        return None, "no_trade"
+
+    def _resolve_safe_mode_state(
+        self,
+        state: RouterStateSnapshot,
+        *,
+        timestamp: Any,
+        availability_state: str,
+    ) -> tuple[RouterStateSnapshot, str | None, str, str]:
+        metadata = dict(state.metadata or {})
+        decision_count = int(metadata.get("decision_count", 0)) + 1
+        last_switch_index = metadata.get("last_switch_decision_index")
+        if last_switch_index is not None:
+            last_switch_index = int(last_switch_index)
+
+        current_model_id = None if state.active_model_id is None else str(state.active_model_id)
+        target_model_id, safe_mode_action = self._resolve_safe_mode_target()
+        switched = bool(target_model_id != current_model_id)
+
+        next_metadata = dict(metadata)
+        next_metadata["decision_count"] = decision_count
+        next_metadata["last_switch_decision_index"] = decision_count if switched else last_switch_index
+        next_metadata["raw_best_model_id"] = target_model_id
+        next_metadata["blocked_switch_reason"] = None
+        next_metadata["regime_availability_state"] = str(availability_state)
+        next_metadata["safe_mode_policy"] = self.safe_mode_policy
+        next_metadata["safe_mode_action"] = safe_mode_action
+
+        next_state = RouterStateSnapshot(
+            active_model_id=target_model_id,
+            last_switch_at=(timestamp if switched else state.last_switch_at),
+            cooldown_active=False,
+            pending_challenger_id=None,
+            pending_challenger_streak=0,
+            metadata=next_metadata,
+        )
+        return next_state, target_model_id, f"{availability_state}_safe_mode", safe_mode_action
 
     def _resolve_routing_state(
         self,
@@ -303,6 +383,36 @@ class HardSwitchRouter(_BaseSpecialistRouter):
         normalized_state = _normalize_state(state)
         resolved_timestamp = timestamp or normalized_state.last_switch_at or "now"
         resolved_regime_state = _normalize_regime_state(regime_state, timestamp=resolved_timestamp)
+        availability_state = _classify_regime_availability(resolved_regime_state)
+        if availability_state != "known":
+            next_state, selected_model_id, route_reason, safe_mode_action = self._resolve_safe_mode_state(
+                normalized_state,
+                timestamp=resolved_timestamp,
+                availability_state=availability_state,
+            )
+            decision = RoutingDecisionContract(
+                as_of=resolved_regime_state.as_of,
+                available_at=resolved_regime_state.available_at,
+                selected_model_id=selected_model_id,
+                weights=({selected_model_id: 1.0} if selected_model_id is not None else {}),
+                regime_label=(None if resolved_regime_state.label is None else str(resolved_regime_state.label)),
+                regime_confidence=resolved_regime_state.confidence,
+                route_reason=route_reason,
+                hysteresis_applied=False,
+                cooldown_active=False,
+                candidate_scores=({selected_model_id: 1.0} if selected_model_id is not None else {}),
+                components=[],
+                metadata={
+                    "router_type": self.router_type,
+                    "candidate_components": {},
+                    "blocked_switch_reason": None,
+                    "regime_availability_state": availability_state,
+                    "safe_mode_policy": self.safe_mode_policy,
+                    "safe_mode_active": True,
+                    "safe_mode_action": safe_mode_action,
+                },
+            )
+            return next_state, decision
         health_map = _normalize_specialist_health_map(self._snapshot, specialist_health=specialist_health)
         candidate_scores = {}
         candidate_components = {}
@@ -340,6 +450,10 @@ class HardSwitchRouter(_BaseSpecialistRouter):
                     for model_id, components in candidate_components.items()
                 },
                 "blocked_switch_reason": blocked_switch_reason,
+                "regime_availability_state": availability_state,
+                "safe_mode_policy": self.safe_mode_policy,
+                "safe_mode_active": False,
+                "safe_mode_action": None,
             },
         )
         return next_state, decision
@@ -366,6 +480,37 @@ class WeightedRouter(_BaseSpecialistRouter):
         normalized_state = _normalize_state(state)
         resolved_timestamp = timestamp or normalized_state.last_switch_at or "now"
         resolved_regime_state = _normalize_regime_state(regime_state, timestamp=resolved_timestamp)
+        availability_state = _classify_regime_availability(resolved_regime_state)
+        if availability_state != "known":
+            next_state, selected_model_id, route_reason, safe_mode_action = self._resolve_safe_mode_state(
+                normalized_state,
+                timestamp=resolved_timestamp,
+                availability_state=availability_state,
+            )
+            decision = RoutingDecisionContract(
+                as_of=resolved_regime_state.as_of,
+                available_at=resolved_regime_state.available_at,
+                selected_model_id=selected_model_id,
+                weights=({selected_model_id: 1.0} if selected_model_id is not None else {}),
+                regime_label=(None if resolved_regime_state.label is None else str(resolved_regime_state.label)),
+                regime_confidence=resolved_regime_state.confidence,
+                route_reason=route_reason,
+                hysteresis_applied=False,
+                cooldown_active=False,
+                candidate_scores=({selected_model_id: 1.0} if selected_model_id is not None else {}),
+                components=[],
+                metadata={
+                    "router_type": self.router_type,
+                    "candidate_components": {},
+                    "blocked_switch_reason": None,
+                    "allocation_temperature": self.allocation_temperature,
+                    "regime_availability_state": availability_state,
+                    "safe_mode_policy": self.safe_mode_policy,
+                    "safe_mode_active": True,
+                    "safe_mode_action": safe_mode_action,
+                },
+            )
+            return next_state, decision
         health_map = _normalize_specialist_health_map(self._snapshot, specialist_health=specialist_health)
         candidate_scores = {}
         candidate_components = {}
@@ -416,6 +561,10 @@ class WeightedRouter(_BaseSpecialistRouter):
                 },
                 "blocked_switch_reason": blocked_switch_reason,
                 "allocation_temperature": self.allocation_temperature,
+                "regime_availability_state": availability_state,
+                "safe_mode_policy": self.safe_mode_policy,
+                "safe_mode_active": False,
+                "safe_mode_action": None,
             },
         )
         return next_state, decision
@@ -434,6 +583,7 @@ def build_router(config: Mapping[str, Any] | None = None):
         "decay_weight": _coerce_float(config.get("decay_weight"), 0.15),
         "failure_flag_penalty": _coerce_float(config.get("failure_flag_penalty"), 0.2),
         "missing_health_score": _coerce_float(config.get("missing_health_score"), 0.5),
+        "safe_mode_policy": config.get("safe_mode_policy", "fallback_only"),
     }
     if router_type in {"hard_switch", "score_router"}:
         return HardSwitchRouter(**common_kwargs)

@@ -101,17 +101,21 @@ def evaluate_stress_realism_gate(backtest_summary=None, policy=None, regime_awar
     min_stress_fill_ratio = _coerce_float(policy.get("min_stress_fill_ratio"))
     if min_stress_fill_ratio is None and evaluation_mode == "trade_ready":
         min_stress_fill_ratio = 0.25
+    fallback_rows = int(regime_aware_summary.get("fallback_rows") or 0)
+    fallback_evidence_rows = int(regime_aware_summary.get("fallback_evidence_rows") or 0)
+    fallback_share = _coerce_float(regime_aware_summary.get("fallback_row_share"))
+    if fallback_share is None and fallback_evidence_rows > 0:
+        fallback_share = float(fallback_rows) / float(fallback_evidence_rows)
+    candidate_classification = str(regime_aware_summary.get("candidate_classification") or "generalist_only")
+    specialist_candidate = str(regime_aware_summary.get("strategy") or "").lower() == "specialist"
+
     min_stress_trade_count = int(policy.get("min_stress_trade_count", 1 if evaluation_mode == "trade_ready" else 0))
-    require_unseen_regime_fallback_bound = bool(policy.get("require_unseen_regime_fallback_bound", False))
+    require_unseen_regime_fallback_bound = bool(
+        policy.get("require_unseen_regime_fallback_bound", evaluation_mode == "trade_ready" and specialist_candidate)
+    )
     max_unseen_regime_fallback_share = _coerce_float(policy.get("max_unseen_regime_fallback_share"))
     if require_unseen_regime_fallback_bound and max_unseen_regime_fallback_share is None and evaluation_mode == "trade_ready":
         max_unseen_regime_fallback_share = 0.35
-
-    fallback_rows = int(regime_aware_summary.get("fallback_rows") or 0)
-    fallback_evidence_rows = int(regime_aware_summary.get("fallback_evidence_rows") or 0)
-    fallback_share = None
-    if fallback_evidence_rows > 0:
-        fallback_share = float(fallback_rows) / float(fallback_evidence_rows)
 
     missing_metrics = []
     outcome_breaches = []
@@ -206,6 +210,7 @@ def evaluate_stress_realism_gate(backtest_summary=None, policy=None, regime_awar
         "regime_fallback": {
             "enabled": bool(regime_aware_summary.get("enabled", False)),
             "strategy": regime_aware_summary.get("strategy"),
+                "candidate_classification": candidate_classification,
             "fallback_rows": fallback_rows,
             "fallback_evidence_rows": fallback_evidence_rows,
             "fallback_share": fallback_share,
@@ -257,7 +262,8 @@ def evaluate_router_stability_gate(backtest_summary=None, policy=None):
             "switching_cost_share_of_starting_equity": switching_cost_share,
         }
 
-    applicable = bool(report.get("enabled", False) and report.get("applicable", False))
+    router_enabled = bool(report.get("enabled", False))
+    applicable = bool(router_enabled and report.get("applicable", False))
     max_router_switch_rate = _coerce_float(policy.get("max_router_switch_rate"))
     if max_router_switch_rate is None and evaluation_mode == "trade_ready":
         max_router_switch_rate = 0.35
@@ -274,16 +280,21 @@ def evaluate_router_stability_gate(backtest_summary=None, policy=None):
     switching_cost_share = _coerce_float(report.get("switching_cost_share_of_starting_equity"))
     missing_metrics = []
 
-    if not applicable:
+    if not router_enabled:
         passed = True
         reason = None
         status = "not_applicable"
         failure_class = None
     elif decision_count < min_router_decision_count:
-        passed = True
-        reason = None
-        status = "insufficient_evidence"
-        failure_class = None
+        passed = False
+        reason = "router_stability_insufficient_evidence"
+        status = "unknown"
+        failure_class = "router_evidence_insufficient"
+    elif not applicable:
+        passed = False
+        reason = "router_stability_unavailable"
+        status = "unknown"
+        failure_class = "router_evidence_unavailable"
     elif require_router_stability_controls and switch_count > 0 and configured_control_count <= 0:
         passed = False
         reason = "router_stability_controls_missing"
@@ -482,6 +493,13 @@ def build_promotion_gate_check_map(report):
     }
 
 
+def build_promotion_gate_status_map(report):
+    return {
+        str(name): str(gate.get("status") or ("pass" if bool(gate.get("passed", True)) else "fail"))
+        for name, gate in dict((report or {}).get("gate_status") or {}).items()
+    }
+
+
 def resolve_canonical_promotion_score(*, locked_holdout_report=None, selection_value=None, preference="locked_holdout_first"):
     preference = str(preference or "locked_holdout_first").lower()
     locked_holdout_value = _coerce_float((locked_holdout_report or {}).get("raw_objective_value"))
@@ -510,6 +528,7 @@ def get_promotion_score(report):
 
 __all__ = [
     "build_promotion_gate_check_map",
+    "build_promotion_gate_status_map",
     "create_promotion_eligibility_report",
     "evaluate_execution_realism_gate",
     "evaluate_router_stability_gate",

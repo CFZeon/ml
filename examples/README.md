@@ -22,12 +22,14 @@ python example_regime_bundle_automl.py --quick
 Runnable examples:
 
 ```bash
-python examples/minimal_baseline.py
-python examples/multi_feature_funding.py
-python examples/regime_aware.py
-python examples/custom_indicator.py
-python examples/walk_forward.py
+python examples/minimal_baseline.py --quick
+python examples/multi_feature_funding.py --quick
+python examples/regime_aware.py --quick
+python examples/custom_indicator.py --quick
+python examples/walk_forward.py --quick
 ```
+
+The config-backed examples in this folder now use the same shared runner as the root entrypoints, so they also accept `--quiet` and, where the scenario is compatible, `--local-certification`.
 
 Workflow:
 

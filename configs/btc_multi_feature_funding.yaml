@@ -22,6 +22,7 @@ indicators:
   - kind: macd
   - kind: funding_rate
     params:
+      symbol: BTCUSDT
       rolling_window: 9
       max_age: 8h
       min_coverage: 0.6
@@ -35,3 +36,5 @@ backtest:
 quick_overrides:
   data:
     end: 2024-02-20
+  backtest:
+    apply_funding: false

@@ -80,6 +80,9 @@ class RegimeAwareTrainingTest(unittest.TestCase):
         fold = result["folds"][0]
         self.assertEqual(result["strategy"], "specialist")
         self.assertGreater(fold["inference_report"]["fallback_rows"], 0)
+        self.assertEqual(fold["inference_report"]["fallback_evidence_rows"], 40)
+        self.assertEqual(fold["inference_report"]["fallback_row_share"], 1.0)
+        self.assertEqual(fold["inference_report"]["candidate_classification"], "specialist_degraded_to_fallback")
         self.assertIn("2", fold["inference_report"]["unseen_regimes"])
         self.assertIn("0", fold["training_report"]["trained_regimes"])
         self.assertIn("1", fold["training_report"]["trained_regimes"])

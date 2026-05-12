@@ -82,6 +82,10 @@ class FilteredHMMRuntimeTest(unittest.TestCase):
 
         pd.testing.assert_frame_equal(prefix_only["state_frame"], extended["state_frame"].iloc[:72])
         self.assertEqual(prefix_only["detector_manifests"][0].to_dict(), extended["detector_manifests"][0].to_dict())
+        manifest_metadata = prefix_only["detector_manifests"][0].metadata
+        self.assertEqual(manifest_metadata["semantic_schema_version"], "filtered_hmm.semantic.v1")
+        self.assertTrue(manifest_metadata["semantic_state_map"])
+        self.assertTrue(prefix_only["state_frame"]["regime"].dropna().astype(str).str.startswith("hmm__").all())
 
     def test_filtered_hmm_update_does_not_call_smoothed_or_batch_decoding_methods(self):
         from hmmlearn.hmm import GaussianHMM
@@ -111,8 +115,12 @@ class FilteredHMMRuntimeTest(unittest.TestCase):
         self.assertIn("prob_state_0", contract.detector_outputs)
         self.assertIn("prob_state_1", contract.detector_outputs)
         self.assertIn("regime_confidence", contract.detector_outputs)
+        self.assertIn("latent_regime_id", contract.detector_outputs)
+        self.assertIn("semantic_regime", contract.detector_outputs)
         self.assertNotIn("smoothed_probability", contract.detector_outputs)
         self.assertEqual(contract.metadata["posterior_mode"], "filtered")
+        self.assertEqual(contract.metadata["semantic_schema_version"], "filtered_hmm.semantic.v1")
+        self.assertTrue(str(contract.metadata["semantic_label"]).startswith("hmm__"))
 
     def test_pipeline_detect_regimes_routes_legacy_hmm_through_filtered_replay(self):
         index = pd.date_range("2026-08-01", periods=120, freq="1h", tz="UTC")
@@ -136,8 +144,13 @@ class FilteredHMMRuntimeTest(unittest.TestCase):
             "filtered",
         )
         self.assertIn("regime_confidence", result["regime_state_frame"].columns)
+        self.assertIn("latent_regime_id", result["regime_state_frame"].columns)
         self.assertTrue(any(column.startswith("prob_state_") for column in result["regime_state_frame"].columns))
         self.assertFalse(any("smoothed" in column for column in result["regime_state_frame"].columns))
+        self.assertTrue(result["regime_state_frame"]["regime"].dropna().astype(str).str.startswith("hmm__").all())
+        self.assertTrue(
+            pipeline.state["regime_detection"]["detector_manifests"][0].metadata["semantic_state_map"]
+        )
 
 
 if __name__ == "__main__":

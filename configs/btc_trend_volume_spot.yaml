@@ -53,4 +53,14 @@ backtest:
   signal_delay_bars: 1
 quick_overrides:
   data:
-    end: 2024-03-15
+    end: 2024-02-15
+    context_symbols: []
+  regime:
+    enabled: false
+  model:
+    type: logistic
+    cv_method: walk_forward
+    n_splits: 1
+    train_size: 240
+    test_size: 48
+    gap: 6

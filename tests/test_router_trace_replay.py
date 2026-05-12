@@ -53,6 +53,26 @@ class RouterTraceReplayTest(unittest.TestCase):
         self.assertEqual(first["summary"]["route_reason_counts"]["persistence_hold"], 1)
         self.assertEqual(first["summary"]["selected_model_ids"][1], "specialist::bull")
 
+    def test_replay_router_trace_counts_degraded_regime_availability(self):
+        router = HardSwitchRouter(hysteresis_margin=0.0, min_persistence_bars=1, cooldown_bars=0, safe_mode_policy="fallback_only")
+        regime_states = [
+            RegimeStateContract(as_of="2026-05-09T00:00:00Z", available_at="2026-05-09T00:00:00Z", label="bull", confidence=0.9),
+            RegimeStateContract(as_of="2026-05-09T01:00:00Z", available_at="2026-05-09T01:00:00Z", label="bull", confidence=0.9, warm=False),
+            RegimeStateContract(
+                as_of="2026-05-09T02:00:00Z",
+                available_at="2026-05-09T02:00:00Z",
+                label=0,
+                confidence=0.0,
+                warm=False,
+                detector_outputs={"unavailable": 1},
+            ),
+        ]
+
+        trace = replay_router_trace(router, _make_router_library(), regime_states)
+
+        self.assertEqual(trace["summary"]["regime_availability_counts"], {"known": 1, "warm": 1, "unavailable": 1})
+        self.assertEqual(trace["summary"]["safe_mode_action_counts"], {"fallback_only": 2})
+
 
 if __name__ == "__main__":
     unittest.main()

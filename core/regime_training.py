@@ -262,10 +262,20 @@ class RegimeAwareModelBundle:
         X_frame = pd.DataFrame(X).copy()
         regime_frame = _coerce_regime_frame(regime_data, index=X_frame.index)
         if self.strategy == "feature":
+            model = self.model
+            if model is None:
+                raise RuntimeError("feature strategy bundle is missing primary model")
             transformed = self._transform_feature_strategy(X_frame, regime_frame)
-            predictions = pd.Series(self.model.predict(transformed), index=X_frame.index)
-            probabilities = predict_probability_frame(self.model, transformed, ordered_classes=self.ordered_classes)
-            report = {"strategy": self.strategy, "fallback_rows": 0, "unseen_regimes": []}
+            predictions = pd.Series(model.predict(transformed), index=X_frame.index)
+            probabilities = predict_probability_frame(model, transformed, ordered_classes=self.ordered_classes)
+            report = {
+                "strategy": self.strategy,
+                "fallback_rows": 0,
+                "fallback_evidence_rows": int(len(X_frame)),
+                "fallback_row_share": 0.0 if len(X_frame) > 0 else None,
+                "unseen_regimes": [],
+                "candidate_classification": "generalist_only",
+            }
             return predictions, probabilities, report
 
         if self.strategy != "specialist":
@@ -275,6 +285,9 @@ class RegimeAwareModelBundle:
             regime_frame[self.regime_column] if self.regime_column in regime_frame.columns else regime_frame.iloc[:, 0],
             index=X_frame.index,
         ) if not regime_frame.empty else pd.Series(np.nan, index=X_frame.index)
+        fallback_model = self.fallback_model
+        if fallback_model is None:
+            raise RuntimeError("specialist strategy bundle is missing fallback model")
         predictions = pd.Series(0, index=X_frame.index, dtype=int)
         probabilities = pd.DataFrame(0.0, index=X_frame.index, columns=list(self.ordered_classes), dtype=float)
         fallback_rows = 0
@@ -283,7 +296,7 @@ class RegimeAwareModelBundle:
         for regime_value, row_index in labels.groupby(labels).groups.items():
             model = self.specialist_models.get(regime_value)
             if model is None:
-                model = self.fallback_model
+                model = fallback_model
                 fallback_rows += int(len(row_index))
                 unseen_regimes.append(regime_value)
             group_X = X_frame.loc[row_index, self.feature_columns] if self.feature_columns else X_frame.loc[row_index]
@@ -298,10 +311,10 @@ class RegimeAwareModelBundle:
         if len(missing_rows) > 0:
             fallback_rows += int(len(missing_rows))
             fallback_X = X_frame.loc[missing_rows, self.feature_columns] if self.feature_columns else X_frame.loc[missing_rows]
-            fallback_predictions = self.fallback_model.predict(fallback_X)
+            fallback_predictions = fallback_model.predict(fallback_X)
             predictions.loc[missing_rows] = fallback_predictions
             probabilities.loc[missing_rows, :] = predict_probability_frame(
-                self.fallback_model,
+                fallback_model,
                 fallback_X,
                 ordered_classes=self.ordered_classes,
             ).to_numpy()
@@ -310,7 +323,14 @@ class RegimeAwareModelBundle:
         report = {
             "strategy": self.strategy,
             "fallback_rows": int(fallback_rows),
+            "fallback_evidence_rows": int(len(X_frame)),
+            "fallback_row_share": (None if len(X_frame) <= 0 else round(float(fallback_rows / len(X_frame)), 4)),
             "unseen_regimes": sorted({str(value) for value in unseen_regimes}),
+            "candidate_classification": (
+                "generalist_only"
+                if not self.specialist_models
+                else ("specialist_degraded_to_fallback" if fallback_rows > 0 else "specialist_effective")
+            ),
         }
         return predictions, probabilities, report
 
@@ -575,6 +595,7 @@ def train_regime_aware_model(
             },
             "coverage_summary": coverage_summary,
             "sampling_report": sampling_report,
+            "candidate_classification": "generalist_only",
         }
         return bundle, report
 
@@ -642,6 +663,9 @@ def train_regime_aware_model(
         "coverage_summary": coverage_summary,
         "fallback_sampling_report": fallback_sampling_report,
         "specialist_sampling_reports": specialist_sampling_reports,
+        "candidate_classification": (
+            "generalist_only" if not specialist_models else "specialist_effective"
+        ),
     }
     return bundle, report
 

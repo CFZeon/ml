@@ -93,6 +93,17 @@ def _make_discovery_drift_inputs(current_periods=240):
     return reference_features, current_features, reference_predictions, current_predictions, performance
 
 
+def _make_score_recalibration_inputs(current_periods=240):
+    reference_index = pd.date_range("2026-10-01", periods=300, freq="1h", tz="UTC")
+    current_index = pd.date_range("2026-11-01", periods=current_periods, freq="1h", tz="UTC")
+    reference_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=reference_index)
+    current_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=current_index)
+    reference_predictions = pd.DataFrame({"p0": 0.62, "p1": 0.38}, index=reference_index)
+    current_predictions = pd.DataFrame({"p0": 0.94, "p1": 0.06}, index=current_index)
+    performance = pd.Series(np.zeros(len(current_index)), index=current_index)
+    return reference_features, current_features, reference_predictions, current_predictions, performance
+
+
 def _make_active_specialist_library(*, degraded=False):
     if degraded:
         specialist_health = SpecialistHealthContract(
@@ -371,6 +382,43 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             self.assertTrue(result["structural_invalidation"]["discover_recommended"])
             self.assertEqual(result["retrain_status"], "discovery_recommended")
             self.assertEqual(result["action_report"]["recommended_action"], "discover")
+            self.assertEqual(build_calls, [])
+
+    def test_score_only_drift_recommends_recalibration_before_retraining(self):
+        reference_features, current_features, reference_predictions, current_predictions, performance = _make_score_recalibration_inputs()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.12)
+            build_calls = []
+
+            result = run_drift_retraining_cycle(
+                store=store,
+                symbol="BTCUSDT",
+                reference_features=reference_features,
+                current_features=current_features,
+                reference_predictions=reference_predictions,
+                current_predictions=current_predictions,
+                current_performance=performance,
+                bars_since_last_retrain=520,
+                scheduled_window_open=True,
+                train_challenger=lambda: build_calls.append("called"),
+                drift_config={
+                    "min_samples": 200,
+                    "min_drift_signals": 1,
+                    "max_bars_between_retrain": 672,
+                    "confidence_ks_threshold": 0.05,
+                },
+            )
+
+            self.assertTrue(result["drift_guardrails"]["approved"])
+            self.assertTrue(result["drift_report"]["score_drift"])
+            self.assertFalse(result["drift_report"]["action_drift"])
+            self.assertFalse(result["structural_invalidation"]["retrain_recommended"])
+            self.assertFalse(result["structural_invalidation"]["discover_recommended"])
+            self.assertTrue(result["structural_invalidation"]["recalibrate_recommended"])
+            self.assertEqual(result["action_report"]["recommended_action"], "recalibrate")
+            self.assertEqual(result["retrain_status"], "not_recommended")
             self.assertEqual(build_calls, [])
 
     def test_model_ttl_expiry_can_promote_challenger_without_drift_signals(self):

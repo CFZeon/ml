@@ -243,6 +243,8 @@ def _attach_router_trace_summary(summary, router_trace_summary, *, router_switch
             "router_selected_model_ids": list(trace_summary.get("selected_model_ids") or []),
             "router_route_reason_counts": dict(trace_summary.get("route_reason_counts") or {}),
             "router_blocked_switch_reasons": dict(trace_summary.get("blocked_switch_reasons") or {}),
+            "router_regime_availability_counts": dict(trace_summary.get("regime_availability_counts") or {}),
+            "router_safe_mode_action_counts": dict(trace_summary.get("safe_mode_action_counts") or {}),
             "router_alignment": dict(trace_summary.get("alignment") or {}),
             "router_trace_summary": dict(router_trace_summary or {}),
         }

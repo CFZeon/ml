@@ -124,6 +124,88 @@ class DriftMonitoringTest(unittest.TestCase):
         self.assertGreater(float(report["regime_report"]["distribution"]["psi"]), 0.15)
         self.assertTrue(report["recommendation"]["should_retrain"])
 
+    def test_score_drift_is_reported_separately_from_action_drift(self):
+        reference_index = pd.date_range("2026-10-01", periods=320, freq="1h", tz="UTC")
+        current_index = pd.date_range("2026-11-01", periods=240, freq="1h", tz="UTC")
+        reference_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=reference_index)
+        current_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=current_index)
+        reference_predictions = pd.DataFrame({"p0": 0.62, "p1": 0.38}, index=reference_index)
+        current_predictions = pd.DataFrame({"p0": 0.94, "p1": 0.06}, index=current_index)
+
+        monitor = DriftMonitor(
+            reference_features,
+            reference_predictions,
+            config={"min_samples": 200, "min_drift_signals": 1, "confidence_psi_threshold": 0.05},
+        )
+        report = monitor.check(current_features, current_predictions=current_predictions, bars_since_last_retrain=900)
+
+        self.assertTrue(report["score_drift"])
+        self.assertFalse(report["action_drift"])
+        self.assertTrue(report["prediction_drift"])
+        self.assertGreater(float(report["score_report"]["confidence_ks_statistic"]), 0.05)
+        self.assertEqual(report["action_report"]["reference_action_rate"], 1.0)
+        self.assertEqual(report["action_report"]["current_action_rate"], 1.0)
+
+    def test_action_drift_tracks_abstain_shift(self):
+        reference_index = pd.date_range("2026-10-01", periods=320, freq="1h", tz="UTC")
+        current_index = pd.date_range("2026-11-01", periods=240, freq="1h", tz="UTC")
+        reference_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=reference_index)
+        current_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=current_index)
+        reference_predictions = pd.DataFrame({-1: 0.1, 0: 0.1, 1: 0.8}, index=reference_index)
+        current_predictions = pd.DataFrame(
+            {
+                -1: np.r_[np.full(120, 0.1), np.full(120, 0.05)],
+                0: np.r_[np.full(120, 0.1), np.full(120, 0.9)],
+                1: np.r_[np.full(120, 0.8), np.full(120, 0.05)],
+            },
+            index=current_index,
+        )
+
+        monitor = DriftMonitor(
+            reference_features,
+            reference_predictions,
+            config={"min_samples": 200, "min_drift_signals": 1, "abstain_rate_delta_threshold": 0.2},
+        )
+        report = monitor.check(current_features, current_predictions=current_predictions, bars_since_last_retrain=900)
+
+        self.assertTrue(report["action_drift"])
+        self.assertGreater(abs(float(report["action_report"]["abstain_rate_delta"])), 0.2)
+
+    def test_benign_probability_mean_move_without_action_or_performance_change_does_not_force_retraining(self):
+        reference_index = pd.date_range("2026-10-01", periods=320, freq="1h", tz="UTC")
+        current_index = pd.date_range("2026-11-01", periods=240, freq="1h", tz="UTC")
+        reference_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=reference_index)
+        current_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=current_index)
+        reference_predictions = pd.DataFrame({"p0": 0.62, "p1": 0.38}, index=reference_index)
+        current_predictions = pd.DataFrame({"p0": 0.58, "p1": 0.42}, index=current_index)
+        performance = pd.Series(np.zeros(len(current_index)), index=current_index)
+
+        monitor = DriftMonitor(
+            reference_features,
+            reference_predictions,
+            config={
+                "min_samples": 200,
+                "min_drift_signals": 2,
+                "prediction_kl_threshold": 0.2,
+                "confidence_psi_threshold": 0.2,
+                "confidence_ks_threshold": 1.1,
+                "margin_psi_threshold": 0.2,
+                "margin_ks_threshold": 1.1,
+                "max_bars_between_retrain": 5000,
+            },
+        )
+        report = monitor.check(
+            current_features,
+            current_predictions=current_predictions,
+            current_performance=performance,
+            bars_since_last_retrain=900,
+        )
+
+        self.assertFalse(report["score_drift"])
+        self.assertFalse(report["action_drift"])
+        self.assertFalse(report["performance_drift"])
+        self.assertFalse(report["recommendation"]["should_retrain"])
+
     def test_interval_and_trade_rate_normalize_cooldown_and_sample_floors(self):
         reference_index = pd.date_range("2026-10-01", periods=240, freq="4h", tz="UTC")
         current_index = pd.date_range("2026-11-01", periods=60, freq="4h", tz="UTC")
