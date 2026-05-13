@@ -253,9 +253,17 @@ def evaluate_router_stability_gate(backtest_summary=None, policy=None):
             "switch_opportunities": switch_opportunities,
             "switch_count": switch_count,
             "switch_rate": float(switch_count / switch_opportunities) if switch_opportunities > 0 else 0.0,
+            "allocation_change_count": int(backtest_summary.get("router_allocation_change_count", 0) or 0),
+            "blocked_allocation_count": int(backtest_summary.get("router_blocked_allocation_count", 0) or 0),
+            "executed_weight_l1_change_total": _coerce_float(backtest_summary.get("router_executed_weight_l1_change_total")),
+            "executed_weight_turnover_total": _coerce_float(backtest_summary.get("router_executed_weight_turnover_total")),
+            "executed_weight_turnover_rate": _coerce_float(backtest_summary.get("router_executed_weight_turnover_rate")),
+            "mean_effective_model_count": _coerce_float(backtest_summary.get("router_mean_effective_model_count")),
+            "max_effective_model_count": _coerce_float(backtest_summary.get("router_max_effective_model_count")),
             "blocked_switch_count": blocked_switch_count,
             "blocked_switch_rate": float(blocked_switch_count / switch_opportunities) if switch_opportunities > 0 else 0.0,
             "blocked_switch_reasons": blocked_switch_reasons,
+            "allocation_control_reason_counts": dict(backtest_summary.get("router_allocation_control_reason_counts") or {}),
             "control_flags": control_flags,
             "configured_control_count": int(sum(1 for enabled in control_flags.values() if enabled)),
             "switching_cost_estimate": switching_cost_estimate,
@@ -267,6 +275,9 @@ def evaluate_router_stability_gate(backtest_summary=None, policy=None):
     max_router_switch_rate = _coerce_float(policy.get("max_router_switch_rate"))
     if max_router_switch_rate is None and evaluation_mode == "trade_ready":
         max_router_switch_rate = 0.35
+    max_router_executed_weight_turnover_rate = _coerce_float(policy.get("max_router_executed_weight_turnover_rate"))
+    if max_router_executed_weight_turnover_rate is None and max_router_switch_rate is not None:
+        max_router_executed_weight_turnover_rate = float(max_router_switch_rate)
     max_router_switching_cost_share = _coerce_float(policy.get("max_router_switching_cost_share"))
     min_router_decision_count = int(policy.get("min_router_decision_count", 25 if evaluation_mode == "trade_ready" else 0))
     require_router_stability_controls = bool(
@@ -276,9 +287,14 @@ def evaluate_router_stability_gate(backtest_summary=None, policy=None):
     decision_count = int(report.get("decision_count", 0) or 0)
     switch_count = int(report.get("switch_count", 0) or 0)
     switch_rate = _coerce_float(report.get("switch_rate"))
+    allocation_change_count = int(report.get("allocation_change_count", 0) or 0)
+    executed_weight_turnover_total = _coerce_float(report.get("executed_weight_turnover_total"))
+    executed_weight_turnover_rate = _coerce_float(report.get("executed_weight_turnover_rate"))
     configured_control_count = int(report.get("configured_control_count", 0) or 0)
     switching_cost_share = _coerce_float(report.get("switching_cost_share_of_starting_equity"))
     missing_metrics = []
+    primary_metric_name = "executed_weight_turnover_rate" if executed_weight_turnover_rate is not None else "switch_rate"
+    primary_metric_value = executed_weight_turnover_rate if executed_weight_turnover_rate is not None else switch_rate
 
     if not router_enabled:
         passed = True
@@ -300,6 +316,21 @@ def evaluate_router_stability_gate(backtest_summary=None, policy=None):
         reason = "router_stability_controls_missing"
         status = "failed"
         failure_class = "router_controls_missing"
+    elif max_router_executed_weight_turnover_rate is not None and executed_weight_turnover_rate is None and max_router_switch_rate is None:
+        passed = False
+        reason = "router_allocation_turnover_rate_missing"
+        status = "failed"
+        failure_class = "router_metrics_incomplete"
+        missing_metrics.append("executed_weight_turnover_rate")
+    elif (
+        max_router_executed_weight_turnover_rate is not None
+        and executed_weight_turnover_rate is not None
+        and executed_weight_turnover_rate > float(max_router_executed_weight_turnover_rate)
+    ):
+        passed = False
+        reason = "router_allocation_turnover_rate_above_limit"
+        status = "failed"
+        failure_class = "router_allocation_churn"
     elif max_router_switch_rate is not None and switch_rate is None:
         passed = False
         reason = "router_switch_rate_missing"
@@ -335,17 +366,24 @@ def evaluate_router_stability_gate(backtest_summary=None, policy=None):
         "decision_count": decision_count,
         "switch_count": switch_count,
         "switch_rate": switch_rate,
+        "allocation_change_count": allocation_change_count,
+        "executed_weight_turnover_total": executed_weight_turnover_total,
+        "executed_weight_turnover_rate": executed_weight_turnover_rate,
         "blocked_switch_count": int(report.get("blocked_switch_count", 0) or 0),
         "blocked_switch_rate": _coerce_float(report.get("blocked_switch_rate")),
         "blocked_switch_reasons": dict(report.get("blocked_switch_reasons") or {}),
+        "allocation_control_reason_counts": dict(report.get("allocation_control_reason_counts") or {}),
         "configured_control_count": configured_control_count,
         "control_flags": dict(report.get("control_flags") or {}),
         "switching_cost_estimate": _coerce_float(report.get("switching_cost_estimate")),
         "switching_cost_share_of_starting_equity": switching_cost_share,
+        "primary_metric_name": primary_metric_name,
+        "primary_metric_value": primary_metric_value,
         "missing_metrics": missing_metrics,
         "thresholds": {
             "min_router_decision_count": min_router_decision_count,
             "max_router_switch_rate": max_router_switch_rate,
+            "max_router_executed_weight_turnover_rate": max_router_executed_weight_turnover_rate,
             "max_router_switching_cost_share": max_router_switching_cost_share,
             "require_router_stability_controls": require_router_stability_controls,
         },

@@ -4,7 +4,7 @@ from unittest import mock
 import numpy as np
 import pandas as pd
 
-from core import ResearchPipeline, build_reference_validation_bundle, select_features, train_model, trend_scanning_labels
+from core import ResearchPipeline, build_reference_overlay_feature_block, build_reference_validation_bundle, select_features, train_model, trend_scanning_labels
 from core.context import _fetch_period_endpoint, build_futures_context_feature_block
 from core.models import compute_feature_family_diagnostics, summarize_feature_family_diagnostics
 from core.pipeline import _attach_context_ttl_to_operational_monitoring, _resolve_backtest_funding_rates
@@ -366,6 +366,32 @@ class DerivativesContextPipelineTest(unittest.TestCase):
         self.assertIn("context_ttl", monitoring)
         self.assertFalse(monitoring["healthy"])
         self.assertIn("context_ttl_breached", monitoring["reasons"])
+
+    def test_reference_overlay_ttl_blanks_stale_state_and_reports_breach(self):
+        index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        reference_data = pd.DataFrame(
+            {
+                "reference_price": raw_data["close"].iloc[[0]].to_numpy(),
+                "reference_volume": raw_data["volume"].iloc[[0]].to_numpy(),
+                "breadth": [0.1],
+            },
+            index=index[:1],
+        )
+
+        block = build_reference_overlay_feature_block(
+            raw_data,
+            reference_data,
+            rolling_window=4,
+            ttl_config={"max_age": "2h", "max_unknown_rate": 0.0},
+            missing_policy={"mode": "zero_fill"},
+        )
+
+        self.assertIn("reference_overlay_stale_any", block.frame.columns)
+        self.assertEqual(float(block.frame.loc[index[3], "reference_overlay_stale_any"]), 1.0)
+        self.assertAlmostEqual(float(block.frame.loc[index[3], "ref_price_gap"]), 0.0, places=6)
+        self.assertGreater(block.metadata["ttl_report"]["stale_hit_count"], 0)
+        self.assertFalse(block.metadata["ttl_report"]["promotion_pass"])
 
     def test_strict_backtest_funding_policy_rejects_missing_expected_events(self):
         index = pd.date_range("2026-02-01", periods=48, freq="1h", tz="UTC")

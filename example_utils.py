@@ -1691,6 +1691,18 @@ def print_deployment_readiness_summary(report, *, label="deploy ready"):
             f"stale={bool(freshness.get('expired', False))}"
         )
 
+    operating_envelope = dict(components.get("operating_envelope") or {})
+    if operating_envelope:
+        print(
+            "  op envelope : "
+            f"profile={operating_envelope.get('deployment_profile')}  "
+            f"passed={bool(operating_envelope.get('passed', False))}  "
+            f"max_stage={operating_envelope.get('max_release_stage')}"
+        )
+        envelope_reasons = list(operating_envelope.get("reasons") or [])
+        if envelope_reasons:
+            print(f"  envelope why: {envelope_reasons}")
+
     actions = list(report.get("recommended_actions") or [])
     if actions:
         print(f"  next actions : {actions}")

@@ -134,11 +134,10 @@ def _asof_reindex_with_ttl(base_index, frame, max_age=None):
     joined = joined.set_index("timestamp").reindex(aligned_index)
 
     source_timestamp = pd.to_datetime(joined.pop("source_timestamp"), utc=True) if "source_timestamp" in joined.columns else pd.Series(pd.NaT, index=aligned_index)
-    feature_age = pd.Series(pd.NaT, index=aligned_index)
+    feature_age = pd.Series(aligned_index, index=aligned_index) - source_timestamp
     stale_mask = pd.Series(False, index=aligned_index, dtype=bool)
     ttl = _coerce_ttl(max_age)
     if ttl is not None:
-        feature_age = pd.Series(aligned_index, index=aligned_index) - source_timestamp
         stale_mask = source_timestamp.notna() & (feature_age > ttl)
         if stale_mask.any():
             for column in joined.columns:
@@ -700,31 +699,29 @@ def build_cross_asset_context_feature_block(base_data, context_symbol_data, roll
     ttl_sources = {}
 
     medium_horizon = max(6, min(24, rolling_window))
+    source_age_hours = []
+    stale_masks = []
     for symbol, data in context_symbol_data.items():
         if data is None or data.empty:
             continue
 
         prefix = _slug_symbol(symbol)
-        if max_age is None:
-            aligned = data.reindex(base_data.index).ffill()
-            required_columns = [column for column in ["close", "volume"] if column in aligned.columns]
-            if required_columns:
-                missing_mask = aligned[required_columns].isna().any(axis=1)
-                unknown_any.loc[missing_mask.index] = unknown_any.loc[missing_mask.index] | missing_mask
-        else:
-            aligned, diagnostics = _asof_reindex_with_ttl(base_data.index, data, max_age=max_age)
-            required_columns = [column for column in ["close", "volume"] if column in aligned.columns]
-            missing_mask = aligned[required_columns].isna().any(axis=1) if required_columns else pd.Series(True, index=base_data.index, dtype=bool)
-            unknown_any.loc[missing_mask.index] = unknown_any.loc[missing_mask.index] | missing_mask
-            ttl_value = _coerce_ttl(max_age)
-            stale_mask = diagnostics["stale_mask"].fillna(False).astype(bool)
-            ttl_sources[prefix] = {
-                "max_age": str(ttl_value) if ttl_value is not None else None,
-                "stale_hit_count": int(stale_mask.sum()),
-                "stale_hit_rate": float(stale_mask.mean()) if len(stale_mask) > 0 else 0.0,
-                "missing_hit_count": int(missing_mask.sum()),
-                "missing_hit_rate": float(missing_mask.mean()) if len(missing_mask) > 0 else 0.0,
-            }
+        aligned, diagnostics = _asof_reindex_with_ttl(base_data.index, data, max_age=max_age)
+        required_columns = [column for column in ["close", "volume"] if column in aligned.columns]
+        missing_mask = aligned[required_columns].isna().any(axis=1) if required_columns else pd.Series(True, index=base_data.index, dtype=bool)
+        unknown_any.loc[missing_mask.index] = unknown_any.loc[missing_mask.index] | missing_mask
+        ttl_value = _coerce_ttl(max_age)
+        stale_mask = diagnostics["stale_mask"].fillna(False).astype(bool)
+        feature_age = pd.to_timedelta(diagnostics["feature_age"])
+        source_age_hours.append((feature_age.dt.total_seconds() / 3600.0).rename(prefix))
+        stale_masks.append(stale_mask.rename(prefix))
+        ttl_sources[prefix] = {
+            "max_age": str(ttl_value) if ttl_value is not None else None,
+            "stale_hit_count": int(stale_mask.sum()),
+            "stale_hit_rate": float(stale_mask.mean()) if len(stale_mask) > 0 else 0.0,
+            "missing_hit_count": int(missing_mask.sum()),
+            "missing_hit_rate": float(missing_mask.mean()) if len(missing_mask) > 0 else 0.0,
+        }
         close = aligned["close"].astype(float)
         volume = aligned["volume"].astype(float)
         ret_1 = close.pct_change(fill_method=None)
@@ -753,6 +750,13 @@ def build_cross_asset_context_feature_block(base_data, context_symbol_data, roll
         vol_frame = pd.concat(basket_vols, axis=1)
         feature_frame["ctx_basket_vol_mean"] = vol_frame.mean(axis=1)
 
+    if source_age_hours:
+        age_frame = pd.concat(source_age_hours, axis=1)
+        feature_frame["cross_asset_context_source_age_hours"] = age_frame.max(axis=1, skipna=True)
+    if stale_masks:
+        stale_frame = pd.concat(stale_masks, axis=1)
+        feature_frame["cross_asset_context_stale_any"] = stale_frame.any(axis=1).astype(float)
+
     feature_frame, resolved_missing_policy = _finalize_context_feature_frame(
         feature_frame,
         missing_policy=missing_policy,
@@ -763,12 +767,14 @@ def build_cross_asset_context_feature_block(base_data, context_symbol_data, roll
     ttl_report = {
         "enabled": True,
         "scope": "cross_asset_context",
+        "ttl_configured": bool(_coerce_ttl(max_age) is not None),
         "policy": {
             "max_age": str(_coerce_ttl(max_age)) if _coerce_ttl(max_age) is not None else None,
             "max_unknown_rate": float(ttl_policy.get("max_unknown_rate", resolved_missing_policy["max_unknown_rate"])),
             "fill_mode": resolved_missing_policy["mode"],
         },
         "sources": ttl_sources,
+        "stale_hit_count": int(sum(int(source.get("stale_hit_count", 0)) for source in ttl_sources.values())),
         "unknown_hit_count": int(unknown_any.sum()),
         "unknown_hit_rate": float(unknown_any.mean()) if len(unknown_any) > 0 else 0.0,
         "promotion_pass": bool(

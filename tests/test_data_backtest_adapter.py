@@ -944,14 +944,19 @@ class DataBacktestAdapterTest(unittest.TestCase):
         self.assertNotIn("router_decision_count", baseline)
         self.assertEqual(routed["router_decision_count"], 4)
         self.assertEqual(routed["router_switch_count"], 1)
+        self.assertEqual(routed["router_allocation_change_count"], 1)
+        self.assertEqual(routed["router_executed_weight_turnover_total"], 1.0)
         self.assertEqual(routed["router_manifest"]["router_type"], "hard_switch")
         self.assertEqual(routed["router_alignment"]["mode"], "positional")
         self.assertEqual(routed["router_blocked_switch_reasons"], {"persistence_requirement_not_met": 1})
         self.assertTrue(routed["router_stability_report"]["enabled"])
         self.assertEqual(routed["router_stability_report"]["switch_opportunities"], 3)
         self.assertEqual(routed["router_stability_report"]["switch_rate"], 0.3333)
+        self.assertEqual(routed["router_stability_report"]["executed_weight_turnover_rate"], 0.3333)
+        self.assertEqual(routed["router_stability_report"]["primary_stability_metric"], "executed_weight_turnover_rate")
         self.assertEqual(routed["router_stability_report"]["blocked_switch_count"], 1)
         self.assertEqual(routed["router_stability_report"]["blocked_switch_rate"], 0.3333)
+        self.assertEqual(routed["router_stability_report"]["blocked_allocation_count"], 0)
         self.assertEqual(routed["router_stability_report"]["configured_control_count"], 3)
         self.assertEqual(len(routed["router_decision_trace"]), 4)
         self.assertEqual(routed["router_selected_model_ids"][1], "specialist::bull")
@@ -1027,9 +1032,11 @@ class DataBacktestAdapterTest(unittest.TestCase):
             routed["router_switching_cost_report"],
             {
                 "switch_count": 1,
+                "executed_weight_turnover_total": 1.0,
                 "cost_per_switch": 12.5,
+                "cost_per_turnover_unit": 12.5,
                 "estimated_cost": 12.5,
-                "basis": "hypothetical_routing_decisions_not_executed",
+                "basis": "executed_allocation_turnover",
             },
         )
 

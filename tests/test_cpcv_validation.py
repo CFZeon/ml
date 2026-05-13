@@ -74,9 +74,17 @@ class CPCVValidationTest(unittest.TestCase):
                             "decision_count": 100,
                             "switch_count": 12,
                             "switch_rate": 0.12,
+                            "allocation_change_count": 16,
+                            "allocation_change_rate": 0.16,
+                            "executed_weight_turnover_total": 14.0,
+                            "executed_weight_turnover_rate": 0.14,
                             "blocked_switch_count": 20,
                             "blocked_switch_rate": 0.2,
+                            "blocked_allocation_count": 0,
+                            "blocked_allocation_rate": 0.0,
+                            "mean_effective_model_count": 1.05,
                             "blocked_switch_reasons": {"cooldown_active": 2},
+                            "allocation_control_reason_counts": {"selection_only": 100},
                             "configured_control_count": 3,
                             "switching_cost_estimate": 18.0,
                             "switching_cost_share_of_starting_equity": 0.0018,
@@ -91,9 +99,17 @@ class CPCVValidationTest(unittest.TestCase):
                             "decision_count": 80,
                             "switch_count": 8,
                             "switch_rate": 0.1,
+                            "allocation_change_count": 10,
+                            "allocation_change_rate": 0.125,
+                            "executed_weight_turnover_total": 9.0,
+                            "executed_weight_turnover_rate": 0.1125,
                             "blocked_switch_count": 12,
                             "blocked_switch_rate": 0.15,
+                            "blocked_allocation_count": 0,
+                            "blocked_allocation_rate": 0.0,
+                            "mean_effective_model_count": 1.0,
                             "blocked_switch_reasons": {"persistence_requirement_not_met": 3},
+                            "allocation_control_reason_counts": {"selection_only": 80},
                             "configured_control_count": 2,
                             "switching_cost_estimate": 10.0,
                             "switching_cost_share_of_starting_equity": 0.001,
@@ -108,6 +124,7 @@ class CPCVValidationTest(unittest.TestCase):
         self.assertEqual(report["path_count"], 2)
         self.assertEqual(report["applicable_path_count"], 2)
         self.assertAlmostEqual(float(report["mean_switch_rate"]), 0.11, places=6)
+        self.assertAlmostEqual(float(report["mean_executed_weight_turnover_rate"]), 0.12625, places=6)
         self.assertEqual(report["blocked_switch_reasons"], {"cooldown_active": 2, "persistence_requirement_not_met": 3})
 
     def test_cpcv_split_generates_block_combinations_and_embargo(self):

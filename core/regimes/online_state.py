@@ -86,6 +86,7 @@ def replay_regime_detector_trace(
         "trace_summary": trace_summary,
         "detector_manifests": [detector_manifest],
         "mode": mode,
+        "evidence_class": trace_summary.evidence_class,
     }
 
 

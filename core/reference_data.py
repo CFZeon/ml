@@ -54,6 +54,84 @@ def _asof_reindex(base_index, frame):
     return joined.set_index("timestamp").reindex(base_index)
 
 
+def _coerce_ttl(value):
+    if value in {None, False, "", "none", "disabled"}:
+        return None
+    if isinstance(value, pd.Timedelta):
+        return value
+    return pd.Timedelta(value)
+
+
+def _asof_reindex_with_ttl(base_index, frame, max_age=None):
+    aligned_index = pd.DatetimeIndex(base_index)
+    if frame is None or frame.empty:
+        return pd.DataFrame(index=aligned_index), {
+            "source_timestamp": pd.Series(pd.NaT, index=aligned_index),
+            "feature_age": pd.Series(pd.NaT, index=aligned_index),
+            "stale_mask": pd.Series(False, index=aligned_index, dtype=bool),
+        }
+
+    context = frame.sort_index().reset_index().rename(columns={frame.index.name or "index": "source_timestamp"})
+    anchor = pd.DataFrame({"timestamp": aligned_index})
+    joined = pd.merge_asof(anchor, context, left_on="timestamp", right_on="source_timestamp", direction="backward")
+    joined = joined.set_index("timestamp").reindex(aligned_index)
+
+    source_timestamp = pd.to_datetime(joined.pop("source_timestamp"), utc=True) if "source_timestamp" in joined.columns else pd.Series(pd.NaT, index=aligned_index)
+    feature_age = pd.Series(aligned_index, index=aligned_index) - source_timestamp
+    stale_mask = pd.Series(False, index=aligned_index, dtype=bool)
+    ttl = _coerce_ttl(max_age)
+    if ttl is not None:
+        stale_mask = source_timestamp.notna() & (feature_age > ttl)
+        if stale_mask.any():
+            for column in joined.columns:
+                joined.loc[stale_mask, column] = np.nan
+
+    return joined, {
+        "source_timestamp": source_timestamp,
+        "feature_age": feature_age,
+        "stale_mask": stale_mask,
+    }
+
+
+def _resolve_missing_policy(policy=None):
+    resolved = {"mode": "preserve_missing", "add_indicator": True, "max_unknown_rate": 0.0}
+    if isinstance(policy, str):
+        resolved["mode"] = policy
+        policy_mapping = {}
+    elif isinstance(policy, dict):
+        resolved.update(policy)
+        policy_mapping = policy
+    else:
+        policy_mapping = {}
+
+    mode = str(resolved.get("mode", "preserve_missing")).strip().lower()
+    if mode in {"preserve", "preserve_missing", "strict"}:
+        resolved["mode"] = "preserve_missing"
+        if "add_indicator" not in policy_mapping:
+            resolved["add_indicator"] = True
+        if "max_unknown_rate" not in policy_mapping:
+            resolved["max_unknown_rate"] = 0.0
+    else:
+        resolved["mode"] = "zero_fill"
+        if "add_indicator" not in policy_mapping:
+            resolved["add_indicator"] = False
+        if "max_unknown_rate" not in policy_mapping:
+            resolved["max_unknown_rate"] = 1.0
+    resolved["add_indicator"] = bool(resolved.get("add_indicator", resolved["mode"] == "preserve_missing"))
+    resolved["max_unknown_rate"] = float(resolved.get("max_unknown_rate", 0.0 if resolved["mode"] == "preserve_missing" else 1.0))
+    return resolved
+
+
+def _finalize_feature_frame(frame, *, missing_policy=None, unknown_mask=None, unknown_column=None):
+    resolved = _resolve_missing_policy(missing_policy)
+    finalized = pd.DataFrame(frame).replace([np.inf, -np.inf], np.nan)
+    if resolved["add_indicator"] and unknown_mask is not None and unknown_column:
+        finalized[unknown_column] = pd.Series(unknown_mask, index=finalized.index).astype(float)
+    if resolved["mode"] == "zero_fill":
+        finalized = finalized.fillna(0.0)
+    return finalized, resolved
+
+
 def _cache_path(cache_dir, namespace, payload):
     if cache_dir is None:
         return None
@@ -984,7 +1062,7 @@ def build_reference_validation_bundle(
     )
 
 
-def build_reference_overlay_feature_block(base_data, reference_data=None, rolling_window=20):
+def build_reference_overlay_feature_block(base_data, reference_data=None, rolling_window=20, ttl_config=None, missing_policy=None):
     base_frame = pd.DataFrame(base_data)
     if reference_data is None:
         return _empty_feature_block(base_frame.index, "reference_overlay")
@@ -993,7 +1071,9 @@ def build_reference_overlay_feature_block(base_data, reference_data=None, rollin
     if reference_frame.empty:
         return _empty_feature_block(base_frame.index, "reference_overlay")
 
-    aligned = _asof_reindex(base_frame.index, reference_frame)
+    ttl_policy = dict(ttl_config or {})
+    max_age = ttl_policy.get("max_age")
+    aligned, diagnostics = _asof_reindex_with_ttl(base_frame.index, reference_frame, max_age=max_age)
     frame = pd.DataFrame(index=base_frame.index)
 
     reference_price = None
@@ -1027,8 +1107,42 @@ def build_reference_overlay_feature_block(base_data, reference_data=None, rollin
     if frame.empty:
         return _empty_feature_block(base_frame.index, "reference_overlay")
 
+    feature_age = pd.to_timedelta(diagnostics["feature_age"])
+    stale_mask = diagnostics["stale_mask"].fillna(False).astype(bool)
+    unknown_any = frame.isna().any(axis=1)
+    frame["reference_overlay_source_age_hours"] = feature_age.dt.total_seconds() / 3600.0
+    frame["reference_overlay_stale_any"] = stale_mask.astype(float)
+    frame, resolved_missing_policy = _finalize_feature_frame(
+        frame,
+        missing_policy=missing_policy,
+        unknown_mask=unknown_any,
+        unknown_column="reference_overlay_unknown_any",
+    )
+
     laggable_columns = list(frame.columns)
-    return FeatureBlock(frame=frame, laggable_columns=laggable_columns, block_name="reference_overlay")
+    ttl_report = {
+        "enabled": True,
+        "scope": "reference_overlay",
+        "ttl_configured": bool(_coerce_ttl(max_age) is not None),
+        "policy": {
+            "max_age": str(_coerce_ttl(max_age)) if _coerce_ttl(max_age) is not None else None,
+            "max_unknown_rate": float(ttl_policy.get("max_unknown_rate", resolved_missing_policy["max_unknown_rate"])),
+            "fill_mode": resolved_missing_policy["mode"],
+        },
+        "stale_hit_count": int(stale_mask.sum()),
+        "stale_hit_rate": float(stale_mask.mean()) if len(stale_mask) > 0 else 0.0,
+        "unknown_hit_count": int(unknown_any.sum()),
+        "unknown_hit_rate": float(unknown_any.mean()) if len(unknown_any) > 0 else 0.0,
+        "promotion_pass": bool(
+            float(unknown_any.mean()) <= float(ttl_policy.get("max_unknown_rate", resolved_missing_policy["max_unknown_rate"]))
+        ) if len(unknown_any) > 0 else True,
+    }
+    return FeatureBlock(
+        frame=frame,
+        laggable_columns=laggable_columns,
+        block_name="reference_overlay",
+        metadata={"ttl_report": ttl_report},
+    )
 
 
 __all__ = [

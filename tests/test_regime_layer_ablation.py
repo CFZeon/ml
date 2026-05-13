@@ -5,8 +5,8 @@ import numpy as np
 import pandas as pd
 
 from core import ResearchPipeline
-from core.pipeline import _build_fold_local_regime_frame
-from core.regime import RegimeFeatureSet, build_regime_ablation_report
+from core.pipeline import _build_fold_local_regime_frame, _resolve_backtest_regime_states
+from core.regime import RegimeFeatureSet, build_regime_ablation_report, summarize_regime_ablation_reports
 
 
 def _make_ohlcv(index, *, drift=10.0, amplitude=2.0, volume_base=1_000.0):
@@ -112,6 +112,8 @@ class RegimeLayerAblationTest(unittest.TestCase):
         pd.testing.assert_frame_equal(regime_result["regime_state_frame"], regime_result["regimes"])
         self.assertTrue({"trend_regime", "volatility_regime", "liquidity_regime", "regime"}.issubset(regime_result["regimes"].columns))
         self.assertEqual(pipeline.state["regime_detection"]["trace_summary"].mode, "global_preview_only")
+        self.assertEqual(pipeline.state["regime_detection"]["evidence_class"], "preview_only")
+        self.assertEqual(pipeline.state["preview_regime_detection"]["evidence_class"], "preview_only")
         self.assertEqual(len(pipeline.state["regime_detection"]["detector_manifests"]), 1)
         self.assertEqual(
             pipeline.state["regime_detection"]["detector_manifests"][0].detector_type,
@@ -232,6 +234,39 @@ class RegimeLayerAblationTest(unittest.TestCase):
         self.assertLess(report["stability_improvement"], 0.0)
         self.assertLess(report["full_stability"]["persistence"], report["endogenous_stability"]["persistence"])
 
+    def test_regime_ablation_summary_requires_incremental_lift_when_configured(self):
+        report = {
+            "contextual_sources_present": True,
+            "stability_gate": {"required": True, "passed": True, "min_persistence_improvement": 0.0},
+            "incremental_evidence_gate": {
+                "required": True,
+                "min_accuracy_lift": 0.02,
+                "min_directional_accuracy_lift": 0.02,
+                "max_fallback_row_share": 0.35,
+                "min_label_entropy": 0.1,
+                "min_mean_dwell_bars": 2.0,
+            },
+            "full_stability": {"label_entropy": 0.9, "mean_dwell_bars": 8.0},
+            "stability_improvement": 0.15,
+        }
+
+        summary = summarize_regime_ablation_reports(
+            [report],
+            [
+                {
+                    "incremental_evidence": {
+                        "accuracy_lift": 0.0,
+                        "directional_accuracy_lift": 0.0,
+                        "fallback_row_share": 0.1,
+                    }
+                }
+            ],
+        )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertIn("regime_incremental_evidence_failed", summary["reasons"])
+        self.assertIn("regime_accuracy_lift_below_minimum", summary["incremental_evidence_reasons"])
+
     def test_fold_local_builder_accepts_regime_feature_set_output(self):
         raw_data = _make_ohlcv(pd.date_range("2026-08-01", periods=200, freq="1h", tz="UTC"))
         builder_windows = []
@@ -281,6 +316,67 @@ class RegimeLayerAblationTest(unittest.TestCase):
         details = fake_pipeline.state["_last_regime_details"]
         self.assertEqual(details["provenance"]["source_counts"]["market_state"], 1)
         self.assertTrue(details["ablation"]["contextual_sources_present"])
+
+    def test_capital_facing_backtest_rejects_preview_only_regime_artifact(self):
+        index = pd.date_range("2026-08-01", periods=120, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h", "futures_context": {"enabled": False}},
+                "indicators": [],
+                "features": {"rolling_window": 20},
+                "regime": {"method": "explicit"},
+                "backtest": {"evaluation_mode": "local_certification"},
+            }
+        )
+        pipeline.state["raw_data"] = raw_data
+        pipeline.state["data"] = raw_data.copy()
+        pipeline.detect_regimes()
+
+        with self.assertRaisesRegex(RuntimeError, "Preview-only regime artifacts cannot feed capital-facing backtests"):
+            _resolve_backtest_regime_states(pipeline, index)
+
+    def test_capital_facing_training_blocks_preview_regime_details_from_evidence_summary(self):
+        index = pd.date_range("2026-08-01", periods=240, freq="1h", tz="UTC")
+        raw_data = _make_ohlcv(index)
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h", "futures_context": {"enabled": False}},
+                "indicators": [],
+                "features": {"rolling_window": 20, "lookahead_guard": {"enabled": False}},
+                "regime": {"method": "explicit"},
+                "labels": {"kind": "fixed_horizon", "horizon": 1, "threshold": 0.0},
+                "backtest": {"evaluation_mode": "local_certification"},
+                "model": {"type": "logistic", "cv_method": "walk_forward", "n_splits": 1, "gap": 0},
+                "signals": {"avg_win": 0.02, "avg_loss": 0.02},
+            }
+        )
+        pipeline.state["raw_data"] = raw_data
+        pipeline.state["data"] = raw_data.copy()
+        pipeline.state["data_integrity_report"] = {
+            "status": "complete",
+            "gap_policy": "fail",
+            "duplicate_policy": "fail",
+            "missing_rows": 0,
+            "duplicate_report": {"conflicting_duplicate_timestamps": 0},
+        }
+        pipeline.state["data_quality_report"] = {
+            "status": "pass",
+            "blocking": False,
+            "summary": {"quarantined_rows": 0},
+        }
+
+        pipeline.build_features()
+        pipeline.detect_regimes()
+        pipeline.build_labels()
+        pipeline.align_data()
+        training = pipeline.train_models()
+
+        preview_artifact = training["regime"]["preview_artifact"]
+        self.assertEqual(training["regime"]["evidence_class"], "fold_local_oos")
+        self.assertTrue(preview_artifact["blocked_from_evidence"])
+        self.assertEqual(preview_artifact["evidence_class"], "preview_only")
+        self.assertNotIn("provenance", preview_artifact)
 
 
 if __name__ == "__main__":

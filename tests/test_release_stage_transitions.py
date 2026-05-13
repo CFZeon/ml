@@ -7,6 +7,7 @@ from core import (
     LocalRegistryStore,
     build_deployment_readiness_report,
     build_live_calibration_report,
+    build_monitoring_report,
     build_operational_limits_report,
     build_model,
     create_promotion_eligibility_report,
@@ -80,6 +81,34 @@ def _make_paper_report():
     )
 
 
+def _make_validated_monitoring_report(*, deployment_profile="research_workstation"):
+    return build_monitoring_report(
+        policy={"policy_profile": "research"},
+        deployment_profile=deployment_profile,
+        expected_feature_columns=["f1"],
+        actual_feature_columns=["f1"],
+        inference_latencies_ms=[60.0, 75.0, 90.0],
+        queue_backlog=[0, 0, 0],
+        resource_telemetry={
+            "peak_rss_mb": 4096.0,
+            "model_load_latency_ms": 1200.0,
+            "drift_cycle_latency_ms": 180_000.0,
+            "storage_footprint_mb": 2048.0,
+            "symbol_count": 2,
+            "timeframe_count": 1,
+        },
+        replay_benchmark={
+            "run_count": 2,
+            "throughput_bars_per_sec": 400.0,
+            "latency_p95_ms": 90.0,
+            "latency_p99_ms": 120.0,
+            "memory_spike_mb": 4600.0,
+            "restart_recovery_time_ms": 45_000.0,
+            "deterministic_pass": True,
+        },
+    )
+
+
 class ReleaseStageTransitionsTest(unittest.TestCase):
     def test_release_stage_advances_from_certified_to_micro_and_scaled(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -90,7 +119,7 @@ class ReleaseStageTransitionsTest(unittest.TestCase):
             base_kwargs = {
                 "store": store,
                 "symbol": "BTCUSDT",
-                "monitoring_report": {"healthy": True, "reasons": []},
+                "monitoring_report": _make_validated_monitoring_report(),
                 "drift_cycle": {
                     "drift_guardrails": {"approved": False, "reasons": []},
                     "retrain_status": "not_recommended",
@@ -140,7 +169,7 @@ class ReleaseStageTransitionsTest(unittest.TestCase):
             report = build_deployment_readiness_report(
                 store=store,
                 symbol="BTCUSDT",
-                monitoring_report={"healthy": True, "reasons": []},
+                monitoring_report=_make_validated_monitoring_report(deployment_profile="consumer_laptop"),
                 drift_cycle={
                     "drift_guardrails": {"approved": False, "reasons": []},
                     "retrain_status": "not_recommended",

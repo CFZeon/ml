@@ -335,27 +335,59 @@ class ADWINDetector:
         self.fallback_zscore = float(fallback_zscore)
         self._detector = RiverADWIN(delta=self.delta) if RiverADWIN is not None else None
         self._history = deque(maxlen=self.fallback_window * 4)
+        self._state_history = []
 
     @property
     def using_river(self):
         return self._detector is not None
 
+    def _consume_value(self, value):
+        numeric = float(value)
+        self._history.append(numeric)
+        self._state_history.append(numeric)
+        if self._detector is not None:
+            self._detector.update(numeric)
+        return numeric
+
+    def snapshot(self):
+        return {
+            "delta": float(self.delta),
+            "fallback_window": int(self.fallback_window),
+            "fallback_zscore": float(self.fallback_zscore),
+            "using_river": bool(self.using_river),
+            "history": list(self._state_history),
+            "history_length": int(len(self._state_history)),
+        }
+
+    def restore(self, snapshot=None):
+        payload = dict(snapshot or {})
+        history = [
+            float(value)
+            for value in list(payload.get("history") or [])
+            if value is not None and np.isfinite(value)
+        ]
+        self._detector = RiverADWIN(delta=self.delta) if RiverADWIN is not None else None
+        self._history = deque(maxlen=self.fallback_window * 4)
+        self._state_history = []
+        for value in history:
+            self._consume_value(value)
+        return int(len(history))
+
     def update(self, value):
         if value is None or not np.isfinite(value):
             return {"drift_detected": False, "method": "ignored_invalid"}
 
+        numeric_value = self._consume_value(value)
         if self._detector is not None:
-            self._detector.update(float(value))
             drift_detected = bool(getattr(self._detector, "drift_detected", False))
             return {
                 "drift_detected": drift_detected,
                 "method": "river_adwin",
-                "value": float(value),
+                "value": numeric_value,
             }
 
-        self._history.append(float(value))
         if len(self._history) < self.fallback_window * 2:
-            return {"drift_detected": False, "method": "fallback_warmup", "value": float(value)}
+            return {"drift_detected": False, "method": "fallback_warmup", "value": numeric_value}
 
         history = np.asarray(self._history, dtype=float)
         left = history[-(self.fallback_window * 2):-self.fallback_window]
@@ -368,7 +400,7 @@ class ADWINDetector:
         return {
             "drift_detected": bool(drift_detected),
             "method": "fallback_mean_shift",
-            "value": float(value),
+            "value": numeric_value,
             "left_mean": left_mean,
             "right_mean": right_mean,
             "threshold": threshold,
@@ -376,12 +408,31 @@ class ADWINDetector:
 
 
 class DriftMonitor:
-    def __init__(self, reference_features, reference_predictions=None, reference_regimes=None, config=None):
+    def __init__(self, reference_features, reference_predictions=None, reference_regimes=None, config=None, state=None):
         self.reference_features = _safe_frame(reference_features)
         self.reference_predictions = _safe_frame(reference_predictions)
         self.reference_regimes = _coerce_regime_label_series(reference_regimes)
         self.config = _resolve_drift_policy(config)
         self.performance_detector = ADWINDetector(delta=self.config["adwin_delta"])
+        self._restored_state = False
+        self._restored_performance_history = 0
+        if state is not None:
+            self.restore_state(state)
+
+    def snapshot_state(self):
+        return {
+            "performance_detector": self.performance_detector.snapshot(),
+            "restored_state": bool(self._restored_state),
+            "restored_performance_history": int(self._restored_performance_history),
+        }
+
+    def restore_state(self, state=None):
+        payload = dict(state or {})
+        detector_state = dict(payload.get("performance_detector") or payload)
+        restored = self.performance_detector.restore(detector_state)
+        self._restored_state = restored > 0
+        self._restored_performance_history = int(restored)
+        return restored
 
     def check(self, current_features, current_predictions=None, current_performance=None,
               current_regimes=None, bars_since_last_retrain=None):
@@ -564,6 +615,7 @@ class DriftMonitor:
             "regime_drift": regime_drift,
             "performance_updates": performance_updates,
             "performance_drift": performance_drift,
+            "drift_monitor_state": self.snapshot_state(),
             "interval": self.config.get("interval"),
             "bars_per_day": self.config.get("bars_per_day"),
             "cooldown_bars": int(self.config["cooldown_bars"]),

@@ -82,11 +82,15 @@ class RegimeStateContract:
     label: Any = None
     probabilities: dict[str, float] = field(default_factory=dict)
     confidence: float | None = None
+    confidence_kind: str | None = None
+    recognition_lag_bars: int | None = None
+    source_available_at: Any = None
+    availability_reason: str | None = None
     detector_outputs: dict[str, Any] = field(default_factory=dict)
     warm: bool = True
     transition_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    schema_version: str = "phase0.regime_state.v1"
+    schema_version: str = "phase0.regime_state.v2"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +100,10 @@ class RegimeStateContract:
             "label": _serialize_value(self.label),
             "probabilities": {str(key): float(value) for key, value in dict(self.probabilities).items()},
             "confidence": None if self.confidence is None else float(self.confidence),
+            "confidence_kind": None if self.confidence_kind is None else str(self.confidence_kind),
+            "recognition_lag_bars": None if self.recognition_lag_bars is None else int(self.recognition_lag_bars),
+            "source_available_at": _coerce_timestamp(self.source_available_at),
+            "availability_reason": None if self.availability_reason is None else str(self.availability_reason),
             "detector_outputs": _coerce_mapping(self.detector_outputs),
             "warm": bool(self.warm),
             "transition_id": None if self.transition_id is None else str(self.transition_id),
@@ -112,12 +120,20 @@ class RegimeStateContract:
         }
         confidence = data.get("confidence")
         return cls(
-            schema_version=str(data.get("schema_version", "phase0.regime_state.v1")),
+            schema_version=str(data.get("schema_version", "phase0.regime_state.v2")),
             as_of=data.get("as_of"),
             available_at=data.get("available_at"),
             label=data.get("label"),
             probabilities=probabilities,
             confidence=None if confidence is None else float(confidence),
+            confidence_kind=(None if data.get("confidence_kind") is None else str(data.get("confidence_kind"))),
+            recognition_lag_bars=(
+                None if data.get("recognition_lag_bars") is None else int(data.get("recognition_lag_bars"))
+            ),
+            source_available_at=data.get("source_available_at"),
+            availability_reason=(
+                None if data.get("availability_reason") is None else str(data.get("availability_reason"))
+            ),
             detector_outputs=_coerce_mapping(data.get("detector_outputs") or {}),
             warm=bool(data.get("warm", True)),
             transition_id=(None if data.get("transition_id") is None else str(data.get("transition_id"))),
@@ -203,6 +219,7 @@ class RegimeTraceSummary:
     row_count: int
     available_rows: int
     transition_count: int
+    evidence_class: str = "preview_only"
     observation_columns: list[str] = field(default_factory=list)
     state_columns: list[str] = field(default_factory=list)
     label_distribution: dict[str, int] = field(default_factory=dict)
@@ -215,6 +232,7 @@ class RegimeTraceSummary:
         return {
             "schema_version": self.schema_version,
             "mode": str(self.mode),
+            "evidence_class": str(self.evidence_class),
             "row_count": int(self.row_count),
             "available_rows": int(self.available_rows),
             "transition_count": int(self.transition_count),
@@ -232,6 +250,7 @@ class RegimeTraceSummary:
         return cls(
             schema_version=str(data.get("schema_version", "phase0.regime_trace_summary.v1")),
             mode=str(data.get("mode", "preview")),
+            evidence_class=str(data.get("evidence_class", "preview_only")),
             row_count=int(data.get("row_count", 0)),
             available_rows=int(data.get("available_rows", 0)),
             transition_count=int(data.get("transition_count", 0)),

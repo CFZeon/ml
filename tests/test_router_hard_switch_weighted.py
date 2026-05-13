@@ -68,9 +68,11 @@ class RouterRuntimeTest(unittest.TestCase):
             state,
             RegimeStateContract(as_of="2026-05-09T02:00:00Z", available_at="2026-05-09T02:00:00Z", label="risk_off", confidence=0.95),
         )
-        self.assertTrue(decision3.cooldown_active)
-        self.assertEqual(decision3.selected_model_id, "specialist::bull")
-        self.assertEqual(decision3.metadata["blocked_switch_reason"], "cooldown_active")
+        self.assertFalse(decision3.cooldown_active)
+        self.assertEqual(decision3.selected_model_id, "specialist::risk_off")
+        self.assertEqual(decision3.route_reason, "initial_selection")
+        self.assertFalse(decision3.metadata["candidate_eligibility"]["specialist::bull"]["eligible"])
+        self.assertIn("regime_incompatible", decision3.metadata["candidate_eligibility"]["specialist::bull"]["reasons"])
 
     def test_weighted_router_returns_normalized_weights_and_diagnostics(self):
         router = WeightedRouter(allocation_temperature=0.5, hysteresis_margin=0.0, min_persistence_bars=1, cooldown_bars=0)
@@ -85,9 +87,52 @@ class RouterRuntimeTest(unittest.TestCase):
         self.assertEqual(state.active_model_id, "specialist::bull")
         self.assertEqual(decision.selected_model_id, "specialist::bull")
         self.assertAlmostEqual(sum(decision.weights.values()), 1.0)
+        self.assertGreater(decision.effective_model_count, 1.0)
+        self.assertEqual(decision.allocation_control_reason, "mixture_allocation")
+        self.assertGreater(decision.executed_weight_turnover, 0.0)
         self.assertIn("fallback_generalist", decision.candidate_scores)
         self.assertTrue(decision.components)
         self.assertEqual(roundtrip.selected_model_id, "specialist::bull")
+        self.assertEqual(roundtrip.executed_candidate_ids, decision.executed_candidate_ids)
+
+    def test_weighted_router_zeroes_blocked_challenger_weights(self):
+        router = WeightedRouter(allocation_temperature=1.0, hysteresis_margin=1.0, min_persistence_bars=1, cooldown_bars=0)
+        state = router.initialize(_make_active_specialist_library())
+
+        state, decision = router.select(
+            state,
+            RegimeStateContract(as_of="2026-05-09T00:00:00Z", available_at="2026-05-09T00:00:00Z", label="bull", confidence=1.0),
+        )
+
+        self.assertEqual(decision.selected_model_id, "fallback_generalist")
+        self.assertEqual(decision.route_reason, "hysteresis_hold")
+        self.assertEqual(decision.metadata["blocked_switch_reason"], "hysteresis_margin_not_met")
+        self.assertEqual(decision.weights, {"fallback_generalist": 1.0})
+        self.assertEqual(decision.executed_candidate_ids, ["fallback_generalist"])
+        self.assertEqual(decision.effective_model_count, 1.0)
+        self.assertEqual(decision.allocation_control_reason, "blocked_selection_only")
+
+    def test_router_filters_failed_specialist_from_runtime_candidates(self):
+        router = HardSwitchRouter(hysteresis_margin=0.0, min_persistence_bars=1, cooldown_bars=0)
+        state = router.initialize(_make_active_specialist_library())
+
+        state, decision = router.select(
+            state,
+            RegimeStateContract(as_of="2026-05-09T00:00:00Z", available_at="2026-05-09T00:00:00Z", label="bull", confidence=0.95),
+            specialist_health={
+                "health": [
+                    {
+                        "model_id": "specialist::bull",
+                        "failure_flags": ["runtime_failure"],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(decision.selected_model_id, "fallback_generalist")
+        self.assertNotIn("specialist::bull", decision.candidate_scores)
+        self.assertFalse(decision.metadata["candidate_eligibility"]["specialist::bull"]["eligible"])
+        self.assertIn("health_failure_flags", decision.metadata["candidate_eligibility"]["specialist::bull"]["reasons"])
 
     def test_warm_regime_state_routes_to_explicit_safe_fallback(self):
         router = HardSwitchRouter(hysteresis_margin=0.0, min_persistence_bars=1, cooldown_bars=0, safe_mode_policy="fallback_only")

@@ -89,6 +89,57 @@ class DriftMonitoringTest(unittest.TestCase):
 
         self.assertTrue(any(update.get("drift_detected", False) for update in updates))
 
+    def test_drift_monitor_restores_performance_detector_state_across_cycles(self):
+        index = pd.date_range("2026-10-01", periods=80, freq="1h", tz="UTC")
+        reference_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=index)
+        reference_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=index)
+        baseline_performance = pd.Series(np.full(80, 0.1), index=index)
+        shifted_index = pd.date_range("2026-10-05", periods=80, freq="1h", tz="UTC")
+        shifted_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=shifted_index)
+        shifted_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=shifted_index)
+        shifted_performance = pd.Series(np.full(80, 2.5), index=shifted_index)
+
+        monitor = DriftMonitor(
+            reference_features,
+            reference_predictions,
+            config={"min_samples": 1, "min_drift_signals": 1},
+        )
+        first_report = monitor.check(
+            reference_features,
+            current_predictions=reference_predictions,
+            current_performance=baseline_performance,
+            bars_since_last_retrain=800,
+        )
+
+        restored_monitor = DriftMonitor(
+            reference_features,
+            reference_predictions,
+            config={"min_samples": 1, "min_drift_signals": 1},
+            state=first_report["drift_monitor_state"],
+        )
+        restored_report = restored_monitor.check(
+            shifted_features,
+            current_predictions=shifted_predictions,
+            current_performance=shifted_performance,
+            bars_since_last_retrain=800,
+        )
+        fresh_monitor = DriftMonitor(
+            reference_features,
+            reference_predictions,
+            config={"min_samples": 1, "min_drift_signals": 1},
+        )
+        fresh_report = fresh_monitor.check(
+            shifted_features,
+            current_predictions=shifted_predictions,
+            current_performance=shifted_performance,
+            bars_since_last_retrain=800,
+        )
+
+        self.assertFalse(first_report["performance_drift"])
+        self.assertTrue(restored_report["performance_drift"])
+        self.assertFalse(fresh_report["performance_drift"])
+        self.assertEqual(restored_report["drift_monitor_state"]["performance_detector"]["history_length"], 160)
+
     def test_regime_distribution_shift_is_counted_as_drift_evidence(self):
         reference_index = pd.date_range("2026-10-01", periods=320, freq="1h", tz="UTC")
         current_index = pd.date_range("2026-11-01", periods=240, freq="1h", tz="UTC")

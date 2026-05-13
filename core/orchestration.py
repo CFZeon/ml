@@ -10,6 +10,7 @@ from .drift import DriftMonitor, _resolve_drift_policy, evaluate_drift_guardrail
 from .promotion import evaluate_router_stability_gate
 from .registry.store import evaluate_challenger_promotion
 from .specialists.governance import evaluate_specialist_library_governance
+from .storage import read_json
 
 
 _DEFAULT_CRITICAL_ROLLBACK_REASONS = {
@@ -113,6 +114,19 @@ def _augment_drift_report(
     report["current_regime_window"] = _window_summary(current_regimes)
     report["performance_window"] = _window_summary(current_performance)
     return report
+
+
+def _load_persisted_drift_monitor_state(champion_record):
+    record = dict(champion_record or {})
+    report_path = record.get("latest_drift_report")
+    if not report_path:
+        return None
+    try:
+        persisted = read_json(report_path)
+    except Exception:
+        return None
+    state = dict((persisted or {}).get("drift_monitor_state") or {})
+    return state or None
 
 
 def _normalize_challenger_payload(payload):
@@ -447,11 +461,13 @@ def run_drift_retraining_cycle(
             current_specialist_library = store.read_specialist_library(champion["version_id"], symbol=symbol)
         except Exception:
             current_specialist_library = None
+    persisted_monitor_state = _load_persisted_drift_monitor_state(champion)
     monitor = DriftMonitor(
         reference_features,
         reference_predictions,
         reference_regimes=reference_regimes,
         config=resolved_drift_config,
+        state=persisted_monitor_state,
     )
     drift_report = monitor.check(
         current_features,

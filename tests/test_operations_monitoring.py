@@ -216,6 +216,41 @@ class OperationsMonitoringTest(unittest.TestCase):
         self.assertIn("signal_decay", report["reasons"])
         self.assertEqual(report["components"]["signal_decay"]["reason"], "signal_delay_edge_deterioration")
 
+    def test_operating_envelope_telemetry_is_attached_to_monitoring_report(self):
+        report = build_monitoring_report(
+            deployment_profile="consumer_laptop",
+            inference_latencies_ms=[12.0, 18.0, 24.0],
+            resource_telemetry={
+                "peak_rss_mb": 4096.0,
+                "model_load_latency_ms": 850.0,
+                "drift_cycle_latency_ms": 120_000.0,
+                "storage_footprint_mb": 1536.0,
+                "symbol_count": 3,
+                "timeframe_count": 2,
+                "restart_recovery_time_ms": 25_000.0,
+                "degraded_mode_actions": ["disable_mixture_routing"],
+            },
+            replay_benchmark=[
+                {
+                    "throughput_bars_per_sec": 640.0,
+                    "latency_p95_ms": 24.0,
+                    "latency_p99_ms": 32.0,
+                    "memory_spike_mb": 4608.0,
+                    "restart_recovery_time_ms": 25_000.0,
+                    "degraded_mode_triggered": True,
+                    "degraded_mode_actions": ["disable_mixture_routing"],
+                }
+            ],
+        )
+
+        envelope = report["operating_envelope"]
+        self.assertEqual(envelope["deployment_profile"], "consumer_laptop")
+        self.assertTrue(envelope["resource_telemetry"]["observed"])
+        self.assertEqual(envelope["resource_telemetry"]["symbol_count"], 3)
+        self.assertTrue(envelope["replay_benchmark"]["observed"])
+        self.assertEqual(envelope["replay_benchmark"]["run_count"], 1)
+        self.assertIn("disable_mixture_routing", envelope["replay_benchmark"]["degraded_mode_actions"])
+
 
 if __name__ == "__main__":
     unittest.main()

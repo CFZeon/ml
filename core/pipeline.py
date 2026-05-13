@@ -96,11 +96,16 @@ from .regimes.observations import (
     resolve_pipeline_regime_observation_feature_set,
 )
 from .regimes.online_state import replay_regime_detector_trace
-from .readiness import build_deployment_readiness_report
+from .readiness import (
+    build_deployment_readiness_report,
+    build_operational_limits_report,
+    build_paper_trading_report,
+)
 from .regime import (
     build_regime_ablation_report,
     build_regime_state_contracts,
     detect_regime,
+    resolve_regime_evidence_class,
     summarize_regime_ablation_reports,
 )
 from .regime_training import (
@@ -498,6 +503,7 @@ def _route_signal_state_with_router(
     router,
     specialist_library,
     regime_states,
+    specialist_health_trace=None,
     include_decision_trace=False,
 ):
     if (
@@ -535,15 +541,36 @@ def _route_signal_state_with_router(
     if not prepared_surfaces:
         return base_signal_state, None
 
-    trace = replay_router_trace(router, specialist_library, regime_states)
+    trace = replay_router_trace(
+        router,
+        specialist_library,
+        regime_states,
+        specialist_health_trace=specialist_health_trace,
+    )
     decision_trace = list(trace.get("decision_trace") or [])
     if len(decision_trace) != len(index):
         return base_signal_state, None
 
     base_series = {field_name: _as_float_series(base_signal_state.get(field_name), index) for field_name in fields}
+    masked_surfaces = {
+        model_id: {
+            field_name: series.copy()
+            for field_name, series in payload.items()
+        }
+        for model_id, payload in prepared_surfaces.items()
+    }
     routed = {field_name: pd.Series(0.0, index=index, dtype=float) for field_name in fields}
     missing_surface_rows = 0
     weighted_rows = 0
+    eligibility_blocked_rows = 0
+    eligibility_blocked_rows_by_reason = {}
+    fallback_rows_by_cause = {}
+    fallback_model_id = None
+    if isinstance(specialist_library, dict):
+        fallback_model_id = specialist_library.get("fallback_model_id")
+    else:
+        fallback_model_id = getattr(specialist_library, "fallback_model_id", None)
+    fallback_model_id = None if fallback_model_id is None else str(fallback_model_id)
 
     for loc, decision_payload in enumerate(decision_trace):
         decision = (
@@ -551,8 +578,41 @@ def _route_signal_state_with_router(
             if isinstance(decision_payload, RoutingDecisionContract)
             else RoutingDecisionContract.from_dict(decision_payload)
         )
+        candidate_eligibility = dict((decision.metadata or {}).get("candidate_eligibility") or {})
+        row_reasons = set()
+        for model_id, eligibility_payload in candidate_eligibility.items():
+            resolved_payload = dict(eligibility_payload or {})
+            if bool(resolved_payload.get("eligible", False)):
+                continue
+            surface_payload = masked_surfaces.get(str(model_id))
+            if surface_payload is None:
+                continue
+            row_reasons.update(str(reason) for reason in list(resolved_payload.get("reasons") or []) if reason)
+            for field_name in fields:
+                if field_name in surface_payload:
+                    surface_payload[field_name].iloc[loc] = float("nan")
+        if row_reasons:
+            eligibility_blocked_rows += 1
+            for reason in row_reasons:
+                eligibility_blocked_rows_by_reason[str(reason)] = int(
+                    eligibility_blocked_rows_by_reason.get(str(reason), 0)
+                ) + 1
+
         safe_mode_action = str((decision.metadata or {}).get("safe_mode_action") or "")
         safe_mode_active = bool((decision.metadata or {}).get("safe_mode_active", False))
+        selected_model_id = None if decision.selected_model_id is None else str(decision.selected_model_id)
+        if selected_model_id == fallback_model_id:
+            blocked_reason = (decision.metadata or {}).get("blocked_switch_reason")
+            if row_reasons:
+                fallback_causes = list(row_reasons)
+            elif blocked_reason:
+                fallback_causes = [str(blocked_reason)]
+            elif safe_mode_active and safe_mode_action:
+                fallback_causes = [f"safe_mode_{safe_mode_action}"]
+            else:
+                fallback_causes = [str(decision.route_reason)]
+            for cause in fallback_causes:
+                fallback_rows_by_cause[str(cause)] = int(fallback_rows_by_cause.get(str(cause), 0)) + 1
         if safe_mode_action == "no_trade":
             continue
 
@@ -564,19 +624,23 @@ def _route_signal_state_with_router(
         if weights:
             used_any = False
             for model_id, weight in weights.items():
-                payload = prepared_surfaces.get(model_id)
+                payload = masked_surfaces.get(model_id)
                 if payload is None:
                     continue
+                used_model = False
                 for field_name in fields:
                     if field_name in payload:
-                        routed[field_name].iloc[loc] += float(payload[field_name].iloc[loc]) * float(weight)
-                used_any = True
+                        value = payload[field_name].iloc[loc]
+                        if pd.isna(value):
+                            continue
+                        routed[field_name].iloc[loc] += float(value) * float(weight)
+                        used_model = True
+                used_any = bool(used_any or used_model)
             if used_any:
                 weighted_rows += 1
                 continue
 
-        selected_model_id = None if decision.selected_model_id is None else str(decision.selected_model_id)
-        selected_payload = prepared_surfaces.get(selected_model_id)
+        selected_payload = masked_surfaces.get(selected_model_id)
         if selected_payload is None:
             missing_surface_rows += 1
             if safe_mode_active:
@@ -587,7 +651,11 @@ def _route_signal_state_with_router(
 
         for field_name in fields:
             if field_name in selected_payload:
-                routed[field_name].iloc[loc] = float(selected_payload[field_name].iloc[loc])
+                selected_value = selected_payload[field_name].iloc[loc]
+                if pd.isna(selected_value):
+                    routed[field_name].iloc[loc] = float(base_series[field_name].iloc[loc])
+                else:
+                    routed[field_name].iloc[loc] = float(selected_value)
             else:
                 routed[field_name].iloc[loc] = float(base_series[field_name].iloc[loc])
 
@@ -601,9 +669,11 @@ def _route_signal_state_with_router(
     routed_state["router_binding_mode"] = "fold_local_executed_routing"
     routed_state["routed_signal_surfaces"] = {
         model_id: payload.get("continuous_signals")
-        for model_id, payload in prepared_surfaces.items()
+        for model_id, payload in masked_surfaces.items()
         if payload.get("continuous_signals") is not None
     }
+    if specialist_health_trace is not None:
+        routed_state["specialist_health_trace"] = copy.deepcopy(specialist_health_trace)
     routed_state["router_trace_summary"] = {
         "manifest": dict(trace.get("manifest") or {}),
         "summary": {
@@ -611,6 +681,9 @@ def _route_signal_state_with_router(
             "binding_mode": "executed_signals",
             "missing_surface_rows": int(missing_surface_rows),
             "weighted_rows": int(weighted_rows),
+            "eligibility_blocked_rows": int(eligibility_blocked_rows),
+            "eligibility_blocked_rows_by_reason": eligibility_blocked_rows_by_reason,
+            "fallback_rows_by_cause": fallback_rows_by_cause,
         },
     }
     if include_decision_trace:
@@ -634,9 +707,16 @@ def _resolve_backtest_router_runtime_kwargs(pipeline, backtest_config, *, signal
     if resolved_signal_state.get("router_bound", False) and not resolved_signal_state.get("router_diagnostics_enabled", False):
         return {}
 
+    specialist_health_trace = (
+        resolved_signal_state.get("specialist_health_trace")
+        or (pipeline.state.get("training") or {}).get("specialist_health_trace")
+        or pipeline.state.get("specialist_health_trace")
+    )
+
     return {
         "router": build_router(router_config),
         "specialist_library": copy.deepcopy(specialist_library),
+        "specialist_health_trace": copy.deepcopy(specialist_health_trace) if specialist_health_trace is not None else None,
         "include_router_decision_trace": bool(
             resolved_signal_state.get(
                 "router_diagnostics_include_decision_trace",
@@ -1618,6 +1698,8 @@ def _resolve_data_certification_config(pipeline):
         context_sources.append("futures_context")
     if list(cross_asset_context_config.get("symbols") or []):
         context_sources.append("cross_asset_context")
+    if bool(reference_config.get("enabled", False)):
+        context_sources.append("reference_overlay")
 
     enabled = bool(configured.get("enabled", evaluation_mode.is_capital_facing))
     default_mode = "blocking" if evaluation_mode.is_capital_facing else "advisory"
@@ -1738,9 +1820,16 @@ def _build_data_certification_report(pipeline):
         for scope in config["context_sources"]
         if scope in context_ttl_report and not bool((context_ttl_report.get(scope) or {}).get("promotion_pass", True))
     ]
+    missing_ttl_policy_scopes = [
+        scope
+        for scope in config["context_sources"]
+        if scope in context_ttl_report and not bool((context_ttl_report.get(scope) or {}).get("ttl_configured", False))
+    ]
     context_reasons = []
     if config["require_context_validation"] and config["context_sources"] and missing_context_scopes:
         _append_unique_reason(context_reasons, "context_ttl_unavailable")
+    if config["trade_ready_mode"] and missing_ttl_policy_scopes:
+        _append_unique_reason(context_reasons, "context_ttl_policy_missing")
     if breached_context_scopes:
         _append_unique_reason(context_reasons, "context_ttl_breached")
     context_pass = not context_reasons
@@ -1749,6 +1838,7 @@ def _build_data_certification_report(pipeline):
         "promotion_pass": context_pass,
         "required_scopes": list(config["context_sources"]),
         "missing_scopes": missing_context_scopes,
+        "missing_ttl_policy_scopes": missing_ttl_policy_scopes,
         "breached_scopes": breached_context_scopes,
         "reason": context_reasons[0] if context_reasons else None,
         "reasons": context_reasons,
@@ -2014,7 +2104,10 @@ def _resolve_backtest_futures_account(pipeline):
     return configured
 
 
-def _resolve_backtest_runtime_kwargs(pipeline, index, *, signal_state=None):
+_BACKTEST_REGIME_STATES_UNSET = object()
+
+
+def _resolve_backtest_runtime_kwargs(pipeline, index, *, signal_state=None, regime_states=_BACKTEST_REGIME_STATES_UNSET):
     backtest_config = pipeline.section("backtest")
     market = _resolve_backtest_market(pipeline)
     raw_data = pipeline.require("raw_data")
@@ -2043,6 +2136,12 @@ def _resolve_backtest_runtime_kwargs(pipeline, index, *, signal_state=None):
 
     futures_account = _resolve_backtest_futures_account(pipeline)
 
+    resolved_regime_states = (
+        _resolve_backtest_regime_states(pipeline, index)
+        if regime_states is _BACKTEST_REGIME_STATES_UNSET
+        else regime_states
+    )
+
     runtime_kwargs = {
         "engine": backtest_config.get("engine", "vectorbt"),
         "market": market,
@@ -2066,7 +2165,7 @@ def _resolve_backtest_runtime_kwargs(pipeline, index, *, signal_state=None):
         "futures_account": futures_account,
         "futures_contract": pipeline.state.get("futures_contract_spec"),
         "futures_leverage_brackets": pipeline.state.get("futures_leverage_brackets"),
-        "regime_states": _resolve_backtest_regime_states(pipeline, index),
+        "regime_states": resolved_regime_states,
         "symbol_lifecycle": pipeline.state.get("symbol_lifecycle"),
         "symbol_lifecycle_policy": pipeline.state.get("universe_policy"),
         "scenario_schedule": backtest_config.get("scenario_schedule"),
@@ -2155,6 +2254,49 @@ def _build_pipeline_operational_monitoring(
     queue_backlog=None,
     scope="training",
 ):
+    def _resolve_pipeline_deployment_profile():
+        deployment_config = dict(pipeline.section("deployment"))
+        monitoring_config = dict(pipeline.section("monitoring"))
+        configured = deployment_config.get("profile") or monitoring_config.get("deployment_profile")
+        if str(configured or "").strip():
+            return str(configured).strip().lower()
+        trade_ready_profile = dict((pipeline.section("automl") or {}).get("trade_ready_profile") or {})
+        if bool(trade_ready_profile.get("reduced_power", False)):
+            return "reduced_power_research_only"
+        return None
+
+    def _build_pipeline_resource_telemetry():
+        deployment_config = dict(pipeline.section("deployment"))
+        monitoring_config = dict(pipeline.section("monitoring"))
+        telemetry = {
+            **dict(deployment_config.get("resource_telemetry") or {}),
+            **dict(monitoring_config.get("resource_telemetry") or {}),
+            **dict(pipeline.state.get("resource_telemetry") or {}),
+        }
+        if telemetry.get("inference_latencies_ms") is None and inference_latencies_ms is not None:
+            telemetry["inference_latencies_ms"] = list(inference_latencies_ms)
+        if telemetry.get("symbol_count") is None:
+            cross_asset_context = dict(pipeline.state.get("cross_asset_context") or {})
+            telemetry["symbol_count"] = max(1, 1 + len(cross_asset_context))
+        if telemetry.get("timeframe_count") is None:
+            timeframes = set()
+            base_interval = pipeline.section("data").get("interval")
+            if str(base_interval or "").strip():
+                timeframes.add(str(base_interval))
+            for timeframe in list(pipeline.section("features").get("context_timeframes") or []):
+                if str(timeframe or "").strip():
+                    timeframes.add(str(timeframe))
+            if timeframes:
+                telemetry["timeframe_count"] = int(len(timeframes))
+        drift_cycle = dict(pipeline.state.get("drift_cycle") or {})
+        if telemetry.get("drift_cycle_latency_ms") is None:
+            telemetry["drift_cycle_latency_ms"] = (
+                drift_cycle.get("cycle_latency_ms")
+                or drift_cycle.get("latency_ms")
+                or drift_cycle.get("duration_ms")
+            )
+        return telemetry
+
     monitoring_config = dict(pipeline.section("monitoring"))
     backtest_config = pipeline.section("backtest")
     evaluation_mode = resolve_evaluation_mode(backtest_config)
@@ -2190,6 +2332,9 @@ def _build_pipeline_operational_monitoring(
         baseline_signal_decay_report=monitoring_config.get("baseline_signal_decay_report"),
         inference_latencies_ms=inference_latencies_ms,
         queue_backlog=queue_backlog,
+        resource_telemetry=_build_pipeline_resource_telemetry(),
+        replay_benchmark=pipeline.state.get("replay_benchmark"),
+        deployment_profile=_resolve_pipeline_deployment_profile(),
         policy=monitoring_config,
         default_policy_profile=monitoring_config.get("policy_profile", "research"),
     )
@@ -2202,6 +2347,22 @@ def _build_pipeline_operational_monitoring(
             run_id=f"{scope}_{symbol}_{timestamp}",
         )
     return report
+
+
+def _attach_context_ttl_to_operational_monitoring(operational_monitoring, context_ttl_report):
+    monitoring = dict(operational_monitoring or {})
+    report = dict(context_ttl_report or {})
+    if not report:
+        return monitoring
+
+    monitoring["context_ttl"] = report
+    if not all(bool(scope_report.get("promotion_pass", True)) for scope_report in report.values()):
+        monitoring["healthy"] = False
+        reasons = list(monitoring.get("reasons", []))
+        if "context_ttl_breached" not in reasons:
+            reasons.append("context_ttl_breached")
+        monitoring["reasons"] = reasons
+    return monitoring
 
 
 def _timed_inference_call(latency_store, func, *args, **kwargs):
@@ -2229,6 +2390,14 @@ def _resolve_signal_profitability_threshold(training_payload, config):
 
 def _resolve_backtest_regime_states(pipeline, index):
     details = pipeline.state.get("regime_state_details") or {}
+    regime_detection = dict(pipeline.state.get("regime_detection") or {})
+    evidence_class = str(
+        details.get("evidence_class")
+        or regime_detection.get("evidence_class")
+        or resolve_regime_evidence_class(details.get("mode") or regime_detection.get("mode"))
+    )
+    if resolve_evaluation_mode(pipeline.section("backtest")).is_capital_facing and evidence_class == "preview_only":
+        raise RuntimeError("Preview-only regime artifacts cannot feed capital-facing backtests")
     state_contracts = details.get("state_contracts")
     if state_contracts:
         return list(state_contracts)
@@ -2332,9 +2501,15 @@ def _run_path_backtests(pipeline, config, path_entries):
         positions = path["continuous_signals"] if config.get("use_continuous_positions", True) else path["signals"]
         valuation_close = _resolve_backtest_valuation_close(pipeline, positions.index)
         execution_prices = _resolve_backtest_execution_prices(pipeline, positions.index)
-        runtime_kwargs = dict(_resolve_backtest_runtime_kwargs(pipeline, positions.index, signal_state=path) or {})
-        if path.get("regime_states") is not None:
-            runtime_kwargs["regime_states"] = copy.deepcopy(path.get("regime_states"))
+        runtime_kwargs = dict(
+            _resolve_backtest_runtime_kwargs(
+                pipeline,
+                positions.index,
+                signal_state=path,
+                regime_states=copy.deepcopy(path.get("regime_states")),
+            )
+            or {}
+        )
         path_backtest = run_backtest(
             close=valuation_close,
             signals=positions,
@@ -2608,9 +2783,12 @@ def _summarize_path_backtests(path_backtests):
         blocked_switch_reasons = {}
         switching_cost_estimates = []
         switching_cost_shares = []
+        allocation_control_reason_counts = {}
         for report in router_stability_reports:
             for reason, count in dict(report.get("blocked_switch_reasons") or {}).items():
                 blocked_switch_reasons[str(reason)] = blocked_switch_reasons.get(str(reason), 0) + int(count)
+            for reason, count in dict(report.get("allocation_control_reason_counts") or {}).items():
+                allocation_control_reason_counts[str(reason)] = allocation_control_reason_counts.get(str(reason), 0) + int(count)
             switching_cost_estimate = report.get("switching_cost_estimate")
             if switching_cost_estimate is not None:
                 switching_cost_estimates.append(float(switching_cost_estimate))
@@ -2626,8 +2804,15 @@ def _summarize_path_backtests(path_backtests):
             "mean_decision_count": float(np.mean([float(report.get("decision_count", 0)) for report in router_stability_reports])),
             "mean_switch_count": float(np.mean([float(report.get("switch_count", 0)) for report in router_stability_reports])),
             "mean_switch_rate": float(np.mean([float(report.get("switch_rate", 0.0)) for report in router_stability_reports])),
+            "mean_allocation_change_count": float(np.mean([float(report.get("allocation_change_count", 0)) for report in router_stability_reports])),
+            "mean_allocation_change_rate": float(np.mean([float(report.get("allocation_change_rate", 0.0)) for report in router_stability_reports])),
+            "mean_executed_weight_turnover_total": float(np.mean([float(report.get("executed_weight_turnover_total", 0.0)) for report in router_stability_reports])),
+            "mean_executed_weight_turnover_rate": float(np.mean([float(report.get("executed_weight_turnover_rate", 0.0)) for report in router_stability_reports])),
             "mean_blocked_switch_count": float(np.mean([float(report.get("blocked_switch_count", 0)) for report in router_stability_reports])),
             "mean_blocked_switch_rate": float(np.mean([float(report.get("blocked_switch_rate", 0.0)) for report in router_stability_reports])),
+            "mean_blocked_allocation_count": float(np.mean([float(report.get("blocked_allocation_count", 0)) for report in router_stability_reports])),
+            "mean_blocked_allocation_rate": float(np.mean([float(report.get("blocked_allocation_rate", 0.0)) for report in router_stability_reports])),
+            "mean_effective_model_count": float(np.mean([float(report.get("mean_effective_model_count", 0.0)) for report in router_stability_reports])),
             "mean_configured_control_count": float(np.mean([float(report.get("configured_control_count", 0)) for report in router_stability_reports])),
             "mean_switching_cost_estimate": (
                 None if not switching_cost_estimates else float(np.mean(switching_cost_estimates))
@@ -2636,6 +2821,7 @@ def _summarize_path_backtests(path_backtests):
                 None if not switching_cost_shares else float(np.mean(switching_cost_shares))
             ),
             "blocked_switch_reasons": blocked_switch_reasons,
+            "allocation_control_reason_counts": allocation_control_reason_counts,
         }
 
     return summary
@@ -2946,6 +3132,7 @@ def _build_regime_state_frame(feature_set, config, *, index=None, fit_index=None
     replay_result = None
     runtime_method = method
     ablation_detector_spec = None
+    evidence_class = resolve_regime_evidence_class("fold_local_replay" if fit_index is not None else "global_preview_only")
     if authoritative_detector_spec is not None and can_replay_regime_detector_spec(authoritative_detector_spec):
         replay_result = replay_regime_detector_trace(
             regime_window,
@@ -2961,6 +3148,7 @@ def _build_regime_state_frame(feature_set, config, *, index=None, fit_index=None
             metadata={"method": method},
         )
         regimes = replay_result["state_frame"]
+        evidence_class = str(replay_result.get("evidence_class") or evidence_class)
         ablation_detector_spec = authoritative_detector_spec
         runtime_method = canonicalize_regime_detector_type(authoritative_detector_spec.get("type"))
         if runtime_method == "compatibility_explicit":
@@ -2983,6 +3171,7 @@ def _build_regime_state_frame(feature_set, config, *, index=None, fit_index=None
             metadata={"method": method},
         )
         regimes = replay_result["state_frame"]
+        evidence_class = str(replay_result.get("evidence_class") or evidence_class)
         if legacy_detector_spec is not None:
             ablation_detector_spec = legacy_detector_spec
     else:
@@ -3009,6 +3198,8 @@ def _build_regime_state_frame(feature_set, config, *, index=None, fit_index=None
     frame = _coerce_regime_frame(regimes, column_name=config.get("column_name", "regime")).reindex(state_index)
     details = {
         "method": runtime_method,
+        "mode": "fold_local_replay" if fit_index is not None else "global_preview_only",
+        "evidence_class": evidence_class,
         "provenance": dict(feature_set.provenance),
         "source_map": dict(feature_set.source_map),
         "observation_columns": list(regime_window.columns),
@@ -3028,6 +3219,7 @@ def _build_regime_state_frame(feature_set, config, *, index=None, fit_index=None
                 "detector_type": None if detector_manifest is None else detector_manifest.detector_type,
                 "replay": {
                     "mode": replay_result["mode"],
+                    "evidence_class": evidence_class,
                     "detector_count": len(replay_result["detector_manifests"]),
                 },
             }
@@ -3067,11 +3259,26 @@ def _build_fold_local_regime_frame(pipeline, index, fit_index=None):
     return frame, {column: "regime" for column in frame.columns}
 
 
+def _build_preview_regime_artifact(pipeline):
+    regime_detection = dict(pipeline.state.get("regime_detection") or {})
+    if not regime_detection:
+        return {}
+    return {
+        "mode": str(regime_detection.get("mode") or "global_preview_only"),
+        "evidence_class": str(
+            regime_detection.get("evidence_class")
+            or resolve_regime_evidence_class(regime_detection.get("mode"))
+        ),
+        "provenance": copy.deepcopy(pipeline.state.get("regime_provenance") or regime_detection.get("provenance") or {}),
+        "ablation": copy.deepcopy(pipeline.state.get("regime_ablation") or regime_detection.get("ablation") or {}),
+    }
+
+
 def _build_execution_trade_outcomes(pipeline, predictions, holding_bars, cutoff_timestamp=None):
     raw_data = pipeline.require("raw_data")
     backtest_config = pipeline.section("backtest")
     full_index = raw_data.index
-    runtime_kwargs = _resolve_backtest_runtime_kwargs(pipeline, full_index)
+    runtime_kwargs = _resolve_backtest_runtime_kwargs(pipeline, full_index, regime_states=None)
     return build_execution_outcome_frame(
         predictions,
         valuation_prices=_resolve_backtest_valuation_close(pipeline, full_index),
@@ -3118,7 +3325,7 @@ def _build_signal_decay_segment(
         return None
 
     execution_prices = _resolve_backtest_execution_prices(pipeline, signal_index)
-    runtime_kwargs = _resolve_backtest_runtime_kwargs(pipeline, signal_index)
+    runtime_kwargs = _resolve_backtest_runtime_kwargs(pipeline, signal_index, regime_states=None)
     backtest_config = pipeline.section("backtest")
     return {
         "predictions": pd.Series(predictions, copy=False).reindex(signal_index),
@@ -4719,6 +4926,8 @@ class FeaturesStep(PipelineStep):
                 else pipeline.state.get("reference_data")
             ),
             rolling_window=config.get("rolling_window", 20),
+            ttl_config=config.get("reference_overlay_ttl"),
+            missing_policy=config.get("context_missing_policy"),
         )
         features, feature_blocks = _join_feature_block(features, feature_blocks, reference_overlay_block)
         for column in reference_overlay_block.frame.columns:
@@ -4728,6 +4937,11 @@ class FeaturesStep(PipelineStep):
                 "source": str((reference_overlay_block.metadata or {}).get("source", reference_overlay_block.block_name)),
                 "join_mode": str((reference_overlay_block.metadata or {}).get("join_mode", "point_in_time")),
             }
+        ttl_report = dict((reference_overlay_block.metadata or {}).get("ttl_report") or {})
+        if ttl_report:
+            context_ttl_report = dict(pipeline.state.get("context_ttl_report") or {})
+            context_ttl_report["reference_overlay"] = ttl_report
+            pipeline.state["context_ttl_report"] = context_ttl_report
 
         for builder in config.get("builders", []):
             built = builder(pipeline, features.copy())
@@ -4876,8 +5090,9 @@ class RegimeStep(PipelineStep):
         pipeline.state["regime_state_details"] = detection_details
         pipeline.state["regimes"] = regime_state_frame
         pipeline.state["regime_ablation"] = ablation
-        pipeline.state["regime_detection"] = {
+        preview_detection = {
             "mode": "global_preview_only",
+            "evidence_class": str(detection_details.get("evidence_class") or "preview_only"),
             "method": detection_details.get("method", config.get("method", "hmm")),
             "observation_columns": detection_details.get("observation_columns", []),
             "columns": detection_details.get("state_columns", []),
@@ -4890,12 +5105,17 @@ class RegimeStep(PipelineStep):
             "detector_manifests": detection_details.get("detector_manifests", []),
             "replay": detection_details.get("replay", {}),
         }
+        pipeline.state["preview_regime_state_frame"] = regime_state_frame
+        pipeline.state["preview_regimes"] = regime_state_frame
+        pipeline.state["preview_regime_detection"] = copy.deepcopy(preview_detection)
+        pipeline.state["regime_detection"] = preview_detection
         return {
             "regime_observations": feature_set.frame,
             "regime_features": feature_set.frame,
             "regime_state_frame": regime_state_frame,
             "regimes": regime_state_frame,
             "mode": "global_preview_only",
+            "evidence_class": str(detection_details.get("evidence_class") or "preview_only"),
             "provenance": detection_details.get("provenance", {}),
             "ablation": ablation,
         }
@@ -5101,6 +5321,7 @@ class TrainModelsStep(PipelineStep):
         signal_config.setdefault("venue_constraints_available", bool(pipeline.state.get("symbol_filters")))
         backtest_config = pipeline.section("backtest")
         signal_policy_builder = SignalPolicyBuilder(signal_config, backtest_config)
+        evaluation_mode = resolve_evaluation_mode(backtest_config)
         regime_aware_config = _resolve_regime_aware_config(config)
         raw_feature_adaptation_config = dict(
             regime_aware_config.get("feature_adaptation") or pipeline.section("feature_adaptation") or {}
@@ -5340,6 +5561,7 @@ class TrainModelsStep(PipelineStep):
                     "fold": fold,
                     "split_id": split_id,
                     "mode": "fold_local",
+                    "evidence_class": str(regime_details.get("evidence_class") or "fold_local_oos"),
                     "columns": list(regime_frame.columns),
                     "available_rows": int(regime_frame.dropna(how="all").shape[0]),
                     "provenance": regime_details.get("provenance", {}),
@@ -5601,8 +5823,10 @@ class TrainModelsStep(PipelineStep):
                 and regime_aware_config.get("strategy") == "specialist"
                 and hasattr(model, "specialist_models")
             ):
-                regime_detection = dict(pipeline.state.get("regime_detection") or {})
-                detector_manifests = list(regime_detection.get("detector_manifests") or [])
+                regime_artifact = dict(regime_details or {})
+                if not regime_artifact:
+                    regime_artifact = dict(pipeline.state.get("regime_detection") or {})
+                detector_manifests = list(regime_artifact.get("detector_manifests") or [])
                 primary_manifest = detector_manifests[0] if detector_manifests else None
                 if hasattr(primary_manifest, "to_dict"):
                     primary_manifest = primary_manifest.to_dict()
@@ -5615,6 +5839,10 @@ class TrainModelsStep(PipelineStep):
                     metadata={
                         "source": "train_models",
                         "validation_method": validation_method,
+                        "evidence_class": str(
+                            regime_artifact.get("evidence_class")
+                            or resolve_regime_evidence_class(regime_artifact.get("mode"))
+                        ),
                         "regime_semantic_schema_version": manifest_metadata.get("semantic_schema_version"),
                         "regime_semantic_state_map": copy.deepcopy(manifest_metadata.get("semantic_state_map") or {}),
                     },
@@ -5640,6 +5868,7 @@ class TrainModelsStep(PipelineStep):
                     {
                         "fold": fold,
                         "split_id": split_id,
+                        "metrics": metrics,
                         "fit": summarize_regime_coverage(
                             fit_regime_view,
                             regime_column=regime_aware_config.get("regime_column", "regime"),
@@ -5657,8 +5886,43 @@ class TrainModelsStep(PipelineStep):
                         ),
                         "training_report": regime_training_report or {},
                         "inference_report": regime_inference_report,
+                        "baseline_metrics": None,
+                        "incremental_evidence": None,
                     }
                 )
+                if (
+                    regime_aware_config.get("strategy") == "specialist"
+                    and getattr(model, "fallback_model", None) is not None
+                ):
+                    fallback_predictions = pd.Series(
+                        model.fallback_model.predict(X_test_model),
+                        index=X_test_model.index,
+                    )
+                    fallback_probabilities = predict_probability_frame(
+                        model.fallback_model,
+                        X_test_model,
+                        ordered_classes=getattr(model, "ordered_classes", (-1, 0, 1)),
+                    )
+                    baseline_metrics = evaluate_regime_aware_predictions(
+                        y_test,
+                        fallback_predictions,
+                        fallback_probabilities,
+                    )
+                    incremental_evidence = {
+                        "accuracy_lift": (
+                            None
+                            if metrics.get("accuracy") is None or baseline_metrics.get("accuracy") is None
+                            else float(metrics["accuracy"] - baseline_metrics["accuracy"])
+                        ),
+                        "directional_accuracy_lift": (
+                            None
+                            if metrics.get("directional_accuracy") is None or baseline_metrics.get("directional_accuracy") is None
+                            else float(metrics["directional_accuracy"] - baseline_metrics["directional_accuracy"])
+                        ),
+                        "fallback_row_share": regime_inference_report.get("fallback_row_share"),
+                    }
+                    fold_regime_aware[-1]["baseline_metrics"] = baseline_metrics
+                    fold_regime_aware[-1]["incremental_evidence"] = incremental_evidence
             else:
                 metrics = evaluate_model(model, X_test_model, y_test)
                 test_primary_preds, test_primary_probs_raw, regime_inference_report = _timed_inference_call(
@@ -5834,6 +6098,7 @@ class TrainModelsStep(PipelineStep):
                     holding_bars,
                     kelly_trade_count=active_kelly_trade_count,
                 )
+                val_regime_states = None
                 if (
                     router_config
                     and current_specialist_library
@@ -5885,7 +6150,15 @@ class TrainModelsStep(PipelineStep):
                             if _resolve_backtest_execution_prices(pipeline, X_val_model.index) is not None
                             else None
                         ),
-                        **(_resolve_backtest_runtime_kwargs(pipeline, X_val_model.index, signal_state=val_signal_state) or {}),
+                        **(
+                            _resolve_backtest_runtime_kwargs(
+                                pipeline,
+                                X_val_model.index,
+                                signal_state=val_signal_state,
+                                regime_states=val_regime_states,
+                            )
+                            or {}
+                        ),
                     )
             elif not prior_oos_trade_outcomes.empty:
                 sizing_trade_outcomes = prior_oos_trade_outcomes
@@ -6034,6 +6307,7 @@ class TrainModelsStep(PipelineStep):
                 pipeline,
                 X_test_model.index,
                 signal_state=signal_state,
+                regime_states=test_regime_states,
             ) or {}
             if fold_close is not None and len(fold_close) > 0:
                 fold_backtest = run_backtest(
@@ -6237,7 +6511,8 @@ class TrainModelsStep(PipelineStep):
         reference_integrity_report = dict(pipeline.state.get("reference_integrity_report") or {})
         feature_admission_summary = summarize_feature_admission_reports(fold_feature_governance)
         regime_ablation_summary = summarize_regime_ablation_reports(
-            [row.get("ablation") for row in fold_regime]
+            [row.get("ablation") for row in fold_regime],
+            fold_regime_aware,
         )
         regime_coverage_summary = _summarize_regime_coverage_folds(
             fold_regime_aware,
@@ -6307,14 +6582,10 @@ class TrainModelsStep(PipelineStep):
             queue_backlog=[0] * len(inference_latencies_ms),
             scope="training",
         )
-        if context_ttl_report:
-            operational_monitoring["context_ttl"] = context_ttl_report
-            if not all(bool(report.get("promotion_pass", True)) for report in context_ttl_report.values()):
-                operational_monitoring["healthy"] = False
-                reasons = list(operational_monitoring.get("reasons", []))
-                if "context_ttl_breached" not in reasons:
-                    reasons.append("context_ttl_breached")
-                operational_monitoring["reasons"] = reasons
+        operational_monitoring = _attach_context_ttl_to_operational_monitoring(
+            operational_monitoring,
+            context_ttl_report,
+        )
         if data_certification_report and not bool(data_certification_report.get("promotion_pass", True)):
             operational_monitoring["healthy"] = False
             reasons = list(operational_monitoring.get("reasons", []))
@@ -6326,6 +6597,13 @@ class TrainModelsStep(PipelineStep):
             fold_backtests,
             policy=stability_policy,
         )
+        preview_regime_artifact = _build_preview_regime_artifact(pipeline)
+        if preview_regime_artifact and evaluation_mode.is_capital_facing:
+            preview_regime_artifact = {
+                "mode": preview_regime_artifact.get("mode"),
+                "evidence_class": preview_regime_artifact.get("evidence_class", "preview_only"),
+                "blocked_from_evidence": True,
+            }
         validation_details["split_count"] = int(len(fold_metrics))
         validation_details["stability_policy"] = stability_policy
 
@@ -6440,8 +6718,8 @@ class TrainModelsStep(PipelineStep):
             },
             "regime": {
                 "mode": "fold_local",
-                "preview_provenance": pipeline.state.get("regime_provenance"),
-                "preview_ablation": pipeline.state.get("regime_ablation"),
+                "evidence_class": "fold_local_oos",
+                "preview_artifact": preview_regime_artifact,
                 "ablation_summary": regime_ablation_summary,
                 "folds": fold_regime,
                 "regime_aware": regime_aware_summary,
@@ -7093,6 +7371,44 @@ class ResearchPipeline:
         self.state["drift_cycle"] = result
         return result
 
+    def inspect_paper_trading_calibration(
+        self,
+        *,
+        certified_expectations=None,
+        paper_observations=None,
+        policy=None,
+        symbol_filters=None,
+    ):
+        if symbol_filters is None:
+            symbol_filters = self.state.get("symbol_filters")
+        report = build_paper_trading_report(
+            certified_expectations=certified_expectations,
+            paper_observations=paper_observations,
+            policy=policy,
+            symbol_filters=symbol_filters,
+        )
+        self.state["paper_calibration"] = report
+        return report
+
+    def inspect_operational_limits(
+        self,
+        *,
+        operational_limits=None,
+        equity_curve=None,
+        current_equity=None,
+        peak_equity=None,
+        policy=None,
+    ):
+        report = build_operational_limits_report(
+            operational_limits=operational_limits,
+            equity_curve=equity_curve,
+            current_equity=current_equity,
+            peak_equity=peak_equity,
+            policy=policy,
+        )
+        self.state["operational_limits"] = report
+        return report
+
     def inspect_deployment_readiness(
         self,
         *,
@@ -7130,6 +7446,21 @@ class ResearchPipeline:
         if release_request is None:
             release_request = self.state.get("release_request")
 
+        resolved_policy = {
+            **dict(self.section("deployment") or {}),
+            **dict(policy or {}),
+        }
+        if resolved_policy.get("deployment_profile") is None:
+            configured_profile = dict(self.section("monitoring") or {}).get("deployment_profile")
+            if str(configured_profile or "").strip():
+                resolved_policy["deployment_profile"] = str(configured_profile).strip().lower()
+        if resolved_policy.get("deployment_profile") is None:
+            configured_profile = dict(self.section("deployment") or {}).get("profile")
+            if str(configured_profile or "").strip():
+                resolved_policy["deployment_profile"] = str(configured_profile).strip().lower()
+        if not resolved_policy:
+            resolved_policy = None
+
         report = build_deployment_readiness_report(
             store=store,
             symbol=resolved_symbol,
@@ -7141,7 +7472,7 @@ class ResearchPipeline:
             symbol_filters=symbol_filters,
             operational_limits=operational_limits,
             release_request=release_request,
-            policy=policy,
+            policy=resolved_policy,
         )
         self.state["deployment_readiness"] = report
         return report

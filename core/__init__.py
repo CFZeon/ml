@@ -184,6 +184,8 @@ from .labeling import (
 )
 from .lookahead import run_lookahead_analysis
 from .monitoring import (
+    build_replay_benchmark_report,
+    build_resource_telemetry_report,
     build_monitoring_report,
     evaluate_custom_data_ttl,
     evaluate_execution_health,

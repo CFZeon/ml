@@ -15,6 +15,7 @@ _ACTION_HINTS = {
     "paper_calibration": "Attach a green paper or shadow-live calibration report before capital release.",
     "venue_constraints": "Attach current Binance symbol filters before paper verification or capital release.",
     "operational_monitoring": "Refresh operational monitoring and resolve any health breaches before deployment.",
+    "operating_envelope": "Attach a validated deployment profile plus replay benchmark telemetry before advancing beyond research certification.",
     "drift_status": "Resolve the active drift recommendation before deployment.",
     "backend": "Restore the required execution backend before deployment.",
     "operational_limits": "Verify kill switch and operational risk limits before releasing capital.",
@@ -28,6 +29,79 @@ _CAPITAL_RELEASE_STAGES = (
     "micro_capital",
     "scaled_capital",
 )
+
+_STAGE_RANK = {stage: index for index, stage in enumerate(_CAPITAL_RELEASE_STAGES)}
+
+_DEPLOYMENT_PROFILES = {
+    "research_workstation": {
+        "peak_rss_mb": 16_384.0,
+        "model_load_latency_ms": 2_000.0,
+        "per_bar_inference_latency_ms": 500.0,
+        "drift_cycle_latency_ms": 900_000.0,
+        "storage_footprint_mb": 40_960.0,
+        "max_symbols": 64,
+        "max_timeframes": 12,
+        "max_release_stage": "scaled_capital",
+        "capital_eligible": True,
+        "failover_actions": [
+            "simpler_detectors",
+            "reduced_candidate_set",
+            "disable_mixture_routing",
+            "research_only_downgrade",
+        ],
+    },
+    "consumer_laptop": {
+        "peak_rss_mb": 8_192.0,
+        "model_load_latency_ms": 3_000.0,
+        "per_bar_inference_latency_ms": 1_000.0,
+        "drift_cycle_latency_ms": 1_800_000.0,
+        "storage_footprint_mb": 20_480.0,
+        "max_symbols": 16,
+        "max_timeframes": 6,
+        "max_release_stage": "micro_capital",
+        "capital_eligible": True,
+        "failover_actions": [
+            "simpler_detectors",
+            "reduced_candidate_set",
+            "disable_mixture_routing",
+            "research_only_downgrade",
+        ],
+    },
+    "mini_server": {
+        "peak_rss_mb": 12_288.0,
+        "model_load_latency_ms": 1_500.0,
+        "per_bar_inference_latency_ms": 400.0,
+        "drift_cycle_latency_ms": 900_000.0,
+        "storage_footprint_mb": 30_720.0,
+        "max_symbols": 32,
+        "max_timeframes": 8,
+        "max_release_stage": "scaled_capital",
+        "capital_eligible": True,
+        "failover_actions": [
+            "simpler_detectors",
+            "reduced_candidate_set",
+            "disable_mixture_routing",
+            "research_only_downgrade",
+        ],
+    },
+    "reduced_power_research_only": {
+        "peak_rss_mb": 4_096.0,
+        "model_load_latency_ms": 5_000.0,
+        "per_bar_inference_latency_ms": 2_500.0,
+        "drift_cycle_latency_ms": 3_600_000.0,
+        "storage_footprint_mb": 10_240.0,
+        "max_symbols": 4,
+        "max_timeframes": 2,
+        "max_release_stage": "research_certified",
+        "capital_eligible": False,
+        "failover_actions": [
+            "simpler_detectors",
+            "reduced_candidate_set",
+            "disable_mixture_routing",
+            "research_only_downgrade",
+        ],
+    },
+}
 
 _NON_BLOCKING_REASONS = {"approved"}
 
@@ -309,6 +383,169 @@ def _coerce_float(value):
         return None
 
 
+def _coerce_int(value):
+    numeric = _coerce_float(value)
+    if numeric is None:
+        return None
+    return int(round(numeric))
+
+
+def _resolve_deployment_profile(policy=None, release_request=None):
+    policy = dict(policy or {})
+    request = dict(release_request or {})
+    selected = str(
+        request.get("deployment_profile")
+        or policy.get("deployment_profile")
+        or ""
+    ).strip().lower()
+    if not selected:
+        return {
+            "selected": None,
+            "explicit": False,
+            "profile": None,
+        }
+    if selected not in _DEPLOYMENT_PROFILES:
+        raise ValueError(
+            "deployment_profile must be one of " + ", ".join(sorted(_DEPLOYMENT_PROFILES.keys()))
+        )
+    return {
+        "selected": selected,
+        "explicit": True,
+        "profile": dict(_DEPLOYMENT_PROFILES[selected]),
+    }
+
+
+def _extract_operating_envelope_inputs(monitoring_report=None):
+    monitoring = dict(monitoring_report or {})
+    envelope = dict(monitoring.get("operating_envelope") or {})
+    resource_telemetry = dict(
+        envelope.get("resource_telemetry")
+        or monitoring.get("resource_telemetry")
+        or {}
+    )
+    replay_benchmark = dict(
+        envelope.get("replay_benchmark")
+        or monitoring.get("replay_benchmark")
+        or {}
+    )
+    components = dict(monitoring.get("components") or {})
+    inference_component = dict(components.get("inference") or {})
+    if resource_telemetry.get("inference_p95_ms") is None and inference_component.get("p95_latency_ms") is not None:
+        resource_telemetry["inference_p95_ms"] = inference_component.get("p95_latency_ms")
+    if resource_telemetry.get("inference_p50_ms") is None and inference_component.get("p50_latency_ms") is not None:
+        resource_telemetry["inference_p50_ms"] = inference_component.get("p50_latency_ms")
+    if resource_telemetry.get("inference_max_ms") is None and inference_component.get("max_latency_ms") is not None:
+        resource_telemetry["inference_max_ms"] = inference_component.get("max_latency_ms")
+    deployment_profile = envelope.get("deployment_profile") or monitoring.get("deployment_profile")
+    return {
+        "deployment_profile": str(deployment_profile).strip().lower() if str(deployment_profile or "").strip() else None,
+        "resource_telemetry": resource_telemetry,
+        "replay_benchmark": replay_benchmark,
+    }
+
+
+def _evaluate_operating_envelope(monitoring_report=None, *, release_request=None, policy=None):
+    request = dict(release_request or {})
+    requested_stage = str(request.get("requested_stage") or "research_certified").strip().lower()
+    profile_resolution = _resolve_deployment_profile(policy=policy, release_request=release_request)
+    inputs = _extract_operating_envelope_inputs(monitoring_report)
+    selected_profile = profile_resolution.get("selected") or inputs.get("deployment_profile")
+    profile = None
+    explicit = bool(profile_resolution.get("explicit", False) or inputs.get("deployment_profile"))
+    if selected_profile:
+        if selected_profile not in _DEPLOYMENT_PROFILES:
+            raise ValueError(
+                "deployment_profile must be one of " + ", ".join(sorted(_DEPLOYMENT_PROFILES.keys()))
+            )
+        profile = dict(_DEPLOYMENT_PROFILES[selected_profile])
+    resource_telemetry = dict(inputs.get("resource_telemetry") or {})
+    replay_benchmark = dict(inputs.get("replay_benchmark") or {})
+
+    requires_validated_profile = requested_stage in {"paper_verified", "micro_capital", "scaled_capital"}
+    reasons = []
+    measured_values = {
+        "peak_rss_mb": _coerce_float(resource_telemetry.get("peak_rss_mb")),
+        "model_load_latency_ms": _coerce_float(resource_telemetry.get("model_load_latency_ms")),
+        "per_bar_inference_latency_ms": _coerce_float(resource_telemetry.get("inference_p95_ms")),
+        "drift_cycle_latency_ms": _coerce_float(resource_telemetry.get("drift_cycle_latency_ms")),
+        "storage_footprint_mb": _coerce_float(resource_telemetry.get("storage_footprint_mb")),
+        "symbol_count": _coerce_int(resource_telemetry.get("symbol_count")),
+        "timeframe_count": _coerce_int(resource_telemetry.get("timeframe_count")),
+    }
+
+    if requires_validated_profile and not explicit:
+        reasons.append("deployment_profile_unselected")
+
+    if profile is not None:
+        max_release_stage = str(profile.get("max_release_stage") or "research_certified")
+        if _STAGE_RANK.get(requested_stage, 0) > _STAGE_RANK.get(max_release_stage, 1):
+            reasons.append("deployment_profile_stage_exceeded")
+        if requested_stage in {"micro_capital", "scaled_capital"} and not bool(profile.get("capital_eligible", False)):
+            reasons.append("reduced_power_profile_not_capital_eligible")
+
+        required_metrics = [
+            "peak_rss_mb",
+            "model_load_latency_ms",
+            "per_bar_inference_latency_ms",
+            "drift_cycle_latency_ms",
+            "storage_footprint_mb",
+            "symbol_count",
+            "timeframe_count",
+        ]
+        for metric_name in required_metrics:
+            if requires_validated_profile and measured_values.get(metric_name) is None:
+                reasons.append(f"operating_envelope_metric_unavailable:{metric_name}")
+
+        budget_checks = {
+            "peak_rss_mb": float(profile.get("peak_rss_mb")),
+            "model_load_latency_ms": float(profile.get("model_load_latency_ms")),
+            "per_bar_inference_latency_ms": float(profile.get("per_bar_inference_latency_ms")),
+            "drift_cycle_latency_ms": float(profile.get("drift_cycle_latency_ms")),
+            "storage_footprint_mb": float(profile.get("storage_footprint_mb")),
+            "symbol_count": int(profile.get("max_symbols")),
+            "timeframe_count": int(profile.get("max_timeframes")),
+        }
+        for metric_name, budget_value in budget_checks.items():
+            observed_value = measured_values.get(metric_name)
+            if observed_value is None:
+                continue
+            if float(observed_value) > float(budget_value):
+                reasons.append(f"operating_envelope_breach:{metric_name}")
+    elif requires_validated_profile:
+        reasons.append("operating_envelope_profile_unavailable")
+
+    benchmark_required = requires_validated_profile
+    benchmark_observed = bool(replay_benchmark.get("observed", False))
+    if benchmark_required and not benchmark_observed:
+        reasons.append("replay_benchmark_unavailable")
+    if benchmark_observed and replay_benchmark.get("reason"):
+        reasons.append(str(replay_benchmark.get("reason")))
+
+    return {
+        "passed": not reasons,
+        "available": profile is not None,
+        "required": requires_validated_profile,
+        "deployment_profile": selected_profile,
+        "profile_explicit": explicit,
+        "max_release_stage": None if profile is None else profile.get("max_release_stage"),
+        "capital_eligible": None if profile is None else bool(profile.get("capital_eligible", False)),
+        "budgets": {} if profile is None else {
+            "peak_rss_mb": float(profile.get("peak_rss_mb")),
+            "model_load_latency_ms": float(profile.get("model_load_latency_ms")),
+            "per_bar_inference_latency_ms": float(profile.get("per_bar_inference_latency_ms")),
+            "drift_cycle_latency_ms": float(profile.get("drift_cycle_latency_ms")),
+            "storage_footprint_mb": float(profile.get("storage_footprint_mb")),
+            "max_symbols": int(profile.get("max_symbols")),
+            "max_timeframes": int(profile.get("max_timeframes")),
+        },
+        "measured": measured_values,
+        "replay_benchmark": replay_benchmark,
+        "resource_telemetry": resource_telemetry,
+        "failover_actions": [] if profile is None else list(profile.get("failover_actions") or []),
+        "reasons": _dedupe_reasons(reasons),
+    }
+
+
 def _coerce_equity_curve(equity_curve):
     if isinstance(equity_curve, pd.Series):
         series = pd.to_numeric(equity_curve, errors="coerce")
@@ -473,6 +710,23 @@ def _resolve_capital_release_stage(components, release_request=None):
     requested_stage = str(request.get("requested_stage") or "research_certified")
     if requested_stage in {"paper_verified", "micro_capital", "scaled_capital"} and stage == "research_certified":
         blockers.append("paper_verification_required")
+
+    operating_envelope = dict(components.get("operating_envelope") or {})
+    if _STAGE_RANK.get(stage, 0) > _STAGE_RANK["research_certified"]:
+        if not bool(operating_envelope.get("profile_explicit", False)):
+            blockers.append("deployment_profile_unselected")
+            if stage != "research_only":
+                stage = "research_certified"
+        else:
+            max_release_stage = str(operating_envelope.get("max_release_stage") or "research_certified")
+            if _STAGE_RANK.get(stage, 0) > _STAGE_RANK.get(max_release_stage, _STAGE_RANK["research_certified"]):
+                blockers.append("deployment_profile_stage_exceeded")
+                if stage != "research_only":
+                    stage = "research_certified"
+            elif not bool(operating_envelope.get("passed", False)):
+                blockers.extend(list(operating_envelope.get("reasons") or ["operating_envelope_not_ready"]))
+                if stage != "research_only":
+                    stage = "research_certified"
 
     if requested_stage in {"micro_capital", "scaled_capital"}:
         if not bool(request.get("manual_acknowledged", False)):
@@ -888,6 +1142,11 @@ def build_deployment_readiness_report(
             release_request=normalized_release_request,
         ),
         "operational_monitoring": _evaluate_operational_monitoring(record, monitoring_report=monitoring_report),
+        "operating_envelope": _evaluate_operating_envelope(
+            monitoring_report=monitoring_report,
+            release_request=normalized_release_request,
+            policy=policy,
+        ),
         "drift_status": _evaluate_drift_status(record, drift_cycle=drift_cycle),
         "backend": _evaluate_backend_status(backend_status=backend_status, policy=policy),
         "operational_limits": _evaluate_operational_limits(
@@ -935,6 +1194,7 @@ def build_deployment_readiness_report(
             "current_status": None if record is None else record.get("current_status"),
             "capital_release_stage": stage_resolution.get("stage"),
             "requested_stage": stage_resolution.get("requested_stage"),
+            "deployment_profile": (components.get("operating_envelope") or {}).get("deployment_profile"),
         },
         "components": components,
     }

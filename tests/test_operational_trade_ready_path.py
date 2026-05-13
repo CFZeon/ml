@@ -8,6 +8,7 @@ from core import (
     ResearchPipeline,
     build_deployment_readiness_report,
     build_live_calibration_report,
+    build_monitoring_report,
     build_model,
     create_promotion_eligibility_report,
     finalize_promotion_eligibility_report,
@@ -81,6 +82,35 @@ def _make_paper_report(*, duration_days=35.0):
     )
 
 
+def _make_validated_monitoring_report(*, deployment_profile="research_workstation"):
+    return build_monitoring_report(
+        policy={"policy_profile": "research"},
+        deployment_profile=deployment_profile,
+        expected_feature_columns=["f1"],
+        actual_feature_columns=["f1"],
+        inference_latencies_ms=[60.0, 75.0, 90.0],
+        queue_backlog=[0, 0, 0],
+        resource_telemetry={
+            "peak_rss_mb": 4096.0,
+            "model_load_latency_ms": 1200.0,
+            "drift_cycle_latency_ms": 240_000.0,
+            "storage_footprint_mb": 2048.0,
+            "symbol_count": 2,
+            "timeframe_count": 1,
+            "restart_recovery_time_ms": 45_000.0,
+        },
+        replay_benchmark={
+            "run_count": 3,
+            "throughput_bars_per_sec": 500.0,
+            "latency_p95_ms": 90.0,
+            "latency_p99_ms": 120.0,
+            "memory_spike_mb": 4608.0,
+            "restart_recovery_time_ms": 45_000.0,
+            "deterministic_pass": True,
+        },
+    )
+
+
 class OperationalTradeReadyPathTest(unittest.TestCase):
     def test_pipeline_trade_ready_mode_auto_applies_trade_ready_monitoring_profile(self):
         index = pd.date_range("2024-01-01", periods=4, freq="h", tz="UTC")
@@ -113,7 +143,7 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
             report = build_deployment_readiness_report(
                 store=store,
                 symbol="BTCUSDT",
-                monitoring_report={"healthy": True, "reasons": []},
+                monitoring_report=_make_validated_monitoring_report(),
                 drift_cycle={
                     "drift_guardrails": {"approved": False, "reasons": []},
                     "retrain_status": "not_recommended",
@@ -129,6 +159,134 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
             self.assertEqual(report["version_id"], current_champion)
             self.assertEqual(report["summary"]["failed_components"], [])
             self.assertTrue(report["components"]["rollback"]["available"])
+
+    def test_deployment_readiness_blocks_paper_stage_without_explicit_operating_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.10)
+            _register_champion(store, "BTCUSDT", 0.14)
+
+            report = build_deployment_readiness_report(
+                store=store,
+                symbol="BTCUSDT",
+                monitoring_report={"healthy": True, "reasons": []},
+                drift_cycle={
+                    "drift_guardrails": {"approved": False, "reasons": []},
+                    "retrain_status": "not_recommended",
+                },
+                backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+                paper_report=_make_paper_report(),
+            )
+
+            self.assertTrue(report["ready"])
+            self.assertEqual(report["capital_release_stage"], "research_certified")
+            self.assertIn("deployment_profile_unselected", report["release_blockers"])
+            self.assertFalse(report["components"]["operating_envelope"]["profile_explicit"])
+
+    def test_validated_consumer_profile_allows_micro_capital_release(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.10)
+            _register_champion(store, "BTCUSDT", 0.14)
+
+            monitoring_report = build_monitoring_report(
+                policy={"policy_profile": "research"},
+                deployment_profile="consumer_laptop",
+                expected_feature_columns=["f1"],
+                actual_feature_columns=["f1"],
+                inference_latencies_ms=[80.0, 95.0, 110.0],
+                queue_backlog=[0, 0, 0],
+                resource_telemetry={
+                    "peak_rss_mb": 6144.0,
+                    "model_load_latency_ms": 1500.0,
+                    "drift_cycle_latency_ms": 300_000.0,
+                    "storage_footprint_mb": 2048.0,
+                    "symbol_count": 4,
+                    "timeframe_count": 2,
+                    "restart_recovery_time_ms": 45_000.0,
+                },
+                replay_benchmark={
+                    "run_count": 3,
+                    "throughput_bars_per_sec": 420.0,
+                    "latency_p95_ms": 110.0,
+                    "latency_p99_ms": 135.0,
+                    "memory_spike_mb": 6656.0,
+                    "restart_recovery_time_ms": 45_000.0,
+                    "degraded_mode_triggered": False,
+                    "deterministic_pass": True,
+                },
+            )
+
+            report = build_deployment_readiness_report(
+                store=store,
+                symbol="BTCUSDT",
+                monitoring_report=monitoring_report,
+                drift_cycle={
+                    "drift_guardrails": {"approved": False, "reasons": []},
+                    "retrain_status": "not_recommended",
+                },
+                backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+                paper_report=_make_paper_report(),
+                operational_limits={"healthy": True, "kill_switch_ready": True},
+                release_request={"requested_stage": "micro_capital", "manual_acknowledged": True},
+            )
+
+            self.assertTrue(report["ready"])
+            self.assertTrue(report["capital_release_eligible"])
+            self.assertEqual(report["capital_release_stage"], "micro_capital")
+            self.assertEqual(report["components"]["operating_envelope"]["deployment_profile"], "consumer_laptop")
+
+    def test_reduced_power_profile_cannot_progress_beyond_research_certified(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.10)
+            _register_champion(store, "BTCUSDT", 0.14)
+
+            monitoring_report = build_monitoring_report(
+                policy={"policy_profile": "research"},
+                deployment_profile="reduced_power_research_only",
+                expected_feature_columns=["f1"],
+                actual_feature_columns=["f1"],
+                inference_latencies_ms=[400.0, 550.0, 700.0],
+                resource_telemetry={
+                    "peak_rss_mb": 3072.0,
+                    "model_load_latency_ms": 2400.0,
+                    "drift_cycle_latency_ms": 900_000.0,
+                    "storage_footprint_mb": 1024.0,
+                    "symbol_count": 2,
+                    "timeframe_count": 1,
+                },
+                replay_benchmark={
+                    "run_count": 2,
+                    "throughput_bars_per_sec": 120.0,
+                    "latency_p95_ms": 700.0,
+                    "latency_p99_ms": 900.0,
+                    "memory_spike_mb": 3200.0,
+                    "restart_recovery_time_ms": 60_000.0,
+                    "degraded_mode_triggered": True,
+                    "degraded_mode_actions": ["research_only_downgrade"],
+                    "deterministic_pass": True,
+                },
+            )
+
+            report = build_deployment_readiness_report(
+                store=store,
+                symbol="BTCUSDT",
+                monitoring_report=monitoring_report,
+                drift_cycle={
+                    "drift_guardrails": {"approved": False, "reasons": []},
+                    "retrain_status": "not_recommended",
+                },
+                backend_status={"adapter": "nautilus", "available": True, "reasons": []},
+                paper_report=_make_paper_report(),
+                operational_limits={"healthy": True, "kill_switch_ready": True},
+                release_request={"requested_stage": "micro_capital", "manual_acknowledged": True},
+            )
+
+            self.assertFalse(report["capital_release_eligible"])
+            self.assertEqual(report["capital_release_stage"], "research_certified")
+            self.assertIn("deployment_profile_stage_exceeded", report["release_blockers"])
+            self.assertIn("reduced_power_profile_not_capital_eligible", report["reasons"])
 
     def test_deployment_readiness_blocks_on_pending_drift_backend_and_missing_rollback(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -167,7 +325,7 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
             report = build_deployment_readiness_report(
                 store=store,
                 symbol="BTCUSDT",
-                monitoring_report={"healthy": True, "reasons": []},
+                monitoring_report=_make_validated_monitoring_report(),
                 drift_cycle={
                     "drift_guardrails": {"approved": False, "reasons": []},
                     "retrain_status": "not_recommended",
@@ -197,7 +355,7 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
             current_champion = _register_champion(store, "BTCUSDT", 0.14)
 
             pipeline = ResearchPipeline({"data": {"symbol": "BTCUSDT", "interval": "1h"}})
-            pipeline.state["operational_monitoring"] = {"healthy": True, "reasons": []}
+            pipeline.state["operational_monitoring"] = _make_validated_monitoring_report()
             pipeline.state["drift_cycle"] = {
                 "drift_guardrails": {"approved": False, "reasons": []},
                 "retrain_status": "not_recommended",
@@ -246,7 +404,7 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
 
             store.attach_paper_report(current_champion, paper_report, symbol="BTCUSDT")
             pipeline.state.pop("paper_calibration", None)
-            pipeline.state["operational_monitoring"] = {"healthy": True, "reasons": []}
+            pipeline.state["operational_monitoring"] = _make_validated_monitoring_report()
             pipeline.state["drift_cycle"] = {
                 "drift_guardrails": {"approved": False, "reasons": []},
                 "retrain_status": "not_recommended",
@@ -285,7 +443,7 @@ class OperationalTradeReadyPathTest(unittest.TestCase):
             current_champion = _register_champion(store, "BTCUSDT", 0.14)
 
             pipeline = ResearchPipeline({"data": {"symbol": "BTCUSDT", "interval": "1h"}})
-            pipeline.state["operational_monitoring"] = {"healthy": True, "reasons": []}
+            pipeline.state["operational_monitoring"] = _make_validated_monitoring_report(deployment_profile="consumer_laptop")
             pipeline.state["drift_cycle"] = {
                 "drift_guardrails": {"approved": True, "reasons": ["approved", "model_ttl_expired"]},
                 "retrain_status": "promoted",

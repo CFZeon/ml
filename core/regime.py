@@ -143,6 +143,50 @@ def _coerce_contract_scalar(value: Any):
     return value
 
 
+def _resolve_row_value(value, index, position):
+    if value is None:
+        return None
+    if isinstance(value, pd.Series):
+        series = value.reindex(index)
+        return _coerce_contract_scalar(series.iloc[position])
+    if isinstance(value, dict):
+        return _coerce_contract_scalar(value.get(index[position]))
+    if isinstance(value, (list, tuple, np.ndarray, pd.Index)):
+        values = list(value)
+        if position < len(values):
+            return _coerce_contract_scalar(values[position])
+        return None
+    return _coerce_contract_scalar(value)
+
+
+def _shift_contract_available_at(index, position, lag_bars):
+    timestamp = index[position]
+    lag = int(max(0, lag_bars or 0))
+    if lag <= 0:
+        return timestamp
+    target_position = position + lag
+    if target_position < len(index):
+        return index[target_position]
+    if len(index) >= 2:
+        step = index[-1] - index[-2]
+        overflow = target_position - (len(index) - 1)
+        try:
+            return index[-1] + (step * overflow)
+        except Exception:
+            return timestamp
+    return timestamp
+
+
+def _normalize_confidence_kind(value, *, has_probabilities, has_confidence):
+    if value is not None and str(value).strip():
+        return str(value).strip().lower()
+    if has_probabilities:
+        return "posterior"
+    if has_confidence:
+        return "heuristic"
+    return "unsupported"
+
+
 def build_regime_observation_contracts(observations, *, source_map=None, available_at=None, metadata=None):
     feature_set = normalize_regime_feature_set({"frame": observations, "source_map": source_map or {}})
     frame = feature_set.frame
@@ -173,7 +217,8 @@ def build_regime_state_contracts(regimes, *, available_at=None, metadata=None):
 
     shared_metadata = dict(metadata or {})
     contracts = []
-    for timestamp, row in frame.iterrows():
+    index = pd.Index(frame.index)
+    for position, (timestamp, row) in enumerate(frame.iterrows()):
         detector_outputs = {
             str(column): _coerce_contract_scalar(value)
             for column, value in row.items()
@@ -188,20 +233,59 @@ def build_regime_state_contracts(regimes, *, available_at=None, metadata=None):
             for column, value in detector_outputs.items()
             if (column.startswith("prob_") or column.endswith("_prob")) and value is not None
         }
-        if not probabilities and label is not None:
-            probabilities = {str(label): 1.0}
 
         confidence = detector_outputs.get("regime_confidence")
         if confidence is None and probabilities:
             confidence = max(float(value) for value in probabilities.values())
 
+        confidence_kind = _normalize_confidence_kind(
+            detector_outputs.get("confidence_kind") or shared_metadata.get("confidence_kind"),
+            has_probabilities=bool(probabilities),
+            has_confidence=confidence is not None,
+        )
+        if confidence_kind == "unsupported":
+            confidence = None
+
+        explicit_source_available_at = (
+            detector_outputs.get("source_available_at")
+            or detector_outputs.get("available_at")
+            or _resolve_row_value(available_at, index, position)
+        )
+        explicit_lag = detector_outputs.get("recognition_lag_bars")
+        explicit_same_bar = detector_outputs.get("same_bar_available")
+        if explicit_lag is None:
+            if explicit_source_available_at is not None or explicit_same_bar is True:
+                recognition_lag_bars = 0
+            else:
+                recognition_lag_bars = 1
+        else:
+            recognition_lag_bars = int(max(0, int(explicit_lag)))
+        source_available_at = timestamp if explicit_source_available_at is None else explicit_source_available_at
+        resolved_available_at = (
+            explicit_source_available_at
+            if explicit_source_available_at is not None
+            else _shift_contract_available_at(index, position, recognition_lag_bars)
+        )
+        availability_reason = detector_outputs.get("availability_reason")
+        if availability_reason is None:
+            if explicit_source_available_at is not None:
+                availability_reason = "declared_available_at"
+            elif recognition_lag_bars > 0:
+                availability_reason = "deferred_by_default_recognition_lag"
+            else:
+                availability_reason = "same_bar_declared"
+
         contracts.append(
             RegimeStateContract(
                 as_of=timestamp,
-                available_at=(timestamp if available_at is None else available_at),
+                available_at=resolved_available_at,
                 label=label,
                 probabilities=probabilities,
                 confidence=(None if confidence is None else float(confidence)),
+                confidence_kind=confidence_kind,
+                recognition_lag_bars=recognition_lag_bars,
+                source_available_at=source_available_at,
+                availability_reason=(None if availability_reason is None else str(availability_reason)),
                 detector_outputs=detector_outputs,
                 warm=bool(detector_outputs.get("warm", True)),
                 metadata=shared_metadata,
@@ -236,9 +320,11 @@ def build_regime_transition_contracts(regimes, *, available_at=None, metadata=No
 
 def build_regime_trace_summary(regimes, *, mode="preview", observation_columns=None, provenance=None, metadata=None):
     frame = regimes.copy() if isinstance(regimes, pd.DataFrame) else pd.DataFrame({"regime": pd.Series(regimes, copy=False)})
+    evidence_class = resolve_regime_evidence_class(mode)
     if frame.empty:
         return RegimeTraceSummary(
             mode=mode,
+            evidence_class=evidence_class,
             row_count=0,
             available_rows=0,
             transition_count=0,
@@ -253,6 +339,7 @@ def build_regime_trace_summary(regimes, *, mode="preview", observation_columns=N
     transitions = build_regime_transition_contracts(frame, metadata=metadata)
     return RegimeTraceSummary(
         mode=mode,
+        evidence_class=evidence_class,
         row_count=int(len(frame)),
         available_rows=int(frame.dropna(how="all").shape[0]),
         transition_count=int(len(transitions)),
@@ -297,6 +384,19 @@ def _join_state_frame(base_frame, addition, source_name, source_map):
 
 def _resolve_regime_min_periods(window, floor=5):
     return int(max(floor, int(window) // 2))
+
+
+def resolve_regime_evidence_class(mode):
+    normalized = str(mode or "preview").strip().lower()
+    if normalized == "global_preview_only":
+        return "preview_only"
+    if normalized in {"fold_local", "fold_local_replay", "walk_forward_replay"}:
+        return "fold_local_oos"
+    if normalized in {"locked_holdout", "locked_holdout_replay"}:
+        return "locked_holdout"
+    if normalized in {"live", "live_monitoring"}:
+        return "live_monitoring"
+    return normalized or "preview_only"
 
 
 def _online_cusum_score(series, window):
@@ -867,6 +967,11 @@ def compute_regime_path_stability(regimes):
             "switch_count": 0,
             "switch_rate": None,
             "persistence": None,
+            "transition_count": 0,
+            "mean_dwell_bars": None,
+            "min_dwell_bars": None,
+            "label_entropy": None,
+            "dominant_share": None,
         }
 
     if len(labels) == 1:
@@ -876,17 +981,31 @@ def compute_regime_path_stability(regimes):
             "switch_count": 0,
             "switch_rate": 0.0,
             "persistence": 1.0,
+            "transition_count": 0,
+            "mean_dwell_bars": 1.0,
+            "min_dwell_bars": 1,
+            "label_entropy": 0.0,
+            "dominant_share": 1.0,
         }
 
     switches = labels.ne(labels.shift()).iloc[1:]
     switch_count = int(switches.sum())
     switch_rate = float(switch_count / max(1, len(labels) - 1))
+    transition_count = switch_count
+    dwell_lengths = labels.groupby(labels.ne(labels.shift()).cumsum()).size()
+    distribution = labels.value_counts(normalize=True, dropna=True)
+    label_entropy = float(-(distribution * np.log2(distribution.clip(lower=1e-12))).sum()) if not distribution.empty else None
     return {
         "available_rows": int(len(labels)),
         "distinct_states": int(labels.nunique()),
         "switch_count": switch_count,
         "switch_rate": switch_rate,
         "persistence": float(1.0 - switch_rate),
+        "transition_count": int(transition_count),
+        "mean_dwell_bars": float(dwell_lengths.mean()) if not dwell_lengths.empty else None,
+        "min_dwell_bars": int(dwell_lengths.min()) if not dwell_lengths.empty else None,
+        "label_entropy": label_entropy,
+        "dominant_share": float(distribution.iloc[0]) if not distribution.empty else None,
     }
 
 
@@ -975,6 +1094,14 @@ def build_regime_ablation_report(
             "passed": True,
             "min_persistence_improvement": float(dict(config or {}).get("min_persistence_improvement", 0.0)),
         },
+        "incremental_evidence_gate": {
+            "required": bool(dict(config or {}).get("require_incremental_evidence", False)),
+            "min_accuracy_lift": float(dict(config or {}).get("min_accuracy_lift", 0.0)),
+            "min_directional_accuracy_lift": float(dict(config or {}).get("min_directional_accuracy_lift", 0.0)),
+            "max_fallback_row_share": dict(config or {}).get("max_fallback_row_share"),
+            "min_label_entropy": float(dict(config or {}).get("min_label_entropy", 0.0)),
+            "min_mean_dwell_bars": float(dict(config or {}).get("min_mean_dwell_bars", 1.0)),
+        },
     }
 
     if endogenous_only.frame.empty:
@@ -1049,17 +1176,74 @@ def build_regime_ablation_report(
     return report
 
 
-def summarize_regime_ablation_reports(reports):
+def summarize_regime_ablation_reports(reports, regime_aware_reports=None):
     rows = [row for row in (reports or []) if row]
     required_rows = [row for row in rows if row.get("stability_gate", {}).get("required")]
     failed_rows = [row for row in required_rows if not row.get("stability_gate", {}).get("passed", True)]
     agreement_rates = [row.get("agreement_rate") for row in rows if row.get("agreement_rate") is not None]
     improvements = [row.get("stability_improvement") for row in required_rows if row.get("stability_improvement") is not None]
+    label_entropies = [
+        row.get("full_stability", {}).get("label_entropy")
+        for row in rows
+        if row.get("full_stability", {}).get("label_entropy") is not None
+    ]
+    mean_dwell_bars = [
+        row.get("full_stability", {}).get("mean_dwell_bars")
+        for row in rows
+        if row.get("full_stability", {}).get("mean_dwell_bars") is not None
+    ]
     contextual_shares = [
         row.get("full_provenance", {}).get("contextual_share")
         for row in rows
         if row.get("full_provenance", {}).get("contextual_share") is not None
     ]
+    regime_aware_rows = [row for row in (regime_aware_reports or []) if row]
+    incremental_rows = [row.get("incremental_evidence") or {} for row in regime_aware_rows if row.get("incremental_evidence")]
+    accuracy_lifts = [row.get("accuracy_lift") for row in incremental_rows if row.get("accuracy_lift") is not None]
+    directional_accuracy_lifts = [
+        row.get("directional_accuracy_lift")
+        for row in incremental_rows
+        if row.get("directional_accuracy_lift") is not None
+    ]
+    fallback_shares = [
+        row.get("fallback_row_share")
+        for row in incremental_rows
+        if row.get("fallback_row_share") is not None
+    ]
+    max_fallback_row_share = max(fallback_shares) if fallback_shares else None
+
+    incremental_required = any(bool(row.get("incremental_evidence_gate", {}).get("required", False)) for row in rows)
+    min_accuracy_lift = max(
+        [float(row.get("incremental_evidence_gate", {}).get("min_accuracy_lift", 0.0)) for row in rows] or [0.0]
+    )
+    min_directional_accuracy_lift = max(
+        [float(row.get("incremental_evidence_gate", {}).get("min_directional_accuracy_lift", 0.0)) for row in rows] or [0.0]
+    )
+    min_label_entropy = max(
+        [float(row.get("incremental_evidence_gate", {}).get("min_label_entropy", 0.0)) for row in rows] or [0.0]
+    )
+    min_mean_dwell = max(
+        [float(row.get("incremental_evidence_gate", {}).get("min_mean_dwell_bars", 1.0)) for row in rows] or [1.0]
+    )
+    configured_fallback_limits = [
+        row.get("incremental_evidence_gate", {}).get("max_fallback_row_share")
+        for row in rows
+        if row.get("incremental_evidence_gate", {}).get("max_fallback_row_share") is not None
+    ]
+    max_fallback_limit = min(float(value) for value in configured_fallback_limits) if configured_fallback_limits else None
+    incremental_reasons = []
+    if incremental_required and not incremental_rows:
+        incremental_reasons.append("regime_incremental_evidence_missing")
+    if incremental_rows and accuracy_lifts and float(np.mean(accuracy_lifts)) < float(min_accuracy_lift):
+        incremental_reasons.append("regime_accuracy_lift_below_minimum")
+    if incremental_rows and directional_accuracy_lifts and float(np.mean(directional_accuracy_lifts)) < float(min_directional_accuracy_lift):
+        incremental_reasons.append("regime_directional_accuracy_lift_below_minimum")
+    if max_fallback_limit is not None and max_fallback_row_share is not None and float(max_fallback_row_share) > float(max_fallback_limit):
+        incremental_reasons.append("regime_fallback_share_above_limit")
+    if label_entropies and float(np.mean(label_entropies)) < float(min_label_entropy):
+        incremental_reasons.append("regime_label_entropy_below_minimum")
+    if mean_dwell_bars and float(np.mean(mean_dwell_bars)) < float(min_mean_dwell):
+        incremental_reasons.append("regime_mean_dwell_below_minimum")
 
     if not required_rows:
         status = "unknown"
@@ -1067,6 +1251,9 @@ def summarize_regime_ablation_reports(reports):
     elif failed_rows:
         status = "failed"
         reasons = ["regime_stability_failed"]
+    elif incremental_reasons:
+        status = "failed" if incremental_rows else "unknown"
+        reasons = ["regime_incremental_evidence_failed"] + incremental_reasons
     else:
         status = "passed"
         reasons = []
@@ -1078,6 +1265,19 @@ def summarize_regime_ablation_reports(reports):
         "avg_contextual_share": float(np.mean(contextual_shares)) if contextual_shares else 0.0,
         "avg_agreement_rate": float(np.mean(agreement_rates)) if agreement_rates else None,
         "avg_persistence_improvement": float(np.mean(improvements)) if improvements else None,
+        "avg_label_entropy": float(np.mean(label_entropies)) if label_entropies else None,
+        "avg_mean_dwell_bars": float(np.mean(mean_dwell_bars)) if mean_dwell_bars else None,
+        "avg_accuracy_lift": float(np.mean(accuracy_lifts)) if accuracy_lifts else None,
+        "avg_directional_accuracy_lift": (
+            float(np.mean(directional_accuracy_lifts)) if directional_accuracy_lifts else None
+        ),
+        "avg_fallback_row_share": float(np.mean(fallback_shares)) if fallback_shares else None,
+        "max_fallback_row_share": (None if max_fallback_row_share is None else float(max_fallback_row_share)),
+        "incremental_evidence_required": incremental_required,
+        "incremental_evidence_status": (
+            "missing" if incremental_required and not incremental_rows else ("failed" if incremental_reasons else "passed")
+        ),
+        "incremental_evidence_reasons": incremental_reasons,
         "status": status,
         "promotion_pass": status == "passed",
         "reasons": reasons,
@@ -1111,6 +1311,7 @@ __all__ = [
     "detect_regime",
     "infer_regime_source_map",
     "normalize_regime_feature_set",
+    "resolve_regime_evidence_class",
     "summarize_regime_detection_result",
     "summarize_regime_ablation_reports",
     "summarize_regime_provenance",

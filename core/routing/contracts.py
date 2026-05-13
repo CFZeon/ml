@@ -74,6 +74,11 @@ class RoutingDecisionContract:
     available_at: Any
     selected_model_id: str | None = None
     weights: dict[str, float] = field(default_factory=dict)
+    executed_candidate_ids: list[str] = field(default_factory=list)
+    executed_weight_l1_change: float = 0.0
+    executed_weight_turnover: float = 0.0
+    effective_model_count: float = 0.0
+    allocation_control_reason: str | None = None
     regime_label: str | None = None
     regime_confidence: float | None = None
     route_reason: str = "uninitialized"
@@ -82,7 +87,7 @@ class RoutingDecisionContract:
     candidate_scores: dict[str, float] = field(default_factory=dict)
     components: list[RoutingScoreComponent] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-    schema_version: str = "phase0.routing_decision.v1"
+    schema_version: str = "phase0.routing_decision.v2"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -91,6 +96,13 @@ class RoutingDecisionContract:
             "available_at": _serialize_value(self.available_at),
             "selected_model_id": None if self.selected_model_id is None else str(self.selected_model_id),
             "weights": {str(key): float(value) for key, value in dict(self.weights).items()},
+            "executed_candidate_ids": [str(item) for item in list(self.executed_candidate_ids or [])],
+            "executed_weight_l1_change": float(self.executed_weight_l1_change),
+            "executed_weight_turnover": float(self.executed_weight_turnover),
+            "effective_model_count": float(self.effective_model_count),
+            "allocation_control_reason": (
+                None if self.allocation_control_reason is None else str(self.allocation_control_reason)
+            ),
             "regime_label": None if self.regime_label is None else str(self.regime_label),
             "regime_confidence": None if self.regime_confidence is None else float(self.regime_confidence),
             "route_reason": str(self.route_reason),
@@ -106,11 +118,18 @@ class RoutingDecisionContract:
         data = dict(payload or {})
         confidence = data.get("regime_confidence")
         return cls(
-            schema_version=str(data.get("schema_version", "phase0.routing_decision.v1")),
+            schema_version=str(data.get("schema_version", "phase0.routing_decision.v2")),
             as_of=data.get("as_of"),
             available_at=data.get("available_at"),
             selected_model_id=(None if data.get("selected_model_id") is None else str(data.get("selected_model_id"))),
             weights={str(key): float(value) for key, value in dict(data.get("weights") or {}).items()},
+            executed_candidate_ids=[str(item) for item in list(data.get("executed_candidate_ids") or [])],
+            executed_weight_l1_change=float(data.get("executed_weight_l1_change", 0.0) or 0.0),
+            executed_weight_turnover=float(data.get("executed_weight_turnover", 0.0) or 0.0),
+            effective_model_count=float(data.get("effective_model_count", 0.0) or 0.0),
+            allocation_control_reason=(
+                None if data.get("allocation_control_reason") is None else str(data.get("allocation_control_reason"))
+            ),
             regime_label=(None if data.get("regime_label") is None else str(data.get("regime_label"))),
             regime_confidence=None if confidence is None else float(confidence),
             route_reason=str(data.get("route_reason", "uninitialized")),

@@ -240,9 +240,18 @@ def _attach_router_trace_summary(summary, router_trace_summary, *, router_switch
             "router_manifest": dict(router_trace_summary.get("manifest") or {}),
             "router_decision_count": int(trace_summary.get("decision_count", 0)),
             "router_switch_count": int(trace_summary.get("switch_count", 0)),
+            "router_allocation_change_count": int(trace_summary.get("allocation_change_count", 0)),
+            "router_blocked_allocation_count": int(trace_summary.get("blocked_allocation_count", 0)),
+            "router_executed_weight_l1_change_total": float(trace_summary.get("executed_weight_l1_change_total", 0.0) or 0.0),
+            "router_executed_weight_turnover_total": float(trace_summary.get("executed_weight_turnover_total", 0.0) or 0.0),
+            "router_mean_executed_weight_l1_change": float(trace_summary.get("mean_executed_weight_l1_change", 0.0) or 0.0),
+            "router_mean_executed_weight_turnover": float(trace_summary.get("mean_executed_weight_turnover", 0.0) or 0.0),
+            "router_mean_effective_model_count": float(trace_summary.get("mean_effective_model_count", 0.0) or 0.0),
+            "router_max_effective_model_count": float(trace_summary.get("max_effective_model_count", 0.0) or 0.0),
             "router_selected_model_ids": list(trace_summary.get("selected_model_ids") or []),
             "router_route_reason_counts": dict(trace_summary.get("route_reason_counts") or {}),
             "router_blocked_switch_reasons": dict(trace_summary.get("blocked_switch_reasons") or {}),
+            "router_allocation_control_reason_counts": dict(trace_summary.get("allocation_control_reason_counts") or {}),
             "router_regime_availability_counts": dict(trace_summary.get("regime_availability_counts") or {}),
             "router_safe_mode_action_counts": dict(trace_summary.get("safe_mode_action_counts") or {}),
             "router_alignment": dict(trace_summary.get("alignment") or {}),
@@ -255,13 +264,17 @@ def _attach_router_trace_summary(summary, router_trace_summary, *, router_switch
             raise ValueError("router_switching_cost_per_switch must be non-negative")
         if cost_per_switch > 0.0:
             switch_count = int(trace_summary.get("switch_count", 0))
+            turnover_total = float(trace_summary.get("executed_weight_turnover_total", 0.0) or 0.0)
+            cost_units = turnover_total if turnover_total > 0.0 else float(switch_count)
             payload["router_switching_cost_report"] = {
                 "switch_count": switch_count,
+                "executed_weight_turnover_total": _round_metric(turnover_total, 6),
                 "cost_per_switch": _round_metric(cost_per_switch, 6),
-                "estimated_cost": _round_metric(switch_count * cost_per_switch, 6),
-                "basis": "hypothetical_routing_decisions_not_executed",
+                "cost_per_turnover_unit": _round_metric(cost_per_switch, 6),
+                "estimated_cost": _round_metric(cost_units * cost_per_switch, 6),
+                "basis": "executed_allocation_turnover" if turnover_total > 0.0 else "router_switch_count",
             }
-            payload["router_switching_cost_estimate"] = _round_metric(switch_count * cost_per_switch, 6)
+            payload["router_switching_cost_estimate"] = _round_metric(cost_units * cost_per_switch, 6)
     payload["router_stability_report"] = _build_router_stability_report(payload)
     if "decision_trace" in router_trace_summary:
         payload["router_decision_trace"] = list(router_trace_summary.get("decision_trace") or [])
@@ -276,9 +289,19 @@ def _build_router_stability_report(summary):
     decision_count = int(payload.get("router_decision_count", 0) or 0)
     switch_count = int(payload.get("router_switch_count", 0) or 0)
     switch_opportunities = int(max(decision_count - 1, 0))
+    allocation_change_count = int(payload.get("router_allocation_change_count", 0) or 0)
+    blocked_allocation_count = int(payload.get("router_blocked_allocation_count", 0) or 0)
+    executed_weight_l1_change_total = _coerce_float(payload.get("router_executed_weight_l1_change_total")) or 0.0
+    executed_weight_turnover_total = _coerce_float(payload.get("router_executed_weight_turnover_total")) or 0.0
+    mean_effective_model_count = _coerce_float(payload.get("router_mean_effective_model_count")) or 0.0
+    max_effective_model_count = _coerce_float(payload.get("router_max_effective_model_count")) or 0.0
     blocked_switch_reasons = {
         str(reason): int(count)
         for reason, count in dict(payload.get("router_blocked_switch_reasons") or {}).items()
+    }
+    allocation_control_reason_counts = {
+        str(reason): int(count)
+        for reason, count in dict(payload.get("router_allocation_control_reason_counts") or {}).items()
     }
     blocked_switch_count = int(sum(blocked_switch_reasons.values()))
     manifest = dict(payload.get("router_manifest") or {})
@@ -298,6 +321,24 @@ def _build_router_stability_report(summary):
     except (TypeError, ValueError):
         switching_cost_share = None
 
+    executed_weight_turnover_rate = _round_metric(
+        float(executed_weight_turnover_total / switch_opportunities) if switch_opportunities > 0 else 0.0,
+        4,
+    )
+    allocation_change_rate = _round_metric(
+        float(allocation_change_count / switch_opportunities) if switch_opportunities > 0 else 0.0,
+        4,
+    )
+    blocked_allocation_rate = _round_metric(
+        float(blocked_allocation_count / switch_opportunities) if switch_opportunities > 0 else 0.0,
+        4,
+    )
+    primary_stability_metric = "executed_weight_turnover_rate" if decision_count > 0 else "switch_rate"
+    primary_stability_value = executed_weight_turnover_rate if decision_count > 0 else _round_metric(
+        float(switch_count / switch_opportunities) if switch_opportunities > 0 else 0.0,
+        4,
+    )
+
     return {
         "enabled": True,
         "applicable": bool(decision_count > 0),
@@ -308,6 +349,16 @@ def _build_router_stability_report(summary):
             float(switch_count / switch_opportunities) if switch_opportunities > 0 else 0.0,
             4,
         ),
+        "allocation_change_count": allocation_change_count,
+        "allocation_change_rate": allocation_change_rate,
+        "blocked_allocation_count": blocked_allocation_count,
+        "blocked_allocation_rate": blocked_allocation_rate,
+        "executed_weight_l1_change_total": _round_metric(executed_weight_l1_change_total, 6),
+        "executed_weight_turnover_total": _round_metric(executed_weight_turnover_total, 6),
+        "executed_weight_turnover_rate": executed_weight_turnover_rate,
+        "mean_effective_model_count": _round_metric(mean_effective_model_count, 6),
+        "max_effective_model_count": _round_metric(max_effective_model_count, 6),
+        "allocation_control_reason_counts": allocation_control_reason_counts,
         "blocked_switch_count": blocked_switch_count,
         "blocked_switch_rate": _round_metric(
             float(blocked_switch_count / switch_opportunities) if switch_opportunities > 0 else 0.0,
@@ -318,6 +369,8 @@ def _build_router_stability_report(summary):
         "configured_control_count": int(sum(1 for enabled in control_flags.values() if enabled)),
         "switching_cost_estimate": switching_cost_estimate,
         "switching_cost_share_of_starting_equity": switching_cost_share,
+        "primary_stability_metric": primary_stability_metric,
+        "primary_stability_value": primary_stability_value,
     }
 
 

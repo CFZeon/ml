@@ -7,6 +7,7 @@ from core import (
     LocalRegistryStore,
     build_deployment_readiness_report,
     build_live_calibration_report,
+    build_monitoring_report,
     build_model,
     create_promotion_eligibility_report,
     finalize_promotion_eligibility_report,
@@ -79,6 +80,34 @@ def _make_paper_report():
     )
 
 
+def _make_validated_monitoring_report():
+    return build_monitoring_report(
+        policy={"policy_profile": "research"},
+        deployment_profile="research_workstation",
+        expected_feature_columns=["f1"],
+        actual_feature_columns=["f1"],
+        inference_latencies_ms=[60.0, 75.0, 90.0],
+        queue_backlog=[0, 0, 0],
+        resource_telemetry={
+            "peak_rss_mb": 4096.0,
+            "model_load_latency_ms": 1200.0,
+            "drift_cycle_latency_ms": 180_000.0,
+            "storage_footprint_mb": 2048.0,
+            "symbol_count": 2,
+            "timeframe_count": 1,
+        },
+        replay_benchmark={
+            "run_count": 2,
+            "throughput_bars_per_sec": 400.0,
+            "latency_p95_ms": 90.0,
+            "latency_p99_ms": 120.0,
+            "memory_spike_mb": 4600.0,
+            "restart_recovery_time_ms": 45_000.0,
+            "deterministic_pass": True,
+        },
+    )
+
+
 class TradeReadyPaperGateTest(unittest.TestCase):
     def test_deployment_readiness_blocks_without_paper_report(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -89,7 +118,7 @@ class TradeReadyPaperGateTest(unittest.TestCase):
             report = build_deployment_readiness_report(
                 store=store,
                 symbol="BTCUSDT",
-                monitoring_report={"healthy": True, "reasons": []},
+                monitoring_report=_make_validated_monitoring_report(),
                 drift_cycle={
                     "drift_guardrails": {"approved": False, "reasons": []},
                     "retrain_status": "not_recommended",
@@ -112,7 +141,7 @@ class TradeReadyPaperGateTest(unittest.TestCase):
             report = build_deployment_readiness_report(
                 store=store,
                 symbol="BTCUSDT",
-                monitoring_report={"healthy": True, "reasons": []},
+                monitoring_report=_make_validated_monitoring_report(),
                 drift_cycle={
                     "drift_guardrails": {"approved": False, "reasons": []},
                     "retrain_status": "not_recommended",

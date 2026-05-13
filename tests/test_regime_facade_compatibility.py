@@ -63,6 +63,10 @@ class RegimeFacadeCompatibilityTest(unittest.TestCase):
         self.assertIsInstance(state_contracts[0], RegimeStateContract)
         self.assertEqual(state_contracts[0].label, "bull")
         self.assertAlmostEqual(state_contracts[2].probabilities["prob_risk_off"], 0.8)
+        self.assertEqual(state_contracts[0].confidence_kind, "posterior")
+        self.assertEqual(state_contracts[0].recognition_lag_bars, 1)
+        self.assertEqual(state_contracts[0].source_available_at, index[0])
+        self.assertEqual(state_contracts[0].available_at, index[1])
 
         self.assertEqual(len(transition_contracts), 1)
         self.assertEqual(transition_contracts[0].from_label, "bull")
@@ -73,3 +77,18 @@ class RegimeFacadeCompatibilityTest(unittest.TestCase):
         self.assertIn("trend_20", summary.observation_columns)
         self.assertEqual(detection_summary.mode, "walk_forward")
         self.assertEqual(detection_summary.label_distribution["bull"], 2)
+
+    def test_build_regime_state_contracts_does_not_fabricate_confidence_from_labels(self):
+        index = pd.date_range("2026-05-01", periods=3, freq="1h", tz="UTC")
+        regimes = pd.DataFrame({"regime": ["bull", "bull", "risk_off"]}, index=index)
+
+        contracts = build_regime_state_contracts(regimes)
+
+        self.assertEqual(contracts[0].label, "bull")
+        self.assertEqual(contracts[0].probabilities, {})
+        self.assertIsNone(contracts[0].confidence)
+        self.assertEqual(contracts[0].confidence_kind, "unsupported")
+        self.assertEqual(contracts[0].recognition_lag_bars, 1)
+        self.assertEqual(contracts[0].source_available_at, index[0])
+        self.assertEqual(contracts[0].available_at, index[1])
+        self.assertEqual(contracts[0].availability_reason, "deferred_by_default_recognition_lag")

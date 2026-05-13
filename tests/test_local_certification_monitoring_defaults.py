@@ -82,6 +82,45 @@ class LocalCertificationMonitoringDefaultsTest(unittest.TestCase):
 
         self.assertEqual(report["policy"]["policy_profile"], "local_certification")
 
+    def test_pipeline_monitoring_carries_deployment_profile_and_resource_telemetry(self):
+        index = pd.date_range("2024-01-01", periods=4, freq="1h", tz="UTC")
+        pipeline = ResearchPipeline(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "monitoring": {"deployment_profile": "consumer_laptop"},
+                "features": {"context_timeframes": ["4h"]},
+            }
+        )
+        pipeline.state["raw_data"] = pd.DataFrame({"close": [100.0, 101.0, 102.0, 103.0]}, index=index)
+        pipeline.state["resource_telemetry"] = {
+            "peak_rss_mb": 4096.0,
+            "model_load_latency_ms": 900.0,
+            "storage_footprint_mb": 1024.0,
+        }
+        pipeline.state["replay_benchmark"] = {
+            "run_count": 2,
+            "throughput_bars_per_sec": 300.0,
+            "latency_p95_ms": 20.0,
+            "latency_p99_ms": 24.0,
+            "memory_spike_mb": 4300.0,
+            "restart_recovery_time_ms": 30_000.0,
+            "deterministic_pass": True,
+        }
+
+        report = _build_pipeline_operational_monitoring(
+            pipeline,
+            expected_feature_columns=["feature_a"],
+            actual_feature_columns=["feature_a"],
+            inference_latencies_ms=[10.0, 12.0, 14.0],
+            scope="training",
+        )
+
+        envelope = report["operating_envelope"]
+        self.assertEqual(envelope["deployment_profile"], "consumer_laptop")
+        self.assertEqual(envelope["resource_telemetry"]["symbol_count"], 1)
+        self.assertEqual(envelope["resource_telemetry"]["timeframe_count"], 2)
+        self.assertTrue(envelope["replay_benchmark"]["observed"])
+
 
 if __name__ == "__main__":
     unittest.main()

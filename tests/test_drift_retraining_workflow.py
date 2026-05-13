@@ -266,6 +266,58 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             self.assertIn("cooldown_active", result["drift_guardrails"]["reasons"])
             self.assertEqual(build_calls, [])
 
+    def test_drift_cycle_reuses_persisted_monitor_state_between_runs(self):
+        reference_features, _, reference_predictions, _, _ = _make_stable_drift_inputs(current_periods=80)
+        first_index = pd.date_range("2026-11-01", periods=80, freq="1h", tz="UTC")
+        second_index = pd.date_range("2026-11-05", periods=80, freq="1h", tz="UTC")
+        first_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=first_index)
+        second_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=second_index)
+        first_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=first_index)
+        second_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=second_index)
+        first_performance = pd.Series(np.full(len(first_index), 0.1), index=first_index)
+        second_performance = pd.Series(np.full(len(second_index), 2.5), index=second_index)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalRegistryStore(root_dir=temp_dir)
+            _register_champion(store, "BTCUSDT", 0.12)
+
+            first_result = run_drift_retraining_cycle(
+                store=store,
+                symbol="BTCUSDT",
+                reference_features=reference_features,
+                current_features=first_features,
+                reference_predictions=reference_predictions,
+                current_predictions=first_predictions,
+                current_performance=first_performance,
+                bars_since_last_retrain=800,
+                scheduled_window_open=False,
+                train_challenger=lambda: _make_challenger_payload(0.13),
+                drift_config={"min_samples": 1, "min_drift_signals": 1, "max_bars_between_retrain": 5000},
+            )
+            second_result = run_drift_retraining_cycle(
+                store=store,
+                symbol="BTCUSDT",
+                reference_features=reference_features,
+                current_features=second_features,
+                reference_predictions=reference_predictions,
+                current_predictions=second_predictions,
+                current_performance=second_performance,
+                bars_since_last_retrain=801,
+                scheduled_window_open=False,
+                train_challenger=lambda: _make_challenger_payload(0.13),
+                drift_config={"min_samples": 1, "min_drift_signals": 1, "max_bars_between_retrain": 5000},
+            )
+
+            self.assertFalse(first_result["drift_report"]["performance_drift"])
+            self.assertTrue(second_result["drift_report"]["performance_drift"])
+            self.assertEqual(
+                second_result["drift_report"]["drift_monitor_state"]["performance_detector"]["history_length"],
+                160,
+            )
+            champion = store.get_champion("BTCUSDT")
+            persisted_report = read_json(champion["latest_drift_report"])
+            self.assertEqual(persisted_report["drift_monitor_state"]["performance_detector"]["history_length"], 160)
+
     def test_library_review_policy_recommends_review_for_degraded_active_specialist_library(self):
         reference_features, current_features, reference_predictions, current_predictions, performance = _make_stable_drift_inputs()
 

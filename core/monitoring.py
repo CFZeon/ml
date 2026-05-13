@@ -109,6 +109,15 @@ _POLICY_PROFILES = {
 }
 
 
+def _dedupe_strings(values):
+    items = []
+    for value in values or []:
+        text = str(value or "").strip()
+        if text and text not in items:
+            items.append(text)
+    return items
+
+
 def resolve_monitoring_policy(policy=None, *, default_profile="research"):
     configured = dict(policy or {})
     requested_profile = str(configured.get("policy_profile", default_profile or "research")).strip().lower()
@@ -139,6 +148,25 @@ def _coerce_timedelta(value):
     return pd.Timedelta(value)
 
 
+def _coerce_float_scalar(value):
+    if value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return float(numeric)
+
+
+def _coerce_int_scalar(value):
+    numeric = _coerce_float_scalar(value)
+    if numeric is None:
+        return None
+    return int(round(numeric))
+
+
 def _coerce_float_list(values):
     if values is None:
         return []
@@ -166,6 +194,127 @@ def _round_metric(value, digits=6):
     if not np.isfinite(numeric):
         return numeric
     return round(numeric, digits)
+
+
+def build_resource_telemetry_report(resource_telemetry=None, *, inference_latencies_ms=None):
+    payload = dict(resource_telemetry or {})
+    latencies = _coerce_float_list(payload.get("inference_latencies_ms"))
+    if not latencies:
+        latencies = _coerce_float_list(inference_latencies_ms)
+
+    inference_p50 = _coerce_float_scalar(payload.get("inference_p50_ms"))
+    inference_p95 = _coerce_float_scalar(payload.get("inference_p95_ms"))
+    inference_max = _coerce_float_scalar(payload.get("inference_max_ms"))
+    if latencies:
+        if inference_p50 is None:
+            inference_p50 = float(np.percentile(latencies, 50))
+        if inference_p95 is None:
+            inference_p95 = float(np.percentile(latencies, 95))
+        if inference_max is None:
+            inference_max = float(np.max(latencies))
+
+    throughput_bars_per_sec = _coerce_float_scalar(payload.get("throughput_bars_per_sec"))
+    if throughput_bars_per_sec is None and inference_p95 not in (None, 0.0):
+        throughput_bars_per_sec = float(1000.0 / float(inference_p95))
+
+    report = {
+        "observed": False,
+        "peak_rss_mb": _coerce_float_scalar(payload.get("peak_rss_mb")),
+        "model_load_latency_ms": _coerce_float_scalar(payload.get("model_load_latency_ms")),
+        "inference_p50_ms": inference_p50,
+        "inference_p95_ms": inference_p95,
+        "inference_max_ms": inference_max,
+        "drift_cycle_latency_ms": _coerce_float_scalar(payload.get("drift_cycle_latency_ms")),
+        "storage_footprint_mb": _coerce_float_scalar(payload.get("storage_footprint_mb")),
+        "symbol_count": _coerce_int_scalar(payload.get("symbol_count")),
+        "timeframe_count": _coerce_int_scalar(payload.get("timeframe_count")),
+        "throughput_bars_per_sec": throughput_bars_per_sec,
+        "restart_recovery_time_ms": _coerce_float_scalar(payload.get("restart_recovery_time_ms")),
+        "degraded_mode_triggered": bool(payload.get("degraded_mode_triggered", False)),
+        "degraded_mode_actions": _dedupe_strings(
+            payload.get("degraded_mode_actions") or payload.get("failover_actions") or []
+        ),
+    }
+    report["observed"] = any(
+        report.get(key) is not None
+        for key in (
+            "peak_rss_mb",
+            "model_load_latency_ms",
+            "inference_p50_ms",
+            "inference_p95_ms",
+            "inference_max_ms",
+            "drift_cycle_latency_ms",
+            "storage_footprint_mb",
+            "symbol_count",
+            "timeframe_count",
+            "throughput_bars_per_sec",
+            "restart_recovery_time_ms",
+        )
+    ) or bool(report["degraded_mode_triggered"] or report["degraded_mode_actions"])
+    return report
+
+
+def build_replay_benchmark_report(replay_benchmark=None):
+    if isinstance(replay_benchmark, dict):
+        payload = dict(replay_benchmark)
+        degraded_mode_actions = _dedupe_strings(
+            payload.get("degraded_mode_actions") or payload.get("failover_actions") or []
+        )
+        return {
+            "observed": bool(payload),
+            "run_count": int(payload.get("run_count", 1) or 1),
+            "throughput_bars_per_sec": _coerce_float_scalar(payload.get("throughput_bars_per_sec")),
+            "latency_p95_ms": _coerce_float_scalar(payload.get("latency_p95_ms") or payload.get("p95_latency_ms")),
+            "latency_p99_ms": _coerce_float_scalar(payload.get("latency_p99_ms") or payload.get("p99_latency_ms")),
+            "memory_spike_mb": _coerce_float_scalar(payload.get("memory_spike_mb") or payload.get("peak_rss_mb")),
+            "restart_recovery_time_ms": _coerce_float_scalar(payload.get("restart_recovery_time_ms")),
+            "degraded_mode_triggered": bool(payload.get("degraded_mode_triggered", False)),
+            "degraded_mode_actions": degraded_mode_actions,
+            "deterministic_pass": bool(payload.get("deterministic_pass", True)),
+            "reason": None if bool(payload.get("deterministic_pass", True)) else "replay_benchmark_nondeterministic",
+        }
+
+    rows = list(replay_benchmark or [])
+    if not rows:
+        return {
+            "observed": False,
+            "run_count": 0,
+            "throughput_bars_per_sec": None,
+            "latency_p95_ms": None,
+            "latency_p99_ms": None,
+            "memory_spike_mb": None,
+            "restart_recovery_time_ms": None,
+            "degraded_mode_triggered": False,
+            "degraded_mode_actions": [],
+            "deterministic_pass": None,
+            "reason": None,
+        }
+
+    throughput_values = _coerce_float_list(row.get("throughput_bars_per_sec") for row in rows)
+    latency_p95_values = _coerce_float_list(row.get("latency_p95_ms") or row.get("p95_latency_ms") for row in rows)
+    latency_p99_values = _coerce_float_list(row.get("latency_p99_ms") or row.get("p99_latency_ms") for row in rows)
+    memory_spike_values = _coerce_float_list(row.get("memory_spike_mb") or row.get("peak_rss_mb") for row in rows)
+    recovery_values = _coerce_float_list(row.get("restart_recovery_time_ms") for row in rows)
+    degraded_mode_actions = _dedupe_strings(
+        action
+        for row in rows
+        for action in (row.get("degraded_mode_actions") or row.get("failover_actions") or [])
+    )
+    deterministic_pass = all(bool(row.get("deterministic_pass", True)) for row in rows)
+
+    return {
+        "observed": True,
+        "run_count": int(len(rows)),
+        "throughput_bars_per_sec": min(throughput_values) if throughput_values else None,
+        "latency_p95_ms": max(latency_p95_values) if latency_p95_values else None,
+        "latency_p99_ms": max(latency_p99_values) if latency_p99_values else None,
+        "memory_spike_mb": max(memory_spike_values) if memory_spike_values else None,
+        "restart_recovery_time_ms": max(recovery_values) if recovery_values else None,
+        "degraded_mode_triggered": any(bool(row.get("degraded_mode_triggered", False)) for row in rows),
+        "degraded_mode_actions": degraded_mode_actions,
+        "deterministic_pass": deterministic_pass,
+        "reason": None if deterministic_pass else "replay_benchmark_nondeterministic",
+    }
 
 
 def _coerce_backtest_reports(backtest_reports):
@@ -647,6 +796,9 @@ def build_monitoring_report(
     baseline_signal_decay_report=None,
     inference_latencies_ms=None,
     queue_backlog=None,
+    resource_telemetry=None,
+    replay_benchmark=None,
+    deployment_profile=None,
     policy=None,
     default_policy_profile="research",
 ):
@@ -689,6 +841,25 @@ def build_monitoring_report(
             policy=resolved_policy,
         ),
     }
+
+    resource_telemetry_report = build_resource_telemetry_report(
+        resource_telemetry,
+        inference_latencies_ms=inference_latencies_ms,
+    )
+    replay_benchmark_report = build_replay_benchmark_report(replay_benchmark)
+    operating_envelope = {
+        "healthy": replay_benchmark_report.get("reason") is None,
+        "observed": bool(resource_telemetry_report.get("observed", False) or replay_benchmark_report.get("observed", False)),
+        "deployment_profile": (
+            str(deployment_profile).strip().lower()
+            if str(deployment_profile or "").strip()
+            else None
+        ),
+        "resource_telemetry": resource_telemetry_report,
+        "replay_benchmark": replay_benchmark_report,
+        "reason": replay_benchmark_report.get("reason"),
+    }
+    components["operating_envelope"] = operating_envelope
 
     unhealthy_components = [name for name, component in components.items() if not component.get("healthy", True)]
     required_components = [str(name) for name in list(resolved_policy.get("required_components") or [])]
@@ -743,6 +914,9 @@ def build_monitoring_report(
         "signal_half_life_bars": components["signal_decay"].get("half_life_bars"),
         "net_edge_at_effective_delay": components["signal_decay"].get("net_edge_at_effective_delay"),
         "fallback_assumption_rate": components["fallback_assumptions"].get("fallback_assumption_rate"),
+        "deployment_profile": operating_envelope.get("deployment_profile"),
+        "peak_rss_mb": resource_telemetry_report.get("peak_rss_mb"),
+        "storage_footprint_mb": resource_telemetry_report.get("storage_footprint_mb"),
     }
     return {
         "healthy": not top_level_reasons,
@@ -750,6 +924,7 @@ def build_monitoring_report(
         "policy": resolved_policy,
         "summary": summary,
         "components": components,
+        "operating_envelope": operating_envelope,
         "monitoring_gate_report": monitoring_gate_report,
         "reasons": top_level_reasons,
     }
@@ -818,6 +993,8 @@ def write_monitoring_artifacts(report, root_dir, run_id=None):
 
 
 __all__ = [
+    "build_replay_benchmark_report",
+    "build_resource_telemetry_report",
     "build_monitoring_report",
     "evaluate_custom_data_ttl",
     "evaluate_execution_health",
