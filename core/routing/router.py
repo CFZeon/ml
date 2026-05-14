@@ -18,6 +18,7 @@ from .contracts import RouterManifest, RouterStateSnapshot, RoutingDecisionContr
 _VALID_SAFE_MODE_POLICIES = {"fallback_only", "no_trade"}
 _VALID_ALLOCATION_MODES = {"selection_only", "mixture_allocation"}
 _VALID_EXECUTION_POLICIES = {"relaxed_missing_health", "fallback_only_until_health_binding"}
+_DEFAULT_EXECUTION_POLICY = "fallback_only_until_health_binding"
 
 
 def _coerce_float(value: Any, default: float = 0.0) -> float:
@@ -79,19 +80,24 @@ def _normalize_allocation_mode(value: Any) -> str:
 
 
 def _normalize_execution_policy(value: Any) -> str:
-    policy = str(value or "relaxed_missing_health").strip().lower()
+    policy = str(value or _DEFAULT_EXECUTION_POLICY).strip().lower()
     if policy not in _VALID_EXECUTION_POLICIES:
-        return "relaxed_missing_health"
+        return _DEFAULT_EXECUTION_POLICY
     return policy
 
 
 def _classify_regime_availability(regime_state: RegimeStateContract) -> str:
     detector_outputs = dict(regime_state.detector_outputs or {})
     metadata = dict(regime_state.metadata or {})
+    availability_state = str(metadata.get("availability_state") or "").strip().lower()
     reason = str(metadata.get("reason") or "").strip().lower()
 
+    if bool(detector_outputs.get("timing_blocked", 0)) or availability_state == "timing_blocked":
+        return "timing_blocked"
     if bool(detector_outputs.get("unavailable", 0)) or reason in {"unfitted", "missing_observation"}:
         return "unavailable"
+    if availability_state == "stale" or bool(detector_outputs.get("stale", 0)):
+        return "stale"
     if regime_state.label is None and not detector_outputs and regime_state.confidence is None:
         return "unavailable"
     if not bool(regime_state.warm):
@@ -144,6 +150,24 @@ def _has_resolved_health_evidence(health: SpecialistHealthContract | None, metad
         "owner_policy",
     )
     return any(metadata.get(field_name) not in (None, "", [], {}) for field_name in evidence_fields)
+
+
+def _build_health_evidence_lineage(
+    health: SpecialistHealthContract | None,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    resolved_metadata = dict(metadata or {})
+    lineage = {
+        "source": resolved_metadata.get("health_evidence_source") or resolved_metadata.get("health_source") or resolved_metadata.get("source"),
+        "recorded_at": resolved_metadata.get("last_refresh_at") or resolved_metadata.get("health_recorded_at") or resolved_metadata.get("recorded_at"),
+        "sample_count": resolved_metadata.get("sample_count") or resolved_metadata.get("row_count"),
+        "metric_basis": resolved_metadata.get("metric_basis"),
+        "policy_version": resolved_metadata.get("health_policy_version") or resolved_metadata.get("policy_version") or resolved_metadata.get("owner_policy"),
+        "window_start": resolved_metadata.get("window_start"),
+        "window_end": resolved_metadata.get("window_end"),
+        "last_calibrated_at": None if health is None else health.last_calibrated_at,
+    }
+    return {str(key): value for key, value in lineage.items() if value is not None}
 
 
 def _normalize_weight_map(weights: Mapping[str, float] | None) -> dict[str, float]:
@@ -216,7 +240,7 @@ class _BaseSpecialistRouter:
         failure_flag_penalty: float = 0.2,
         missing_health_score: float = 0.5,
         safe_mode_policy: str = "fallback_only",
-        execution_policy: str = "relaxed_missing_health",
+        execution_policy: str = _DEFAULT_EXECUTION_POLICY,
     ):
         self.policy_name = None if policy_name is None else str(policy_name)
         self.hysteresis_margin = float(max(0.0, hysteresis_margin))
@@ -425,6 +449,7 @@ class _BaseSpecialistRouter:
                 or spec_metadata.get("calibration_expired")
             )
             is_fallback = bool(fallback_model_id is not None and resolved_model_id == fallback_model_id)
+            health_evidence_lineage = _build_health_evidence_lineage(health, health_metadata)
 
             reasons = []
             if lifecycle_state == "retired":
@@ -465,6 +490,8 @@ class _BaseSpecialistRouter:
                 metadata={
                     "regime_keys": regime_keys,
                     "health_failure_flags": failure_flags,
+                    "health_evidence_lineage": health_evidence_lineage,
+                    "eligibility_policy_version": "router.health_binding.v1",
                     "execution_policy": self.execution_policy,
                     "safe_mode_policy": self.safe_mode_policy,
                     "unknown_health_safe_mode": (
@@ -667,7 +694,7 @@ class HardSwitchRouter(_BaseSpecialistRouter):
         resolved_timestamp = timestamp or normalized_state.last_switch_at or "now"
         resolved_regime_state = _normalize_regime_state(regime_state, timestamp=resolved_timestamp)
         availability_state = _classify_regime_availability(resolved_regime_state)
-        if availability_state != "known":
+        if availability_state in {"timing_blocked", "unavailable", "warm"}:
             next_state, selected_model_id, route_reason, safe_mode_action = self._resolve_safe_mode_state(
                 normalized_state,
                 timestamp=resolved_timestamp,
@@ -852,7 +879,7 @@ class WeightedRouter(_BaseSpecialistRouter):
         resolved_timestamp = timestamp or normalized_state.last_switch_at or "now"
         resolved_regime_state = _normalize_regime_state(regime_state, timestamp=resolved_timestamp)
         availability_state = _classify_regime_availability(resolved_regime_state)
-        if availability_state != "known":
+        if availability_state in {"timing_blocked", "unavailable", "warm"}:
             next_state, selected_model_id, route_reason, safe_mode_action = self._resolve_safe_mode_state(
                 normalized_state,
                 timestamp=resolved_timestamp,
@@ -1033,7 +1060,7 @@ def build_router(config: Mapping[str, Any] | None = None):
         "failure_flag_penalty": _coerce_float(config.get("failure_flag_penalty"), 0.2),
         "missing_health_score": _coerce_float(config.get("missing_health_score"), 0.5),
         "safe_mode_policy": config.get("safe_mode_policy", "fallback_only"),
-        "execution_policy": config.get("execution_policy", "relaxed_missing_health"),
+        "execution_policy": config.get("execution_policy", _DEFAULT_EXECUTION_POLICY),
     }
     if router_type in {"hard_switch", "score_router"}:
         return HardSwitchRouter(**common_kwargs)

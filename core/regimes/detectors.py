@@ -284,6 +284,106 @@ def _sanitize_regime_token(value: Any) -> str:
     return cleaned or "state"
 
 
+def _explicit_bucket_token(value: Any) -> str:
+    try:
+        numeric_value = int(value)
+    except (TypeError, ValueError):
+        return _sanitize_regime_token(value)
+    return {
+        -1: "low",
+        0: "mid",
+        1: "high",
+    }.get(numeric_value, _sanitize_regime_token(f"bucket_{numeric_value}"))
+
+
+def _default_explicit_canonical_regime_id(trend_regime: Any, volatility_regime: Any, liquidity_regime: Any) -> str:
+    return (
+        "compatibility_explicit"
+        f"__trend_{_explicit_bucket_token(trend_regime)}"
+        f"__volatility_{_explicit_bucket_token(volatility_regime)}"
+        f"__liquidity_{_explicit_bucket_token(liquidity_regime)}"
+    )
+
+
+def _build_explicit_taxonomy_registry(state_frame: pd.DataFrame) -> dict[str, Any]:
+    if state_frame.empty:
+        return {
+            "version": "compatibility_explicit.taxonomy.v1",
+            "identity_basis": "explicit_bucket_state",
+            "state_map": {},
+        }
+
+    required_columns = ["trend_regime", "volatility_regime", "liquidity_regime", "regime"]
+    available_columns = [column for column in required_columns if column in state_frame.columns]
+    if len(available_columns) != len(required_columns):
+        return {
+            "version": "compatibility_explicit.taxonomy.v1",
+            "identity_basis": "explicit_bucket_state",
+            "state_map": {},
+        }
+
+    taxonomy_frame = state_frame.loc[:, required_columns].dropna().drop_duplicates().sort_values(by="regime")
+    state_map = {}
+    for row in taxonomy_frame.itertuples(index=False):
+        canonical_regime_id = _default_explicit_canonical_regime_id(
+            row.trend_regime,
+            row.volatility_regime,
+            row.liquidity_regime,
+        )
+        state_map[str(int(row.regime))] = {
+            "legacy_regime_label": int(row.regime),
+            "canonical_regime_id": canonical_regime_id,
+            "routing_regime_id": canonical_regime_id,
+            "semantic_label": (
+                f"trend_{_explicit_bucket_token(row.trend_regime)}"
+                f"__volatility_{_explicit_bucket_token(row.volatility_regime)}"
+                f"__liquidity_{_explicit_bucket_token(row.liquidity_regime)}"
+            ),
+            "state_signature_summary": {
+                "trend_regime": int(row.trend_regime),
+                "volatility_regime": int(row.volatility_regime),
+                "liquidity_regime": int(row.liquidity_regime),
+            },
+            "mapping_confidence": 1.0,
+            "remap_reason": "deterministic_bucket_identity",
+        }
+
+    return {
+        "version": "compatibility_explicit.taxonomy.v1",
+        "identity_basis": "explicit_bucket_state",
+        "state_map": state_map,
+    }
+
+
+def _attach_explicit_taxonomy_columns(state_frame: pd.DataFrame) -> pd.DataFrame:
+    frame = pd.DataFrame(state_frame).copy()
+    if frame.empty:
+        frame["canonical_regime_id"] = pd.Series(dtype=object)
+        frame["routing_regime_id"] = pd.Series(dtype=object)
+        return frame
+
+    if not {"trend_regime", "volatility_regime", "liquidity_regime"}.issubset(frame.columns):
+        frame["canonical_regime_id"] = pd.Series([None] * len(frame), index=frame.index, dtype=object)
+        frame["routing_regime_id"] = pd.Series([None] * len(frame), index=frame.index, dtype=object)
+        return frame
+
+    canonical_regime_ids = []
+    for row in frame.itertuples():
+        if pd.isna(getattr(row, "trend_regime")) or pd.isna(getattr(row, "volatility_regime")) or pd.isna(getattr(row, "liquidity_regime")):
+            canonical_regime_ids.append(None)
+            continue
+        canonical_regime_ids.append(
+            _default_explicit_canonical_regime_id(
+                getattr(row, "trend_regime"),
+                getattr(row, "volatility_regime"),
+                getattr(row, "liquidity_regime"),
+            )
+        )
+    frame["canonical_regime_id"] = pd.Series(canonical_regime_ids, index=frame.index, dtype=object)
+    frame["routing_regime_id"] = pd.Series(canonical_regime_ids, index=frame.index, dtype=object)
+    return frame
+
+
 def _default_hmm_canonical_regime_id(detector_name: Any, ordered_state_id: int) -> str:
     return f"filtered_hmm__{_sanitize_regime_token(detector_name)}__state_{int(ordered_state_id)}"
 
@@ -1187,10 +1287,19 @@ class ExplicitCompatibilityRegimeDetector:
     column_name: str = "regime"
     _fit_frame: pd.DataFrame = field(default_factory=pd.DataFrame, init=False, repr=False)
     _fit_window: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    _taxonomy_registry: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     def fit(self, observations: Any) -> "ExplicitCompatibilityRegimeDetector":
         self._fit_frame = _normalize_frame(observations)
         self._fit_window = _fit_window_payload(self._fit_frame)
+        fitted_state_frame = detect_regime(
+            self._fit_frame,
+            n_regimes=int(dict(self.config or {}).get("n_regimes", 2)),
+            method="explicit",
+            config=dict(self.config or {}),
+            fit_features=self._fit_frame,
+        )
+        self._taxonomy_registry = _build_explicit_taxonomy_registry(fitted_state_frame)
         return self
 
     def initialize(self, observations: Any | None = None) -> dict[str, Any]:
@@ -1203,6 +1312,9 @@ class ExplicitCompatibilityRegimeDetector:
             config=dict(self.config or {}),
             fit_features=reference,
         )
+        state_frame = _attach_explicit_taxonomy_columns(state_frame)
+        if not self._taxonomy_registry:
+            self._taxonomy_registry = _build_explicit_taxonomy_registry(state_frame)
         return {
             "position": 0,
             "state_frame": state_frame.reindex(replay_frame.index),
@@ -1230,8 +1342,14 @@ class ExplicitCompatibilityRegimeDetector:
             if _coerce_scalar(value) is not None
         }
         label = detector_outputs.get(self.column_name)
+        if label is None:
+            label = detector_outputs.get("regime")
+        if label is None:
+            label = detector_outputs.get("canonical_regime_id")
         if label is None and detector_outputs:
             label = detector_outputs[next(iter(detector_outputs))]
+
+        canonical_regime_id = detector_outputs.get("canonical_regime_id")
 
         runtime_state["position"] = position + 1
         return runtime_state, RegimeStateContract(
@@ -1244,7 +1362,9 @@ class ExplicitCompatibilityRegimeDetector:
             warm=bool(detector_outputs),
             metadata={
                 "detector_name": self.detector_name,
-                "compatibility_mode": "legacy_explicit",
+                "compatibility_mode": "canonical_explicit",
+                "canonical_regime_id": canonical_regime_id,
+                "routing_regime_id": detector_outputs.get("routing_regime_id"),
             },
         )
 
@@ -1262,7 +1382,10 @@ class ExplicitCompatibilityRegimeDetector:
             },
             warmup_bars=(None if config.get("feature_lookback") is None else int(config.get("feature_lookback"))),
             fit_window=dict(self._fit_window),
-            metadata={"compatibility_mode": "legacy_explicit"},
+            metadata={
+                "compatibility_mode": "canonical_explicit",
+                "taxonomy_registry": dict(self._taxonomy_registry or {}),
+            },
         )
 
 

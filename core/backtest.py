@@ -13,7 +13,7 @@ from .execution import (
     resolve_execution_policy,
     resolve_liquidity_inputs,
 )
-from .routing import replay_router_trace
+from .routing import build_admissible_router_regime_trace, replay_router_trace
 from .slippage import (
     _estimate_fill_event_costs,
     _estimate_slippage_rates,
@@ -153,41 +153,8 @@ def _align_router_regime_states(regime_states, target_index):
     if not normalized:
         raise ValueError("router regime_states are required when router tracing is enabled")
 
-    target_index = pd.Index(target_index)
-    if len(normalized) == len(target_index):
-        return normalized, {
-            "mode": "positional",
-            "target_row_count": int(len(target_index)),
-            "source_row_count": int(len(normalized)),
-        }
-
-    by_timestamp = {}
-    for contract in normalized:
-        timestamp_value = contract.available_at if contract.available_at is not None else contract.as_of
-        if timestamp_value is None:
-            continue
-        by_timestamp[pd.Timestamp(timestamp_value)] = RegimeStateContract.from_dict(contract.to_dict())
-
-    aligned = []
-    missing = []
-    for timestamp in target_index:
-        key = pd.Timestamp(timestamp)
-        contract = by_timestamp.get(key)
-        if contract is None:
-            missing.append(str(key))
-        else:
-            aligned.append(contract)
-
-    if missing:
-        raise ValueError(
-            "router regime_states must either match the backtest length positionally or provide exact available_at/as_of timestamps"
-        )
-
-    return aligned, {
-        "mode": "timestamp_exact",
-        "target_row_count": int(len(target_index)),
-        "source_row_count": int(len(normalized)),
-    }
+    aligned_payload = build_admissible_router_regime_trace(normalized, pd.Index(target_index))
+    return list(aligned_payload.get("regime_states") or []), dict(aligned_payload.get("alignment") or {})
 
 
 def _build_router_trace_summary(
@@ -217,24 +184,130 @@ def _build_router_trace_summary(
         specialist_library,
         aligned_regime_states,
         specialist_health_trace=specialist_health_trace,
+        decision_timestamps=target_index,
     )
     summary = dict(trace.get("summary") or {})
     summary["alignment"] = alignment_report
     payload = {
         "manifest": dict(trace.get("manifest") or {}),
         "summary": summary,
+        "decision_trace": list(trace.get("decision_trace") or []),
+        "include_decision_trace": bool(include_router_decision_trace),
     }
-    if include_router_decision_trace:
-        payload["decision_trace"] = list(trace.get("decision_trace") or [])
     return payload
 
 
-def _attach_router_trace_summary(summary, router_trace_summary, *, router_switching_cost_per_switch=None):
+def _build_router_switching_cost_series(router_trace_summary, target_index, router_switching_cost_per_switch=None):
+    index = pd.Index(target_index)
+    cost_series = pd.Series(0.0, index=index, dtype=float)
+    if router_trace_summary is None or router_switching_cost_per_switch is None:
+        return cost_series, None
+
+    cost_per_switch = float(router_switching_cost_per_switch)
+    if cost_per_switch < 0.0:
+        raise ValueError("router_switching_cost_per_switch must be non-negative")
+    if cost_per_switch <= 0.0 or index.empty:
+        return cost_series, None
+
+    trace_summary = dict(router_trace_summary.get("summary") or {})
+    decision_trace = list(router_trace_summary.get("decision_trace") or [])
+    previous_model_id = None
+    for position, payload in enumerate(decision_trace):
+        timestamp = payload.get("decision_timestamp")
+        if timestamp is not None:
+            timestamp = pd.Timestamp(timestamp)
+        elif position < len(index):
+            timestamp = index[position]
+        else:
+            timestamp = None
+        if timestamp is None or timestamp not in cost_series.index:
+            previous_model_id = payload.get("selected_model_id")
+            continue
+
+        cost_units = float(payload.get("executed_weight_turnover", 0.0) or 0.0)
+        if cost_units <= 0.0:
+            l1_change = float(payload.get("executed_weight_l1_change", 0.0) or 0.0)
+            if l1_change > 0.0:
+                cost_units = l1_change / 2.0
+        selected_model_id = payload.get("selected_model_id")
+        if cost_units <= 0.0 and previous_model_id is not None and selected_model_id != previous_model_id:
+            cost_units = 1.0
+        if cost_units > 0.0:
+            cost_series.loc[timestamp] += float(cost_units * cost_per_switch)
+        previous_model_id = selected_model_id
+
+    switch_count = int(trace_summary.get("switch_count", 0) or 0)
+    turnover_total = float(trace_summary.get("executed_weight_turnover_total", 0.0) or 0.0)
+    estimated_cost = float(cost_series.sum())
+    if estimated_cost <= 0.0:
+        fallback_units = turnover_total if turnover_total > 0.0 else float(switch_count)
+        if fallback_units > 0.0 and not cost_series.empty:
+            cost_series.iloc[-1] = float(fallback_units * cost_per_switch)
+            estimated_cost = float(cost_series.sum())
+
+    if estimated_cost <= 0.0:
+        return cost_series, None
+
+    return cost_series, {
+        "switch_count": switch_count,
+        "executed_weight_turnover_total": _round_metric(turnover_total, 6),
+        "cost_per_switch": _round_metric(cost_per_switch, 6),
+        "cost_per_turnover_unit": _round_metric(cost_per_switch, 6),
+        "estimated_cost": _round_metric(estimated_cost, 6),
+        "basis": "executed_allocation_turnover" if turnover_total > 0.0 else "router_switch_count",
+    }
+
+
+def _apply_cash_costs_to_equity(base_equity, *, starting_equity, cash_costs=None):
+    base_equity = pd.Series(base_equity, copy=False).astype(float)
+    if base_equity.empty:
+        empty_series = pd.Series(dtype=float, index=base_equity.index)
+        return empty_series, empty_series, 0.0
+
+    cost_series = pd.Series(0.0, index=base_equity.index, dtype=float)
+    if cash_costs is not None:
+        cost_series = pd.Series(cash_costs, index=base_equity.index).reindex(base_equity.index).fillna(0.0).astype(float)
+
+    prev_base_equity = base_equity.shift(1).fillna(float(starting_equity))
+    gross_returns = (
+        base_equity.divide(prev_base_equity.replace(0.0, np.nan))
+        .subtract(1.0)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+
+    adjusted_equity = pd.Series(0.0, index=base_equity.index, dtype=float)
+    running_equity = float(starting_equity)
+    for position in range(len(base_equity)):
+        running_equity = float(running_equity * (1.0 + float(gross_returns.iloc[position])) - float(cost_series.iloc[position]))
+        adjusted_equity.iloc[position] = running_equity
+
+    adjusted_returns = (
+        adjusted_equity.divide(adjusted_equity.shift(1).fillna(float(starting_equity)).replace(0.0, np.nan))
+        .subtract(1.0)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+    return adjusted_equity, adjusted_returns, float(cost_series.sum())
+
+
+def _attach_router_trace_summary(
+    summary,
+    router_trace_summary,
+    *,
+    router_switching_cost_per_switch=None,
+    router_switching_cost_report=None,
+):
     payload = dict(summary or {})
     if router_trace_summary is None:
         return payload
 
     trace_summary = dict(router_trace_summary.get("summary") or {})
+    expose_decision_trace = bool(router_trace_summary.get("include_decision_trace", False))
+    raw_router_trace_summary = dict(router_trace_summary or {})
+    raw_router_trace_summary.pop("include_decision_trace", None)
+    if not expose_decision_trace:
+        raw_router_trace_summary.pop("decision_trace", None)
     payload.update(
         {
             "router_manifest": dict(router_trace_summary.get("manifest") or {}),
@@ -255,28 +328,25 @@ def _attach_router_trace_summary(summary, router_trace_summary, *, router_switch
             "router_regime_availability_counts": dict(trace_summary.get("regime_availability_counts") or {}),
             "router_safe_mode_action_counts": dict(trace_summary.get("safe_mode_action_counts") or {}),
             "router_alignment": dict(trace_summary.get("alignment") or {}),
-            "router_trace_summary": dict(router_trace_summary or {}),
+            "router_trace_summary": raw_router_trace_summary,
         }
     )
-    if router_switching_cost_per_switch is not None:
-        cost_per_switch = float(router_switching_cost_per_switch)
-        if cost_per_switch < 0.0:
-            raise ValueError("router_switching_cost_per_switch must be non-negative")
-        if cost_per_switch > 0.0:
-            switch_count = int(trace_summary.get("switch_count", 0))
-            turnover_total = float(trace_summary.get("executed_weight_turnover_total", 0.0) or 0.0)
-            cost_units = turnover_total if turnover_total > 0.0 else float(switch_count)
-            payload["router_switching_cost_report"] = {
-                "switch_count": switch_count,
-                "executed_weight_turnover_total": _round_metric(turnover_total, 6),
-                "cost_per_switch": _round_metric(cost_per_switch, 6),
-                "cost_per_turnover_unit": _round_metric(cost_per_switch, 6),
-                "estimated_cost": _round_metric(cost_units * cost_per_switch, 6),
-                "basis": "executed_allocation_turnover" if turnover_total > 0.0 else "router_switch_count",
-            }
-            payload["router_switching_cost_estimate"] = _round_metric(cost_units * cost_per_switch, 6)
+    if router_switching_cost_report is not None:
+        payload["router_switching_cost_report"] = dict(router_switching_cost_report)
+        payload["router_switching_cost_estimate"] = float(router_switching_cost_report.get("estimated_cost", 0.0) or 0.0)
+        payload["router_switching_cost_paid"] = float(router_switching_cost_report.get("estimated_cost", 0.0) or 0.0)
+    elif router_switching_cost_per_switch is not None:
+        _, computed_report = _build_router_switching_cost_series(
+            router_trace_summary,
+            payload.get("equity_curve", pd.Index([])).index if isinstance(payload.get("equity_curve"), pd.Series) else pd.Index([]),
+            router_switching_cost_per_switch=router_switching_cost_per_switch,
+        )
+        if computed_report is not None:
+            payload["router_switching_cost_report"] = dict(computed_report)
+            payload["router_switching_cost_estimate"] = float(computed_report.get("estimated_cost", 0.0) or 0.0)
+            payload["router_switching_cost_paid"] = float(computed_report.get("estimated_cost", 0.0) or 0.0)
     payload["router_stability_report"] = _build_router_stability_report(payload)
-    if "decision_trace" in router_trace_summary:
+    if expose_decision_trace:
         payload["router_decision_trace"] = list(router_trace_summary.get("decision_trace") or [])
     return payload
 
@@ -2120,7 +2190,8 @@ def _run_futures_account_backtest(close, position, equity, fee_rate, slippage_ra
                                   significance=None, benchmark_returns=None,
                                   benchmark_sharpe=None, volume=None,
                                   slippage_model=None, orderbook_depth=None,
-                                  execution_report=None, interval=None):
+                                  execution_report=None, interval=None,
+                                  router_switching_costs=None):
     valuation_series = pd.Series(close, copy=False).astype(float)
     execution_series = valuation_series if execution_prices is None else pd.Series(
         execution_prices, index=valuation_series.index
@@ -2167,8 +2238,12 @@ def _run_futures_account_backtest(close, position, equity, fee_rate, slippage_ra
     total_fees_paid = 0.0
     total_slippage_paid = 0.0
     total_funding_pnl = 0.0
+    total_router_switching_cost_paid = 0.0
     total_liquidation_fees = 0.0
     bars_above_warning = 0
+    router_cost_series = pd.Series(0.0, index=valuation_series.index, dtype=float)
+    if router_switching_costs is not None:
+        router_cost_series = pd.Series(router_switching_costs, index=valuation_series.index).reindex(valuation_series.index).fillna(0.0).astype(float)
 
     for loc, timestamp in enumerate(valuation_series.index):
         price_now = float(valuation_series.iloc[loc])
@@ -2280,9 +2355,11 @@ def _run_futures_account_backtest(close, position, equity, fee_rate, slippage_ra
         turnover = abs(capped_target - previous_position)
         fee_cash = max(prev_equity, 0.0) * turnover * float(fee_rate)
         slippage_cash = max(prev_equity, 0.0) * turnover * float(slippage_rates.iloc[loc])
+        router_switching_cost_cash = float(router_cost_series.iloc[loc])
         total_fees_paid += fee_cash
         total_slippage_paid += slippage_cash
-        ending_equity = max(total_equity_before_trade - fee_cash - slippage_cash, 0.0)
+        total_router_switching_cost_paid += router_switching_cost_cash
+        ending_equity = max(total_equity_before_trade - fee_cash - slippage_cash - router_switching_cost_cash, 0.0)
 
         post_notional = abs(capped_target) * ending_equity
         post_leverage_cap, _ = _resolve_futures_leverage_cap(post_notional, futures_account)
@@ -2350,6 +2427,7 @@ def _run_futures_account_backtest(close, position, equity, fee_rate, slippage_ra
         signal_delay_bars=signal_delay_bars,
         trade_ledger=trade_ledger,
         funding_pnl=total_funding_pnl,
+        router_switching_cost_paid=total_router_switching_cost_paid,
         engine="pandas",
         significance=significance,
         benchmark_returns=benchmark_returns,
@@ -2559,7 +2637,8 @@ def _summarize_metric_qualification(*, closed_trades, effective_bet_count, minim
 
 def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equity,
                         fees_paid, slippage_paid, signal_delay_bars, trade_ledger,
-                        funding_pnl=0.0, engine="pandas", significance=None,
+                        funding_pnl=0.0, router_switching_cost_paid=0.0,
+                        engine="pandas", significance=None,
                         benchmark_returns=None, benchmark_sharpe=None,
                         execution_report=None, futures_account_report=None,
                         interval=None):
@@ -2690,6 +2769,7 @@ def _summarize_backtest(equity_curve, strat_ret, position, execution_series, equ
         "fees_paid": _round_metric(fees_paid, 2),
         "slippage_paid": _round_metric(slippage_paid, 2),
         "funding_pnl": _round_metric(funding_pnl, 2),
+        "router_switching_cost_paid": _round_metric(router_switching_cost_paid, 2),
         "funding_paid": _round_metric(funding_paid, 2),
         "funding_received": _round_metric(funding_received, 2),
         "total_return": _round_metric(total_ret, 4),
@@ -2941,7 +3021,8 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
                            significance=None, benchmark_returns=None,
                            benchmark_sharpe=None, volume=None,
                            slippage_model=None, orderbook_depth=None,
-                           execution_report=None, interval=None):
+                           execution_report=None, interval=None,
+                           router_switching_costs=None):
     if vbt is None or Direction is None or SizeType is None:
         raise ImportError("vectorbt is not installed")
 
@@ -2974,8 +3055,12 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
 
     base_equity = pd.Series(portfolio.value(), index=valuation_series.index, dtype=float)
     funding_cash = _compute_funding_cash(position, funding_rates, base_equity)
-    adjusted_equity = base_equity + funding_cash.cumsum()
-    adjusted_returns = adjusted_equity.pct_change().fillna(0.0)
+    gross_equity = base_equity + funding_cash.cumsum()
+    adjusted_equity, adjusted_returns, router_switching_cost_paid = _apply_cash_costs_to_equity(
+        gross_equity,
+        starting_equity=equity,
+        cash_costs=router_switching_costs,
+    )
     trade_ledger = _vectorbt_trade_ledger(portfolio, valuation_series.index)
     fees_paid = float(portfolio.orders.records_readable["Fees"].sum()) if not portfolio.orders.records_readable.empty else 0.0
     slippage_paid = _resolve_realized_slippage_paid(
@@ -2995,6 +3080,7 @@ def _run_vectorbt_backtest(close, position, equity, fee_rate, slippage_rate,
         signal_delay_bars=signal_delay_bars,
         trade_ledger=trade_ledger,
         funding_pnl=float(funding_cash.sum()),
+        router_switching_cost_paid=router_switching_cost_paid,
         engine="vectorbt",
         significance=significance,
         benchmark_returns=benchmark_returns,
@@ -3009,7 +3095,8 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
                          significance=None, benchmark_returns=None,
                          benchmark_sharpe=None, volume=None,
                          slippage_model=None, orderbook_depth=None,
-                         execution_report=None, interval=None):
+                         execution_report=None, interval=None,
+                         router_switching_costs=None):
     valuation_series = pd.Series(close, copy=False).astype(float)
     execution_series = valuation_series if execution_prices is None else pd.Series(execution_prices, index=valuation_series.index).reindex(valuation_series.index).astype(float)
     returns = valuation_series.pct_change().fillna(0.0)
@@ -3032,8 +3119,13 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
     if funding_rates is not None:
         funding_returns = -held_position * _require_complete_funding_series(funding_rates, position.index)
 
-    strat_ret = held_position * returns + funding_returns - fees - slippage
-    equity_curve = equity * (1.0 + strat_ret).cumprod()
+    gross_returns = held_position * returns + funding_returns - fees - slippage
+    gross_equity = equity * (1.0 + gross_returns).cumprod()
+    equity_curve, strat_ret, router_switching_cost_paid = _apply_cash_costs_to_equity(
+        gross_equity,
+        starting_equity=equity,
+        cash_costs=router_switching_costs,
+    )
     trade_ledger = _build_trade_ledger(strat_ret, position, execution_series)
     prev_equity = equity_curve.shift(1).fillna(equity)
     return _summarize_backtest(
@@ -3051,6 +3143,7 @@ def _run_pandas_backtest(close, position, equity, fee_rate, slippage_rate,
         signal_delay_bars=signal_delay_bars,
         trade_ledger=trade_ledger,
         funding_pnl=float((prev_equity * funding_returns).sum()),
+        router_switching_cost_paid=router_switching_cost_paid,
         engine="pandas",
         significance=significance,
         benchmark_returns=benchmark_returns,
@@ -3385,6 +3478,11 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         specialist_health_trace=specialist_health_trace,
         include_router_decision_trace=include_router_decision_trace,
     )
+    router_switching_costs, router_switching_cost_report = _build_router_switching_cost_series(
+        router_trace_summary,
+        executable_position.index,
+        router_switching_cost_per_switch=router_switching_cost_per_switch,
+    )
     if resolved_futures_account is not None:
         summary = _run_futures_account_backtest(
             close=valuation_series,
@@ -3405,6 +3503,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
             orderbook_depth=orderbook_depth,
             execution_report=execution_report,
             interval=interval,
+            router_switching_costs=router_switching_costs,
         )
         summary = _attach_backtest_regime_segment_payload(
             summary,
@@ -3422,6 +3521,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
             summary,
             router_trace_summary,
             router_switching_cost_per_switch=router_switching_cost_per_switch,
+            router_switching_cost_report=router_switching_cost_report,
         )
         summary["funding_coverage_report"] = dict(funding_coverage_report)
         summary = _annotate_backtest_engine_summary(summary, requested_engine=requested_engine)
@@ -3455,6 +3555,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                 orderbook_depth=orderbook_depth,
                 execution_report=execution_report,
                 interval=interval,
+                router_switching_costs=router_switching_costs,
             )
             summary = _attach_backtest_regime_segment_payload(
                 summary,
@@ -3472,6 +3573,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
                 summary,
                 router_trace_summary,
                 router_switching_cost_per_switch=router_switching_cost_per_switch,
+                router_switching_cost_report=router_switching_cost_report,
             )
             summary["funding_coverage_report"] = dict(funding_coverage_report)
             summary = _annotate_backtest_engine_summary(summary, requested_engine=requested_engine)
@@ -3512,6 +3614,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         orderbook_depth=orderbook_depth,
         execution_report=execution_report,
         interval=interval,
+        router_switching_costs=router_switching_costs,
     )
     summary = _attach_backtest_regime_segment_payload(
         summary,
@@ -3529,6 +3632,7 @@ def run_backtest(close, signals, equity=10_000.0, fee_rate=0.001, slippage_rate=
         summary,
         router_trace_summary,
         router_switching_cost_per_switch=router_switching_cost_per_switch,
+        router_switching_cost_report=router_switching_cost_report,
     )
     summary["funding_coverage_report"] = dict(funding_coverage_report)
     summary = _annotate_backtest_engine_summary(

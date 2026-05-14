@@ -67,6 +67,38 @@ def _normalize_health_contract_payload(payload: Mapping[str, Any]) -> Specialist
     return SpecialistHealthContract.from_dict(data)
 
 
+def _resolve_health_binding_metadata(payload: Mapping[str, Any], metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    data = dict(payload or {})
+    resolved = _coerce_metadata(metadata)
+    failure_flags = [str(item) for item in list(data.get("failure_flags") or [])]
+    has_measured_evidence = bool(
+        data.get("fallback_only")
+        or data.get("stability_score") is not None
+        or data.get("decay_score") is not None
+        or data.get("last_calibrated_at") is not None
+        or failure_flags
+        or resolved.get("sample_count") is not None
+        or resolved.get("metric_basis") is not None
+    )
+    if "health_binding_resolved" not in resolved:
+        resolved["health_binding_resolved"] = bool(has_measured_evidence)
+    if not str(resolved.get("health_state") or "").strip():
+        if bool(data.get("fallback_only")):
+            resolved["health_state"] = "fallback_only"
+        elif failure_flags:
+            resolved["health_state"] = "failed"
+        elif bool(resolved.get("health_binding_resolved", False)):
+            resolved["health_state"] = "measured"
+        else:
+            resolved["health_state"] = "unknown"
+    resolved.setdefault("health_evidence_source", resolved.get("health_source") or resolved.get("source") or "specialist_health_update")
+    if resolved.get("last_refresh_at") is None:
+        last_refresh_at = resolved.get("health_recorded_at") or resolved.get("recorded_at")
+        if last_refresh_at is not None:
+            resolved["last_refresh_at"] = last_refresh_at
+    return resolved
+
+
 def _normalize_performance_slice_payload(payload: Mapping[str, Any]) -> SpecialistPerformanceSlice:
     data = dict(payload or {})
     model_id = str(data.get("model_id", "")).strip()
@@ -112,7 +144,7 @@ def normalize_specialist_health_update(update: Mapping[str, Any] | None) -> dict
         if recorded_at is not None:
             item_metadata.setdefault("health_recorded_at", _serialize_metadata_value(recorded_at))
         item_metadata.setdefault("health_source", source)
-        item_payload["metadata"] = item_metadata
+        item_payload["metadata"] = _resolve_health_binding_metadata(item_payload, item_metadata)
         health_updates.append(_normalize_health_contract_payload(item_payload))
 
     performance_updates = []

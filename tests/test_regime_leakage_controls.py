@@ -8,7 +8,8 @@ import pandas as pd
 from core import ResearchPipeline, build_feature_adapter, detect_regime, sequential_bootstrap
 from core.features import FeatureSelectionResult
 from core.models import train_model
-from core.pipeline import SignalsStep, _build_specialist_signal_surfaces
+from core.pipeline import SignalsStep, _build_specialist_signal_surfaces, _train_inner_meta_model
+from core.regimes import RegimeStateContract
 from core.regime_training import RegimeAwareModelBundle
 
 
@@ -229,6 +230,70 @@ class RegimeLeakageControlsTest(unittest.TestCase):
             surfaces["specialist::bull"]["surface_edge_policy"],
             "bundle_level_shared_meta_containment",
         )
+
+    def test_inner_meta_training_uses_admissible_regime_surface_when_state_contracts_exist(self):
+        index = pd.date_range("2026-05-03", periods=150, freq="1h", tz="UTC")
+        X = pd.DataFrame({"feature": np.linspace(-1.0, 1.0, len(index))}, index=index)
+        y = pd.Series(np.where(X["feature"] >= 0.0, 1, -1), index=index)
+        sample_weights = pd.Series(1.0, index=index)
+        labels = pd.DataFrame({"label": y, "t1": index}, index=index)
+        preview_regime = pd.DataFrame({"regime": "bull"}, index=index)
+        delayed_rows = 5
+        state_contracts = [
+            RegimeStateContract(
+                as_of=timestamp,
+                available_at=(timestamp if position >= delayed_rows else index[position + 1]),
+                label="bull",
+                recognition_lag_bars=(0 if position >= delayed_rows else 1),
+                warm=True,
+            )
+            for position, timestamp in enumerate(index)
+        ]
+        observed_surfaces = []
+
+        class DummyInnerBundle:
+            def predict_with_probability_report(self, X_inner, regime_data=None):
+                probabilities = pd.DataFrame({-1: 0.25, 1: 0.75}, index=X_inner.index)
+                predictions = pd.Series(1, index=X_inner.index)
+                return predictions, probabilities, {}
+
+        def _fake_train_regime_aware_model(X_inner, y_inner, regime_data, **kwargs):
+            observed_surfaces.append(pd.DataFrame(regime_data).copy())
+            return DummyInnerBundle(), {"strategy": "specialist"}
+
+        with (
+            patch("core.pipeline.train_regime_aware_model", side_effect=_fake_train_regime_aware_model),
+            patch("core.pipeline.train_meta_model", return_value=object()),
+        ):
+            _train_inner_meta_model(
+                X,
+                y,
+                sample_weights,
+                {
+                    "type": "logistic",
+                    "params": {"random_state": 7, "max_iter": 100},
+                    "meta_params": {"random_state": 11, "max_iter": 100},
+                    "meta_n_splits": 2,
+                    "n_splits": 2,
+                    "gap": 0,
+                },
+                labels=labels,
+                close=pd.Series(np.linspace(100.0, 101.0, len(index)), index=index),
+                trade_outcome_builder=lambda predictions: pd.DataFrame(index=predictions.index),
+                regime_data=preview_regime,
+                regime_state_contracts=state_contracts,
+                regime_aware_config={
+                    "enabled": True,
+                    "strategy": "specialist",
+                    "regime_column": "regime",
+                    "min_samples_per_regime": 10,
+                },
+            )
+
+        self.assertTrue(observed_surfaces)
+        self.assertTrue(any("timing_blocked" in frame.columns for frame in observed_surfaces))
+        self.assertTrue(any(frame["timing_blocked"].fillna(0).gt(0).any() for frame in observed_surfaces))
+        self.assertTrue(any(frame["regime"].isna().any() for frame in observed_surfaces))
 
     def test_random_forest_warns_when_high_concurrency_sequential_bootstrap_is_disabled(self):
         index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")

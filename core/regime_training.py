@@ -49,6 +49,13 @@ def _coerce_regime_frame(regime_data, index=None):
     return frame
 
 
+def _coerce_training_regime_frame(regime_data, index=None, column_name="regime"):
+    state_contracts = _coerce_regime_state_contracts(regime_data, index=index)
+    if state_contracts is not None:
+        return build_admissible_regime_view(state_contracts, index=index, column_name=column_name)
+    return _coerce_regime_frame(regime_data, index=index)
+
+
 def _coerce_regime_state_contracts(regime_data, index=None):
     try:
         contracts = normalize_regime_state_contracts(regime_data)
@@ -717,14 +724,25 @@ def train_regime_aware_model(
 ):
     X_frame = pd.DataFrame(X).copy()
     y_series = pd.Series(y, index=X_frame.index)
-    regime_frame = _coerce_regime_frame(regime_data, index=X_frame.index)
     regime_state_contracts = _coerce_regime_state_contracts(regime_data, index=X_frame.index)
+    regime_frame = _coerce_training_regime_frame(regime_data, index=X_frame.index, column_name=regime_column)
     strategy = str(strategy).lower()
     validate_feature_adaptation_runtime_support(
         dict(feature_config or {}).get("feature_adaptation") or {},
         regime_aware_strategy=strategy,
     )
     coverage_summary = summarize_regime_coverage(regime_frame, regime_column=regime_column, config=coverage_config)
+    regime_surface_type = (
+        "admissible_regime_surface"
+        if regime_state_contracts is not None or "timing_blocked" in regime_frame.columns or "admissible" in regime_frame.columns
+        else "preview_regime_surface"
+    )
+    regime_admissibility_policy = (
+        "available_at_decision_time"
+        if regime_surface_type == "admissible_regime_surface"
+        else "preview_alignment"
+    )
+    timing_blocked_training_rows = _diagnostic_flag_count(regime_frame, "timing_blocked", X_frame.index)
 
     if strategy == "feature":
         feature_result = build_regime_aware_feature_frame(X_frame, regime_frame, config=feature_config)
@@ -760,6 +778,10 @@ def train_regime_aware_model(
             "coverage_summary": coverage_summary,
             "sampling_report": sampling_report,
             "candidate_classification": "generalist_only",
+            "regime_surface_type": regime_surface_type,
+            "regime_admissibility_policy": regime_admissibility_policy,
+            "timing_blocked_training_rows": int(timing_blocked_training_rows),
+            "unknown_regime_rows": int(pd.Series(regime_frame.get(regime_column), index=X_frame.index).isna().sum()) if regime_column in regime_frame.columns else 0,
         }
         return bundle, report
 
@@ -771,6 +793,7 @@ def train_regime_aware_model(
 
     target_column = _resolve_regime_identity_column(regime_frame, preferred_column=regime_column)
     labels = pd.Series(regime_frame[target_column], index=X_frame.index)
+    unknown_regime_rows = int(labels.isna().sum())
     regime_aliases_by_id = _build_regime_alias_map(regime_frame, target_column, semantic_column=regime_column)
     fallback_model, fallback_sampling_report = _train_constant_safe_model(
         X_frame,
@@ -833,6 +856,10 @@ def train_regime_aware_model(
         "candidate_classification": (
             "generalist_only" if not specialist_models else "specialist_effective"
         ),
+        "regime_surface_type": regime_surface_type,
+        "regime_admissibility_policy": regime_admissibility_policy,
+        "timing_blocked_training_rows": int(timing_blocked_training_rows),
+        "unknown_regime_rows": int(unknown_regime_rows),
     }
     return bundle, report
 

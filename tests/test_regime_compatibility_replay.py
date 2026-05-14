@@ -35,7 +35,15 @@ class RegimeCompatibilityReplayTest(unittest.TestCase):
         )
         legacy = detect_regime(observations, method="explicit", config=config)
 
-        pd.testing.assert_frame_equal(replayed["state_frame"], legacy.reindex(observations.index))
+        pd.testing.assert_frame_equal(
+            replayed["state_frame"][legacy.columns],
+            legacy.reindex(observations.index),
+        )
+        self.assertIn("canonical_regime_id", replayed["state_frame"].columns)
+        self.assertIn("routing_regime_id", replayed["state_frame"].columns)
+        self.assertTrue(
+            replayed["state_frame"]["canonical_regime_id"].dropna().astype(str).str.startswith("compatibility_explicit__").all()
+        )
         self.assertEqual(len(replayed["detector_manifests"]), 1)
         self.assertEqual(replayed["trace_summary"].available_rows, len(observations))
 
@@ -63,6 +71,7 @@ class RegimeCompatibilityReplayTest(unittest.TestCase):
             first["detector_manifests"][0].to_dict(),
             second["detector_manifests"][0].to_dict(),
         )
+        self.assertTrue((first["state_frame"]["canonical_regime_id"] == second["state_frame"]["canonical_regime_id"]).all())
 
 
 if __name__ == "__main__":

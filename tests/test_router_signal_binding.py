@@ -62,6 +62,7 @@ class RouterSignalBindingTest(unittest.TestCase):
                     timeframe="1h",
                     compatible_regimes=[],
                     estimator_family="dummy",
+                    metadata={"fallback_only": True, "lifecycle_state": "active"},
                 ),
                 SpecialistSpec(
                     model_id="specialist::bull",
@@ -69,6 +70,21 @@ class RouterSignalBindingTest(unittest.TestCase):
                     timeframe="1h",
                     compatible_regimes=["bull"],
                     estimator_family="dummy",
+                    metadata={"lifecycle_state": "active"},
+                ),
+            ],
+            health=[
+                SpecialistHealthContract(
+                    model_id="fallback_generalist",
+                    compatible_regimes=[],
+                    fallback_only=True,
+                    metadata={"health_binding_resolved": True, "health_state": "fallback_only"},
+                ),
+                SpecialistHealthContract(
+                    model_id="specialist::bull",
+                    compatible_regimes=["bull"],
+                    stability_score=0.8,
+                    metadata={"health_binding_resolved": True, "health_state": "measured"},
                 ),
             ],
         ).to_dict()
@@ -301,6 +317,124 @@ class RouterSignalBindingTest(unittest.TestCase):
         self.assertListEqual(routed_signal_state["continuous_signals"].tolist(), [0.0, 0.0, 0.0])
         self.assertEqual(router_trace_summary["summary"]["eligibility_blocked_rows"], 3)
         self.assertEqual(router_trace_summary["summary"]["fallback_rows_by_cause"], {"health_unbound": 3})
+
+    def test_router_binding_respects_delayed_regime_recognition_by_decision_time(self):
+        index = pd.date_range("2026-05-10", periods=3, freq="1h", tz="UTC")
+        zeros = pd.Series(0.0, index=index)
+        ones = pd.Series(1.0, index=index)
+        base_signal_state = {
+            "event_signals": zeros,
+            "continuous_signals": zeros,
+            "signals": zeros.astype(int),
+            "position_size": zeros,
+            "meta_prob": zeros,
+            "profitability_prob": zeros,
+            "direction_edge": zeros,
+            "confidence": zeros,
+            "expected_trade_edge": zeros,
+        }
+        specialist_signal_surfaces = {
+            "fallback_generalist": {
+                "event_signals": zeros,
+                "continuous_signals": zeros,
+                "signals": zeros.astype(int),
+                "position_size": zeros,
+                "meta_prob": zeros,
+                "profitability_prob": zeros,
+                "direction_edge": zeros,
+                "confidence": zeros,
+                "expected_trade_edge": zeros,
+            },
+            "specialist::bull": {
+                "event_signals": ones,
+                "continuous_signals": ones,
+                "signals": ones.astype(int),
+                "position_size": ones,
+                "meta_prob": ones,
+                "profitability_prob": ones,
+                "direction_edge": ones,
+                "confidence": ones,
+                "expected_trade_edge": ones,
+            },
+        }
+        specialist_library = SpecialistLibrarySnapshot(
+            symbol="BTCUSDT",
+            timeframe="1h",
+            fallback_model_id="fallback_generalist",
+            specialists=[
+                SpecialistSpec(
+                    model_id="fallback_generalist",
+                    symbol="BTCUSDT",
+                    timeframe="1h",
+                    compatible_regimes=[],
+                    estimator_family="dummy",
+                    metadata={"fallback_only": True, "lifecycle_state": "active"},
+                ),
+                SpecialistSpec(
+                    model_id="specialist::bull",
+                    symbol="BTCUSDT",
+                    timeframe="1h",
+                    compatible_regimes=["bull"],
+                    estimator_family="dummy",
+                    metadata={"lifecycle_state": "active"},
+                ),
+            ],
+            health=[
+                SpecialistHealthContract(
+                    model_id="fallback_generalist",
+                    compatible_regimes=[],
+                    fallback_only=True,
+                    metadata={"health_binding_resolved": True, "health_state": "fallback_only"},
+                ),
+                SpecialistHealthContract(
+                    model_id="specialist::bull",
+                    compatible_regimes=["bull"],
+                    stability_score=0.8,
+                    metadata={"health_binding_resolved": True, "health_state": "measured"},
+                ),
+            ],
+        ).to_dict()
+        regime_states = [
+            RegimeStateContract(
+                as_of=index[0],
+                available_at=index[1],
+                label="bull",
+                confidence=0.95,
+                warm=True,
+            ),
+            RegimeStateContract(
+                as_of=index[1],
+                available_at=index[1],
+                label="bull",
+                confidence=0.95,
+                warm=True,
+            ),
+            RegimeStateContract(
+                as_of=index[2],
+                available_at=index[2],
+                label="bull",
+                confidence=0.95,
+                warm=True,
+            ),
+        ]
+
+        routed_signal_state, router_trace_summary = _route_signal_state_with_router(
+            base_signal_state,
+            specialist_signal_surfaces,
+            router=HardSwitchRouter(),
+            specialist_library=specialist_library,
+            regime_states=regime_states,
+        )
+
+        self.assertListEqual(routed_signal_state["continuous_signals"].tolist(), [0.0, 1.0, 1.0])
+        self.assertEqual(
+            router_trace_summary["summary"]["alignment"]["mode"],
+            "decision_time_admissible",
+        )
+        self.assertEqual(
+            router_trace_summary["summary"]["regime_availability_counts"].get("timing_blocked"),
+            1,
+        )
 
 
 if __name__ == "__main__":

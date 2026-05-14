@@ -238,6 +238,55 @@ class RouterRuntimeTest(unittest.TestCase):
         self.assertFalse(decision.metadata["candidate_eligibility"]["specialist::bull"]["health_binding_resolved"])
         self.assertIn("health_unbound", decision.metadata["candidate_eligibility"]["specialist::bull"]["reasons"])
 
+    def test_router_defaults_to_health_binding_execution_policy(self):
+        library = SpecialistLibrarySnapshot(
+            symbol="BTCUSDT",
+            timeframe="1h",
+            fallback_model_id="fallback_generalist",
+            specialists=[
+                SpecialistSpec(
+                    model_id="fallback_generalist",
+                    symbol="BTCUSDT",
+                    timeframe="1h",
+                    compatible_regimes=[],
+                    estimator_family="logisticregression",
+                    metadata={"fallback_only": True, "lifecycle_state": "candidate"},
+                ),
+                SpecialistSpec(
+                    model_id="specialist::bull",
+                    symbol="BTCUSDT",
+                    timeframe="1h",
+                    compatible_regimes=["bull"],
+                    estimator_family="logisticregression",
+                    metadata={"lifecycle_state": "active"},
+                ),
+            ],
+            health=[
+                SpecialistHealthContract(
+                    model_id="fallback_generalist",
+                    compatible_regimes=[],
+                    fallback_only=True,
+                    metadata={"health_binding_resolved": True, "health_state": "fallback_only"},
+                ),
+            ],
+        )
+        router = HardSwitchRouter(hysteresis_margin=0.0, min_persistence_bars=1, cooldown_bars=0)
+        state = router.initialize(library)
+
+        state, decision = router.select(
+            state,
+            RegimeStateContract(as_of="2026-05-09T00:00:00Z", available_at="2026-05-09T00:00:00Z", label="bull", confidence=0.95),
+        )
+
+        self.assertEqual(router.manifest().metadata["execution_policy"], "fallback_only_until_health_binding")
+        self.assertEqual(decision.selected_model_id, "fallback_generalist")
+        self.assertFalse(decision.metadata["candidate_eligibility"]["specialist::bull"]["eligible"])
+        self.assertIn("health_unbound", decision.metadata["candidate_eligibility"]["specialist::bull"]["reasons"])
+        self.assertEqual(
+            decision.metadata["candidate_eligibility"]["specialist::bull"]["metadata"]["eligibility_policy_version"],
+            "router.health_binding.v1",
+        )
+
     def test_router_blocks_candidate_specialist_in_execution_mode_even_with_bound_health(self):
         library = SpecialistLibrarySnapshot(
             symbol="BTCUSDT",
@@ -354,6 +403,7 @@ class RouterRuntimeTest(unittest.TestCase):
         self.assertIsInstance(hard_switch, HardSwitchRouter)
         self.assertIsInstance(weighted, WeightedRouter)
         self.assertEqual(weighted.manifest().router_type, "confidence_weighted")
+        self.assertEqual(weighted.manifest().metadata["execution_policy"], "fallback_only_until_health_binding")
         self.assertEqual(hard_switch.manifest().metadata["safe_mode_policy"], "fallback_only")
         self.assertEqual(hard_switch.manifest().metadata["execution_policy"], "fallback_only_until_health_binding")
 

@@ -37,6 +37,32 @@ class GlobalLookaheadGuardDefaultTest(unittest.TestCase):
         self.assertEqual(guard["mode"], "blocking")
         self.assertTrue(guard["trade_ready_mode"])
 
+    def test_regime_aware_research_pipeline_defaults_to_full_causal_surface(self):
+        pipeline = ResearchPipeline(
+            {
+                "features": {},
+                "regime": {"method": "hmm", "n_regimes": 2},
+                "feature_adaptation": {
+                    "selection": {"mode": "per_regime_mask", "fallback": "global"},
+                },
+                "model": {
+                    "type": "logistic",
+                    "regime_aware": {"enabled": True, "strategy": "specialist"},
+                },
+                "router": {"enabled": True},
+                "backtest": {"evaluation_mode": "research_only"},
+            }
+        )
+
+        guard = _resolve_lookahead_guard_config(pipeline)
+
+        self.assertTrue(guard["enabled"])
+        self.assertEqual(guard["mode"], "advisory")
+        self.assertEqual(guard["audit_scope"], "full_causal_surface")
+        self.assertEqual(guard["required_evidence_class"], "causal_research")
+        self.assertIn("admissible_regimes", guard["artifact_names"])
+        self.assertIn("router_decisions", guard["artifact_names"])
+
 
 if __name__ == "__main__":
     unittest.main()

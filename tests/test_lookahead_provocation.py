@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -40,7 +41,7 @@ class LookaheadProvocationTest(unittest.TestCase):
                 },
                 "regime": {"method": "hmm", "n_regimes": 2},
                 "labels": {"kind": "fixed_horizon", "horizon": 4, "threshold": 0.0001},
-                "model": {"type": "gbm", "cv_method": "walk_forward", "n_splits": 1, "gap": 0},
+                "model": {"type": "gbm", "cv_method": "walk_forward", "n_splits": 1, "gap": 3},
                 "feature_selection": {"enabled": False},
                 "signals": {"avg_win": 0.02, "avg_loss": 0.02},
                 "backtest": {"use_open_execution": False, "signal_delay_bars": 1},
@@ -96,6 +97,7 @@ class LookaheadProvocationTest(unittest.TestCase):
         raw = self._make_raw(seed=24)
         pipeline = self._make_pipeline(raw)
         pipeline.config["backtest"]["evaluation_mode"] = "trade_ready"
+        pipeline.config["backtest"]["execution_policy"] = {"adapter": "nautilus", "force_simulation": False}
         pipeline.config["data_certification"] = {"enabled": False}
         pipeline.config["features"]["lookahead_guard"] = {
             "decision_sample_size": 8,
@@ -103,17 +105,29 @@ class LookaheadProvocationTest(unittest.TestCase):
         }
 
         pipeline.build_features()
-        report = _run_pipeline_lookahead_guard(pipeline)
+
+        class _AvailableNautilusAdapter:
+            def __init__(self, scenario_schedule=None, scenario_policy=None):
+                self.available = True
+                self.backend = "nautilus"
+
+            def describe_scenarios(self):
+                return {"configured": False, "policy": {}}
+
+        with mock.patch("core.backtest.NautilusExecutionAdapter", _AvailableNautilusAdapter):
+            report = _run_pipeline_lookahead_guard(pipeline)
 
         self.assertTrue(report["enabled"])
         self.assertEqual(report["mode"], "blocking")
-        self.assertEqual(report["audit_scope"], "pre_training_causal_surface")
+        self.assertEqual(report["audit_scope"], "full_causal_surface")
         self.assertTrue(report["trade_ready_mode"])
         self.assertFalse(report["builders_present"])
-        self.assertTrue(report["promotion_pass"])
-        self.assertEqual(report["biased_columns"], [])
-        self.assertEqual(sorted(report["artifact_reports"].keys()), ["features"])
-        self.assertEqual(report["status"], "passed")
+        self.assertFalse(report["promotion_pass"])
+        self.assertEqual(report["required_evidence_class"], "capital_facing")
+        self.assertEqual(report["evidence_class"], "preview_only")
+        self.assertEqual(report["status"], "unavailable")
+        self.assertIn("lookahead_guard_baseline_unavailable:RuntimeError", report["reasons"])
+        self.assertIn("Preview-only regime artifacts", report["baseline_error"])
 
     def test_default_audit_surface_reports_probabilities_signals_and_execution_inputs(self):
         raw = self._make_raw(seed=7)
@@ -128,6 +142,8 @@ class LookaheadProvocationTest(unittest.TestCase):
 
         self.assertIn("features", report["artifacts"])
         self.assertIn("regimes", report["artifacts"])
+        self.assertIn("regime_state_contracts", report["artifacts"])
+        self.assertIn("admissible_regimes", report["artifacts"])
         self.assertIn("labels", report["artifacts"])
         self.assertIn("aligned_labels", report["artifacts"])
         self.assertIn("oos_probabilities", report["artifacts"])

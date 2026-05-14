@@ -128,4 +128,8 @@ class SpecialistContractsTest(unittest.TestCase):
         self.assertEqual(updated.metadata["selection_contract"]["candidate_model_ids"], ["fallback_generalist", "specialist::bull"])
         self.assertEqual(updated.metadata["health_history"]["update_count"], 1)
         self.assertEqual(updated.health[0].model_id, "specialist::bull")
+        self.assertTrue(updated.health[0].metadata["health_binding_resolved"])
+        self.assertEqual(updated.health[0].metadata["health_state"], "measured")
+        self.assertEqual(updated.health[0].metadata["health_evidence_source"], "specialist_monitoring")
+        self.assertEqual(updated.health[0].metadata["last_refresh_at"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(len(updated.performance_slices), 1)

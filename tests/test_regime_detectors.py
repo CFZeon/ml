@@ -8,6 +8,7 @@ from core.regimes.detectors import (
     LiquidityRegimeDetector,
     TrendRegimeDetector,
     VolatilityRegimeDetector,
+    build_compatibility_regime_detector,
     build_regime_detector,
     is_native_regime_detector_spec,
     resolve_authoritative_regime_detector_spec,
@@ -135,6 +136,31 @@ class RegimeDetectorsTest(unittest.TestCase):
                     ]
                 }
             )
+
+    def test_compatibility_detector_emits_canonical_identity_registry(self):
+        index = pd.date_range("2026-08-01", periods=48, freq="1h", tz="UTC")
+        observations = _make_observations(index)
+        detector = build_compatibility_regime_detector({"method": "explicit", "column_name": "regime"})
+        detector.fit(observations)
+        manifest = detector.manifest().to_dict()
+        taxonomy_registry = dict(manifest.get("metadata") or {}).get("taxonomy_registry") or {}
+
+        runtime_state = detector.initialize(observations)
+        runtime_state, contract = detector.update(
+            runtime_state,
+            RegimeObservationContract(
+                as_of=index[0],
+                available_at=index[0],
+                values=observations.iloc[0].to_dict(),
+                source_map={column: "instrument_state" for column in observations.columns},
+            ),
+        )
+
+        self.assertEqual(dict(manifest.get("metadata") or {}).get("compatibility_mode"), "canonical_explicit")
+        self.assertEqual(taxonomy_registry.get("identity_basis"), "explicit_bucket_state")
+        self.assertTrue(dict(taxonomy_registry.get("state_map") or {}))
+        self.assertIn("canonical_regime_id", contract.detector_outputs)
+        self.assertEqual(contract.metadata.get("canonical_regime_id"), contract.detector_outputs.get("canonical_regime_id"))
 
 
 if __name__ == "__main__":

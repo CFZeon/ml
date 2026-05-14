@@ -471,7 +471,7 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             self.assertFalse(result["structural_invalidation"]["discover_recommended"])
             self.assertTrue(result["structural_invalidation"]["recalibrate_recommended"])
             self.assertEqual(result["action_report"]["recommended_action"], "recalibrate")
-            self.assertEqual(result["retrain_status"], "not_recommended")
+            self.assertEqual(result["retrain_status"], "recalibration_recommended")
             self.assertEqual(build_calls, [])
 
     def test_model_ttl_expiry_can_promote_challenger_without_drift_signals(self):
@@ -496,9 +496,9 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             )
 
             self.assertTrue(result["drift_report"]["model_ttl_expired"])
-            self.assertIn("ttl_without_material_drift", result["drift_guardrails"]["reasons"])
-            self.assertEqual(result["action_report"]["recommended_action"], "hold")
-            self.assertEqual(result["retrain_status"], "not_recommended")
+            self.assertTrue(result["drift_guardrails"]["maintenance_refresh_recommended"])
+            self.assertEqual(result["action_report"]["recommended_action"], "maintenance_refresh")
+            self.assertEqual(result["retrain_status"], "maintenance_refresh_recommended")
             self.assertIsNone(result["candidate_version_id"])
             self.assertEqual(store.get_champion("BTCUSDT")["version_id"], champion_id)
 

@@ -411,6 +411,53 @@ class ADWINDetector:
         }
 
 
+def _resolve_drift_recommendation_channels(
+    *,
+    model_ttl_expired,
+    feature_drift,
+    score_drift,
+    action_drift,
+    regime_drift,
+    performance_drift,
+    enough_samples,
+    cooldown_active,
+    evidence_count,
+    min_drift_signals,
+):
+    maintenance_refresh_recommended = bool(model_ttl_expired)
+    drift_investigation_recommended = bool(
+        enough_samples and not cooldown_active and (bool(regime_drift) or bool(feature_drift))
+    )
+    recalibration_recommended = bool(
+        enough_samples and not cooldown_active and (bool(score_drift) or bool(action_drift))
+    )
+    structural_trigger = bool(performance_drift) or bool(feature_drift and action_drift)
+    structural_retrain_recommended = bool(
+        enough_samples
+        and not cooldown_active
+        and structural_trigger
+        and int(evidence_count) >= int(min_drift_signals)
+    )
+
+    recommended_action = "hold"
+    if structural_retrain_recommended:
+        recommended_action = "structural_retrain"
+    elif recalibration_recommended:
+        recommended_action = "recalibration"
+    elif drift_investigation_recommended:
+        recommended_action = "drift_investigation"
+    elif maintenance_refresh_recommended:
+        recommended_action = "maintenance_refresh"
+
+    return {
+        "maintenance_refresh_recommended": maintenance_refresh_recommended,
+        "drift_investigation_recommended": drift_investigation_recommended,
+        "recalibration_recommended": recalibration_recommended,
+        "structural_retrain_recommended": structural_retrain_recommended,
+        "recommended_action": recommended_action,
+    }
+
+
 class DriftMonitor:
     def __init__(self, reference_features, reference_predictions=None, reference_regimes=None, config=None, state=None):
         self.reference_features = _safe_frame(reference_features)
@@ -571,33 +618,48 @@ class DriftMonitor:
         enough_samples = sample_count >= int(self.config["min_samples"])
         evidence_count = int(feature_drift) + int(score_drift) + int(action_drift) + int(regime_drift) + int(performance_drift)
         sufficient_evidence = evidence_count >= int(self.config["min_drift_signals"])
-        ttl_evidence_sufficient = evidence_count >= int(self.config.get("min_ttl_drift_signals", 1))
-        should_retrain = bool(
-            enough_samples
-            and not cooldown_active
-            and (
-                sufficient_evidence
-                or (model_ttl_expired and ttl_evidence_sufficient)
-            )
+        recommendation_channels = _resolve_drift_recommendation_channels(
+            model_ttl_expired=model_ttl_expired,
+            feature_drift=feature_drift,
+            score_drift=score_drift,
+            action_drift=action_drift,
+            regime_drift=regime_drift,
+            performance_drift=performance_drift,
+            enough_samples=enough_samples,
+            cooldown_active=cooldown_active,
+            evidence_count=evidence_count,
+            min_drift_signals=int(self.config["min_drift_signals"]),
         )
+        ttl_evidence_sufficient = bool(model_ttl_expired)
+        should_retrain = bool(recommendation_channels["structural_retrain_recommended"])
 
         reasons = []
         if model_ttl_expired:
             reasons.append("model_ttl_expired")
+        if feature_drift:
+            reasons.append("feature_drift_detected")
         if score_drift:
             reasons.append("score_drift_detected")
         if action_drift:
             reasons.append("action_drift_detected")
+        if regime_drift:
+            reasons.append("regime_drift_detected")
+        if performance_drift:
+            reasons.append("performance_drift_detected")
         if not enough_samples:
             reasons.append("minimum_samples_not_met")
         if cooldown_active:
             reasons.append("cooldown_active")
-        if enough_samples and not sufficient_evidence and not model_ttl_expired:
+        if enough_samples and not sufficient_evidence and not recommendation_channels["structural_retrain_recommended"]:
             reasons.append("insufficient_drift_evidence")
-        if model_ttl_expired and not ttl_evidence_sufficient:
-            reasons.append("ttl_without_material_drift")
-        if should_retrain:
-            reasons.append("retrain_recommended")
+        for field_name in (
+            "maintenance_refresh_recommended",
+            "drift_investigation_recommended",
+            "recalibration_recommended",
+            "structural_retrain_recommended",
+        ):
+            if recommendation_channels[field_name]:
+                reasons.append(field_name)
 
         return {
             "sample_count": sample_count,
@@ -653,6 +715,11 @@ class DriftMonitor:
             "ttl_evidence_sufficient": ttl_evidence_sufficient,
             "recommendation": {
                 "should_retrain": should_retrain,
+                "recommended_action": recommendation_channels["recommended_action"],
+                "maintenance_refresh_recommended": recommendation_channels["maintenance_refresh_recommended"],
+                "drift_investigation_recommended": recommendation_channels["drift_investigation_recommended"],
+                "recalibration_recommended": recommendation_channels["recalibration_recommended"],
+                "structural_retrain_recommended": recommendation_channels["structural_retrain_recommended"],
                 "reasons": reasons,
                 "bars_since_last_retrain": bars_since_last_retrain,
                 "max_bars_between_retrain": max_bars_between_retrain,
@@ -676,26 +743,41 @@ def evaluate_drift_guardrails(drift_report, policy=None):
     model_ttl_expired = bool(report.get("model_ttl_expired", False))
     max_bars_between_retrain = int(policy.get("max_bars_between_retrain", report.get("max_bars_between_retrain") or (24 * 28)))
     cooldown_active = bars_since_last_retrain is not None and int(bars_since_last_retrain) < cooldown_bars and not model_ttl_expired
+    recommendation_channels = _resolve_drift_recommendation_channels(
+        model_ttl_expired=model_ttl_expired,
+        feature_drift=bool(report.get("feature_drift", False)),
+        score_drift=bool(report.get("score_drift", False)),
+        action_drift=bool(report.get("action_drift", False)),
+        regime_drift=bool(report.get("regime_drift", False)),
+        performance_drift=bool(report.get("performance_drift", False)),
+        enough_samples=sample_count >= minimum_samples,
+        cooldown_active=cooldown_active,
+        evidence_count=evidence_count,
+        min_drift_signals=minimum_signal_count,
+    )
     approved = bool(
-        sample_count >= minimum_samples
-        and (
-            evidence_count >= minimum_signal_count
-            or (model_ttl_expired and evidence_count >= minimum_ttl_signal_count)
-        )
-        and not cooldown_active
-        and bool(report.get("recommendation", {}).get("should_retrain", False))
+        recommendation_channels["maintenance_refresh_recommended"]
+        or recommendation_channels["drift_investigation_recommended"]
+        or recommendation_channels["recalibration_recommended"]
+        or recommendation_channels["structural_retrain_recommended"]
     )
     reasons = []
     if model_ttl_expired:
         reasons.append("model_ttl_expired")
     if sample_count < minimum_samples:
         reasons.append("minimum_samples_not_met")
-    if evidence_count < minimum_signal_count and not model_ttl_expired:
+    if evidence_count < minimum_signal_count and not recommendation_channels["structural_retrain_recommended"]:
         reasons.append("insufficient_drift_evidence")
-    if model_ttl_expired and evidence_count < minimum_ttl_signal_count:
-        reasons.append("ttl_without_material_drift")
     if cooldown_active:
         reasons.append("cooldown_active")
+    for field_name in (
+        "maintenance_refresh_recommended",
+        "drift_investigation_recommended",
+        "recalibration_recommended",
+        "structural_retrain_recommended",
+    ):
+        if recommendation_channels[field_name]:
+            reasons.append(field_name)
     if approved:
         reasons.append("approved")
     return {
@@ -711,6 +793,11 @@ def evaluate_drift_guardrails(drift_report, policy=None):
         "min_ttl_drift_signals": minimum_ttl_signal_count,
         "max_bars_between_retrain": max_bars_between_retrain,
         "trade_rate_min_samples": policy.get("trade_rate_min_samples"),
+        "recommended_action": recommendation_channels["recommended_action"],
+        "maintenance_refresh_recommended": recommendation_channels["maintenance_refresh_recommended"],
+        "drift_investigation_recommended": recommendation_channels["drift_investigation_recommended"],
+        "recalibration_recommended": recommendation_channels["recalibration_recommended"],
+        "structural_retrain_recommended": recommendation_channels["structural_retrain_recommended"],
     }
 
 

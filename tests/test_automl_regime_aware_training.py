@@ -161,6 +161,10 @@ class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
         self.assertTrue(regime_summary["enabled"])
         self.assertEqual(regime_summary["strategy"], "feature")
         self.assertGreater(len(regime_summary["folds"]), 0)
+        self.assertEqual(
+            regime_summary["folds"][0]["training_report"]["regime_surface_type"],
+            "admissible_regime_surface",
+        )
         self.assertGreater(len(training["oos_predictions"]), 0)
         coverage_summary = training["regime"]["coverage_summary"]
         self.assertIsNotNone(coverage_summary["fit_ok_share"])

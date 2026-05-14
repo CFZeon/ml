@@ -96,6 +96,7 @@ from .regimes.observations import (
     resolve_pipeline_regime_observation_feature_set,
 )
 from .regimes.online_state import replay_regime_detector_trace, slice_regime_state_contracts
+from .regimes.online_state import build_admissible_regime_view
 from .readiness import (
     build_deployment_readiness_report,
     build_operational_limits_report,
@@ -114,7 +115,12 @@ from .regime_training import (
     summarize_regime_coverage,
     train_regime_aware_model,
 )
-from .routing import RoutingDecisionContract, build_router, replay_router_trace
+from .routing import (
+    RoutingDecisionContract,
+    build_admissible_router_regime_trace,
+    build_router,
+    replay_router_trace,
+)
 from .slippage import (
     DepthCurveImpactModel,
     FillAwareCostModel,
@@ -550,14 +556,22 @@ def _route_signal_state_with_router(
     if not prepared_surfaces:
         return base_signal_state, None
 
+    aligned_trace = build_admissible_router_regime_trace(regime_states, index)
     trace = replay_router_trace(
         router,
         specialist_library,
-        regime_states,
+        aligned_trace["regime_states"],
         specialist_health_trace=specialist_health_trace,
+        decision_timestamps=index,
     )
     decision_trace = list(trace.get("decision_trace") or [])
-    if len(decision_trace) != len(index):
+    decision_by_timestamp = {}
+    for payload in decision_trace:
+        decision_timestamp = payload.get("decision_timestamp")
+        if decision_timestamp is None:
+            continue
+        decision_by_timestamp[pd.Timestamp(decision_timestamp)] = payload
+    if not decision_by_timestamp and len(decision_trace) != len(index):
         return base_signal_state, None
 
     base_series = {field_name: _as_float_series(base_signal_state.get(field_name), index) for field_name in fields}
@@ -581,7 +595,15 @@ def _route_signal_state_with_router(
         fallback_model_id = getattr(specialist_library, "fallback_model_id", None)
     fallback_model_id = None if fallback_model_id is None else str(fallback_model_id)
 
-    for loc, decision_payload in enumerate(decision_trace):
+    for loc, timestamp in enumerate(index):
+        decision_payload = decision_by_timestamp.get(pd.Timestamp(timestamp))
+        if decision_payload is None:
+            if loc >= len(decision_trace):
+                missing_surface_rows += 1
+                for field_name in fields:
+                    routed[field_name].iloc[loc] = float(base_series[field_name].iloc[loc])
+                continue
+            decision_payload = decision_trace[loc]
         decision = (
             decision_payload
             if isinstance(decision_payload, RoutingDecisionContract)
@@ -687,6 +709,7 @@ def _route_signal_state_with_router(
         "manifest": dict(trace.get("manifest") or {}),
         "summary": {
             **dict(trace.get("summary") or {}),
+            "alignment": dict(aligned_trace.get("alignment") or {}),
             "binding_mode": "executed_signals",
             "missing_surface_rows": int(missing_surface_rows),
             "weighted_rows": int(weighted_rows),
@@ -1411,16 +1434,34 @@ def _resolve_lookahead_guard_config(pipeline):
     backtest_config = pipeline.section("backtest")
     evaluation_mode = resolve_evaluation_mode(backtest_config)
     automl_config = pipeline.section("automl")
+    model_config = pipeline.section("model")
+    regime_config = pipeline.section("regime")
     builders = list(features_config.get("builders") or [])
     configured = copy.deepcopy(features_config.get("lookahead_guard") or {})
+    regime_aware_config = _resolve_regime_aware_config(model_config)
+    router_config = _resolve_pipeline_router_config(pipeline)
+    feature_adaptation_config = dict(
+        regime_aware_config.get("feature_adaptation")
+        or pipeline.section("feature_adaptation")
+        or {}
+    )
 
     automl_enabled = bool(automl_config.get("enabled", False))
-    full_causal_surface = bool(evaluation_mode.is_capital_facing or automl_enabled)
+    regime_detection_enabled = bool(regime_config) and str(regime_config.get("method") or "").strip().lower() not in {"", "none", "disabled"}
+    regime_aware_enabled = bool(regime_aware_config.get("enabled"))
+    router_enabled = bool(router_config)
+    regime_conditioned_feature_adaptation = bool(feature_adaptation_config)
+    full_causal_surface = bool(
+        evaluation_mode.is_capital_facing
+        or automl_enabled
+        or regime_detection_enabled
+        or regime_aware_enabled
+        or router_enabled
+        or regime_conditioned_feature_adaptation
+    )
     default_enabled = True
     enabled = bool(configured.get("enabled", default_enabled))
-    default_mode = "blocking" if default_enabled else "advisory"
-    if not (evaluation_mode.is_capital_facing or automl_enabled or builders):
-        default_mode = "advisory"
+    default_mode = "blocking" if (evaluation_mode.is_capital_facing or automl_enabled) else "advisory"
     mode = str(configured.get("mode", default_mode)).strip().lower()
     if mode not in {"blocking", "advisory"}:
         mode = default_mode
@@ -1440,6 +1481,8 @@ def _resolve_lookahead_guard_config(pipeline):
         default_artifact_names = [
             "features",
             "regimes",
+            "regime_state_contracts",
+            "admissible_regimes",
             "labels",
             "aligned_labels",
             "oos_probabilities",
@@ -1449,7 +1492,15 @@ def _resolve_lookahead_guard_config(pipeline):
             "execution_prices",
             "execution_volume",
         ]
+        if router_enabled:
+            default_artifact_names.extend(["router_decisions", "routed_signals"])
         default_audit_scope = "full_causal_surface"
+
+    required_evidence_class = (
+        "capital_facing"
+        if evaluation_mode.is_capital_facing
+        else ("promotion_eligible" if automl_enabled else "causal_research")
+    )
 
     return {
         "enabled": enabled,
@@ -1469,11 +1520,52 @@ def _resolve_lookahead_guard_config(pipeline):
         "builder_count": int(len(builders)),
         "trade_ready_mode": evaluation_mode.is_capital_facing,
         "automl_enabled": automl_enabled,
+        "regime_detection_enabled": regime_detection_enabled,
+        "regime_aware_enabled": regime_aware_enabled,
+        "router_enabled": router_enabled,
+        "regime_conditioned_feature_adaptation": regime_conditioned_feature_adaptation,
+        "full_causal_surface_required": full_causal_surface,
+        "required_evidence_class": required_evidence_class,
     }
+
+
+def _resolve_lookahead_guard_evidence_class(guard_config, *, has_bias=False, coverage_reasons=None):
+    coverage_reasons = list(coverage_reasons or [])
+    if has_bias or coverage_reasons:
+        return "preview_only"
+    if bool(guard_config.get("trade_ready_mode", False)):
+        return "capital_facing"
+    if bool(guard_config.get("automl_enabled", False)):
+        return "promotion_eligible"
+    return "causal_research"
 
 
 def _run_pipeline_lookahead_guard(pipeline):
     guard_config = _resolve_lookahead_guard_config(pipeline)
+    if bool(pipeline.state.get("_lookahead_replay_active", False)):
+        report = {
+            **guard_config,
+            "enabled": False,
+            "status": "replay_bypass",
+            "has_bias": False,
+            "promotion_pass": True,
+            "reasons": ["lookahead_guard_replay_bypass"],
+            "biased_columns": [],
+            "biased_artifacts": [],
+            "checked_timestamps": 0,
+            "requested_timestamps": 0,
+            "skipped_timestamps": [],
+            "artifact_report": {},
+            "artifact_reports": {},
+            "requested_step_names": list(guard_config.get("step_names") or []),
+            "requested_artifact_names": list(guard_config.get("artifact_names") or []),
+            "stage_coverage": {},
+            "evidence_class": "preview_only",
+            "evidence_downgrade": None,
+        }
+        pipeline.state["lookahead_guard_report"] = report
+        return report
+    initial_evidence_class = _resolve_lookahead_guard_evidence_class(guard_config)
     report = {
         **guard_config,
         "status": "pending",
@@ -1490,11 +1582,19 @@ def _run_pipeline_lookahead_guard(pipeline):
         "requested_step_names": list(guard_config.get("step_names") or []),
         "requested_artifact_names": list(guard_config.get("artifact_names") or []),
         "stage_coverage": {},
+        "evidence_class": initial_evidence_class,
+        "evidence_downgrade": None,
     }
     if not guard_config["enabled"]:
         report["status"] = "disabled"
         report["promotion_pass"] = False
         report["reasons"] = ["lookahead_guard_disabled"]
+        report["evidence_class"] = "preview_only"
+        report["evidence_downgrade"] = {
+            "required": report.get("required_evidence_class", "causal_research"),
+            "actual": "preview_only",
+            "reason": "lookahead_guard_disabled",
+        }
         pipeline.state["lookahead_guard_report"] = report
         return report
 
@@ -1517,9 +1617,11 @@ def _run_pipeline_lookahead_guard(pipeline):
         ]
     report["stage_coverage"] = {
         "requested_steps": list(report["requested_step_names"]),
+        "audited_steps": list(available_step_names),
         "available_steps": list(available_step_names),
         "missing_steps": list(missing_step_names),
         "requested_artifacts": list(report["requested_artifact_names"]),
+        "audited_artifacts": [],
         "available_artifacts": [],
         "missing_artifacts": [],
     }
@@ -1528,18 +1630,51 @@ def _run_pipeline_lookahead_guard(pipeline):
         report["status"] = "skipped"
         report["promotion_pass"] = False
         report["reasons"] = ["lookahead_guard_skipped"]
+        report["evidence_class"] = "preview_only"
+        report["evidence_downgrade"] = {
+            "required": report.get("required_evidence_class", "causal_research"),
+            "actual": "preview_only",
+            "reason": "lookahead_guard_skipped",
+        }
         pipeline.state["lookahead_guard_report"] = report
         return report
 
     from .lookahead import run_lookahead_analysis
 
-    audit = run_lookahead_analysis(
-        pipeline,
-        step_names=available_step_names,
-        artifact_names=guard_config["artifact_names"],
-        sample_count=guard_config["decision_sample_size"],
-        min_prefix_rows=guard_config["min_prefix_rows"],
-    )
+    try:
+        audit = run_lookahead_analysis(
+            pipeline,
+            step_names=available_step_names,
+            artifact_names=guard_config["artifact_names"],
+            sample_count=guard_config["decision_sample_size"],
+            min_prefix_rows=guard_config["min_prefix_rows"],
+        )
+    except Exception as exc:
+        baseline_reason = f"lookahead_guard_baseline_unavailable:{type(exc).__name__}"
+        stage_coverage = dict(report.get("stage_coverage") or {})
+        stage_coverage["audited_steps"] = list(available_step_names)
+        stage_coverage["audited_artifacts"] = []
+        stage_coverage["missing_artifacts"] = list(report.get("requested_artifact_names") or [])
+        report.update(
+            {
+                "status": "unavailable",
+                "promotion_pass": False,
+                "reasons": [baseline_reason],
+                "baseline_error": str(exc),
+                "available_artifact_names": [],
+                "missing_artifact_names": list(report.get("requested_artifact_names") or []),
+                "stage_coverage": stage_coverage,
+                "audit": {"reason": "baseline_replay_failed", "error": str(exc)},
+                "evidence_class": "preview_only",
+                "evidence_downgrade": {
+                    "required": str(guard_config.get("required_evidence_class") or "causal_research"),
+                    "actual": "preview_only",
+                    "reasons": [baseline_reason],
+                },
+            }
+        )
+        pipeline.state["lookahead_guard_report"] = report
+        return report
 
     artifact_reports = dict(audit.get("artifacts") or {})
     biased_entries = list(audit.get("biased_columns") or [])
@@ -1573,11 +1708,26 @@ def _run_pipeline_lookahead_guard(pipeline):
         for artifact_name in missing_artifact_names
     )
     stage_coverage = dict(report.get("stage_coverage") or {})
+    stage_coverage["audited_steps"] = list(available_step_names)
+    stage_coverage["audited_artifacts"] = list(available_artifact_names)
     stage_coverage["available_artifacts"] = list(available_artifact_names)
     stage_coverage["missing_artifacts"] = list(missing_artifact_names)
 
-    coverage_blocks = bool(guard_config.get("trade_ready_mode", False) and coverage_reasons)
+    coverage_blocks = bool(coverage_reasons)
     has_bias = bool(audit.get("has_bias", False))
+    evidence_class = _resolve_lookahead_guard_evidence_class(
+        guard_config,
+        has_bias=has_bias,
+        coverage_reasons=coverage_reasons,
+    )
+    required_evidence_class = str(guard_config.get("required_evidence_class") or "causal_research")
+    evidence_downgrade = None
+    if evidence_class != required_evidence_class:
+        evidence_downgrade = {
+            "required": required_evidence_class,
+            "actual": evidence_class,
+            "reasons": [*coverage_reasons, *failure_reasons] or ["lookahead_guard_incomplete"],
+        }
 
     report.update(
         {
@@ -1608,6 +1758,8 @@ def _run_pipeline_lookahead_guard(pipeline):
             "missing_artifact_names": missing_artifact_names,
             "stage_coverage": stage_coverage,
             "audit": audit,
+            "evidence_class": evidence_class,
+            "evidence_downgrade": evidence_downgrade,
         }
     )
     pipeline.state["lookahead_guard_report"] = report
@@ -4511,12 +4663,21 @@ def _train_inner_meta_model(
     resolved_regime_aware = _resolve_regime_aware_config(
         {"regime_aware": regime_aware_config or model_config.get("regime_aware")}
     )
-    regime_frame = pd.DataFrame(regime_data).reindex(X_train.index) if regime_data is not None else None
+    regime_column = resolved_regime_aware.get("regime_column", "regime")
     resolved_state_contracts = (
         slice_regime_state_contracts(regime_state_contracts, X_train.index)
         if regime_state_contracts is not None
         else None
     )
+    regime_frame = None
+    if resolved_state_contracts is not None:
+        regime_frame = build_admissible_regime_view(
+            resolved_state_contracts,
+            index=X_train.index,
+            column_name=regime_column,
+        )
+    elif regime_data is not None:
+        regime_frame = pd.DataFrame(regime_data).reindex(X_train.index)
 
     for inner_train_idx, inner_test_idx in walk_forward_split(
         X_train,
@@ -5666,14 +5827,38 @@ class TrainModelsStep(PipelineStep):
             if X_val is not None and X_val.empty:
                 X_val, y_val, labels_val = None, None, None
 
-            fit_regime_view = regime_frame.reindex(X_fit.index) if not regime_frame.empty else pd.DataFrame(index=X_fit.index)
-            val_regime_view = (
-                regime_frame.reindex(X_val.index)
-                if X_val is not None and not regime_frame.empty
-                else pd.DataFrame(index=X_val.index if X_val is not None else pd.Index([], dtype=object))
-            )
-            test_regime_view = regime_frame.reindex(X_test.index) if not regime_frame.empty else pd.DataFrame(index=X_test.index)
             fold_regime_state_contracts = list(regime_details.get("state_contracts") or [])
+            fit_regime_view = (
+                build_admissible_regime_view(
+                    slice_regime_state_contracts(fold_regime_state_contracts, X_fit.index),
+                    index=X_fit.index,
+                    column_name=regime_aware_config.get("regime_column", "regime"),
+                )
+                if fold_regime_state_contracts
+                else (regime_frame.reindex(X_fit.index) if not regime_frame.empty else pd.DataFrame(index=X_fit.index))
+            )
+            val_regime_view = (
+                build_admissible_regime_view(
+                    slice_regime_state_contracts(fold_regime_state_contracts, X_val.index),
+                    index=X_val.index,
+                    column_name=regime_aware_config.get("regime_column", "regime"),
+                )
+                if X_val is not None and fold_regime_state_contracts
+                else (
+                    regime_frame.reindex(X_val.index)
+                    if X_val is not None and not regime_frame.empty
+                    else pd.DataFrame(index=X_val.index if X_val is not None else pd.Index([], dtype=object))
+                )
+            )
+            test_regime_view = (
+                build_admissible_regime_view(
+                    slice_regime_state_contracts(fold_regime_state_contracts, X_test.index),
+                    index=X_test.index,
+                    column_name=regime_aware_config.get("regime_column", "regime"),
+                )
+                if fold_regime_state_contracts
+                else (regime_frame.reindex(X_test.index) if not regime_frame.empty else pd.DataFrame(index=X_test.index))
+            )
 
             adaptation_result = apply_feature_adaptation_to_splits(
                 X_fit,
@@ -5790,7 +5975,7 @@ class TrainModelsStep(PipelineStep):
                 X_fit_model,
                 y_fit,
                 feature_metadata=fold_feature_metadata,
-                regime_data=regime_frame.reindex(X_fit_model.index) if not regime_frame.empty else None,
+                regime_data=fit_regime_view if not fit_regime_view.empty else None,
                 config=pipeline.section("feature_governance"),
                 candidate_order=selected_columns,
             )
@@ -5851,7 +6036,7 @@ class TrainModelsStep(PipelineStep):
                 model, regime_training_report = train_regime_aware_model(
                     X_train_primary,
                     y_train_primary,
-                    train_regime_view,
+                    fit_regime_states if fit_regime_states else train_regime_view,
                     strategy=regime_aware_config.get("strategy", "feature"),
                     model_type=config.get("type", "gbm"),
                     model_params=config.get("params"),
@@ -6052,7 +6237,7 @@ class TrainModelsStep(PipelineStep):
                     cutoff_timestamp=cutoff_timestamp,
                 ),
                 context_frame=meta_context_frame.reindex(X_fit_model.index) if meta_context_frame is not None else None,
-                regime_data=fit_regime_view if not fit_regime_view.empty else None,
+                regime_data=fit_regime_states if fit_regime_states else (fit_regime_view if not fit_regime_view.empty else None),
                 regime_state_contracts=fit_regime_states,
                 regime_aware_config=regime_training_config,
                 feature_lag_bars=feature_lag_bars,
@@ -6773,6 +6958,8 @@ class TrainModelsStep(PipelineStep):
             "data_certification": data_certification_report,
             "signal_decay": signal_decay,
             "lookahead_guard": lookahead_guard_report,
+            "research_evidence_class": str(lookahead_guard_report.get("evidence_class") or "preview_only"),
+            "evidence_downgrade": copy.deepcopy(lookahead_guard_report.get("evidence_downgrade")),
             "feature_governance": {
                 "mode": "fold_local",
                 "retirement": pipeline.state.get("feature_retirement", {}),
@@ -6794,6 +6981,7 @@ class TrainModelsStep(PipelineStep):
             "regime": {
                 "mode": "fold_local",
                 "evidence_class": "fold_local_oos",
+                "research_evidence_class": str(lookahead_guard_report.get("evidence_class") or "preview_only"),
                 "preview_artifact": preview_regime_artifact,
                 "ablation_summary": regime_ablation_summary,
                 "folds": fold_regime,

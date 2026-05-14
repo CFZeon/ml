@@ -311,11 +311,10 @@ def _evaluate_structural_invalidation_policy(drift_report, drift_guardrails, *, 
     policy = dict(policy or {})
     report = dict(drift_report or {})
     guardrails = dict(drift_guardrails or {})
+    recommendation = dict(report.get("recommendation") or {})
     approved = bool(guardrails.get("approved", False))
 
     structural_reasons = []
-    if bool(policy.get("allow_model_ttl_expiry", True)) and bool(report.get("model_ttl_expired", False)):
-        structural_reasons.append("model_ttl_expired")
     if bool(policy.get("allow_performance_drift", True)) and bool(report.get("performance_drift", False)):
         structural_reasons.append("performance_drift_detected")
     if (
@@ -325,29 +324,65 @@ def _evaluate_structural_invalidation_policy(drift_report, drift_guardrails, *, 
     ):
         structural_reasons.append("joint_feature_action_drift_detected")
 
+    maintenance_reasons = []
+    if bool(policy.get("allow_model_ttl_expiry", True)) and bool(recommendation.get("maintenance_refresh_recommended", False)):
+        maintenance_reasons.append("model_ttl_expired")
+
     discovery_reasons = []
-    if not structural_reasons:
-        if bool(policy.get("discover_on_regime_drift", True)) and bool(report.get("regime_drift", False)):
-            discovery_reasons.append("regime_drift_detected")
-        if bool(policy.get("discover_on_feature_drift", True)) and bool(report.get("feature_drift", False)):
-            discovery_reasons.append("feature_drift_detected")
+    if bool(policy.get("discover_on_regime_drift", True)) and bool(report.get("regime_drift", False)):
+        discovery_reasons.append("regime_drift_detected")
+    if bool(policy.get("discover_on_feature_drift", True)) and bool(report.get("feature_drift", False)):
+        discovery_reasons.append("feature_drift_detected")
 
     calibration_reasons = []
-    if not structural_reasons and not discovery_reasons:
-        if bool(policy.get("recalibrate_on_score_drift", True)) and bool(report.get("score_drift", False)):
-            calibration_reasons.append("score_drift_detected")
-        if bool(policy.get("recalibrate_on_action_drift", True)) and bool(report.get("action_drift", False)):
-            calibration_reasons.append("action_drift_detected")
+    if bool(policy.get("recalibrate_on_score_drift", True)) and bool(report.get("score_drift", False)):
+        calibration_reasons.append("score_drift_detected")
+    if bool(policy.get("recalibrate_on_action_drift", True)) and bool(report.get("action_drift", False)):
+        calibration_reasons.append("action_drift_detected")
 
     observe_reasons = []
-    if not structural_reasons and not discovery_reasons and not calibration_reasons and int(report.get("evidence_count") or 0) > 0:
+    if (
+        not structural_reasons
+        and not discovery_reasons
+        and not calibration_reasons
+        and not maintenance_reasons
+        and int(report.get("evidence_count") or 0) > 0
+    ):
         observe_reasons.append("drift_observe_only")
 
-    retrain_recommended = bool(approved and structural_reasons)
-    discover_recommended = bool(approved and not retrain_recommended and discovery_reasons)
-    recalibrate_recommended = bool(approved and not retrain_recommended and not discover_recommended and calibration_reasons)
+    retrain_recommended = bool(
+        approved
+        and bool(guardrails.get("structural_retrain_recommended", recommendation.get("structural_retrain_recommended", False)))
+        and structural_reasons
+    )
+    discover_recommended = bool(
+        approved
+        and not retrain_recommended
+        and bool(guardrails.get("drift_investigation_recommended", recommendation.get("drift_investigation_recommended", False)))
+        and discovery_reasons
+    )
+    recalibrate_recommended = bool(
+        approved
+        and not retrain_recommended
+        and not discover_recommended
+        and bool(guardrails.get("recalibration_recommended", recommendation.get("recalibration_recommended", False)))
+        and calibration_reasons
+    )
+    maintenance_refresh_recommended = bool(
+        approved
+        and not retrain_recommended
+        and not discover_recommended
+        and not recalibrate_recommended
+        and bool(guardrails.get("maintenance_refresh_recommended", recommendation.get("maintenance_refresh_recommended", False)))
+        and maintenance_reasons
+    )
     observe_recommended = bool(
-        approved and not retrain_recommended and not discover_recommended and not recalibrate_recommended and observe_reasons
+        approved
+        and not retrain_recommended
+        and not discover_recommended
+        and not recalibrate_recommended
+        and not maintenance_refresh_recommended
+        and observe_reasons
     )
 
     return {
@@ -356,6 +391,7 @@ def _evaluate_structural_invalidation_policy(drift_report, drift_guardrails, *, 
         "retrain_recommended": retrain_recommended,
         "discover_recommended": discover_recommended,
         "recalibrate_recommended": recalibrate_recommended,
+        "maintenance_refresh_recommended": maintenance_refresh_recommended,
         "observe_recommended": observe_recommended,
         "action": (
             "retrain"
@@ -364,6 +400,8 @@ def _evaluate_structural_invalidation_policy(drift_report, drift_guardrails, *, 
             if discover_recommended
             else "recalibrate"
             if recalibrate_recommended
+            else "maintenance_refresh"
+            if maintenance_refresh_recommended
             else "observe"
             if observe_recommended
             else "hold"
@@ -375,11 +413,14 @@ def _evaluate_structural_invalidation_policy(drift_report, drift_guardrails, *, 
             if discover_recommended
             else calibration_reasons
             if recalibrate_recommended
+            else maintenance_reasons
+            if maintenance_refresh_recommended
             else observe_reasons
         ),
         "structural_reasons": structural_reasons,
         "discovery_reasons": discovery_reasons,
         "calibration_reasons": calibration_reasons,
+        "maintenance_reasons": maintenance_reasons,
         "observe_reasons": observe_reasons,
     }
 
@@ -408,6 +449,12 @@ def _resolve_drift_action_report(*, library_review, router_recalibration, struct
             "recommended_action": "recalibrate",
             "source": "structural_invalidation",
             "reasons": list(structural_invalidation.get("calibration_reasons") or []),
+        }
+    if bool(structural_invalidation.get("maintenance_refresh_recommended", False)):
+        return {
+            "recommended_action": "maintenance_refresh",
+            "source": "structural_invalidation",
+            "reasons": list(structural_invalidation.get("maintenance_reasons") or []),
         }
     if bool(structural_invalidation.get("retrain_recommended", False)):
         return {
@@ -539,16 +586,26 @@ def run_drift_retraining_cycle(
             "status": "not_required",
         },
     }
+    if library_review.get("recommended", False):
+        result["retrain_status"] = "library_review_recommended"
+        return result
+
+    if router_recalibration.get("recommended", False):
+        result["retrain_status"] = "router_recalibration_recommended"
+        return result
+
     if not drift_guardrails.get("approved", False):
-        if library_review.get("recommended", False):
-            result["retrain_status"] = "library_review_recommended"
-        elif router_recalibration.get("recommended", False):
-            result["retrain_status"] = "router_recalibration_recommended"
+        return result
+
+    if structural_invalidation.get("maintenance_refresh_recommended", False):
+        result["retrain_status"] = "maintenance_refresh_recommended"
         return result
 
     if not structural_invalidation.get("retrain_recommended", False):
         if structural_invalidation.get("discover_recommended", False):
             result["retrain_status"] = "discovery_recommended"
+        elif structural_invalidation.get("recalibrate_recommended", False):
+            result["retrain_status"] = "recalibration_recommended"
         return result
 
     if not scheduled_window_open:

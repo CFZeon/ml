@@ -45,7 +45,9 @@ class DriftMonitoringTest(unittest.TestCase):
         self.assertTrue(report["prediction_drift"])
         self.assertFalse(report["recommendation"]["should_retrain"])
         self.assertIn("minimum_samples_not_met", report["recommendation"]["reasons"])
-        self.assertFalse(guardrails["approved"])
+        self.assertTrue(guardrails["approved"])
+        self.assertFalse(guardrails["structural_retrain_recommended"])
+        self.assertEqual(guardrails["recommended_action"], "maintenance_refresh")
 
     def test_model_ttl_expiry_can_force_retrain_without_drift_signals(self):
         reference_index = pd.date_range("2026-10-01", periods=300, freq="1h", tz="UTC")
@@ -76,9 +78,14 @@ class DriftMonitoringTest(unittest.TestCase):
         self.assertFalse(report["prediction_drift"])
         self.assertFalse(report["performance_drift"])
         self.assertTrue(report["model_ttl_expired"])
-        self.assertTrue(report["recommendation"]["should_retrain"])
+        self.assertFalse(report["recommendation"]["should_retrain"])
+        self.assertEqual(report["recommendation"]["recommended_action"], "maintenance_refresh")
+        self.assertTrue(report["recommendation"]["maintenance_refresh_recommended"])
+        self.assertFalse(report["recommendation"]["structural_retrain_recommended"])
         self.assertIn("model_ttl_expired", report["recommendation"]["reasons"])
         self.assertTrue(guardrails["approved"])
+        self.assertEqual(guardrails["recommended_action"], "maintenance_refresh")
+        self.assertTrue(guardrails["maintenance_refresh_recommended"])
         self.assertIn("model_ttl_expired", guardrails["reasons"])
 
     def test_adwin_detector_or_fallback_flags_abrupt_mean_shift(self):
@@ -173,7 +180,9 @@ class DriftMonitoringTest(unittest.TestCase):
         self.assertFalse(report["feature_drift"])
         self.assertFalse(report["prediction_drift"])
         self.assertGreater(float(report["regime_report"]["distribution"]["psi"]), 0.15)
-        self.assertTrue(report["recommendation"]["should_retrain"])
+        self.assertFalse(report["recommendation"]["should_retrain"])
+        self.assertEqual(report["recommendation"]["recommended_action"], "drift_investigation")
+        self.assertTrue(report["recommendation"]["drift_investigation_recommended"])
 
     def test_score_drift_is_reported_separately_from_action_drift(self):
         reference_index = pd.date_range("2026-10-01", periods=320, freq="1h", tz="UTC")

@@ -75,6 +75,50 @@ class RouterTraceReplayTest(unittest.TestCase):
         self.assertEqual(trace["summary"]["regime_availability_counts"], {"known": 1, "warm": 1, "unavailable": 1})
         self.assertEqual(trace["summary"]["safe_mode_action_counts"], {"fallback_only": 2})
 
+    def test_replay_router_trace_uses_decision_timestamps_for_delayed_regime_recognition(self):
+        router = HardSwitchRouter(hysteresis_margin=0.0, min_persistence_bars=1, cooldown_bars=0)
+        decision_index = [
+            "2026-05-09T00:00:00Z",
+            "2026-05-09T01:00:00Z",
+            "2026-05-09T02:00:00Z",
+        ]
+        regime_states = [
+            RegimeStateContract(
+                as_of=decision_index[0],
+                available_at=decision_index[1],
+                label="bull",
+                confidence=0.9,
+                warm=True,
+                detector_outputs={"timing_blocked": 1},
+                metadata={"availability_state": "timing_blocked"},
+            ),
+            RegimeStateContract(
+                as_of=decision_index[1],
+                available_at=decision_index[1],
+                label="bull",
+                confidence=0.9,
+                warm=True,
+            ),
+            RegimeStateContract(
+                as_of=decision_index[2],
+                available_at=decision_index[2],
+                label="bull",
+                confidence=0.9,
+                warm=True,
+            ),
+        ]
+
+        trace = replay_router_trace(
+            router,
+            _make_router_library(),
+            regime_states,
+            decision_timestamps=decision_index,
+        )
+
+        self.assertEqual(trace["decision_trace"][0]["decision_timestamp"], "2026-05-09T00:00:00+00:00")
+        self.assertEqual(trace["summary"]["regime_availability_counts"]["timing_blocked"], 1)
+        self.assertEqual(trace["decision_trace"][0]["selected_model_id"], "fallback_generalist")
+
 
 if __name__ == "__main__":
     unittest.main()

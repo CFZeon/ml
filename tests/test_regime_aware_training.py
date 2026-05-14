@@ -179,6 +179,39 @@ class RegimeAwareTrainingTest(unittest.TestCase):
         self.assertEqual(inference_report["fallback_rows"], 0)
         self.assertEqual(inference_report["unseen_regimes"], [])
 
+    def test_specialist_training_uses_admissible_regime_surface_for_delayed_contracts(self):
+        X, y, regime_frame = self._make_balanced_dataset(n=120, seed=15)
+        delayed_rows = 6
+        state_contracts = []
+        for position, timestamp in enumerate(regime_frame.index):
+            available_at = timestamp if position >= delayed_rows else regime_frame.index[position + 1]
+            state_contracts.append(
+                RegimeStateContract(
+                    as_of=timestamp,
+                    available_at=available_at,
+                    label=int(regime_frame.loc[timestamp, "regime"]),
+                    recognition_lag_bars=(0 if position >= delayed_rows else 1),
+                    warm=True,
+                )
+            )
+
+        _, report = train_regime_aware_model(
+            X,
+            y,
+            state_contracts,
+            strategy="specialist",
+            model_type="logistic",
+            model_params={"random_state": 7, "max_iter": 400},
+            min_samples_per_regime=10,
+            coverage_config={"max_dominant_share": 1.0, "min_distinct_regimes": 1},
+        )
+
+        self.assertEqual(report["regime_surface_type"], "admissible_regime_surface")
+        self.assertEqual(report["regime_admissibility_policy"], "available_at_decision_time")
+        self.assertEqual(report["timing_blocked_training_rows"], delayed_rows)
+        self.assertEqual(report["unknown_regime_rows"], delayed_rows)
+        self.assertEqual(sum(report["trained_rows_by_regime"].values()), len(X) - delayed_rows)
+
     def test_feature_strategy_rejects_non_identity_feature_adaptation_scaling(self):
         X, y, regime_frame = self._make_balanced_dataset()
 

@@ -7,6 +7,7 @@ import pandas as pd
 
 from .execution import resolve_liquidity_inputs
 from .pipeline import ResearchPipeline, _resolve_backtest_execution_prices, _resolve_backtest_runtime_kwargs
+from .regimes.online_state import build_admissible_regime_view, build_regime_frame_from_state_contracts
 
 
 DEFAULT_LOOKAHEAD_STEPS = [
@@ -23,6 +24,8 @@ DEFAULT_LOOKAHEAD_STEPS = [
 DEFAULT_AUDIT_ARTIFACTS = [
     "features",
     "regimes",
+    "regime_state_contracts",
+    "admissible_regimes",
     "labels",
     "aligned_labels",
     "oos_probabilities",
@@ -113,7 +116,9 @@ def _resolve_step_sequence(base_pipeline, requested_steps):
 def _prepare_pipeline(base_pipeline, pipeline_class=None, end_timestamp=None):
     pipeline_class = pipeline_class or type(base_pipeline) or ResearchPipeline
     replay_pipeline = pipeline_class(copy.deepcopy(base_pipeline.config), steps=_clone_step_definitions(base_pipeline))
+    replay_pipeline.config.setdefault("features", {}).setdefault("lookahead_guard", {})["enabled"] = False
     replay_pipeline.state.update(_seed_replay_state(base_pipeline.state, end_timestamp=end_timestamp))
+    replay_pipeline.state["_lookahead_replay_active"] = True
     return replay_pipeline
 
 
@@ -151,16 +156,64 @@ def _first_frame(*values):
     return None
 
 
+def _router_decision_frame(router_trace_summary):
+    decision_trace = list(dict(router_trace_summary or {}).get("decision_trace") or [])
+    if not decision_trace:
+        return None
+
+    rows = {}
+    for position, decision in enumerate(decision_trace):
+        timestamp = decision.get("decision_timestamp") or decision.get("timestamp")
+        if timestamp is None:
+            timestamp = position
+        metadata = dict(decision.get("metadata") or {})
+        rows[timestamp] = {
+            "selected_model_id": decision.get("selected_model_id"),
+            "route_reason": decision.get("route_reason"),
+            "safe_mode_action": decision.get("safe_mode_action"),
+            "selection_mode": decision.get("selection_mode"),
+            "regime_availability_state": (
+                metadata.get("regime_availability_state")
+                or decision.get("regime_availability_state")
+            ),
+            "selected_weight": decision.get("selected_weight"),
+        }
+    return pd.DataFrame.from_dict(rows, orient="index") if rows else None
+
+
 def _extract_audit_artifacts(pipeline, artifact_names=None):
     artifact_names = list(artifact_names or DEFAULT_AUDIT_ARTIFACTS)
     artifacts = {}
     training = pipeline.state.get("training") or {}
     signals = pipeline.state.get("signals") or {}
     signal_paths = signals.get("paths") if isinstance(signals, dict) else None
+    regime_state_details = pipeline.state.get("regime_state_details") or {}
+    regime_state_contracts = list(regime_state_details.get("state_contracts") or [])
+    regime_state_index = None
+    regime_state_frame = _as_audit_frame(pipeline.state.get("regime_state_frame"), "regime")
+    if regime_state_frame is not None and not regime_state_frame.empty:
+        regime_state_index = regime_state_frame.index
+    elif "regimes" in pipeline.state:
+        regimes_frame = _as_audit_frame(pipeline.state.get("regimes"), "regime")
+        if regimes_frame is not None and not regimes_frame.empty:
+            regime_state_index = regimes_frame.index
+    contract_frame = None
+    admissible_regime_frame = None
+    if regime_state_contracts:
+        contract_frame = build_regime_frame_from_state_contracts(
+            regime_state_contracts,
+            index=regime_state_index,
+        )
+        admissible_regime_frame = build_admissible_regime_view(
+            regime_state_contracts,
+            index=regime_state_index,
+        )
 
     direct_artifacts = {
         "features": ("build_features", _as_audit_frame(pipeline.state.get("features"), "features")),
         "regimes": ("detect_regimes", _as_audit_frame(pipeline.state.get("regimes"), "regime")),
+        "regime_state_contracts": ("detect_regimes", contract_frame),
+        "admissible_regimes": ("detect_regimes", admissible_regime_frame),
         "labels": ("build_labels", _as_audit_frame(pipeline.state.get("labels"), "label")),
         "aligned_labels": ("align_data", _as_audit_frame(pipeline.state.get("labels_aligned"), "label")),
         "oos_probabilities": (
@@ -193,6 +246,19 @@ def _extract_audit_artifacts(pipeline, artifact_names=None):
                 ),
                 _concat_path_frames(signal_paths, "continuous_signals", "continuous_signals"),
             ),
+        ),
+        "routed_signals": (
+            "generate_signals",
+            _first_frame(
+                _as_audit_frame(
+                    signals.get("continuous_signals") if isinstance(signals, dict) and signals.get("router_bound") else None,
+                    "routed_signals",
+                ),
+            ),
+        ),
+        "router_decisions": (
+            "generate_signals",
+            _router_decision_frame(signals.get("router_trace_summary") if isinstance(signals, dict) else None),
         ),
     }
 
