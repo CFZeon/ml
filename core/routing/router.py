@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 
 from ..regimes.contracts import RegimeStateContract
 from ..specialists import (
+    SpecialistEligibilityContract,
     SpecialistHealthContract,
     build_specialist_selection_contract,
     normalize_specialist_library_snapshot,
@@ -16,6 +17,7 @@ from .contracts import RouterManifest, RouterStateSnapshot, RoutingDecisionContr
 
 _VALID_SAFE_MODE_POLICIES = {"fallback_only", "no_trade"}
 _VALID_ALLOCATION_MODES = {"selection_only", "mixture_allocation"}
+_VALID_EXECUTION_POLICIES = {"relaxed_missing_health", "fallback_only_until_health_binding"}
 
 
 def _coerce_float(value: Any, default: float = 0.0) -> float:
@@ -45,6 +47,23 @@ def _normalize_regime_state(regime_state: Any, *, timestamp: Any) -> RegimeState
     return RegimeStateContract(as_of=timestamp, available_at=timestamp)
 
 
+def _resolve_regime_keys(regime_state: RegimeStateContract) -> list[str]:
+    keys = []
+    for payload in (dict(regime_state.detector_outputs or {}), dict(regime_state.metadata or {})):
+        for field_name in ("canonical_regime_id", "routing_regime_id", "regime_id"):
+            value = payload.get(field_name)
+            if value is None:
+                continue
+            normalized = str(value)
+            if normalized and normalized not in keys:
+                keys.append(normalized)
+    if regime_state.label is not None:
+        normalized_label = str(regime_state.label)
+        if normalized_label and normalized_label not in keys:
+            keys.append(normalized_label)
+    return keys
+
+
 def _normalize_safe_mode_policy(value: Any) -> str:
     policy = str(value or "fallback_only").strip().lower()
     if policy not in _VALID_SAFE_MODE_POLICIES:
@@ -57,6 +76,13 @@ def _normalize_allocation_mode(value: Any) -> str:
     if mode not in _VALID_ALLOCATION_MODES:
         return "mixture_allocation"
     return mode
+
+
+def _normalize_execution_policy(value: Any) -> str:
+    policy = str(value or "relaxed_missing_health").strip().lower()
+    if policy not in _VALID_EXECUTION_POLICIES:
+        return "relaxed_missing_health"
+    return policy
 
 
 def _classify_regime_availability(regime_state: RegimeStateContract) -> str:
@@ -93,6 +119,31 @@ def _normalize_specialist_health_map(
         contract = item if isinstance(item, SpecialistHealthContract) else SpecialistHealthContract.from_dict(item)
         base_map[str(contract.model_id)] = contract
     return base_map
+
+
+def _has_resolved_health_evidence(health: SpecialistHealthContract | None, metadata: Mapping[str, Any] | None = None) -> bool:
+    if health is None:
+        return False
+    metadata = dict(metadata or {})
+    if metadata.get("health_binding_resolved") is True:
+        return True
+    if metadata.get("health_binding_resolved") is False:
+        return False
+    if health.stability_score is not None or health.decay_score is not None:
+        return True
+    if list(health.failure_flags or []):
+        return True
+    if health.last_calibrated_at is not None:
+        return True
+    evidence_fields = (
+        "health_state",
+        "evidence_window",
+        "sample_count",
+        "metric_basis",
+        "last_refresh_time",
+        "owner_policy",
+    )
+    return any(metadata.get(field_name) not in (None, "", [], {}) for field_name in evidence_fields)
 
 
 def _normalize_weight_map(weights: Mapping[str, float] | None) -> dict[str, float]:
@@ -165,6 +216,7 @@ class _BaseSpecialistRouter:
         failure_flag_penalty: float = 0.2,
         missing_health_score: float = 0.5,
         safe_mode_policy: str = "fallback_only",
+        execution_policy: str = "relaxed_missing_health",
     ):
         self.policy_name = None if policy_name is None else str(policy_name)
         self.hysteresis_margin = float(max(0.0, hysteresis_margin))
@@ -176,6 +228,7 @@ class _BaseSpecialistRouter:
         self.failure_flag_penalty = float(failure_flag_penalty)
         self.missing_health_score = float(missing_health_score)
         self.safe_mode_policy = _normalize_safe_mode_policy(safe_mode_policy)
+        self.execution_policy = _normalize_execution_policy(execution_policy)
         self._snapshot = None
 
     @property
@@ -220,6 +273,7 @@ class _BaseSpecialistRouter:
                 "stability_weight": self.stability_weight,
                 "decay_weight": self.decay_weight,
                 "failure_flag_penalty": self.failure_flag_penalty,
+                "execution_policy": self.execution_policy,
                 "safe_mode_policy": self.safe_mode_policy,
             },
         )
@@ -258,21 +312,26 @@ class _BaseSpecialistRouter:
         health_map: Mapping[str, SpecialistHealthContract],
     ) -> tuple[float, list[RoutingScoreComponent]]:
         selection_contract = self._selection_contract()
+        regime_keys = _resolve_regime_keys(regime_state)
         regime_label = None if regime_state.label is None else str(regime_state.label)
+        routing_regime_key = regime_keys[0] if regime_keys else None
         confidence_kind = str(getattr(regime_state, "confidence_kind", None) or "").strip().lower()
         regime_confidence = 0.0
         if confidence_kind in {"", "posterior", "calibrated_score"}:
             regime_confidence = _coerce_float(regime_state.confidence, 0.0)
         compatible_regimes = list((selection_contract.get("compatible_regimes") or {}).get(str(model_id)) or [])
         if compatible_regimes:
-            compatibility_score = 1.0 if regime_label in compatible_regimes else 0.0
+            compatibility_score = 1.0 if any(key in compatible_regimes for key in regime_keys) else 0.0
         elif self._snapshot and str(model_id) == str(self._snapshot.fallback_model_id):
             compatibility_score = self.fallback_bias
         else:
             compatibility_score = 0.5
 
         health = health_map.get(str(model_id))
-        stability_score = self.missing_health_score if health is None else _coerce_float(health.stability_score, self.missing_health_score)
+        health_metadata = {} if health is None else dict(health.metadata or {})
+        health_binding_resolved = _has_resolved_health_evidence(health, health_metadata)
+        stability_default = 0.0 if self.execution_policy != "relaxed_missing_health" and not health_binding_resolved else self.missing_health_score
+        stability_score = stability_default if health is None else _coerce_float(health.stability_score, stability_default)
         decay_score = 0.0 if health is None else _coerce_float(health.decay_score, 0.0)
         failure_flags = [] if health is None else list(health.failure_flags or [])
         failure_penalty = self.failure_flag_penalty if failure_flags else 0.0
@@ -287,6 +346,8 @@ class _BaseSpecialistRouter:
                 penalized=False,
                 metadata={
                     "regime_label": regime_label,
+                    "routing_regime_key": routing_regime_key,
+                    "regime_keys": regime_keys,
                     "compatible_regimes": compatible_regimes,
                     "confidence_kind": confidence_kind or None,
                 },
@@ -296,6 +357,7 @@ class _BaseSpecialistRouter:
                 value=float(stability_score),
                 weight=float(self.stability_weight),
                 penalized=False,
+                metadata={"health_binding_resolved": bool(health_binding_resolved)},
             ),
             RoutingScoreComponent(
                 name="decay_score",
@@ -321,7 +383,9 @@ class _BaseSpecialistRouter:
     ) -> dict[str, dict[str, Any]]:
         selection_contract = self._selection_contract()
         spec_map = self._specialist_spec_map()
+        regime_keys = _resolve_regime_keys(regime_state)
         regime_label = None if regime_state.label is None else str(regime_state.label)
+        routing_regime_key = regime_keys[0] if regime_keys else None
         lifecycle_state_by_model_id = dict(selection_contract.get("lifecycle_state_by_model_id") or {})
         compatible_regimes_by_model_id = dict(selection_contract.get("compatible_regimes") or {})
         fallback_model_id = None
@@ -335,6 +399,7 @@ class _BaseSpecialistRouter:
             spec_metadata = dict((spec.metadata or {}) if spec is not None else {})
             health = health_map.get(resolved_model_id)
             health_metadata = dict((health.metadata or {}) if health is not None else {})
+            health_binding_resolved = _has_resolved_health_evidence(health, health_metadata)
             lifecycle_state = str(
                 lifecycle_state_by_model_id.get(resolved_model_id)
                 or spec_metadata.get("lifecycle_state")
@@ -364,33 +429,51 @@ class _BaseSpecialistRouter:
             reasons = []
             if lifecycle_state == "retired":
                 reasons.append("lifecycle_retired")
+            if not is_fallback and self.execution_policy != "relaxed_missing_health" and lifecycle_state == "candidate":
+                reasons.append("lifecycle_candidate")
+            if not is_fallback and self.execution_policy != "relaxed_missing_health" and lifecycle_state == "shadow_challenger":
+                reasons.append("lifecycle_shadow_challenger")
             if not is_fallback and lifecycle_state == "degraded":
                 reasons.append("lifecycle_degraded")
-            if not is_fallback and compatible_regimes and regime_label not in compatible_regimes:
+            if not is_fallback and compatible_regimes and not any(key in compatible_regimes for key in regime_keys):
                 reasons.append("regime_incompatible")
-            if regime_label is not None and regime_label in incompatible_regimes:
+            if incompatible_regimes and any(key in incompatible_regimes for key in regime_keys):
                 reasons.append("regime_explicitly_incompatible")
             if failure_flags:
                 reasons.append("health_failure_flags")
             if health_state in {"failed", "degraded", "blocked"} or bool(health_metadata.get("eligibility_blocked", False)):
                 reasons.append("health_blocked")
+            if not is_fallback and self.execution_policy != "relaxed_missing_health" and not health_binding_resolved:
+                reasons.append("health_unbound")
             if calibration_expired:
                 reasons.append("calibration_expired")
             if not is_fallback and bool(getattr(health, "fallback_only", False)):
                 reasons.append("fallback_only")
 
-            eligibility[resolved_model_id] = {
-                "model_id": resolved_model_id,
-                "eligible": not reasons,
-                "reasons": list(dict.fromkeys(reasons)),
-                "fallback_model": is_fallback,
-                "regime_label": regime_label,
-                "compatible_regimes": compatible_regimes,
-                "lifecycle_state": lifecycle_state,
-                "health_failure_flags": failure_flags,
-                "health_state": None if not health_state else health_state,
-                "calibration_fresh": not calibration_expired,
-            }
+            eligibility[resolved_model_id] = SpecialistEligibilityContract(
+                model_id=resolved_model_id,
+                eligible=not reasons,
+                reasons=list(dict.fromkeys(reasons)),
+                fallback_model=is_fallback,
+                regime_label=regime_label,
+                routing_regime_key=routing_regime_key,
+                compatible_regimes=compatible_regimes,
+                lifecycle_state=lifecycle_state,
+                health_state=None if not health_state else health_state,
+                calibration_fresh=not calibration_expired,
+                health_binding_resolved=bool(health_binding_resolved),
+                metadata={
+                    "regime_keys": regime_keys,
+                    "health_failure_flags": failure_flags,
+                    "execution_policy": self.execution_policy,
+                    "safe_mode_policy": self.safe_mode_policy,
+                    "unknown_health_safe_mode": (
+                        self.safe_mode_policy
+                        if not is_fallback and self.execution_policy != "relaxed_missing_health" and not health_binding_resolved
+                        else None
+                    ),
+                },
+            ).to_dict()
         return eligibility
 
     def _resolve_safe_mode_target(self) -> tuple[str | None, str]:
@@ -950,6 +1033,7 @@ def build_router(config: Mapping[str, Any] | None = None):
         "failure_flag_penalty": _coerce_float(config.get("failure_flag_penalty"), 0.2),
         "missing_health_score": _coerce_float(config.get("missing_health_score"), 0.5),
         "safe_mode_policy": config.get("safe_mode_policy", "fallback_only"),
+        "execution_policy": config.get("execution_policy", "relaxed_missing_health"),
     }
     if router_type in {"hard_switch", "score_router"}:
         return HardSwitchRouter(**common_kwargs)

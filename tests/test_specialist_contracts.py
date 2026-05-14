@@ -68,6 +68,11 @@ class SpecialistContractsTest(unittest.TestCase):
         self.assertEqual(roundtrip.symbol, "BTCUSDT")
         self.assertEqual(roundtrip.timeframe, "1h")
         self.assertEqual(len(roundtrip.specialists), len(snapshot.specialists))
+        specialist_health = next(item for item in health if item.model_id == "specialist::bull")
+        fallback_health = next(item for item in health if item.model_id == "fallback_generalist")
+        self.assertFalse(specialist_health.metadata["health_binding_resolved"])
+        self.assertEqual(specialist_health.metadata["health_state"], "unknown")
+        self.assertTrue(fallback_health.metadata["health_binding_resolved"])
 
     def test_specialist_health_updates_preserve_selection_contract(self):
         snapshot = SpecialistLibrarySnapshot(

@@ -2,6 +2,7 @@
 
 from .contracts import (
     SpecialistArtifactRef,
+    SpecialistEligibilityContract,
     SpecialistHealthContract,
     SpecialistLibrarySnapshot,
     SpecialistLifecycleState,
@@ -44,6 +45,7 @@ __all__ = [
     "project_specialist_library_snapshot",
     "resolve_specialist_lifecycle_transition",
     "SpecialistArtifactRef",
+    "SpecialistEligibilityContract",
     "SpecialistHealthContract",
     "SpecialistLibrarySnapshot",
     "SpecialistLifecycleState",

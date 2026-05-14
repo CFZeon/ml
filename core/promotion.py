@@ -106,6 +106,8 @@ def evaluate_stress_realism_gate(backtest_summary=None, policy=None, regime_awar
     fallback_share = _coerce_float(regime_aware_summary.get("fallback_row_share"))
     if fallback_share is None and fallback_evidence_rows > 0:
         fallback_share = float(fallback_rows) / float(fallback_evidence_rows)
+    unseen_regime_degradation = dict(regime_aware_summary.get("unseen_regime_degradation_report") or {})
+    max_fallback_row_share = _coerce_float(unseen_regime_degradation.get("max_fallback_row_share"))
     candidate_classification = str(regime_aware_summary.get("candidate_classification") or "generalist_only")
     specialist_candidate = str(regime_aware_summary.get("strategy") or "").lower() == "specialist"
 
@@ -116,6 +118,13 @@ def evaluate_stress_realism_gate(backtest_summary=None, policy=None, regime_awar
     max_unseen_regime_fallback_share = _coerce_float(policy.get("max_unseen_regime_fallback_share"))
     if require_unseen_regime_fallback_bound and max_unseen_regime_fallback_share is None and evaluation_mode == "trade_ready":
         max_unseen_regime_fallback_share = 0.35
+    max_single_fold_unseen_regime_fallback_share = _coerce_float(policy.get("max_single_fold_unseen_regime_fallback_share"))
+    if (
+        require_unseen_regime_fallback_bound
+        and max_single_fold_unseen_regime_fallback_share is None
+        and max_unseen_regime_fallback_share is not None
+    ):
+        max_single_fold_unseen_regime_fallback_share = float(max_unseen_regime_fallback_share)
 
     missing_metrics = []
     outcome_breaches = []
@@ -151,6 +160,12 @@ def evaluate_stress_realism_gate(backtest_summary=None, policy=None, regime_awar
             and fallback_share > float(max_unseen_regime_fallback_share)
         ):
             outcome_breaches.append("unseen_regime_fallback_share_above_limit")
+        elif (
+            max_single_fold_unseen_regime_fallback_share is not None
+            and max_fallback_row_share is not None
+            and max_fallback_row_share > float(max_single_fold_unseen_regime_fallback_share)
+        ):
+            outcome_breaches.append("single_fold_unseen_regime_fallback_share_above_limit")
 
     if evaluation_mode != "trade_ready":
         passed = False
@@ -206,6 +221,7 @@ def evaluate_stress_realism_gate(backtest_summary=None, policy=None, regime_awar
             "min_stress_trade_count": min_stress_trade_count,
             "require_unseen_regime_fallback_bound": require_unseen_regime_fallback_bound,
             "max_unseen_regime_fallback_share": max_unseen_regime_fallback_share,
+            "max_single_fold_unseen_regime_fallback_share": max_single_fold_unseen_regime_fallback_share,
         },
         "regime_fallback": {
             "enabled": bool(regime_aware_summary.get("enabled", False)),
@@ -214,7 +230,9 @@ def evaluate_stress_realism_gate(backtest_summary=None, policy=None, regime_awar
             "fallback_rows": fallback_rows,
             "fallback_evidence_rows": fallback_evidence_rows,
             "fallback_share": fallback_share,
+            "max_fallback_row_share": max_fallback_row_share,
             "unseen_regimes": list(regime_aware_summary.get("unseen_regimes") or []),
+            "adaptive_value_report": copy.deepcopy(regime_aware_summary.get("adaptive_value_report") or {}),
         },
         "research_only": not passed,
     }

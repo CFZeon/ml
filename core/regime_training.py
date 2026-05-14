@@ -17,6 +17,12 @@ from .models import (
     train_model,
     walk_forward_split,
 )
+from .regimes.online_state import (
+    build_admissible_regime_view,
+    build_regime_frame_from_state_contracts,
+    normalize_regime_state_contracts,
+    slice_regime_state_contracts,
+)
 from .specialists.library import project_specialist_library_snapshot
 from .specialists.contracts import (
     SpecialistHealthContract,
@@ -34,10 +40,83 @@ def _coerce_regime_frame(regime_data, index=None):
         column_name = regime_data.name or "regime"
         frame = regime_data.to_frame(name=column_name)
     else:
-        frame = pd.DataFrame(regime_data).copy()
+        try:
+            frame = build_regime_frame_from_state_contracts(regime_data)
+        except Exception:
+            frame = pd.DataFrame(regime_data).copy()
     if index is not None:
         frame = frame.reindex(index)
     return frame
+
+
+def _coerce_regime_state_contracts(regime_data, index=None):
+    try:
+        contracts = normalize_regime_state_contracts(regime_data)
+    except Exception:
+        return None
+    if not contracts:
+        return []
+    return slice_regime_state_contracts(contracts, index) if index is not None else contracts
+
+
+def _coerce_inference_regime_frame(regime_data, index=None, column_name="regime"):
+    state_contracts = _coerce_regime_state_contracts(regime_data, index=index)
+    if state_contracts is not None:
+        return build_admissible_regime_view(state_contracts, index=index, column_name=column_name)
+    return _coerce_regime_frame(regime_data, index=index)
+
+
+def _diagnostic_flag_count(regime_frame, column_name, index):
+    if regime_frame is None or regime_frame.empty or column_name not in regime_frame.columns:
+        return 0
+    series = pd.to_numeric(pd.Series(regime_frame[column_name], index=index, copy=False), errors="coerce")
+    return int(series.fillna(0).gt(0).sum())
+
+
+def _resolve_regime_identity_column(regime_frame, preferred_column="regime"):
+    if regime_frame is None or regime_frame.empty:
+        return str(preferred_column or "regime")
+
+    ordered_candidates = []
+    for candidate in ("canonical_regime_id", preferred_column, "regime"):
+        candidate_name = str(candidate or "").strip()
+        if candidate_name and candidate_name not in ordered_candidates:
+            ordered_candidates.append(candidate_name)
+    ordered_candidates.extend(
+        str(column)
+        for column in regime_frame.columns
+        if str(column) not in ordered_candidates
+    )
+
+    for candidate_name in ordered_candidates:
+        if candidate_name not in regime_frame.columns:
+            continue
+        series = pd.Series(regime_frame[candidate_name], copy=False)
+        if series.notna().any():
+            return candidate_name
+    return str(regime_frame.columns[0])
+
+
+def _build_regime_alias_map(regime_frame, identity_column, semantic_column="regime"):
+    if (
+        regime_frame is None
+        or regime_frame.empty
+        or identity_column == semantic_column
+        or identity_column not in regime_frame.columns
+        or semantic_column not in regime_frame.columns
+    ):
+        return {}
+
+    alias_frame = regime_frame.loc[:, [identity_column, semantic_column]].dropna()
+    if alias_frame.empty:
+        return {}
+
+    alias_map = {}
+    for regime_id, rows in alias_frame.groupby(identity_column):
+        aliases = sorted({str(value) for value in rows[semantic_column] if value is not None})
+        if aliases:
+            alias_map[str(regime_id)] = aliases
+    return alias_map
 
 
 def _subset_sampling_metadata(sampling_metadata, index):
@@ -115,7 +194,7 @@ def summarize_regime_coverage(regime_data, regime_column="regime", config=None):
             "reasons": ["regime_data_unavailable"],
         }
 
-    target_column = regime_column if regime_column in regime_frame.columns else regime_frame.columns[0]
+    target_column = _resolve_regime_identity_column(regime_frame, preferred_column=regime_column)
     labels = pd.Series(regime_frame[target_column], copy=False).dropna()
     if labels.empty:
         return {
@@ -126,6 +205,7 @@ def summarize_regime_coverage(regime_data, regime_column="regime", config=None):
             "dominant_regime": None,
             "dominant_share": None,
             "regime_distribution": {},
+            "regime_identity_column": target_column,
             "coverage_ok": False,
             "reasons": ["regime_labels_missing"],
         }
@@ -140,6 +220,14 @@ def summarize_regime_coverage(regime_data, regime_column="regime", config=None):
     if dominant_share > max_dominant_share:
         reasons.append("dominant_regime_exceeds_threshold")
     status = "passed" if not reasons else "failed"
+    semantic_distribution = {}
+    if target_column != regime_column and regime_column in regime_frame.columns:
+        semantic_labels = pd.Series(regime_frame[regime_column], copy=False).dropna()
+        if not semantic_labels.empty:
+            semantic_distribution = {
+                str(key): float(value)
+                for key, value in semantic_labels.value_counts(normalize=True, dropna=True).items()
+            }
     return {
         "status": status,
         "promotion_pass": status == "passed",
@@ -148,6 +236,8 @@ def summarize_regime_coverage(regime_data, regime_column="regime", config=None):
         "dominant_regime": dominant_regime,
         "dominant_share": dominant_share,
         "regime_distribution": {str(key): float(value) for key, value in distribution.items()},
+        "regime_identity_column": target_column,
+        "semantic_regime_distribution": semantic_distribution,
         "coverage_ok": not reasons,
         "reasons": reasons,
     }
@@ -260,7 +350,7 @@ class RegimeAwareModelBundle:
 
     def predict_with_probability_report(self, X, regime_data):
         X_frame = pd.DataFrame(X).copy()
-        regime_frame = _coerce_regime_frame(regime_data, index=X_frame.index)
+        regime_frame = _coerce_inference_regime_frame(regime_data, index=X_frame.index, column_name=self.regime_column)
         if self.strategy == "feature":
             model = self.model
             if model is None:
@@ -281,10 +371,23 @@ class RegimeAwareModelBundle:
         if self.strategy != "specialist":
             raise ValueError(f"Unknown regime-aware strategy={self.strategy!r}")
 
+        identity_column = _resolve_regime_identity_column(regime_frame, preferred_column=self.regime_column)
         labels = pd.Series(
-            regime_frame[self.regime_column] if self.regime_column in regime_frame.columns else regime_frame.iloc[:, 0],
+            regime_frame[identity_column] if identity_column in regime_frame.columns else regime_frame.iloc[:, 0],
             index=X_frame.index,
         ) if not regime_frame.empty else pd.Series(np.nan, index=X_frame.index)
+        alternate_labels = None
+        for candidate_column in (self.regime_column, "regime"):
+            if candidate_column != identity_column and candidate_column in regime_frame.columns:
+                alternate_labels = pd.Series(regime_frame[candidate_column], index=X_frame.index)
+                break
+        alternate_lookup = {}
+        if alternate_labels is not None:
+            alias_frame = pd.DataFrame({"primary": labels, "alternate": alternate_labels}).dropna()
+            for primary_value, rows in alias_frame.groupby("primary"):
+                aliases = [value for value in pd.unique(rows["alternate"]) if value is not None]
+                if aliases:
+                    alternate_lookup[primary_value] = aliases
         fallback_model = self.fallback_model
         if fallback_model is None:
             raise RuntimeError("specialist strategy bundle is missing fallback model")
@@ -292,9 +395,16 @@ class RegimeAwareModelBundle:
         probabilities = pd.DataFrame(0.0, index=X_frame.index, columns=list(self.ordered_classes), dtype=float)
         fallback_rows = 0
         unseen_regimes = []
+        timing_blocked_rows = _diagnostic_flag_count(regime_frame, "timing_blocked", X_frame.index)
+        unavailable_rows = _diagnostic_flag_count(regime_frame, "unavailable", X_frame.index)
 
         for regime_value, row_index in labels.groupby(labels).groups.items():
             model = self.specialist_models.get(regime_value)
+            if model is None:
+                for alternate_value in list(alternate_lookup.get(regime_value) or []):
+                    model = self.specialist_models.get(alternate_value)
+                    if model is not None:
+                        break
             if model is None:
                 model = fallback_model
                 fallback_rows += int(len(row_index))
@@ -325,6 +435,9 @@ class RegimeAwareModelBundle:
             "fallback_rows": int(fallback_rows),
             "fallback_evidence_rows": int(len(X_frame)),
             "fallback_row_share": (None if len(X_frame) <= 0 else round(float(fallback_rows / len(X_frame)), 4)),
+            "regime_identity_column": identity_column,
+            "timing_blocked_rows": int(timing_blocked_rows),
+            "unavailable_rows": int(unavailable_rows),
             "unseen_regimes": sorted({str(value) for value in unseen_regimes}),
             "candidate_classification": (
                 "generalist_only"
@@ -360,6 +473,25 @@ def _resolve_initial_specialist_lifecycle_state(metadata=None):
         if state.value == normalized:
             return state
     raise ValueError(f"Unknown specialist lifecycle_state {configured!r}")
+
+
+def _resolve_regime_binding_metadata(training_report=None, regime_name=None):
+    resolved_report = dict(training_report or {})
+    regime_key = str(regime_name)
+    aliases_by_id = {
+        str(key): [str(item) for item in list(value or [])]
+        for key, value in dict(resolved_report.get("regime_aliases_by_id") or {}).items()
+    }
+    aliases = list(aliases_by_id.get(regime_key) or [])
+    identity_kind = str(resolved_report.get("regime_identity_column") or "regime")
+    metadata = {
+        "routing_regime_id": regime_key,
+        "routing_identity_kind": identity_kind,
+        "regime_label": (aliases[0] if aliases else regime_key),
+    }
+    if aliases:
+        metadata["semantic_labels"] = aliases
+    return metadata
 
 
 def build_specialist_specs_from_bundle(bundle, training_report=None, *, symbol="unknown", timeframe="unknown", metadata=None):
@@ -422,8 +554,8 @@ def build_specialist_specs_from_bundle(bundle, training_report=None, *, symbol="
                 training_window=training_window,
                 metadata={
                     **shared_metadata,
+                    **_resolve_regime_binding_metadata(training_report, regime_name),
                     "bundle_strategy": bundle.strategy,
-                    "regime_label": regime_name,
                     "lifecycle_state": lifecycle_state.value,
                 },
             )
@@ -446,7 +578,13 @@ def build_specialist_health_contracts(bundle, training_report=None, *, metadata=
                 decay_score=None,
                 failure_flags=[],
                 fallback_only=False,
-                metadata={**shared_metadata, "bundle_strategy": bundle.strategy},
+                metadata={
+                    **shared_metadata,
+                    "bundle_strategy": bundle.strategy,
+                    "health_binding_resolved": False,
+                    "health_state": "unknown",
+                    "health_evidence_source": "placeholder_training_summary",
+                },
             )
         )
         return health
@@ -460,7 +598,13 @@ def build_specialist_health_contracts(bundle, training_report=None, *, metadata=
                 decay_score=None,
                 failure_flags=[],
                 fallback_only=True,
-                metadata={**shared_metadata, "bundle_strategy": bundle.strategy},
+                metadata={
+                    **shared_metadata,
+                    "bundle_strategy": bundle.strategy,
+                    "health_binding_resolved": True,
+                    "health_state": "fallback_only",
+                    "health_evidence_source": "fallback_safe_mode",
+                },
             )
         )
 
@@ -474,7 +618,14 @@ def build_specialist_health_contracts(bundle, training_report=None, *, metadata=
                 decay_score=None,
                 failure_flags=[],
                 fallback_only=False,
-                metadata={**shared_metadata, "bundle_strategy": bundle.strategy},
+                metadata={
+                    **shared_metadata,
+                    **_resolve_regime_binding_metadata(training_report, regime_name),
+                    "bundle_strategy": bundle.strategy,
+                    "health_binding_resolved": False,
+                    "health_state": "unknown",
+                    "health_evidence_source": "placeholder_training_summary",
+                },
             )
         )
 
@@ -487,7 +638,15 @@ def build_specialist_health_contracts(bundle, training_report=None, *, metadata=
                 decay_score=None,
                 failure_flags=[str(reason)],
                 fallback_only=False,
-                metadata={**shared_metadata, "bundle_strategy": bundle.strategy, "skipped": True},
+                metadata={
+                    **shared_metadata,
+                    **_resolve_regime_binding_metadata(training_report, regime_name),
+                    "bundle_strategy": bundle.strategy,
+                    "skipped": True,
+                    "health_binding_resolved": False,
+                    "health_state": "unknown",
+                    "health_evidence_source": "placeholder_training_summary",
+                },
             )
         )
     return health
@@ -511,11 +670,15 @@ def build_specialist_library_snapshot(bundle, training_report=None, *, symbol="u
         performance_slices.append(
             SpecialistPerformanceSlice(
                 model_id=f"specialist::{regime_name}",
-                regime_label=regime_name,
+                regime_label=str(_resolve_regime_binding_metadata(training_report, regime_name).get("regime_label")),
                 split_role="training_slice",
                 row_count=int(row_count),
                 metric_summary={"trained_rows": int(row_count)},
-                metadata={**shared_metadata, "bundle_strategy": bundle.strategy},
+                metadata={
+                    **shared_metadata,
+                    **_resolve_regime_binding_metadata(training_report, regime_name),
+                    "bundle_strategy": bundle.strategy,
+                },
             )
         )
 
@@ -555,6 +718,7 @@ def train_regime_aware_model(
     X_frame = pd.DataFrame(X).copy()
     y_series = pd.Series(y, index=X_frame.index)
     regime_frame = _coerce_regime_frame(regime_data, index=X_frame.index)
+    regime_state_contracts = _coerce_regime_state_contracts(regime_data, index=X_frame.index)
     strategy = str(strategy).lower()
     validate_feature_adaptation_runtime_support(
         dict(feature_config or {}).get("feature_adaptation") or {},
@@ -605,8 +769,9 @@ def train_regime_aware_model(
     if regime_frame.empty:
         raise ValueError("specialist strategy requires regime_data")
 
-    target_column = regime_column if regime_column in regime_frame.columns else regime_frame.columns[0]
+    target_column = _resolve_regime_identity_column(regime_frame, preferred_column=regime_column)
     labels = pd.Series(regime_frame[target_column], index=X_frame.index)
+    regime_aliases_by_id = _build_regime_alias_map(regime_frame, target_column, semantic_column=regime_column)
     fallback_model, fallback_sampling_report = _train_constant_safe_model(
         X_frame,
         y_series,
@@ -660,6 +825,8 @@ def train_regime_aware_model(
         "skipped_regimes": skipped_regimes,
         "fallback_enabled": True,
         "regime_alignment": "inference_aligned_input",
+        "regime_identity_column": target_column,
+        "regime_aliases_by_id": regime_aliases_by_id,
         "coverage_summary": coverage_summary,
         "fallback_sampling_report": fallback_sampling_report,
         "specialist_sampling_reports": specialist_sampling_reports,
@@ -692,6 +859,7 @@ def train_regime_aware_walk_forward(
     X_frame = pd.DataFrame(X).copy()
     y_series = pd.Series(y, index=X_frame.index)
     regime_frame = _coerce_regime_frame(regime_data, index=X_frame.index)
+    regime_state_contracts = _coerce_regime_state_contracts(regime_data, index=X_frame.index)
 
     folds = []
     oos_predictions = []
@@ -714,6 +882,9 @@ def train_regime_aware_walk_forward(
         y_test = y_series.iloc[test_idx]
         regime_train = regime_frame.iloc[train_idx]
         regime_test = regime_frame.iloc[test_idx]
+        regime_test_inference = regime_test
+        if regime_state_contracts is not None:
+            regime_test_inference = slice_regime_state_contracts(regime_state_contracts, X_test.index)
         weight_train = None
         if sample_weight is not None:
             weight_train = pd.Series(sample_weight, index=X_frame.index).iloc[train_idx]
@@ -734,7 +905,7 @@ def train_regime_aware_walk_forward(
             min_samples_per_regime=min_samples_per_regime,
             sample_weight=weight_train,
         )
-        predictions, probabilities, inference_report = bundle.predict_with_probability_report(X_test, regime_test)
+        predictions, probabilities, inference_report = bundle.predict_with_probability_report(X_test, regime_test_inference)
         metrics = evaluate_regime_aware_predictions(y_test, predictions, probabilities)
 
         folds.append(

@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from core import build_regime_aware_feature_frame, train_regime_aware_model, train_regime_aware_walk_forward
+from core.regimes import RegimeStateContract
 
 
 class RegimeAwareTrainingTest(unittest.TestCase):
@@ -86,6 +87,97 @@ class RegimeAwareTrainingTest(unittest.TestCase):
         self.assertIn("2", fold["inference_report"]["unseen_regimes"])
         self.assertIn("0", fold["training_report"]["trained_regimes"])
         self.assertIn("1", fold["training_report"]["trained_regimes"])
+
+    def test_specialist_inference_respects_delayed_regime_availability(self):
+        X, y, regime_frame = self._make_balanced_dataset(n=180, seed=9)
+
+        bundle, _ = train_regime_aware_model(
+            X.iloc[:140],
+            y.iloc[:140],
+            regime_frame.iloc[:140],
+            strategy="specialist",
+            model_type="logistic",
+            model_params={"random_state": 7, "max_iter": 400},
+            min_samples_per_regime=20,
+            coverage_config={"max_dominant_share": 1.0, "min_distinct_regimes": 1},
+        )
+
+        test_X = X.iloc[140:144]
+        test_regime = regime_frame.iloc[140:144]
+        state_contracts = [
+            RegimeStateContract(
+                as_of=test_X.index[0],
+                available_at=test_X.index[1],
+                label=int(test_regime.iloc[0]["regime"]),
+                recognition_lag_bars=1,
+                warm=True,
+            ),
+            *[
+                RegimeStateContract(
+                    as_of=timestamp,
+                    available_at=timestamp,
+                    label=int(test_regime.loc[timestamp, "regime"]),
+                    recognition_lag_bars=0,
+                    warm=True,
+                )
+                for timestamp in test_X.index[1:]
+            ],
+        ]
+
+        _, _, inference_report = bundle.predict_with_probability_report(test_X, state_contracts)
+
+        self.assertEqual(inference_report["fallback_rows"], 1)
+        self.assertEqual(inference_report["timing_blocked_rows"], 1)
+        self.assertEqual(inference_report["fallback_evidence_rows"], len(test_X))
+        self.assertIn("missing", inference_report["unseen_regimes"])
+
+    def test_specialist_strategy_prefers_canonical_regime_id_over_semantic_label(self):
+        X, y, regime_frame = self._make_balanced_dataset(n=180, seed=13)
+        semantic_frame = pd.DataFrame(
+            {
+                "regime": np.where(regime_frame["regime"].eq(0), "hmm__legacy_bull", "hmm__legacy_bear"),
+                "canonical_regime_id": np.where(
+                    regime_frame["regime"].eq(0),
+                    "filtered_hmm__hmm_native__state_0",
+                    "filtered_hmm__hmm_native__state_1",
+                ),
+            },
+            index=regime_frame.index,
+        )
+
+        bundle, report = train_regime_aware_model(
+            X.iloc[:140],
+            y.iloc[:140],
+            semantic_frame.iloc[:140],
+            strategy="specialist",
+            model_type="logistic",
+            model_params={"random_state": 7, "max_iter": 400},
+            min_samples_per_regime=20,
+            coverage_config={"max_dominant_share": 1.0, "min_distinct_regimes": 1},
+        )
+
+        test_X = X.iloc[140:160]
+        test_frame = semantic_frame.iloc[140:160]
+        state_contracts = [
+            RegimeStateContract(
+                as_of=timestamp,
+                available_at=timestamp,
+                label=("hmm__renamed_bull" if test_frame.loc[timestamp, "canonical_regime_id"].endswith("state_0") else "hmm__renamed_bear"),
+                warm=True,
+                detector_outputs={
+                    "canonical_regime_id": str(test_frame.loc[timestamp, "canonical_regime_id"]),
+                },
+            )
+            for timestamp in test_X.index
+        ]
+
+        _, _, inference_report = bundle.predict_with_probability_report(test_X, state_contracts)
+
+        self.assertEqual(report["regime_identity_column"], "canonical_regime_id")
+        self.assertEqual(bundle.regime_column, "canonical_regime_id")
+        self.assertEqual(inference_report["regime_identity_column"], "canonical_regime_id")
+        self.assertEqual(inference_report["fallback_rows"], 0)
+        self.assertEqual(inference_report["unseen_regimes"], [])
 
     def test_feature_strategy_rejects_non_identity_feature_adaptation_scaling(self):
         X, y, regime_frame = self._make_balanced_dataset()

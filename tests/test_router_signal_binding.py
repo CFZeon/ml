@@ -215,6 +215,93 @@ class RouterSignalBindingTest(unittest.TestCase):
         self.assertEqual(router_trace_summary["summary"]["fallback_rows_by_cause"], {"health_failure_flags": 1})
         self.assertTrue(pd.isna(routed_signal_state["routed_signal_surfaces"]["specialist::bull"].iloc[1]))
 
+    def test_router_binding_fails_closed_until_health_binding_exists(self):
+        index = pd.date_range("2026-05-10", periods=3, freq="1h", tz="UTC")
+        zeros = pd.Series(0.0, index=index)
+        ones = pd.Series(1.0, index=index)
+        base_signal_state = {
+            "event_signals": zeros,
+            "continuous_signals": zeros,
+            "signals": zeros.astype(int),
+            "position_size": zeros,
+            "meta_prob": zeros,
+            "profitability_prob": zeros,
+            "direction_edge": zeros,
+            "confidence": zeros,
+            "expected_trade_edge": zeros,
+        }
+        specialist_signal_surfaces = {
+            "fallback_generalist": {
+                "event_signals": zeros,
+                "continuous_signals": zeros,
+                "signals": zeros.astype(int),
+                "position_size": zeros,
+                "meta_prob": zeros,
+                "profitability_prob": zeros,
+                "direction_edge": zeros,
+                "confidence": zeros,
+                "expected_trade_edge": zeros,
+            },
+            "specialist::bull": {
+                "event_signals": ones,
+                "continuous_signals": ones,
+                "signals": ones.astype(int),
+                "position_size": ones,
+                "meta_prob": ones,
+                "profitability_prob": ones,
+                "direction_edge": ones,
+                "confidence": ones,
+                "expected_trade_edge": ones,
+            },
+        }
+        specialist_library = SpecialistLibrarySnapshot(
+            symbol="BTCUSDT",
+            timeframe="1h",
+            fallback_model_id="fallback_generalist",
+            specialists=[
+                SpecialistSpec(
+                    model_id="fallback_generalist",
+                    symbol="BTCUSDT",
+                    timeframe="1h",
+                    compatible_regimes=[],
+                    estimator_family="dummy",
+                    metadata={"fallback_only": True, "lifecycle_state": "active"},
+                ),
+                SpecialistSpec(
+                    model_id="specialist::bull",
+                    symbol="BTCUSDT",
+                    timeframe="1h",
+                    compatible_regimes=["bull"],
+                    estimator_family="dummy",
+                    metadata={"lifecycle_state": "active"},
+                ),
+            ],
+            health=[
+                SpecialistHealthContract(
+                    model_id="fallback_generalist",
+                    compatible_regimes=[],
+                    fallback_only=True,
+                    metadata={"health_binding_resolved": True, "health_state": "fallback_only"},
+                )
+            ],
+        ).to_dict()
+        regime_states = [
+            RegimeStateContract(as_of=timestamp, available_at=timestamp, label="bull", confidence=0.95)
+            for timestamp in index
+        ]
+
+        routed_signal_state, router_trace_summary = _route_signal_state_with_router(
+            base_signal_state,
+            specialist_signal_surfaces,
+            router=HardSwitchRouter(execution_policy="fallback_only_until_health_binding"),
+            specialist_library=specialist_library,
+            regime_states=regime_states,
+        )
+
+        self.assertListEqual(routed_signal_state["continuous_signals"].tolist(), [0.0, 0.0, 0.0])
+        self.assertEqual(router_trace_summary["summary"]["eligibility_blocked_rows"], 3)
+        self.assertEqual(router_trace_summary["summary"]["fallback_rows_by_cause"], {"health_unbound": 3})
+
 
 if __name__ == "__main__":
     unittest.main()

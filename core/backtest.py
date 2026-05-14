@@ -286,15 +286,23 @@ def _build_router_stability_report(summary):
     if "router_decision_count" not in payload:
         return None
 
+    def _coerce_metric_float(value):
+        try:
+            if value is None:
+                return 0.0
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
     decision_count = int(payload.get("router_decision_count", 0) or 0)
     switch_count = int(payload.get("router_switch_count", 0) or 0)
     switch_opportunities = int(max(decision_count - 1, 0))
     allocation_change_count = int(payload.get("router_allocation_change_count", 0) or 0)
     blocked_allocation_count = int(payload.get("router_blocked_allocation_count", 0) or 0)
-    executed_weight_l1_change_total = _coerce_float(payload.get("router_executed_weight_l1_change_total")) or 0.0
-    executed_weight_turnover_total = _coerce_float(payload.get("router_executed_weight_turnover_total")) or 0.0
-    mean_effective_model_count = _coerce_float(payload.get("router_mean_effective_model_count")) or 0.0
-    max_effective_model_count = _coerce_float(payload.get("router_max_effective_model_count")) or 0.0
+    executed_weight_l1_change_total = _coerce_metric_float(payload.get("router_executed_weight_l1_change_total"))
+    executed_weight_turnover_total = _coerce_metric_float(payload.get("router_executed_weight_turnover_total"))
+    mean_effective_model_count = _coerce_metric_float(payload.get("router_mean_effective_model_count"))
+    max_effective_model_count = _coerce_metric_float(payload.get("router_max_effective_model_count"))
     blocked_switch_reasons = {
         str(reason): int(count)
         for reason, count in dict(payload.get("router_blocked_switch_reasons") or {}).items()

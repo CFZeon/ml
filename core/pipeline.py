@@ -95,7 +95,7 @@ from .regimes.observations import (
     build_fold_local_regime_observation_feature_set,
     resolve_pipeline_regime_observation_feature_set,
 )
-from .regimes.online_state import replay_regime_detector_trace
+from .regimes.online_state import replay_regime_detector_trace, slice_regime_state_contracts
 from .readiness import (
     build_deployment_readiness_report,
     build_operational_limits_report,
@@ -403,6 +403,7 @@ def _resolve_pipeline_router_config(pipeline):
 
     if not resolved or not bool(resolved.get("enabled", True)):
         return {}
+    resolved.setdefault("execution_policy", "fallback_only_until_health_binding")
     return resolved
 
 
@@ -446,6 +447,7 @@ def _build_specialist_signal_surfaces(
         runtime_models.append((f"specialist::{regime_value}", specialist_model))
 
     surfaces = {}
+    shared_meta_prob = None
     for model_id, estimator in runtime_models:
         predictions = pd.Series(estimator.predict(model_X), index=X_frame.index)
         probability_frame_raw = predict_probability_frame(
@@ -454,24 +456,30 @@ def _build_specialist_signal_surfaces(
             ordered_classes=getattr(model, "ordered_classes", (-1, 0, 1)),
         )
         probability_frame = _apply_primary_probability_calibrator(probability_frame_raw, primary_calibrator)
-        X_meta = build_meta_feature_frame(predictions, probability_frame_raw, context=resolved_context)
-        if inference_latencies_ms is None:
-            meta_prob_raw = pd.Series(_positive_class_probability(meta_model, X_meta), index=X_frame.index)
-        else:
-            meta_prob_raw = pd.Series(
-                _timed_inference_call(
-                    inference_latencies_ms,
-                    _positive_class_probability,
-                    meta_model,
-                    X_meta,
-                ),
-                index=X_frame.index,
+        if shared_meta_prob is None:
+            X_meta = build_meta_feature_frame(predictions, probability_frame_raw, context=resolved_context)
+            if inference_latencies_ms is None:
+                meta_prob_raw = pd.Series(_positive_class_probability(meta_model, X_meta), index=X_frame.index)
+            else:
+                meta_prob_raw = pd.Series(
+                    _timed_inference_call(
+                        inference_latencies_ms,
+                        _positive_class_probability,
+                        meta_model,
+                        X_meta,
+                    ),
+                    index=X_frame.index,
+                )
+            shared_meta_prob = (
+                pd.Series(
+                    apply_binary_probability_calibrator(meta_calibrator, meta_prob_raw.to_numpy()),
+                    index=X_frame.index,
+                    dtype=float,
+                ).clip(0.0, 1.0)
+                if meta_calibrator is not None
+                else meta_prob_raw.clip(0.0, 1.0)
             )
-        meta_prob = pd.Series(
-            apply_binary_probability_calibrator(meta_calibrator, meta_prob_raw.to_numpy()),
-            index=X_frame.index,
-            dtype=float,
-        ).clip(0.0, 1.0) if meta_calibrator is not None else meta_prob_raw.clip(0.0, 1.0)
+        meta_prob = pd.Series(shared_meta_prob, index=X_frame.index, copy=False)
         signal_state = _build_signal_state(
             predictions,
             probability_frame,
@@ -492,6 +500,7 @@ def _build_specialist_signal_surfaces(
             "direction_edge": signal_state["direction_edge"],
             "confidence": signal_state["confidence"],
             "expected_trade_edge": signal_state["expected_trade_edge"],
+            "surface_edge_policy": "bundle_level_shared_meta_containment",
         }
     return surfaces
 
@@ -4225,6 +4234,18 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None,
                 if row.get(source_key) is not None
             ]
             summary[target_key] = None if not values else round(float(np.mean(values)), 6)
+        for source_key, target_key, reducer in (
+            ("net_profit_pct", "worst_net_profit_pct", min),
+            ("sharpe_ratio", "worst_sharpe_ratio", min),
+            ("max_drawdown", "worst_max_drawdown", max),
+            ("total_trades", "worst_total_trades", min),
+        ):
+            values = [
+                float(row.get(source_key))
+                for row in rows
+                if row.get(source_key) is not None
+            ]
+            summary[target_key] = None if not values else round(float(reducer(values)), 6)
         return summary
 
     unseen_regime_degradation_report = {
@@ -4239,6 +4260,19 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None,
             None
             if fallback_evidence_rows <= 0
             else round(float(fallback_rows / fallback_evidence_rows), 4)
+        ),
+        "max_fallback_row_share": (
+            None
+            if not affected_folds
+            else round(
+                float(
+                    max(
+                        float(fold.get("fallback_row_share") or 0.0)
+                        for fold in affected_folds
+                    )
+                ),
+                4,
+            )
         ),
         "unseen_regimes": sorted(unseen_regimes),
         "by_regime": {},
@@ -4255,7 +4289,31 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None,
                 if not bucket["fallback_row_shares"]
                 else round(float(np.mean(bucket["fallback_row_shares"])), 4)
             ),
+            "max_fallback_row_share": (
+                None
+                if not bucket["fallback_row_shares"]
+                else round(float(max(bucket["fallback_row_shares"])), 4)
+            ),
         }
+
+    adaptive_value_report = {
+        "enabled": str(strategy) == "specialist",
+        "evidence_class": "tail_sensitive_fallback_degradation",
+        "fallback_dependency": {
+            "fallback_rows": int(fallback_rows),
+            "fallback_evidence_rows": int(fallback_evidence_rows),
+            "fallback_row_share": unseen_regime_degradation_report["fallback_row_share"],
+            "max_fallback_row_share": unseen_regime_degradation_report["max_fallback_row_share"],
+            "unseen_regimes": sorted(unseen_regimes),
+        },
+        "tail_metrics": {
+            "affected_folds": unseen_regime_degradation_report["affected_fold_metrics"],
+            "clean_folds": unseen_regime_degradation_report["clean_fold_metrics"],
+        },
+        "descriptive_only_metrics": {
+            "same_fold_uplift": None,
+        },
+    }
 
     candidate_classification = "generalist_only"
     if str(strategy) == "specialist" and trained_regimes:
@@ -4298,6 +4356,7 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None,
         "unseen_regimes": sorted(unseen_regimes),
         "specialist_shortfalls": specialist_shortfalls,
         "unseen_regime_degradation_report": unseen_regime_degradation_report,
+        "adaptive_value_report": adaptive_value_report,
         "candidate_classification": candidate_classification,
         "strategy": strategy,
     }
@@ -4437,6 +4496,7 @@ def _train_inner_meta_model(
     trade_outcome_builder=None,
     context_frame=None,
     regime_data=None,
+    regime_state_contracts=None,
     regime_aware_config=None,
     feature_lag_bars=0,
 ):
@@ -4452,6 +4512,11 @@ def _train_inner_meta_model(
         {"regime_aware": regime_aware_config or model_config.get("regime_aware")}
     )
     regime_frame = pd.DataFrame(regime_data).reindex(X_train.index) if regime_data is not None else None
+    resolved_state_contracts = (
+        slice_regime_state_contracts(regime_state_contracts, X_train.index)
+        if regime_state_contracts is not None
+        else None
+    )
 
     for inner_train_idx, inner_test_idx in walk_forward_split(
         X_train,
@@ -4470,6 +4535,8 @@ def _train_inner_meta_model(
         inner_labels_train = labels.iloc[inner_train_idx] if labels is not None else None
         inner_regime_train = regime_frame.iloc[inner_train_idx] if regime_frame is not None else None
         inner_regime_test = regime_frame.iloc[inner_test_idx] if regime_frame is not None else None
+        if resolved_state_contracts is not None:
+            inner_regime_test = slice_regime_state_contracts(resolved_state_contracts, X_inner_test.index)
 
         inner_test_start = X_inner_test.index[0] if len(X_inner_test) > 0 else None
         X_inner_train, y_inner_train, inner_labels_train, w_inner_train, _ = _purge_overlapping_training_rows(
@@ -5606,6 +5673,7 @@ class TrainModelsStep(PipelineStep):
                 else pd.DataFrame(index=X_val.index if X_val is not None else pd.Index([], dtype=object))
             )
             test_regime_view = regime_frame.reindex(X_test.index) if not regime_frame.empty else pd.DataFrame(index=X_test.index)
+            fold_regime_state_contracts = list(regime_details.get("state_contracts") or [])
 
             adaptation_result = apply_feature_adaptation_to_splits(
                 X_fit,
@@ -5710,6 +5778,9 @@ class TrainModelsStep(PipelineStep):
                 else pd.DataFrame(index=X_val_model.index if X_val_model is not None else pd.Index([], dtype=object))
             )
             test_regime_view = test_regime_view.reindex(X_test_model.index) if not test_regime_view.empty else pd.DataFrame(index=X_test_model.index)
+            fit_regime_states = slice_regime_state_contracts(fold_regime_state_contracts, X_fit_model.index)
+            val_regime_states = slice_regime_state_contracts(fold_regime_state_contracts, X_val_model.index) if X_val_model is not None else []
+            test_regime_states = slice_regime_state_contracts(fold_regime_state_contracts, X_test_model.index)
 
             fold_feature_metadata = filter_feature_metadata(
                 pipeline.state.get("feature_metadata") or derive_feature_metadata(fold_feature_blocks, columns=selected_columns),
@@ -5845,6 +5916,11 @@ class TrainModelsStep(PipelineStep):
                         ),
                         "regime_semantic_schema_version": manifest_metadata.get("semantic_schema_version"),
                         "regime_semantic_state_map": copy.deepcopy(manifest_metadata.get("semantic_state_map") or {}),
+                        "regime_canonical_schema_version": manifest_metadata.get("canonical_schema_version"),
+                        "regime_canonical_state_map": copy.deepcopy(manifest_metadata.get("canonical_state_map") or {}),
+                        "regime_taxonomy_stability_report": copy.deepcopy(
+                            manifest_metadata.get("taxonomy_stability_report") or {}
+                        ),
                     },
                 ).to_dict()
             fold_bootstrap.append(
@@ -5861,7 +5937,7 @@ class TrainModelsStep(PipelineStep):
                     _predict_primary_model_outputs,
                     model,
                     X_test_model,
-                    regime_data=test_regime_view,
+                    regime_data=test_regime_states,
                 )
                 metrics = evaluate_regime_aware_predictions(y_test, test_primary_preds, test_primary_probs_raw)
                 fold_regime_aware.append(
@@ -5977,6 +6053,7 @@ class TrainModelsStep(PipelineStep):
                 ),
                 context_frame=meta_context_frame.reindex(X_fit_model.index) if meta_context_frame is not None else None,
                 regime_data=fit_regime_view if not fit_regime_view.empty else None,
+                regime_state_contracts=fit_regime_states,
                 regime_aware_config=regime_training_config,
                 feature_lag_bars=feature_lag_bars,
             )
@@ -6014,7 +6091,7 @@ class TrainModelsStep(PipelineStep):
                     _predict_primary_model_outputs,
                     model,
                     X_val_model,
-                    regime_data=val_regime_view if regime_aware_config.get("enabled") else None,
+                    regime_data=val_regime_states if regime_aware_config.get("enabled") else None,
                 )
                 val_primary_probs, primary_calibrator = _calibrate_primary_probability_frame(
                     val_primary_probs_raw,
@@ -6098,15 +6175,13 @@ class TrainModelsStep(PipelineStep):
                     holding_bars,
                     kelly_trade_count=active_kelly_trade_count,
                 )
-                val_regime_states = None
                 if (
                     router_config
                     and current_specialist_library
-                    and not val_regime_view.empty
+                    and val_regime_states
                     and regime_aware_config.get("enabled")
                     and regime_aware_config.get("strategy") == "specialist"
                 ):
-                    val_regime_states = build_regime_state_contracts(val_regime_view)
                     val_specialist_signal_surfaces = _build_specialist_signal_surfaces(
                         model,
                         X_val_model,
@@ -6262,13 +6337,10 @@ class TrainModelsStep(PipelineStep):
                 holding_bars,
                 kelly_trade_count=active_kelly_trade_count,
             )
-            test_regime_states = None
-            if not test_regime_view.empty:
-                test_regime_states = build_regime_state_contracts(test_regime_view)
             if (
                 router_config
                 and current_specialist_library
-                and test_regime_states is not None
+                and test_regime_states
                 and regime_aware_config.get("enabled")
                 and regime_aware_config.get("strategy") == "specialist"
             ):
@@ -6563,6 +6635,9 @@ class TrainModelsStep(PipelineStep):
                     "unseen_regimes": list((regime_coverage_summary or {}).get("unseen_regimes") or []),
                     "unseen_regime_degradation_report": copy.deepcopy(
                         (regime_coverage_summary or {}).get("unseen_regime_degradation_report") or {}
+                    ),
+                    "adaptive_value_report": copy.deepcopy(
+                        (regime_coverage_summary or {}).get("adaptive_value_report") or {}
                     ),
                     "candidate_classification": (regime_coverage_summary or {}).get("candidate_classification"),
                     "trained_regimes": sorted(trained_regimes),
@@ -7049,8 +7124,13 @@ class BacktestStep(PipelineStep):
         unseen_regime_degradation_report = copy.deepcopy(
             ((training.get("regime") or {}).get("coverage_summary") or {}).get("unseen_regime_degradation_report") or {}
         )
+        adaptive_value_report = copy.deepcopy(
+            ((training.get("regime") or {}).get("coverage_summary") or {}).get("adaptive_value_report") or {}
+        )
         if unseen_regime_degradation_report:
             backtest["unseen_regime_degradation_report"] = unseen_regime_degradation_report
+        if adaptive_value_report:
+            backtest["adaptive_value_report"] = adaptive_value_report
         feature_frame = pipeline.state.get("X")
         feature_columns = list(feature_frame.columns) if isinstance(feature_frame, pd.DataFrame) else []
         signal_decay_report = dict(training.get("signal_decay") or {})
@@ -7087,6 +7167,10 @@ class BacktestStep(PipelineStep):
             if unseen_regime_degradation_report:
                 backtest["diagnostic_validation"]["summary"]["unseen_regime_degradation_report"] = copy.deepcopy(
                     unseen_regime_degradation_report
+                )
+            if adaptive_value_report:
+                backtest["diagnostic_validation"]["summary"]["adaptive_value_report"] = copy.deepcopy(
+                    adaptive_value_report
                 )
             backtest["debug"] = {
                 "cpcv_path_backtests": path_backtests,

@@ -85,7 +85,48 @@ class FilteredHMMRuntimeTest(unittest.TestCase):
         manifest_metadata = prefix_only["detector_manifests"][0].metadata
         self.assertEqual(manifest_metadata["semantic_schema_version"], "filtered_hmm.semantic.v1")
         self.assertTrue(manifest_metadata["semantic_state_map"])
+        self.assertEqual(manifest_metadata["canonical_schema_version"], "filtered_hmm.canonical.v1")
+        self.assertTrue(manifest_metadata["canonical_state_map"])
+        self.assertIn("taxonomy_stability_report", manifest_metadata)
         self.assertTrue(prefix_only["state_frame"]["regime"].dropna().astype(str).str.startswith("hmm__").all())
+        self.assertTrue(
+            prefix_only["state_frame"]["canonical_regime_id"].dropna().astype(str).str.startswith("filtered_hmm__").all()
+        )
+
+    def test_filtered_hmm_can_preserve_reference_canonical_ids(self):
+        index = pd.date_range("2026-08-01", periods=96, freq="1h", tz="UTC")
+        observations = _make_hmm_observations(index)
+        spec = {"name": "hmm_native", "type": "filtered_hmm"}
+        config = {"column_name": "regime", "n_regimes": 2, "random_state": 7, "n_iter": 40}
+
+        deployed = build_regime_detector(spec, config=config)
+        deployed.fit(observations.iloc[:64])
+        deployed_manifest = deployed.manifest().to_dict()
+        reference_map = {
+            state_index: {
+                **dict(payload or {}),
+                "canonical_regime_id": f"deployed_family_{state_index}",
+            }
+            for state_index, payload in dict(deployed_manifest["metadata"]["canonical_state_map"]).items()
+        }
+
+        remapped = build_regime_detector(
+            spec,
+            config={
+                **config,
+                "reference_canonical_state_map": reference_map,
+            },
+        )
+        remapped.fit(observations.iloc[:64])
+        remapped_manifest = remapped.manifest().to_dict()
+        remapped_ids = {
+            state_index: payload["canonical_regime_id"]
+            for state_index, payload in dict(remapped_manifest["metadata"]["canonical_state_map"]).items()
+        }
+
+        self.assertEqual(remapped_ids, {state_index: payload["canonical_regime_id"] for state_index, payload in reference_map.items()})
+        self.assertTrue(remapped_manifest["metadata"]["taxonomy_stability_report"]["reference_available"])
+        self.assertEqual(remapped_manifest["metadata"]["taxonomy_stability_report"]["compatibility_break_count"], 0)
 
     def test_filtered_hmm_update_does_not_call_smoothed_or_batch_decoding_methods(self):
         from hmmlearn.hmm import GaussianHMM
@@ -117,10 +158,13 @@ class FilteredHMMRuntimeTest(unittest.TestCase):
         self.assertIn("regime_confidence", contract.detector_outputs)
         self.assertIn("latent_regime_id", contract.detector_outputs)
         self.assertIn("semantic_regime", contract.detector_outputs)
+        self.assertIn("canonical_regime_id", contract.detector_outputs)
         self.assertNotIn("smoothed_probability", contract.detector_outputs)
         self.assertEqual(contract.metadata["posterior_mode"], "filtered")
         self.assertEqual(contract.metadata["semantic_schema_version"], "filtered_hmm.semantic.v1")
+        self.assertEqual(contract.metadata["canonical_schema_version"], "filtered_hmm.canonical.v1")
         self.assertTrue(str(contract.metadata["semantic_label"]).startswith("hmm__"))
+        self.assertTrue(str(contract.metadata["canonical_regime_id"]).startswith("filtered_hmm__"))
 
     def test_pipeline_detect_regimes_routes_legacy_hmm_through_filtered_replay(self):
         index = pd.date_range("2026-08-01", periods=120, freq="1h", tz="UTC")
@@ -145,11 +189,15 @@ class FilteredHMMRuntimeTest(unittest.TestCase):
         )
         self.assertIn("regime_confidence", result["regime_state_frame"].columns)
         self.assertIn("latent_regime_id", result["regime_state_frame"].columns)
+        self.assertIn("canonical_regime_id", result["regime_state_frame"].columns)
         self.assertTrue(any(column.startswith("prob_state_") for column in result["regime_state_frame"].columns))
         self.assertFalse(any("smoothed" in column for column in result["regime_state_frame"].columns))
         self.assertTrue(result["regime_state_frame"]["regime"].dropna().astype(str).str.startswith("hmm__").all())
         self.assertTrue(
             pipeline.state["regime_detection"]["detector_manifests"][0].metadata["semantic_state_map"]
+        )
+        self.assertTrue(
+            pipeline.state["regime_detection"]["detector_manifests"][0].metadata["canonical_state_map"]
         )
 
 

@@ -278,6 +278,20 @@ def _sanitize_semantic_feature_name(name: Any) -> str:
     return cleaned or "feature"
 
 
+def _sanitize_regime_token(value: Any) -> str:
+    text = str(value or "state").strip().lower()
+    cleaned = "".join(character if character.isalnum() else "_" for character in text).strip("_")
+    return cleaned or "state"
+
+
+def _default_hmm_canonical_regime_id(detector_name: Any, ordered_state_id: int) -> str:
+    return f"filtered_hmm__{_sanitize_regime_token(detector_name)}__state_{int(ordered_state_id)}"
+
+
+def _new_hmm_regime_family_id(detector_name: Any, ordered_state_id: int) -> str:
+    return f"filtered_hmm__{_sanitize_regime_token(detector_name)}__new_family__state_{int(ordered_state_id)}"
+
+
 def _bucket_semantic_state_value(value: float, all_values: np.ndarray) -> str:
     values = np.asarray(all_values, dtype=float)
     if values.size <= 1 or np.allclose(values, values[0]):
@@ -304,10 +318,13 @@ def _build_hmm_semantic_state_map(ordered_means: np.ndarray, feature_names: Sequ
     seen_labels = {}
     for state_index in range(means.shape[0]):
         feature_signature = {}
+        state_signature_summary = {}
         label_parts = []
         for feature_index, feature_name in enumerate(resolved_names):
-            bucket = _bucket_semantic_state_value(float(means[state_index, feature_index]), means[:, feature_index])
+            value = float(means[state_index, feature_index])
+            bucket = _bucket_semantic_state_value(value, means[:, feature_index])
             feature_signature[feature_name] = bucket
+            state_signature_summary[feature_name] = round(value, 6)
             label_parts.append(f"{feature_name}_{bucket}")
         semantic_label = "hmm__" + "__".join(label_parts)
         duplicate_count = seen_labels.get(semantic_label, 0)
@@ -317,8 +334,168 @@ def _build_hmm_semantic_state_map(ordered_means: np.ndarray, feature_names: Sequ
         state_map[int(state_index)] = {
             "semantic_label": semantic_label,
             "feature_signature": feature_signature,
+            "state_signature_summary": state_signature_summary,
         }
     return state_map
+
+
+def _feature_signature_similarity(left: Mapping[str, Any] | None, right: Mapping[str, Any] | None) -> float:
+    left_map = {str(key): str(value) for key, value in dict(left or {}).items()}
+    right_map = {str(key): str(value) for key, value in dict(right or {}).items()}
+    keys = set(left_map.keys()) | set(right_map.keys())
+    if not keys:
+        return 0.0
+    matches = sum(1 for key in keys if left_map.get(key) == right_map.get(key))
+    return float(matches / len(keys))
+
+
+def _coerce_hmm_reference_state_map(config: Mapping[str, Any] | None, detector_name: Any) -> dict[int, dict[str, Any]]:
+    params = dict(config or {})
+    reference_manifest = dict(
+        params.get("reference_detector_manifest")
+        or params.get("reference_manifest")
+        or {}
+    )
+    reference_metadata = dict(reference_manifest.get("metadata") or {})
+    raw_state_map = (
+        params.get("reference_canonical_state_map")
+        or reference_metadata.get("canonical_state_map")
+        or {}
+    )
+    normalized = {}
+    for raw_state_index, payload in dict(raw_state_map or {}).items():
+        try:
+            state_index = int(raw_state_index)
+        except (TypeError, ValueError):
+            continue
+        entry = dict(payload or {})
+        normalized[state_index] = {
+            "canonical_regime_id": str(
+                entry.get("canonical_regime_id") or _default_hmm_canonical_regime_id(detector_name, state_index)
+            ),
+            "semantic_label": (
+                None if entry.get("semantic_label") is None else str(entry.get("semantic_label"))
+            ),
+            "feature_signature": {
+                str(key): str(value) for key, value in dict(entry.get("feature_signature") or {}).items()
+            },
+            "state_signature_summary": {
+                str(key): float(value)
+                for key, value in dict(entry.get("state_signature_summary") or {}).items()
+                if value is not None
+            },
+        }
+    return normalized
+
+
+def _build_hmm_canonical_state_map(
+    ordered_means: np.ndarray,
+    feature_names: Sequence[str],
+    *,
+    detector_name: Any,
+    semantic_state_map: Mapping[int, Mapping[str, Any]] | None,
+    reference_state_map: Mapping[int, Mapping[str, Any]] | None = None,
+    similarity_threshold: float = 0.75,
+) -> dict[int, dict[str, Any]]:
+    del ordered_means, feature_names
+    semantic_map = {int(key): dict(value or {}) for key, value in dict(semantic_state_map or {}).items()}
+    reference_map = {int(key): dict(value or {}) for key, value in dict(reference_state_map or {}).items()}
+    used_reference_states: set[int] = set()
+    canonical_state_map = {}
+
+    for state_index, semantic_state in sorted(semantic_map.items()):
+        feature_signature = {
+            str(key): str(value) for key, value in dict(semantic_state.get("feature_signature") or {}).items()
+        }
+        state_signature_summary = {
+            str(key): float(value)
+            for key, value in dict(semantic_state.get("state_signature_summary") or {}).items()
+            if value is not None
+        }
+        semantic_label = str(semantic_state.get("semantic_label") or f"hmm__state_{state_index}")
+
+        best_reference_index = None
+        best_similarity = -1.0
+        for reference_index, reference_state in reference_map.items():
+            if reference_index in used_reference_states:
+                continue
+            similarity = _feature_signature_similarity(feature_signature, reference_state.get("feature_signature"))
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_reference_index = int(reference_index)
+
+        if best_reference_index is not None and best_similarity >= float(similarity_threshold):
+            reference_state = dict(reference_map.get(best_reference_index) or {})
+            canonical_regime_id = str(
+                reference_state.get("canonical_regime_id")
+                or _default_hmm_canonical_regime_id(detector_name, best_reference_index)
+            )
+            remap_reason = "matched_prior_signature"
+            mapping_confidence = float(best_similarity)
+            used_reference_states.add(best_reference_index)
+        elif reference_map:
+            canonical_regime_id = _new_hmm_regime_family_id(detector_name, state_index)
+            remap_reason = "new_regime_family"
+            mapping_confidence = float(max(best_similarity, 0.0))
+        else:
+            canonical_regime_id = _default_hmm_canonical_regime_id(detector_name, state_index)
+            remap_reason = "initial_fit"
+            mapping_confidence = 1.0
+
+        canonical_state_map[int(state_index)] = {
+            "canonical_regime_id": canonical_regime_id,
+            "semantic_label": semantic_label,
+            "feature_signature": feature_signature,
+            "state_signature_summary": state_signature_summary,
+            "similarity_score": (
+                None if best_similarity < 0.0 else round(float(best_similarity), 6)
+            ),
+            "mapping_confidence": round(float(mapping_confidence), 6),
+            "remap_reason": remap_reason,
+        }
+    return canonical_state_map
+
+
+def _summarize_hmm_taxonomy_stability(
+    canonical_state_map: Mapping[int, Mapping[str, Any]] | None,
+    *,
+    reference_available: bool,
+) -> dict[str, Any]:
+    entries = [dict(value or {}) for value in dict(canonical_state_map or {}).values()]
+    total_states = int(len(entries))
+    if total_states <= 0:
+        return {
+            "reference_available": bool(reference_available),
+            "neighboring_refit_agreement": None,
+            "mean_state_signature_similarity": None,
+            "remap_rate": None,
+            "unresolved_new_state_rate": None,
+            "compatibility_break_count": 0,
+        }
+
+    matched_count = sum(1 for entry in entries if entry.get("remap_reason") == "matched_prior_signature")
+    unresolved_count = sum(1 for entry in entries if entry.get("remap_reason") == "new_regime_family")
+    similarity_values = [
+        float(entry.get("similarity_score"))
+        for entry in entries
+        if entry.get("similarity_score") is not None
+    ]
+    return {
+        "reference_available": bool(reference_available),
+        "neighboring_refit_agreement": (
+            None if not reference_available else round(float(matched_count / total_states), 6)
+        ),
+        "mean_state_signature_similarity": (
+            None if not similarity_values else round(float(np.mean(similarity_values)), 6)
+        ),
+        "remap_rate": (
+            None if not reference_available else round(float(matched_count / total_states), 6)
+        ),
+        "unresolved_new_state_rate": (
+            None if not reference_available else round(float(unresolved_count / total_states), 6)
+        ),
+        "compatibility_break_count": int(unresolved_count),
+    }
 
 
 def _forward_filter_step(
@@ -645,6 +822,9 @@ class FilteredHMMDetector:
     _covariance_type: str = field(default="diag", init=False, repr=False)
     _semantic_state_map: dict[int, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _semantic_schema_version: str = field(default="filtered_hmm.semantic.v1", init=False, repr=False)
+    _canonical_state_map: dict[int, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+    _canonical_schema_version: str = field(default="filtered_hmm.canonical.v1", init=False, repr=False)
+    _taxonomy_stability_report: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     @property
     def params(self) -> dict[str, Any]:
@@ -663,6 +843,19 @@ class FilteredHMMDetector:
         self._semantic_state_map = _build_hmm_semantic_state_map(
             self._means[self._ordered_state_indices],
             self._selected_columns,
+        )
+        reference_state_map = _coerce_hmm_reference_state_map(self.params, self.detector_name)
+        self._canonical_state_map = _build_hmm_canonical_state_map(
+            self._means[self._ordered_state_indices],
+            self._selected_columns,
+            detector_name=self.detector_name,
+            semantic_state_map=self._semantic_state_map,
+            reference_state_map=reference_state_map,
+            similarity_threshold=float(self.params.get("canonical_similarity_threshold", 0.75)),
+        )
+        self._taxonomy_stability_report = _summarize_hmm_taxonomy_stability(
+            self._canonical_state_map,
+            reference_available=bool(reference_state_map),
         )
         return self
 
@@ -742,6 +935,19 @@ class FilteredHMMDetector:
             self._means[self._ordered_state_indices],
             self._selected_columns,
         )
+        reference_state_map = _coerce_hmm_reference_state_map(self.params, self.detector_name)
+        self._canonical_state_map = _build_hmm_canonical_state_map(
+            self._means[self._ordered_state_indices],
+            self._selected_columns,
+            detector_name=self.detector_name,
+            semantic_state_map=self._semantic_state_map,
+            reference_state_map=reference_state_map,
+            similarity_threshold=float(self.params.get("canonical_similarity_threshold", 0.75)),
+        )
+        self._taxonomy_stability_report = _summarize_hmm_taxonomy_stability(
+            self._canonical_state_map,
+            reference_available=bool(reference_state_map),
+        )
         return self
 
     def initialize(self, observations: Any | None = None) -> dict[str, Any]:
@@ -800,7 +1006,12 @@ class FilteredHMMDetector:
             position = int(runtime_state.get("position", 0))
             warm = warmup_bars is None or position + 1 >= int(warmup_bars)
             semantic_state = dict(self._semantic_state_map.get(0) or {})
+            canonical_state = dict(self._canonical_state_map.get(0) or {})
             semantic_label = semantic_state.get("semantic_label", "hmm__fallback_state")
+            canonical_regime_id = str(
+                canonical_state.get("canonical_regime_id")
+                or _default_hmm_canonical_regime_id(self.detector_name, 0)
+            )
             detector_outputs = {
                 "regime_confidence": 1.0,
                 "selected_column_count": int(selected_column_count),
@@ -808,6 +1019,7 @@ class FilteredHMMDetector:
                 "degenerate_fallback": 1,
                 "latent_regime_id": 0,
                 "semantic_regime": semantic_label,
+                "canonical_regime_id": canonical_regime_id,
                 "prob_state_0": 1.0,
             }
             if warm:
@@ -827,8 +1039,14 @@ class FilteredHMMDetector:
                     "detector_type": "filtered_hmm",
                     "posterior_mode": self._posterior_mode,
                     "semantic_schema_version": self._semantic_schema_version,
+                    "canonical_schema_version": self._canonical_schema_version,
                     "semantic_label": semantic_label,
+                    "canonical_regime_id": canonical_regime_id,
                     "semantic_signature": dict(semantic_state.get("feature_signature") or {}),
+                    "state_signature_summary": dict(semantic_state.get("state_signature_summary") or {}),
+                    "mapping_confidence": canonical_state.get("mapping_confidence"),
+                    "similarity_score": canonical_state.get("similarity_score"),
+                    "remap_reason": canonical_state.get("remap_reason"),
                     "reason": self._fallback_reason,
                     "selected_columns": list(self._selected_columns),
                 },
@@ -855,7 +1073,12 @@ class FilteredHMMDetector:
         confidence = float(ordered_probabilities[ordered_state_id]) if ordered_probabilities.size else 0.0
         warm = warmup_bars is None or int(runtime_state["position"]) >= int(warmup_bars)
         semantic_state = dict(self._semantic_state_map.get(ordered_state_id) or {})
+        canonical_state = dict(self._canonical_state_map.get(ordered_state_id) or {})
         semantic_label = semantic_state.get("semantic_label", f"hmm__state_{ordered_state_id}")
+        canonical_regime_id = str(
+            canonical_state.get("canonical_regime_id")
+            or _default_hmm_canonical_regime_id(self.detector_name, ordered_state_id)
+        )
         detector_outputs = {
             "regime_confidence": float(confidence),
             "selected_column_count": int(selected_column_count),
@@ -864,6 +1087,7 @@ class FilteredHMMDetector:
             "degenerate_fallback": 0,
             "latent_regime_id": int(ordered_state_id),
             "semantic_regime": semantic_label,
+            "canonical_regime_id": canonical_regime_id,
         }
         if warm:
             detector_outputs[self.column_name] = semantic_label
@@ -887,8 +1111,14 @@ class FilteredHMMDetector:
                 "detector_type": "filtered_hmm",
                 "posterior_mode": self._posterior_mode,
                 "semantic_schema_version": self._semantic_schema_version,
+                "canonical_schema_version": self._canonical_schema_version,
                 "semantic_label": semantic_label,
+                "canonical_regime_id": canonical_regime_id,
                 "semantic_signature": dict(semantic_state.get("feature_signature") or {}),
+                "state_signature_summary": dict(semantic_state.get("state_signature_summary") or {}),
+                "mapping_confidence": canonical_state.get("mapping_confidence"),
+                "similarity_score": canonical_state.get("similarity_score"),
+                "remap_reason": canonical_state.get("remap_reason"),
                 "selected_columns": list(self._selected_columns),
             },
         )
@@ -906,9 +1136,24 @@ class FilteredHMMDetector:
                 str(int(state_index)): {
                     "semantic_label": str(payload.get("semantic_label")),
                     "feature_signature": dict(payload.get("feature_signature") or {}),
+                    "state_signature_summary": dict(payload.get("state_signature_summary") or {}),
                 }
                 for state_index, payload in dict(self._semantic_state_map or {}).items()
             },
+            "canonical_schema_version": self._canonical_schema_version,
+            "canonical_state_map": {
+                str(int(state_index)): {
+                    "canonical_regime_id": str(payload.get("canonical_regime_id")),
+                    "semantic_label": str(payload.get("semantic_label")),
+                    "feature_signature": dict(payload.get("feature_signature") or {}),
+                    "state_signature_summary": dict(payload.get("state_signature_summary") or {}),
+                    "similarity_score": payload.get("similarity_score"),
+                    "mapping_confidence": payload.get("mapping_confidence"),
+                    "remap_reason": payload.get("remap_reason"),
+                }
+                for state_index, payload in dict(self._canonical_state_map or {}).items()
+            },
+            "taxonomy_stability_report": dict(self._taxonomy_stability_report or {}),
             "state_remap": {
                 str(int(raw_state)): int(ordered_state)
                 for raw_state, ordered_state in enumerate(self._raw_to_ordered.tolist() if self._raw_to_ordered.size else [])

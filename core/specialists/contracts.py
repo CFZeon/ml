@@ -183,6 +183,61 @@ class SpecialistHealthContract:
 
 
 @dataclass(frozen=True)
+class SpecialistEligibilityContract:
+    model_id: str
+    eligible: bool = False
+    reasons: list[str] = field(default_factory=list)
+    fallback_model: bool = False
+    regime_label: str | None = None
+    routing_regime_key: str | None = None
+    compatible_regimes: list[str] = field(default_factory=list)
+    lifecycle_state: str | None = None
+    health_state: str | None = None
+    calibration_fresh: bool = True
+    health_binding_resolved: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+    schema_version: str = "phase0.specialist_eligibility.v1"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "model_id": str(self.model_id),
+            "eligible": bool(self.eligible),
+            "reasons": _coerce_string_list(self.reasons),
+            "fallback_model": bool(self.fallback_model),
+            "regime_label": None if self.regime_label is None else str(self.regime_label),
+            "routing_regime_key": None if self.routing_regime_key is None else str(self.routing_regime_key),
+            "compatible_regimes": _coerce_string_list(self.compatible_regimes),
+            "lifecycle_state": None if self.lifecycle_state is None else str(self.lifecycle_state),
+            "health_state": None if self.health_state is None else str(self.health_state),
+            "calibration_fresh": bool(self.calibration_fresh),
+            "health_binding_resolved": bool(self.health_binding_resolved),
+            "metadata": _coerce_mapping(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "SpecialistEligibilityContract":
+        data = dict(payload or {})
+        return cls(
+            schema_version=str(data.get("schema_version", "phase0.specialist_eligibility.v1")),
+            model_id=str(data.get("model_id", "specialist")),
+            eligible=bool(data.get("eligible", False)),
+            reasons=_coerce_string_list(data.get("reasons")),
+            fallback_model=bool(data.get("fallback_model", False)),
+            regime_label=(None if data.get("regime_label") is None else str(data.get("regime_label"))),
+            routing_regime_key=(
+                None if data.get("routing_regime_key") is None else str(data.get("routing_regime_key"))
+            ),
+            compatible_regimes=_coerce_string_list(data.get("compatible_regimes")),
+            lifecycle_state=(None if data.get("lifecycle_state") is None else str(data.get("lifecycle_state"))),
+            health_state=(None if data.get("health_state") is None else str(data.get("health_state"))),
+            calibration_fresh=bool(data.get("calibration_fresh", True)),
+            health_binding_resolved=bool(data.get("health_binding_resolved", False)),
+            metadata=_coerce_mapping(data.get("metadata") or {}),
+        )
+
+
+@dataclass(frozen=True)
 class SpecialistPerformanceSlice:
     model_id: str
     regime_label: str | None = None

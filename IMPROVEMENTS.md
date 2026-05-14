@@ -2,373 +2,397 @@
 
 Date: 2026-05-13
 
-This document converts the adversarial audit into implementation workstreams.
-It is not a feature wishlist. Each section corresponds to a specific failure mode
-that can invalidate research conclusions or amplify losses in production.
+This document converts the hostile audit of the regime, routing, specialist, and
+drift stack into implementation workstreams. It supersedes older draft sections
+that mixed unrelated improvements with the audited failures. Every section below
+maps directly to a specific problem identified in the audit.
 
 ## Institutional Reference Set
 
-- BCBS 239, Principles for effective risk data aggregation and risk reporting: https://www.bis.org/publ/bcbs239.htm
-- SEC Rule 15c3-5 fact sheet, market access controls: https://www.sec.gov/news/press/2010/2010-210.htm
-- NIST AI RMF overview: https://www.nist.gov/itl/ai-risk-management-framework
-- NIST AI RMF Playbook: https://airc.nist.gov/AI_RMF_Knowledge_Base/Playbook/
-- NIST AI RMF FAQs: https://www.nist.gov/itl/ai-risk-management-framework/ai-risk-management-framework-faqs
-- BIS FSI Occasional Paper No 24, Managing explanations: how regulators can address AI explainability: https://www.bis.org/fsi/fsipapers24.htm
+- PRA SS1/23, Model risk management principles for banks.
+- BCBS 239, Principles for effective risk data aggregation and risk reporting.
+- SEC Rule 15c3-5 market access control fact sheet.
+- NIST AI RMF 1.0.
+- NIST AI RMF Playbook.
+- BIS FSI Occasional Paper No 24, Managing explanations: how regulators can address AI explainability.
 
-## Working Rules For This Plan
+## Program Rules
 
-- Control metrics must describe the executed path, not a proxy path.
-- Every adaptive control must carry explicit data lineage, timing, and state persistence.
-- Capital-facing modes must fail closed when the framework cannot prove causal inputs, calibrated uncertainty, or operational headroom.
-- Preview, research, validation, and deployment artifacts must remain explicitly separated.
+- Capital-facing paths must fail closed when causal timing, calibration, lineage, or runtime eligibility cannot be proven.
+- Preview and research artifacts must never be reusable as promotion or deployment evidence without an explicit admissibility transition.
+- Router metrics, specialist metrics, and drift metrics must describe the executed path, not a reconstructed narrative path.
+- Any adaptive control that can change exposure must expose stable identifiers, persisted state, and replayable decision evidence.
 
-## 1. Bind Router Stability To Executed Exposure
+## 1. Enforce Causal Regime Availability In Specialist And Meta Paths
 
 ### Audit Problem
 
-The current weighted router can block a model switch via hysteresis or cooldown while
-still allocating execution weight to the blocked challenger. Router stability metrics
-count only selected-model switches, and router switching costs are attached as
-hypothetical diagnostics rather than realized costs.
+The regime-aware specialist path and the inner meta-model path can consume raw
+aligned regime labels directly at inference time even though the regime contract
+supports delayed availability via `available_at` and `recognition_lag_bars`.
+This means the adaptive stack can be evaluated using regime information earlier
+than the framework's own causal contract allows.
 
 ### Institutional Practice Synthesis
 
-Research basis: SEC Rule 15c3-5, NIST AI RMF, NIST AI RMF Playbook.
+Research basis: PRA SS1/23 Principles 3 and 4, NIST AI RMF, SEC Rule 15c3-5.
 
-- SEC 15c3-5 requires automated controls to apply before market access and remain under direct, exclusive control of the operator.
-- NIST AI RMF and the Playbook emphasize that monitoring and risk treatment must reflect the actual deployed behavior across the lifecycle.
-- A routing-control framework is not institution-grade if the supervisory metric describes one decision path while execution follows another.
+- PRA Principle 3 requires model development, implementation, and use to be controlled in a way that matches actual operating conditions rather than optimistic assumptions.
+- PRA Principle 4 requires validation of conceptual soundness and implementation, which includes whether timing assumptions are causal and reproducible.
+- NIST AI RMF treats validity, reliability, and traceability as lifecycle properties, not post hoc labels.
+- SEC 15c3-5 is not a model-risk text, but it is directly relevant to trading controls: pre-trade controls must operate before exposure is taken, not as a retrospective supervisory story.
 
 ### Technical Implementation Plan
 
-- Split router semantics into two explicit modes:
-  - `selection_only`: exactly one model may receive non-zero executed weight.
-  - `mixture_allocation`: multiple models may receive weight, but mixture eligibility must be determined before weights are generated.
-- Refactor `core/routing/router.py` so hysteresis, persistence, cooldown, and safe-mode controls operate on the executed candidate set, not only on `selected_model_id`.
-- In `WeightedRouter`, zero out any candidate that is blocked by hysteresis, cooldown, lifecycle state, health state, or compatibility constraints before softmax normalization.
-- Extend `RoutingDecisionContract` to carry:
-  - `executed_candidate_ids`
-  - `executed_weight_turnover`
-  - `executed_weight_l1_change`
-  - `effective_model_count`
-  - `allocation_control_reason`
-- Replace `router_switch_count` as the primary stability measure with a richer executed-exposure report:
-  - discrete switch count
-  - weight turnover
-  - concentration drift
-  - effective candidate count
-  - blocked-allocation count
-- In `core/pipeline.py`, keep `_route_signal_state_with_router(...)` and router diagnostics on the same contract and same decision object so the bound path and the reported path cannot diverge.
-- In `core/backtest.py`, charge router costs from realized weight deltas and routed exposure turnover, not only from model-id switches.
-- Promote router stability gates to read executed-allocation metrics first, with legacy switch-count metrics retained only for backward-compatible reporting.
+- Create a single admissible regime-input abstraction for all inference consumers:
+  - primary specialist routing
+  - inner meta-model training
+  - validation-time specialist surface construction
+  - test-time specialist routing
+- Refactor the pipeline so these consumers receive `RegimeStateContract` rows or a derived admissible view keyed by `available_at`, never a raw aligned label frame.
+- Add an explicit helper such as `build_admissible_regime_view(index, regime_states, cutoff_mode)` that:
+  - drops states whose `available_at` is later than the decision timestamp
+  - preserves `warm`, `unavailable`, and lagged states
+  - surfaces fallback causes when no admissible state exists
+- Remove any direct use of contemporaneous `regime_data=test_regime_view` or equivalent aligned label frames in specialist inference and inner meta-model training.
+- Add a strict policy flag for capital-facing and promotion-facing runs:
+  - `causal_regime_only=true`
+  - hard failure if the caller attempts to pass label-only regime frames without availability metadata
+- Persist regime timing evidence per fold:
+  - same-bar recognition rate
+  - lagged-recognition rate
+  - unavailable-state rate
+  - fallback rows due to timing only
+- Extend lookahead tests so they explicitly provoke regime timing violations in specialist inference and meta-model training, not only in the main signal path.
 
 ### Validation And Exit Criteria
 
-- A `hysteresis_hold` or `cooldown_hold` decision implies zero executed weight to the blocked challenger in `selection_only` mode.
-- `mixture_allocation` mode reports non-zero allocation turnover whenever weights change even if `selected_model_id` stays constant.
-- Backtest PnL changes when router weight churn changes.
-- Promotion and stress gates fail on allocation churn even when model-id switch rate is low.
+- Specialist inference, inner meta-model training, validation, and test routing all consume the same admissible regime contract.
+- A regime state with `available_at > decision_time` is never visible to an executable or promotion-facing path.
+- Timing-only fallback rates are reported and auditable.
+- Prefix replay and causal replay agree on specialist eligibility whenever the same admissible regime states are supplied.
 
-## 2. Make Specialist Execution Honor Health, Lifecycle, And True Regime Eligibility
+## 2. Stabilize Regime Taxonomy Before Using It As A Routing Key
 
 ### Audit Problem
 
-The executed routing path ignores dynamic specialist health updates and evaluates all
-specialist surfaces on all rows using the same downstream meta path. That creates a
-correlated ensemble disguised as a governed specialist architecture.
+The HMM detector constructs semantic labels from within-fit relative state means,
+and those labels are then used as exact compatibility keys for specialist
+selection and routing. The resulting taxonomy can be internally coherent within a
+fit while remaining unstable across retrains or neighboring refits.
 
 ### Institutional Practice Synthesis
 
-Research basis: BIS FSI 24, NIST AI RMF, SEC Rule 15c3-5.
+Research basis: PRA SS1/23 Principles 3, 4, and 5, BIS FSI 24, NIST AI RMF.
 
-- BIS FSI 24 ties acceptable advanced-model deployment to governance, documentation, validation, deployment, monitoring, and independent review.
-- NIST AI RMF requires accountability and traceability over who can act, when, and under what constraints.
-- SEC market-access practice rejects reliance on customer assurances in place of operator-controlled gating; the analogous rule here is that runtime eligibility cannot be inferred from static specialist registration alone.
+- PRA model development and validation expectations imply that a model taxonomy used for decisions must be stable enough to be interpreted, monitored, and challenged across model changes.
+- PRA mitigants require controls when model outputs can change for reasons unrelated to the underlying risk.
+- BIS FSI 24 emphasizes that governance, validation, monitoring, documentation, and independent review become harder when labels and explanations are unstable or misleading.
+- NIST AI RMF requires traceability and transparency around how a system maps inputs to decisions over time.
 
 ### Technical Implementation Plan
 
-- Thread `specialist_health_trace` through `_route_signal_state_with_router(...)` so execution and replay consume the same time-local health payload.
-- Introduce a runtime `SpecialistEligibilityContract` derived per bar from:
-  - compatible regime label
+- Decouple `routing identity` from `human semantic label`.
+- Introduce a detector-owned `canonical_regime_id` that is stable across retrains whenever the underlying state remains sufficiently similar.
+- Maintain a regime mapping artifact in detector manifests containing:
+  - canonical state id
+  - semantic label
+  - state signature summary
+  - similarity score to prior deployed states
+  - mapping confidence
+  - remap reason
+- Replace exact string compatibility on `compatible_regimes=[semantic_label]` with compatibility on canonical ids or explicit regime families.
+- Add a regime remapping step at retrain time:
+  - compare new state signatures to the deployed detector's signatures
+  - preserve canonical ids when similarity exceeds threshold
+  - mark genuinely new states as `new_regime_family` instead of silently overloading old names
+- Prevent drift logic from using raw label-name changes as evidence until the remapping step has run.
+- Add taxonomy-stability diagnostics to every detector training report:
+  - neighboring-refit agreement
+  - state-signature distance
+  - remap rate
+  - unresolved new-state rate
+  - compatibility break count
+- Require specialist libraries to bind to canonical regime ids or stable regime-family identifiers, not ephemeral semantic names.
+
+### Validation And Exit Criteria
+
+- Retraining with neighboring windows does not silently change routing keys when state economics are materially unchanged.
+- Unmapped states are explicit and auditable rather than hidden inside fallback behavior.
+- Regime drift metrics distinguish true state-distribution change from label-renaming noise.
+- Specialist compatibility survives routine detector refits unless a real taxonomy change is declared.
+
+## 3. Replace Placeholder Router Health With Runtime Eligibility Evidence
+
+### Audit Problem
+
+The router claims to score specialists with stability, decay, and failure signals,
+but the default specialist health contracts are initialized with `None` or empty
+values. In default operation, routing can therefore appear health-aware while in
+practice relying mostly on regime compatibility plus a neutral missing-health
+default.
+
+### Institutional Practice Synthesis
+
+Research basis: PRA SS1/23 Principles 2, 3, and 5, SEC Rule 15c3-5, NIST AI RMF.
+
+- PRA governance requires that important model controls have identified owners and actual operating effect, not placeholder governance artifacts.
+- PRA mitigants are meant to reduce model risk in production, not decorate research summaries.
+- SEC 15c3-5 is relevant here because exposure-changing controls must remain under direct operator control before execution and cannot be delegated to assumptions about downstream safety.
+- NIST AI RMF requires accountability, monitoring, and enforceable operational controls across the lifecycle.
+
+### Technical Implementation Plan
+
+- Split the current router inputs into three distinct contracts:
+  - `SpecialistRegistrationContract`: static library membership and metadata
+  - `SpecialistEligibilityContract`: bar-local executable eligibility
+  - `SpecialistHealthEvidenceContract`: measured performance and degradation evidence
+- Remove `missing_health_score` as a default execution-time neutralizer for capital-facing modes.
+- In executable modes, unresolved health must produce one of two outcomes:
+  - specialist blocked and fallback-only routing
+  - explicit `unknown_health_safe_mode` if policy permits no-trade
+- Generate bar-local eligibility from persisted evidence and runtime monitors:
   - lifecycle state
-  - certification status
+  - certification state
+  - compatibility with the admissible regime id
   - calibration freshness
-  - health failure flags
-  - decay and stability thresholds
-- Refactor `_build_specialist_signal_surfaces(...)` to support row-level masking:
-  - incompatible or degraded specialists emit `NaN` or explicit `no_trade`, not live predictions.
-  - fallback generalist fills only the rows where no specialist remains eligible.
-- Separate `specialist prediction availability` from `router candidate availability` so allocation cannot silently blend disallowed specialists.
-- Add per-specialist meta-context support or per-specialist calibration identifiers so the meta layer no longer homogenizes all specialists by default.
-- Store eligibility traces in backtest artifacts and registry manifests so promotion review can audit why a specialist was routable on each segment.
+  - performance decay thresholds
+  - failure flags
+  - warm-up requirements
+- Thread the same eligibility trace through:
+  - runtime routing
+  - replay diagnostics
+  - backtest summaries
+  - promotion evidence
+- Require specialist health manifests to contain measured values with lineage:
+  - evidence window
+  - sample count
+  - metric basis
+  - last refresh time
+  - owner policy that marked the specialist active, degraded, shadow, or blocked
+- Add a containment mode for incomplete health programs:
+  - `router_execution_policy=fallback_only_until_health_binding`
 
 ### Validation And Exit Criteria
 
-- Execution and replay produce identical routed allocations when fed the same health trace.
-- A degraded or failed specialist never contributes non-zero execution weight.
-- Fallback usage is measurable by cause: unseen regime, health failure, lifecycle block, calibration expiry, or missing regime state.
-- Specialist performance reports are computed only on eligible rows.
+- No specialist receives non-zero executed exposure in capital-facing modes without a resolved eligibility decision.
+- Replay, backtest, and runtime all agree on which specialists were executable on each bar.
+- Health-driven blocks are reported by cause and sample lineage.
+- Placeholder `None` health values are impossible to interpret as a positive routing score in executable modes.
 
-## 3. Remove Synthetic Confidence And Enforce Real Availability Timing
+## 4. Replace Shared Meta-Model Reuse With Specialist-Specific Edge Validation
 
 ### Audit Problem
 
-Several regime paths fabricate certainty by converting labels into probability 1.0 and
-defaulting `available_at` to the same timestamp as `as_of`. That overstates confidence
-and makes transitions visible earlier than a live system could know them.
+One meta-model can be trained on out-of-fold primary bundle outputs and then
+reused to estimate expected edge for fallback and specialist models separately.
+That lets the router compare specialist surfaces using a meta model that was not
+trained or validated on each specialist's own prediction distribution.
 
 ### Institutional Practice Synthesis
 
-Research basis: NIST AI RMF, NIST AI RMF Playbook, BIS FSI 24.
+Research basis: PRA SS1/23 Principles 3 and 4, BIS FSI 24, NIST AI RMF.
 
-- NIST AI RMF treats validity, reliability, transparency, and accountability as lifecycle properties, not labels applied after the fact.
-- The Playbook emphasizes measurement and documentation of uncertainty rather than implicit certainty.
-- BIS FSI 24 explicitly warns that explanation and uncertainty tooling can be unstable or misleading if it does not correspond to how the model actually works.
+- PRA conceptual soundness requires that a model be used only in ways consistent with its development assumptions and validation evidence.
+- PRA independent validation requires scrutiny of implementation choices that can create hidden extrapolation or misuse of model outputs.
+- BIS FSI 24 warns that advanced-model overlays can produce misleading confidence or explanations when applied outside the conditions that justify them.
+- NIST AI RMF Measure and Manage functions imply that uncertainty, validity, and monitoring must follow the actual deployed scoring path.
 
 ### Technical Implementation Plan
 
-- Redesign `RegimeStateContract` generation so label-only outputs no longer auto-populate `probabilities={label: 1.0}` or `confidence=1.0`.
-- Add explicit fields:
-  - `confidence_kind` with values such as `posterior`, `calibrated_score`, `heuristic`, `unsupported`
-  - `recognition_lag_bars`
-  - `source_available_at`
-  - `availability_reason`
-- Require every detector to declare whether same-bar availability is valid. If not explicitly declared, shift `available_at` by the minimum causal recognition lag.
-- Restrict router scoring to calibrated or posterior confidence kinds. Heuristic confidence may be reported but must not drive allocation.
-- Add detector-level calibration support for confidence-bearing detectors, including reliability summaries stored in manifests.
-- Make `build_regime_state_contracts(...)` preserve `confidence=None` when the upstream state frame lacks probability or calibrated confidence outputs.
-- Add hard assertions in capital-facing modes that `available_at >= as_of` and same-bar recognition is justified by detector contract, not by default.
+- Immediate containment:
+  - disable specialist-specific expected-edge ranking based on a shared bundle-level meta model
+  - route only on admissible regime compatibility and certified health until specialist-specific edge evidence exists
+- Medium-term replacement:
+  - train a separate meta edge model per executable scoring surface, or
+  - train a single multi-surface model with an explicit `surface_id` and prove by holdout validation that it is stable across surfaces
+- Require any specialist edge model to be trained from that specialist's own out-of-fold predictions, probabilities, and realized outcomes.
+- Add per-surface calibration diagnostics:
+  - Brier score
+  - expected calibration error
+  - profitability calibration by decile
+  - abstain calibration
+  - minimum trade count
+- For counterfactual specialist evaluation, use a separately governed shadow-evaluation program rather than treating synthetic cross-surface meta outputs as deployable edge estimates.
+- Persist per-specialist meta lineage in artifacts:
+  - training folds
+  - feature schema
+  - outcome basis
+  - calibration date
+  - admissible operating range
+- Hard-block Kelly sizing or expected-utility sizing when the relevant specialist edge model lacks per-surface validation.
 
 ### Validation And Exit Criteria
 
-- No path fabricates confidence from labels alone.
-- Same-bar regime recognition occurs only when explicitly declared by the detector contract.
-- Router behavior changes when confidence is unavailable instead of silently assuming certainty.
-- Backtest alignment reports surface recognition lag and unavailable-state rates.
+- No specialist ranking in executable routing depends on a meta model validated only on another surface.
+- Each deployed edge model has surface-specific calibration and profitability evidence.
+- Kelly sizing is disabled automatically when per-surface trade counts or calibration quality are insufficient.
+- Shadow specialist edge estimates are labeled as non-executable unless they pass the same validation program as live surfaces.
 
-## 4. Replace Persistence-Only Regime Stability Gating With Incremental Predictive Evidence
+## 5. Prevent Candidate Specialists From Entering Executable Research Paths
 
 ### Audit Problem
 
-The current regime stability gate can pass a contextual regime taxonomy simply because it
-switches less often than an endogenous baseline. That rewards stickiness, not usefulness.
+New specialists default into candidate state, yet the router can still fall back to
+candidate models when no active or certified models exist. That means research and
+backtest performance can depend on specialists that have not passed the library's
+own lifecycle controls.
 
 ### Institutional Practice Synthesis
 
-Research basis: NIST AI RMF, BIS FSI 24.
+Research basis: PRA SS1/23 Principles 2, 3, 4, and 5, SEC Rule 15c3-5, NIST AI RMF.
 
-- Institutional model governance does not accept internal consistency as a substitute for outcome validity.
-- Explainability and review requirements imply that a contextual regime must provide measurable incremental value over simpler alternatives.
-- Stable narratives that do not improve decisions are still model risk.
+- PRA governance and validation principles require explicit control over model changes and production use, especially when model components change exposure.
+- Candidate, shadow, and active states must have different operating permissions; otherwise lifecycle governance is cosmetic.
+- SEC market-access practice is a useful analogue: controls must remain under the operator's control and be applied before orders are exposed to the market.
+- NIST AI RMF requires documented policies for when systems can move from development into operational use.
 
 ### Technical Implementation Plan
 
-- Replace the current `persistence improvement` gate with a multi-metric incremental-evidence gate.
-- Add contextual-regime evaluation metrics that compare enriched regimes against an endogenous-only baseline on:
-  - transition-aware predictive lift
-  - locked-holdout incremental utility after costs
-  - unseen-regime fallback rate
-  - post-transition degradation
-  - label entropy floor and minimum dwell distribution
-  - boundary reproducibility under neighboring refits
-- Demote pure persistence to a secondary diagnostic rather than a promotion control.
-- Store full regime-gating evidence under a dedicated artifact block such as `regime_incremental_evidence`.
-- Make promotion contingent on the enriched regime either:
-  - improving decision quality after costs, or
-  - reducing catastrophic fallback/degradation without hiding risk in no-trade behavior.
-- Add a null benchmark that tests whether the contextual regime merely partitions past performance without improving out-of-sample routing or thresholding.
+- Separate `research evaluation`, `shadow evaluation`, and `executable routing` permissions.
+- Change router candidate selection policy for executable modes to:
+  - use only `active_model_ids`
+  - optionally allow `certified_model_ids` if explicitly configured
+  - never auto-include `candidate_model_ids`
+  - never auto-include `degraded_model_ids` unless the safe-mode policy explicitly authorizes a fallback exception
+- Add a `shadow_specialist_surfaces` path so candidate specialists can still be evaluated counterfactually without contributing to executed exposure.
+- Require a formal transition artifact before a specialist becomes executable:
+  - promotion decision
+  - calibration evidence
+  - minimum sample evidence
+  - regime compatibility evidence
+  - rollback target
+- Persist lifecycle transitions with timestamps and approver policy lineage.
+- Add pipeline assertions so promotion-facing or capital-facing summaries cannot claim performance from candidate specialists in the executed path.
 
 ### Validation And Exit Criteria
 
-- A stickier regime that adds no predictive or execution benefit fails promotion.
-- Regime gate reports include both stability diagnostics and incremental outcome evidence.
-- Contextual regimes cannot be promoted on persistence alone.
+- Executed backtests and live routing never allocate to candidate specialists unless an explicit research override is enabled.
+- Shadow candidate performance is reported separately from executable performance.
+- Promotion review can reconstruct exactly when a specialist moved from candidate to executable status.
+- Removal of candidate exposure changes executed-path metrics whenever older runs were benefitting from unapproved specialists.
 
-## 5. Make Cross-Venue And Cross-Asset Context Freshness Fail Closed
+## 6. Tighten Drift Governance So Retraining Is Not Calendar-Driven Or Taxonomy-Driven Noise
 
 ### Audit Problem
 
-Cross-asset context can forward-fill indefinitely when no TTL is configured, and reference
-overlays rely on backward alignment without a mandatory freshness policy. That permits stale
-state to masquerade as valid regime context.
+The drift workflow can approve retraining on model TTL expiry even without drift
+evidence, while regime drift is partly computed from categorical regime label and
+transition distributions that may themselves be unstable when the detector
+taxonomy changes.
 
 ### Institutional Practice Synthesis
 
-Research basis: BCBS 239, NIST AI RMF, NIST AI RMF FAQs.
+Research basis: PRA SS1/23 Principles 3, 4, and 5, NIST AI RMF, BIS FSI 24.
 
-- BCBS 239 emphasizes risk data that can be aggregated fully, quickly, and accurately under stress.
-- Timeliness, completeness, and adaptability are core data-control expectations for institution-grade risk systems.
-- NIST AI RMF extends those expectations across deployment and monitoring: trustworthy systems must remain reliable and resilient in operation, not only in development.
+- Institutional model-risk practice distinguishes monitoring, recalibration, challenger training, and production replacement; those are not interchangeable actions.
+- PRA mitigants and validation principles imply that automatic model replacement should not be driven by maintenance timers alone.
+- NIST AI RMF Manage and Govern functions emphasize ongoing monitoring, policy-driven response, and documented decision thresholds.
+- BIS FSI 24 highlights the governance burden created when complex model outputs are unstable or hard to interpret across changes.
 
 ### Technical Implementation Plan
 
-- Change `core/context.py` and `core/reference_data.py` defaults so cross-asset, futures, and reference overlays require an explicit TTL policy in capital-facing modes.
-- Remove indefinite forward-fill as the default for cross-asset leader data. The default should be `preserve_missing` plus an unknown indicator unless a narrower policy is explicitly configured.
-- Add source-timestamp, feature-age, and freshness-state columns to every context block.
-- Introduce a unified `ContextFreshnessContract` for all non-local data sources:
-  - source timestamp
-  - availability timestamp
-  - age at decision time
-  - TTL status
-  - fill method used
-  - data-quality flags
-- In capital-facing modes, stale contextual features must either:
-  - be dropped and force fallback behavior, or
-  - block signal generation if the feature family is required for the selected path.
-- Extend scenario testing with stale-feed and partial-venue-lag events for futures context, reference overlays, and leader-basket symbols.
-- Persist freshness diagnostics into research artifacts, promotion evidence, and deployment readiness reports.
+- Split current `should_retrain` into three separate recommendations:
+  - `maintenance_refresh_recommended`
+  - `drift_investigation_recommended`
+  - `structural_retrain_recommended`
+- Reclassify TTL expiry as a maintenance trigger only. TTL alone may schedule challenger training or recalibration review, but it must not authorize automatic promotion.
+- Gate structural retraining on durable evidence:
+  - persistent multi-window drift evidence, or
+  - a critical-event override with explicit operator acknowledgement
+- Refactor regime drift so it operates on stable regime identities or detector score distributions, not raw semantic labels alone.
+- Add a `taxonomy_instability_guard` that suppresses regime-distribution drift escalation until remapping and stability checks have completed.
+- Require challenger replacement to satisfy both:
+  - post-selection evidence better than the champion on admissible holdout criteria
+  - post-retrain warm-up or shadow evidence if triggered by maintenance only
+- Persist separate drift channels and actions:
+  - feature drift
+  - score drift
+  - action drift
+  - stable-regime drift
+  - performance drift
+  - maintenance TTL
+- Add a formal retrain decision report with action lineage:
+  - why a challenger was trained
+  - why recalibration was sufficient or insufficient
+  - whether taxonomy instability was present
+  - why promotion was or was not allowed
 
 ### Validation And Exit Criteria
 
-- No contextual feature can be used without a measurable freshness state.
-- Capital-facing runs fail closed when required context is stale beyond policy.
-- Stress tests include stale cross-venue and stale leader-asset scenarios.
-- Promotion evidence includes stale-hit and unknown-hit rates for each context source.
+- TTL expiry alone cannot produce automatic champion replacement.
+- Regime drift alarms do not fire on pure label remapping events.
+- Maintenance refreshes, recalibrations, challenger trainings, and promotions are visibly distinct actions in logs and registry artifacts.
+- Historical drift decisions can be replayed and explained without relying on unstable semantic label names.
 
-## 6. Persist Drift State Across Operating Cycles
+## 7. Replace Same-Fold Specialist Uplift And Mean-Path Narratives With Locked-Holdout, Cost-Aware Evidence
 
 ### Audit Problem
 
-The drift monitor is recreated for each retraining cycle, so ADWIN and related evidence are
-window-local rather than persistent. That makes drift decisions sensitive to arbitrary cycle
-boundaries and can both miss structural breaks and trigger noisy retrains.
+Specialist incremental evidence is currently framed as same-fold accuracy lift
+versus the fallback generalist, and aggregate CPCV or path summaries can average
+away the exact tail-path failures that matter most in live trading. This can make
+the adaptive architecture look stronger than the tradable evidence supports.
 
 ### Institutional Practice Synthesis
 
-Research basis: NIST AI RMF, NIST AI RMF Playbook, BIS FSI 24.
+Research basis: PRA SS1/23 Principle 4, BCBS 239, NIST AI RMF, BIS FSI 24.
 
-- Institutional monitoring expects deployment-time behavior to be reviewed continuously, not as isolated snapshots.
-- Advanced AI governance requires monitoring, validation, and independent review to track the same model through time.
-- A drift process that resets hidden state at each review boundary is not operational monitoring; it is repeated re-sampling.
-
-### Technical Implementation Plan
-
-- Persist `DriftMonitor` state and detector internals alongside the champion artifact in the registry.
-- Add a `DriftStateSnapshot` artifact containing:
-  - detector family state
-  - reference/current window lineage
-  - last approved drift evidence
-  - cooldown state
-  - last recalibration and retrain timestamps
-- Make `run_drift_retraining_cycle(...)` load prior detector state, update it with the new slice, and persist the updated state after evaluation.
-- Distinguish three layers explicitly in stored state:
-  - distribution baselines
-  - streaming detector state
-  - decision-policy state
-- Add overlap-aware confirmation logic so structural retraining requires either:
-  - persistent evidence across sequential windows, or
-  - a critical-event override.
-- Preserve separate state for score drift, action drift, regime drift, and performance drift so one family cannot implicitly overwrite another.
-- Add deterministic replay tooling that can recompute a historical drift decision from persisted state and the exact input window.
-
-### Validation And Exit Criteria
-
-- Replaying the same chronological monitoring stream yields the same retrain decision regardless of review window batching.
-- Detector state survives process restarts.
-- Drift decisions can be reconstructed from persisted artifacts without hidden in-memory state.
-
-## 7. Hard-Separate Global Preview From Admissible Evidence
-
-### Audit Problem
-
-The pipeline still supports a `global_preview_only` regime path that fits detectors on the same
-window it later narrates. That is acceptable for inspection, but dangerous if preview artifacts
-bleed into validation, backtest, or promotion evidence.
-
-### Institutional Practice Synthesis
-
-Research basis: NIST AI RMF, NIST AI RMF Playbook, BIS FSI 24.
-
-- Lifecycle governance requires clear separation between development, validation, deployment, and monitoring artifacts.
-- Explainability and review lose value when a retrospective research object is reused as if it were live evidence.
-- Institution-grade review demands that non-causal preview outputs be clearly labeled, isolated, and barred from promotion decisions.
+- PRA independent validation requires evidence that is relevant to the model's actual use, not only internally favorable summary statistics.
+- BCBS 239 requires risk reporting that is accurate, timely, and decision-useful under stress; tail-path blindness is not acceptable risk reporting.
+- NIST AI RMF Measure and Manage functions support outcome-based evaluation, uncertainty visibility, and escalation when aggregate summaries hide important failure modes.
+- BIS FSI 24 reinforces that persuasive narratives and explanations are not substitutes for reliable validation evidence.
 
 ### Technical Implementation Plan
 
-- Split regime outputs into two explicit namespaces:
-  - `preview_regime_*` for full-sample or exploratory traces
-  - `evidence_regime_*` for fold-local, holdout, or deployment-admissible traces
-- Prevent `global_preview_only` artifacts from populating any state that can later feed:
-  - backtest runtime kwargs
-  - training summaries used for promotion
-  - registry manifests used for capital-facing review
-- Add a `evidence_class` field to every regime artifact with allowed values such as `preview_only`, `fold_local_oos`, `locked_holdout`, `live_monitoring`.
-- In capital-facing modes, reject any run where a preview-only regime artifact is attached to backtest or promotion evidence.
-- Update pipeline serialization and summary builders to preserve the distinction end to end.
-- Add tests that deliberately attempt to reuse preview artifacts in validation and assert hard failure.
+- Replace same-fold specialist uplift as the default evidence class with a layered evidence stack:
+  - locked-holdout post-cost uplift versus champion fallback
+  - worst-fold and worst-path degradation
+  - transition-segment behavior
+  - fallback dependence under unseen or unavailable regimes
+  - calibration and abstain quality
+  - significance or stability intervals where sample size permits
+- Treat accuracy lift as a secondary descriptive metric, never as a promotion control.
+- Expand CPCV and path summaries to report tail-sensitive statistics in addition to means:
+  - minimum
+  - lower decile or lower quartile
+  - conditional worst-regime performance
+  - maximum switch-cost burden
+  - maximum fallback share
+  - maximum eligible-specialist collapse
+- Add promotion blockers keyed to adverse tails rather than only average uplift.
+- Require specialist evidence to be traced to admissible rows only:
+  - no unavailable regime rows
+  - no blocked-by-health rows
+  - no candidate-only execution rows
+- Add a dedicated `adaptive_value_report` artifact covering:
+  - economic incremental value after costs
+  - robustness across paths and regimes
+  - dependency on fallback behavior
+  - sensitivity to taxonomy remaps and recalibration
 
 ### Validation And Exit Criteria
 
-- Preview artifacts are impossible to pass into capital-facing backtests and promotion gates.
-- Research UI can still inspect preview traces, but summaries clearly mark them as non-evidentiary.
-- Registry manifests store only admissible evidence classes for champion/challenger review.
-
-## 8. Define A Real Consumer-Hardware And Reduced-Power Operating Envelope
-
-### Audit Problem
-
-The framework has a `reduced_power` notion, but no explicit CPU, RAM, storage, dataset-size,
-or latency envelope proving the stack is safe and deterministic on consumer hardware. There is
-no standards-based basis to claim retail suitability without that envelope.
-
-### Institutional Practice Synthesis
-
-Research basis: SEC Rule 15c3-5, NIST AI RMF, NIST AI RMF FAQs.
-
-- SEC market-access controls assume the operator maintains direct control, pre-trade controls, and regular review of effectiveness.
-- NIST AI RMF is lifecycle-wide and scalable, but it still requires systems to remain valid, reliable, safe, secure, resilient, and documented in deployment.
-- A consumer-hardware claim is a deployment claim; it needs measured capacity, latency, failure-mode handling, and clear stage-gating rather than informal reassurance.
-
-### Technical Implementation Plan
-
-- Define explicit deployment profiles in config and readiness policy:
-  - `research_workstation`
-  - `consumer_laptop`
-  - `mini_server`
-  - `reduced_power_research_only`
-- For each profile, declare hard budgets for:
-  - peak RSS memory
-  - model load latency
-  - per-bar inference latency
-  - drift-cycle latency
-  - storage footprint
-  - maximum supported symbol and timeframe set
-- Instrument the pipeline and runtime with resource telemetry and persist it into readiness reports.
-- Extend readiness gating so any profile breach blocks progression above `research_certified` unless a narrower validated profile is explicitly selected.
-- Add a deterministic replay benchmark suite that runs representative workflows on the declared low-spec profile and records:
-  - throughput
-  - latency tail percentiles
-  - memory spikes
-  - restart recovery time
-  - degraded-mode behavior
-- Define failover behavior for low-resource conditions:
-  - forced fallback to simpler detectors
-  - reduced candidate set
-  - disabled mixture routing
-  - research-only downgrade
-- Publish a supported-operating-envelope matrix in user-facing docs and release criteria.
-
-### Validation And Exit Criteria
-
-- Every capital-facing mode is tied to a validated hardware profile.
-- `reduced_power` remains non-capital-eligible unless a dedicated validation program is added.
-- Retail suitability claims are backed by reproducible replay benchmarks and readiness reports.
+- A specialist architecture that improves mean accuracy but worsens tail economic outcomes fails promotion.
+- Promotion evidence exposes worst-path, worst-regime, and worst-transition behavior alongside central tendencies.
+- Same-fold uplift is clearly labeled descriptive and non-evidentiary.
+- Adaptive-value reports can explain whether specialist benefit remains after costs, fallback, and adverse-path analysis.
 
 ## Recommended Implementation Order
 
-1. Bind router stability to executed exposure.
-2. Remove synthetic confidence and enforce real availability timing.
-3. Make context freshness fail closed.
-4. Persist drift state across cycles.
-5. Hard-separate preview from admissible evidence.
-6. Make specialist execution honor health and eligibility.
-7. Replace persistence-only regime gating.
-8. Define the consumer-hardware operating envelope.
+1. Enforce causal regime availability in specialist and meta paths.
+2. Stabilize regime taxonomy before using it as a routing key.
+3. Replace placeholder router health with runtime eligibility evidence.
+4. Prevent candidate specialists from entering executable research paths.
+5. Replace shared meta-model reuse with specialist-specific edge validation.
+6. Tighten drift governance so retraining is not calendar-driven or taxonomy-driven noise.
+7. Replace same-fold specialist uplift and mean-path narratives with locked-holdout, cost-aware evidence.
 
-## Definition Of Done For The Program
+## Definition Of Done For This Audit Remediation Program
 
-- No capital-facing path depends on fabricated probabilities, same-bar regime availability by default, or preview-only artifacts.
-- Router, specialist, and drift controls report the executed path and can be replayed deterministically.
-- Contextual data sources are freshness-aware, point-in-time safe, and stress-tested.
-- Promotion, stress, and readiness gates evaluate the same artifacts that live runtime uses.
-- Consumer-hardware claims are tied to measured resource envelopes and enforced stage gates.
+- No executable or promotion-facing path consumes regime information earlier than its admissible availability contract allows.
+- Specialist routing keys remain stable across routine detector refits, or changes are explicitly remapped and governed.
+- Router exposure changes depend only on resolved runtime eligibility and measured health evidence.
+- No executable allocation depends on a candidate specialist or a meta edge surface that lacks surface-specific validation.
+- Drift policy distinguishes maintenance from structural deterioration and does not treat taxonomy noise as market drift.
+- Promotion evidence is locked-holdout, cost-aware, tail-sensitive, and tied to admissible executed rows.

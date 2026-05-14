@@ -8,7 +8,8 @@ import pandas as pd
 from core import ResearchPipeline, build_feature_adapter, detect_regime, sequential_bootstrap
 from core.features import FeatureSelectionResult
 from core.models import train_model
-from core.pipeline import SignalsStep
+from core.pipeline import SignalsStep, _build_specialist_signal_surfaces
+from core.regime_training import RegimeAwareModelBundle
 
 
 class _FoldScopedPipeline:
@@ -164,6 +165,70 @@ class RegimeLeakageControlsTest(unittest.TestCase):
         self.assertTrue(report["sequential_bootstrap_used"])
         self.assertEqual(report["reason"], "high_concurrency_resampled")
         self.assertFalse(model.bootstrap)
+
+    def test_specialist_signal_surfaces_share_bundle_meta_prob_until_surface_validation_exists(self):
+        index = pd.date_range("2026-05-03", periods=8, freq="1h", tz="UTC")
+        X = pd.DataFrame({"feature": np.linspace(-1.0, 1.0, len(index))}, index=index)
+
+        class DummyClassifier:
+            def __init__(self, classes, probabilities, threshold=0.0):
+                self.classes_ = np.array(classes)
+                self._probabilities = np.array(probabilities, dtype=float)
+                self._threshold = float(threshold)
+
+            def predict(self, frame):
+                return np.where(frame["feature"].to_numpy() >= self._threshold, 1, -1)
+
+            def predict_proba(self, frame):
+                return np.tile(self._probabilities, (len(frame), 1))
+
+        class RecordingMetaClassifier:
+            def __init__(self, classes, probabilities):
+                self.classes_ = np.array(classes)
+                self._probabilities = np.array(probabilities, dtype=float)
+                self.predict_proba_calls = 0
+
+            def predict(self, frame):
+                return np.ones(len(frame), dtype=int)
+
+            def predict_proba(self, frame):
+                self.predict_proba_calls += 1
+                return np.tile(self._probabilities, (len(frame), 1))
+
+        bundle = RegimeAwareModelBundle(
+            strategy="specialist",
+            fallback_model=DummyClassifier(classes=[-1, 1], probabilities=[0.45, 0.55], threshold=0.0),
+            specialist_models={
+                "bull": DummyClassifier(classes=[-1, 1], probabilities=[0.2, 0.8], threshold=-0.2),
+            },
+            feature_columns=["feature"],
+            regime_column="regime",
+        )
+        meta_model = RecordingMetaClassifier(classes=[0, 1], probabilities=[0.2, 0.8])
+
+        surfaces = _build_specialist_signal_surfaces(
+            bundle,
+            X,
+            meta_model=meta_model,
+            signal_config={"threshold": 0.0, "edge_threshold": 0.0, "meta_threshold": 0.5, "fraction": 0.5},
+            avg_win=0.02,
+            avg_loss=0.01,
+            holding_bars=1,
+        )
+
+        self.assertEqual(meta_model.predict_proba_calls, 1)
+        pd.testing.assert_series_equal(
+            surfaces["fallback_generalist"]["meta_prob"],
+            surfaces["specialist::bull"]["meta_prob"],
+        )
+        pd.testing.assert_series_equal(
+            surfaces["fallback_generalist"]["expected_trade_edge"],
+            surfaces["specialist::bull"]["expected_trade_edge"],
+        )
+        self.assertEqual(
+            surfaces["specialist::bull"]["surface_edge_policy"],
+            "bundle_level_shared_meta_containment",
+        )
 
     def test_random_forest_warns_when_high_concurrency_sequential_bootstrap_is_disabled(self):
         index = pd.date_range("2026-02-01", periods=12, freq="1h", tz="UTC")

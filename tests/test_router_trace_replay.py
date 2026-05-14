@@ -49,8 +49,8 @@ class RouterTraceReplayTest(unittest.TestCase):
 
         self.assertEqual(first["decision_trace"], second["decision_trace"])
         self.assertEqual(first["summary"]["decision_count"], 3)
-        self.assertEqual(first["summary"]["switch_count"], 1)
-        self.assertEqual(first["summary"]["executed_weight_turnover_total"], 1.0)
+        self.assertEqual(first["summary"]["switch_count"], 2)
+        self.assertEqual(first["summary"]["executed_weight_turnover_total"], 2.0)
         self.assertEqual(first["summary"]["blocked_allocation_count"], 0)
         self.assertEqual(first["summary"]["route_reason_counts"]["persistence_hold"], 1)
         self.assertEqual(first["summary"]["selected_model_ids"][1], "specialist::bull")

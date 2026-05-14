@@ -15,6 +15,7 @@ from core import (
     run_drift_retraining_cycle,
     upsert_promotion_gate,
 )
+from core.drift import DriftMonitor
 from core.specialists import SpecialistHealthContract, SpecialistLibrarySnapshot, SpecialistPerformanceSlice, SpecialistSpec
 from core.storage import read_json
 
@@ -495,14 +496,42 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             )
 
             self.assertTrue(result["drift_report"]["model_ttl_expired"])
-            self.assertIn("model_ttl_expired", result["drift_guardrails"]["reasons"])
-            self.assertEqual(result["action_report"]["recommended_action"], "retrain")
-            self.assertEqual(result["retrain_status"], "promoted")
-            self.assertTrue(result["promotion_decision"]["approved"])
-            self.assertTrue(result["post_retrain_warmup"]["required"])
-            self.assertEqual(result["post_retrain_warmup"]["mode"], "paper")
-            self.assertNotEqual(result["candidate_version_id"], champion_id)
-            self.assertEqual(store.get_champion("BTCUSDT")["version_id"], result["candidate_version_id"])
+            self.assertIn("ttl_without_material_drift", result["drift_guardrails"]["reasons"])
+            self.assertEqual(result["action_report"]["recommended_action"], "hold")
+            self.assertEqual(result["retrain_status"], "not_recommended")
+            self.assertIsNone(result["candidate_version_id"])
+            self.assertEqual(store.get_champion("BTCUSDT")["version_id"], champion_id)
+
+    def test_canonical_regime_ids_prevent_label_rename_drift_noise(self):
+        reference_index = pd.date_range("2026-10-01", periods=300, freq="1h", tz="UTC")
+        current_index = pd.date_range("2026-11-01", periods=240, freq="1h", tz="UTC")
+        reference_features = pd.DataFrame(
+            {
+                "alpha": 0.0,
+                "beta": 0.0,
+                "regime": "range_label",
+                "canonical_regime_id": "family_0",
+            },
+            index=reference_index,
+        )
+        current_features = pd.DataFrame(
+            {
+                "alpha": 0.0,
+                "beta": 0.0,
+                "regime": "trend_label",
+                "canonical_regime_id": "family_0",
+            },
+            index=current_index,
+        )
+        reference_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=reference_index)
+        current_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=current_index)
+
+        monitor = DriftMonitor(reference_features, reference_predictions=reference_predictions, config={"min_samples": 1})
+        report = monitor.check(current_features, current_predictions=current_predictions)
+
+        self.assertFalse(report["regime_drift"])
+        self.assertEqual(report["regime_report"]["identity_column"], "canonical_regime_id")
+        self.assertEqual(float((report["regime_report"]["distribution"] or {}).get("total_variation") or 0.0), 0.0)
 
     def test_scheduled_drift_retrain_promotes_approved_challenger(self):
         reference_features, current_features, reference_predictions, current_predictions, performance = _make_drift_inputs()

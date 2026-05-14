@@ -138,10 +138,14 @@ class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
         self.assertEqual(report["by_regime"]["crash"]["affected_fold_count"], 1)
         self.assertEqual(report["affected_folds"][0]["split_id"], "fold_0")
         self.assertEqual(report["affected_fold_metrics"]["mean_net_profit_pct"], -2.0)
+        self.assertEqual(report["affected_fold_metrics"]["worst_net_profit_pct"], -2.0)
         self.assertEqual(report["clean_fold_metrics"]["mean_net_profit_pct"], 1.5)
+        self.assertEqual(report["max_fallback_row_share"], 0.25)
         self.assertEqual(summary["fallback_evidence_rows"], 60)
         self.assertEqual(summary["fallback_row_share"], 0.1667)
         self.assertEqual(summary["candidate_classification"], "specialist_degraded_to_fallback")
+        self.assertEqual(summary["adaptive_value_report"]["evidence_class"], "tail_sensitive_fallback_degradation")
+        self.assertEqual(summary["adaptive_value_report"]["fallback_dependency"]["max_fallback_row_share"], 0.25)
 
     def test_train_models_supports_regime_aware_primary_path(self):
         pipeline = _build_pipeline(_make_market_frame(seed=17), strategy="feature")
@@ -165,8 +169,11 @@ class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
         self.assertIn("validation", coverage_summary["folds"][0])
         self.assertIn("test", coverage_summary["folds"][0])
         self.assertTrue(coverage_summary["unseen_regime_degradation_report"]["enabled"])
+        self.assertIn("adaptive_value_report", coverage_summary)
         self.assertIn("unseen_regime_degradation_report", regime_summary)
+        self.assertIn("adaptive_value_report", regime_summary)
         self.assertIn("unseen_regime_degradation_report", backtest)
+        self.assertIn("adaptive_value_report", backtest)
         self.assertEqual(list(signals["continuous_signals"].index), list(training["oos_predictions"].index))
         self.assertGreaterEqual(backtest["total_trades"], 0)
 

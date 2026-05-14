@@ -230,6 +230,36 @@ class PromotionGateBindingTest(unittest.TestCase):
         self.assertEqual(stress_realism["reason"], "unseen_regime_fallback_share_above_limit")
         self.assertEqual(stress_realism["regime_fallback"]["candidate_classification"], "specialist_degraded_to_fallback")
 
+    def test_trade_ready_specialist_blocks_worst_fold_fallback_tail(self):
+        stress_realism = evaluate_stress_realism_gate(
+            {
+                "evaluation_mode": "trade_ready",
+                "stress_matrix": {
+                    "configured": True,
+                    "scenario_names": ["downtime", "stale_mark", "halt"],
+                    "worst_max_drawdown": -0.05,
+                    "worst_fill_ratio": 0.95,
+                    "worst_trade_count": 3,
+                },
+            },
+            policy={"max_unseen_regime_fallback_share": 0.2},
+            regime_aware_summary={
+                "enabled": True,
+                "strategy": "specialist",
+                "candidate_classification": "specialist_degraded_to_fallback",
+                "fallback_rows": 15,
+                "fallback_evidence_rows": 100,
+                "fallback_row_share": 0.15,
+                "unseen_regimes": ["crash"],
+                "unseen_regime_degradation_report": {"max_fallback_row_share": 0.35},
+                "adaptive_value_report": {"evidence_class": "tail_sensitive_fallback_degradation"},
+            },
+        )
+
+        self.assertFalse(stress_realism["passed"])
+        self.assertEqual(stress_realism["reason"], "single_fold_unseen_regime_fallback_share_above_limit")
+        self.assertEqual(stress_realism["regime_fallback"]["max_fallback_row_share"], 0.35)
+
     def test_router_stability_gate_blocks_over_switching(self):
         router_stability = evaluate_router_stability_gate(
             {

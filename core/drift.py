@@ -34,7 +34,10 @@ def _coerce_regime_label_series(value):
     if isinstance(value, pd.DataFrame):
         if value.empty:
             return pd.Series(dtype=float)
-        column = "regime" if "regime" in value.columns else value.columns[0]
+        if "canonical_regime_id" in value.columns and pd.Series(value["canonical_regime_id"], copy=False).notna().any():
+            column = "canonical_regime_id"
+        else:
+            column = "regime" if "regime" in value.columns else value.columns[0]
         return pd.Series(value[column], copy=False)
     return _safe_series(value)
 
@@ -96,6 +99,7 @@ def _resolve_drift_policy(config=None):
         "expected_trades_per_day": None,
         "min_expected_trades": None,
         "min_drift_signals": 2,
+        "min_ttl_drift_signals": 1,
         "adwin_delta": 0.002,
         "interval": None,
         "post_retrain_warmup_required": True,
@@ -439,11 +443,11 @@ class DriftMonitor:
         current_features = _safe_frame(current_features)
         current_predictions = _safe_frame(current_predictions)
         inferred_reference_regimes = self.reference_regimes
-        if inferred_reference_regimes.empty and "regime" in self.reference_features.columns:
-            inferred_reference_regimes = _coerce_regime_label_series(self.reference_features["regime"])
+        if inferred_reference_regimes.empty and not self.reference_features.empty:
+            inferred_reference_regimes = _coerce_regime_label_series(self.reference_features)
         inferred_current_regimes = _coerce_regime_label_series(current_regimes)
-        if inferred_current_regimes.empty and "regime" in current_features.columns:
-            inferred_current_regimes = _coerce_regime_label_series(current_features["regime"])
+        if inferred_current_regimes.empty and not current_features.empty:
+            inferred_current_regimes = _coerce_regime_label_series(current_features)
 
         sample_count = int(
             len(current_features)
@@ -524,6 +528,15 @@ class DriftMonitor:
         reference_transition = _categorical_transition_distribution(inferred_reference_regimes)
         current_transition = _categorical_transition_distribution(inferred_current_regimes)
         regime_transition_tv = _distribution_total_variation(reference_transition, current_transition)
+        regime_identity_column = None
+        if isinstance(current_regimes, pd.DataFrame) and "canonical_regime_id" in current_regimes.columns:
+            regime_identity_column = "canonical_regime_id"
+        elif isinstance(current_features, pd.DataFrame) and "canonical_regime_id" in current_features.columns:
+            regime_identity_column = "canonical_regime_id"
+        elif isinstance(current_regimes, pd.DataFrame) and "regime" in current_regimes.columns:
+            regime_identity_column = "regime"
+        elif isinstance(current_features, pd.DataFrame) and "regime" in current_features.columns:
+            regime_identity_column = "regime"
         regime_drift = bool(
             regime_distribution is not None
             and (
@@ -558,7 +571,15 @@ class DriftMonitor:
         enough_samples = sample_count >= int(self.config["min_samples"])
         evidence_count = int(feature_drift) + int(score_drift) + int(action_drift) + int(regime_drift) + int(performance_drift)
         sufficient_evidence = evidence_count >= int(self.config["min_drift_signals"])
-        should_retrain = bool(enough_samples and not cooldown_active and (sufficient_evidence or model_ttl_expired))
+        ttl_evidence_sufficient = evidence_count >= int(self.config.get("min_ttl_drift_signals", 1))
+        should_retrain = bool(
+            enough_samples
+            and not cooldown_active
+            and (
+                sufficient_evidence
+                or (model_ttl_expired and ttl_evidence_sufficient)
+            )
+        )
 
         reasons = []
         if model_ttl_expired:
@@ -573,6 +594,8 @@ class DriftMonitor:
             reasons.append("cooldown_active")
         if enough_samples and not sufficient_evidence and not model_ttl_expired:
             reasons.append("insufficient_drift_evidence")
+        if model_ttl_expired and not ttl_evidence_sufficient:
+            reasons.append("ttl_without_material_drift")
         if should_retrain:
             reasons.append("retrain_recommended")
 
@@ -611,6 +634,7 @@ class DriftMonitor:
                 "reference_transition_distribution": reference_transition,
                 "current_transition_distribution": current_transition,
                 "transition_total_variation": regime_transition_tv,
+                "identity_column": regime_identity_column,
             },
             "regime_drift": regime_drift,
             "performance_updates": performance_updates,
@@ -626,12 +650,15 @@ class DriftMonitor:
             "cooldown_active": cooldown_active,
             "minimum_samples_met": enough_samples,
             "evidence_count": evidence_count,
+            "ttl_evidence_sufficient": ttl_evidence_sufficient,
             "recommendation": {
                 "should_retrain": should_retrain,
                 "reasons": reasons,
                 "bars_since_last_retrain": bars_since_last_retrain,
                 "max_bars_between_retrain": max_bars_between_retrain,
                 "model_ttl_expired": model_ttl_expired,
+                "ttl_evidence_sufficient": ttl_evidence_sufficient,
+                "min_ttl_drift_signals": int(self.config.get("min_ttl_drift_signals", 1)),
             },
         }
 
@@ -641,6 +668,7 @@ def evaluate_drift_guardrails(drift_report, policy=None):
     minimum_samples = int(policy.get("min_samples", 200))
     cooldown_bars = int(policy.get("cooldown_bars", 500))
     minimum_signal_count = int(policy.get("min_drift_signals", 2))
+    minimum_ttl_signal_count = int(policy.get("min_ttl_drift_signals", 1))
     report = dict(drift_report or {})
     sample_count = int(report.get("sample_count") or 0)
     evidence_count = int(report.get("evidence_count") or 0)
@@ -650,7 +678,10 @@ def evaluate_drift_guardrails(drift_report, policy=None):
     cooldown_active = bars_since_last_retrain is not None and int(bars_since_last_retrain) < cooldown_bars and not model_ttl_expired
     approved = bool(
         sample_count >= minimum_samples
-        and (evidence_count >= minimum_signal_count or model_ttl_expired)
+        and (
+            evidence_count >= minimum_signal_count
+            or (model_ttl_expired and evidence_count >= minimum_ttl_signal_count)
+        )
         and not cooldown_active
         and bool(report.get("recommendation", {}).get("should_retrain", False))
     )
@@ -661,6 +692,8 @@ def evaluate_drift_guardrails(drift_report, policy=None):
         reasons.append("minimum_samples_not_met")
     if evidence_count < minimum_signal_count and not model_ttl_expired:
         reasons.append("insufficient_drift_evidence")
+    if model_ttl_expired and evidence_count < minimum_ttl_signal_count:
+        reasons.append("ttl_without_material_drift")
     if cooldown_active:
         reasons.append("cooldown_active")
     if approved:
@@ -675,6 +708,7 @@ def evaluate_drift_guardrails(drift_report, policy=None):
         "cooldown_bars": int(cooldown_bars),
         "min_samples": int(minimum_samples),
         "model_ttl_expired": model_ttl_expired,
+        "min_ttl_drift_signals": minimum_ttl_signal_count,
         "max_bars_between_retrain": max_bars_between_retrain,
         "trade_rate_min_samples": policy.get("trade_rate_min_samples"),
     }
