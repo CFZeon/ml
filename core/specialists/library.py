@@ -13,12 +13,27 @@ from .contracts import (
 
 
 _ALLOWED_LIFECYCLE_TRANSITIONS = {
+    SpecialistLifecycleState.RESEARCH_ONLY: {
+        SpecialistLifecycleState.SHADOW,
+        SpecialistLifecycleState.RETIRED,
+    },
+    SpecialistLifecycleState.SHADOW: {
+        SpecialistLifecycleState.EXECUTABLE,
+        SpecialistLifecycleState.RETIRED,
+    },
+    SpecialistLifecycleState.EXECUTABLE: {
+        SpecialistLifecycleState.DEGRADED,
+        SpecialistLifecycleState.RETIRED,
+    },
     SpecialistLifecycleState.CANDIDATE: {
+        SpecialistLifecycleState.RESEARCH_ONLY,
+        SpecialistLifecycleState.SHADOW,
         SpecialistLifecycleState.CERTIFIED,
         SpecialistLifecycleState.RETIRED,
     },
     SpecialistLifecycleState.CERTIFIED: {
         SpecialistLifecycleState.ACTIVE,
+        SpecialistLifecycleState.EXECUTABLE,
         SpecialistLifecycleState.SHADOW_CHALLENGER,
         SpecialistLifecycleState.RETIRED,
     },
@@ -139,6 +154,9 @@ def build_specialist_selection_contract(snapshot: Any) -> dict[str, Any]:
     lifecycle_state_by_model_id = {}
     compatible_regimes = {}
     buckets = {
+        SpecialistLifecycleState.RESEARCH_ONLY.value: [],
+        SpecialistLifecycleState.SHADOW.value: [],
+        SpecialistLifecycleState.EXECUTABLE.value: [],
         SpecialistLifecycleState.CANDIDATE.value: [],
         SpecialistLifecycleState.CERTIFIED.value: [],
         SpecialistLifecycleState.ACTIVE.value: [],
@@ -155,10 +173,14 @@ def build_specialist_selection_contract(snapshot: Any) -> dict[str, Any]:
 
     return {
         "fallback_model_id": resolved.fallback_model_id,
+        "research_only_model_ids": buckets[SpecialistLifecycleState.RESEARCH_ONLY.value],
+        "shadow_candidate_model_ids": buckets[SpecialistLifecycleState.SHADOW.value],
+        "executable_model_ids": buckets[SpecialistLifecycleState.EXECUTABLE.value],
         "candidate_model_ids": buckets[SpecialistLifecycleState.CANDIDATE.value],
         "certified_model_ids": buckets[SpecialistLifecycleState.CERTIFIED.value],
         "active_model_ids": buckets[SpecialistLifecycleState.ACTIVE.value],
-        "shadow_model_ids": buckets[SpecialistLifecycleState.SHADOW_CHALLENGER.value],
+        "shadow_challenger_model_ids": buckets[SpecialistLifecycleState.SHADOW_CHALLENGER.value],
+        "shadow_model_ids": buckets[SpecialistLifecycleState.SHADOW.value] + buckets[SpecialistLifecycleState.SHADOW_CHALLENGER.value],
         "degraded_model_ids": buckets[SpecialistLifecycleState.DEGRADED.value],
         "retired_model_ids": buckets[SpecialistLifecycleState.RETIRED.value],
         "compatible_regimes": compatible_regimes,

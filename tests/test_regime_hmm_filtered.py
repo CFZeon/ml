@@ -128,6 +128,55 @@ class FilteredHMMRuntimeTest(unittest.TestCase):
         self.assertTrue(remapped_manifest["metadata"]["taxonomy_stability_report"]["reference_available"])
         self.assertEqual(remapped_manifest["metadata"]["taxonomy_stability_report"]["compatibility_break_count"], 0)
 
+    def test_filtered_hmm_marks_low_confidence_same_family_remaps_for_shadow(self):
+        index = pd.date_range("2026-08-01", periods=96, freq="1h", tz="UTC")
+        observations = _make_hmm_observations(index)
+        spec = {"name": "hmm_native", "type": "filtered_hmm"}
+        config = {"column_name": "regime", "n_regimes": 2, "random_state": 7, "n_iter": 40}
+
+        deployed = build_regime_detector(spec, config=config)
+        deployed.fit(observations.iloc[:64])
+        deployed_manifest = deployed.manifest().to_dict()
+        reference_map = {
+            state_index: {
+                **dict(payload or {}),
+                "canonical_regime_id": f"deployed_family_{state_index}",
+                "regime_family_id": f"deployed_family_{state_index}",
+                "feature_signature": {
+                    **dict((payload or {}).get("feature_signature") or {}),
+                },
+            }
+            for state_index, payload in dict(deployed_manifest["metadata"]["canonical_state_map"]).items()
+        }
+        for payload in reference_map.values():
+            signature = dict(payload.get("feature_signature") or {})
+            if not signature:
+                continue
+            first_key = next(iter(signature))
+            signature[first_key] = "forced_low_confidence_bucket"
+            payload["feature_signature"] = signature
+
+        remapped = build_regime_detector(
+            spec,
+            config={
+                **config,
+                "reference_canonical_state_map": reference_map,
+                "canonical_similarity_threshold": 0.75,
+                "canonical_low_confidence_threshold": 0.5,
+            },
+        )
+        remapped.fit(observations.iloc[:64])
+        remapped_manifest = remapped.manifest().to_dict()
+        canonical_state_map = dict(remapped_manifest["metadata"]["canonical_state_map"])
+
+        self.assertTrue(remapped_manifest["metadata"]["taxonomy_registry"])
+        self.assertTrue(any(payload["remap_reason"] == "same_family_low_confidence" for payload in canonical_state_map.values()))
+        low_confidence_entry = next(payload for payload in canonical_state_map.values() if payload["remap_reason"] == "same_family_low_confidence")
+        self.assertEqual(low_confidence_entry["mapping_status"], "needs_shadow_period")
+        self.assertEqual(low_confidence_entry["regime_family_id"], low_confidence_entry["predecessor_canonical_regime_id"])
+        self.assertIn("needs_shadow_period", low_confidence_entry["canonical_regime_id"])
+        self.assertGreaterEqual(remapped_manifest["metadata"]["taxonomy_stability_report"]["needs_shadow_period_count"], 1)
+
     def test_filtered_hmm_update_does_not_call_smoothed_or_batch_decoding_methods(self):
         from hmmlearn.hmm import GaussianHMM
 

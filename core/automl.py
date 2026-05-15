@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .automl_contracts import validate_summary_contract
+from .evaluation_modes import is_selection_eligible_evidence_class
 from .evaluation_modes import resolve_evaluation_mode
 from .promotion import (
     build_promotion_gate_check_map,
@@ -1485,7 +1486,11 @@ def _summarize_backtest(backtest, *, evidence_class=None):
         summary["statistical_significance"] = backtest.get("statistical_significance")
     if backtest.get("signal_decay") is not None:
         summary["signal_decay"] = backtest.get("signal_decay")
-    summary["evidence_class"] = str(evidence_class or backtest.get("evidence_class") or "backtest_payload")
+    payload_evidence_class = str(backtest.get("evidence_class") or "").strip().lower()
+    resolved_evidence_class = str(evidence_class or backtest.get("evidence_class") or "backtest_payload")
+    if payload_evidence_class and not is_selection_eligible_evidence_class(payload_evidence_class):
+        resolved_evidence_class = payload_evidence_class
+    summary["evidence_class"] = resolved_evidence_class
     return summary
 
 
@@ -3508,6 +3513,10 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         objective_gate_passed = bool(
             (objective_diagnostics.get("classification_gates") or {}).get("passed", True)
         )
+        selection_evidence_class = str((validation_metrics.get("backtest") or {}).get("evidence_class") or "")
+        selection_evidence_pass = bool(is_selection_eligible_evidence_class(selection_evidence_class))
+        if not selection_evidence_pass:
+            selection_value = float("-inf")
         training_summary = validation_metrics.get("training") or {}
         promotion_gates = dict(training_summary.get("promotion_gates") or {})
         feature_admission_summary = dict((training_summary.get("feature_governance") or {}).get("admission_summary") or {})
@@ -3572,6 +3581,7 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
         signal_decay_pass = signal_decay_gate["passed"]
 
         eligibility_checks = {
+            "selection_evidence": selection_evidence_pass,
             "minimum_dsr": bool(meets_minimum_dsr_threshold or not dsr_gate_applies),
             "objective_constraints": objective_gate_passed,
             "validation_trade_count": bool(
@@ -3626,6 +3636,9 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
                 _gs("minimum_dsr", ec["minimum_dsr"], dsr_value,
                     minimum_dsr_threshold if dsr_gate_applies else None,
                     "deflated_sharpe_below_threshold", deflated_sharpe),
+                _gs("selection_evidence", ec["selection_evidence"],
+                    selection_evidence_class or None, ["outer_replay", "locked_holdout", "causal_research", "promotion_eligible", "capital_facing"],
+                    "preview_only_evidence_not_selectable", {"evidence_class": selection_evidence_class}),
                 _gs("objective_constraints", ec["objective_constraints"],
                     objective_gate_passed, True, "objective_constraints_failed", objective_diagnostics),
                 _gs("validation_trade_count", ec["validation_trade_count"],
@@ -3865,7 +3878,12 @@ def _build_trial_selection_report(completed_trials, trial_records, objective_nam
 
 def _build_top_trial_reports(selection_report):
     top_trials = []
-    for report in list((selection_report or {}).get("trial_reports") or [])[:5]:
+    eligible_reports = [
+        report
+        for report in list((selection_report or {}).get("trial_reports") or [])
+        if bool((report.get("selection_policy") or {}).get("eligibility_checks", {}).get("selection_evidence", True))
+    ]
+    for report in eligible_reports[:5]:
         top_trials.append(
             {
                 "number": int(report["number"]),

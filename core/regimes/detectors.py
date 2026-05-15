@@ -392,6 +392,10 @@ def _new_hmm_regime_family_id(detector_name: Any, ordered_state_id: int) -> str:
     return f"filtered_hmm__{_sanitize_regime_token(detector_name)}__new_family__state_{int(ordered_state_id)}"
 
 
+def _shadow_hmm_regime_id(regime_family_id: Any, ordered_state_id: int) -> str:
+    return f"{str(regime_family_id)}__needs_shadow_period__state_{int(ordered_state_id)}"
+
+
 def _bucket_semantic_state_value(value: float, all_values: np.ndarray) -> str:
     values = np.asarray(all_values, dtype=float)
     if values.size <= 1 or np.allclose(values, values[0]):
@@ -473,6 +477,16 @@ def _coerce_hmm_reference_state_map(config: Mapping[str, Any] | None, detector_n
             "canonical_regime_id": str(
                 entry.get("canonical_regime_id") or _default_hmm_canonical_regime_id(detector_name, state_index)
             ),
+            "regime_family_id": str(
+                entry.get("regime_family_id")
+                or entry.get("canonical_regime_id")
+                or _default_hmm_canonical_regime_id(detector_name, state_index)
+            ),
+            "routing_regime_id": str(
+                entry.get("routing_regime_id")
+                or entry.get("canonical_regime_id")
+                or _default_hmm_canonical_regime_id(detector_name, state_index)
+            ),
             "semantic_label": (
                 None if entry.get("semantic_label") is None else str(entry.get("semantic_label"))
             ),
@@ -484,6 +498,10 @@ def _coerce_hmm_reference_state_map(config: Mapping[str, Any] | None, detector_n
                 for key, value in dict(entry.get("state_signature_summary") or {}).items()
                 if value is not None
             },
+            "mapping_status": str(entry.get("mapping_status") or "stable_match"),
+            "predecessor_canonical_regime_id": (
+                None if entry.get("predecessor_canonical_regime_id") is None else str(entry.get("predecessor_canonical_regime_id"))
+            ),
         }
     return normalized
 
@@ -496,6 +514,7 @@ def _build_hmm_canonical_state_map(
     semantic_state_map: Mapping[int, Mapping[str, Any]] | None,
     reference_state_map: Mapping[int, Mapping[str, Any]] | None = None,
     similarity_threshold: float = 0.75,
+    low_confidence_threshold: float = 0.5,
 ) -> dict[int, dict[str, Any]]:
     del ordered_means, feature_names
     semantic_map = {int(key): dict(value or {}) for key, value in dict(semantic_state_map or {}).items()}
@@ -530,20 +549,46 @@ def _build_hmm_canonical_state_map(
                 reference_state.get("canonical_regime_id")
                 or _default_hmm_canonical_regime_id(detector_name, best_reference_index)
             )
+            regime_family_id = str(reference_state.get("regime_family_id") or canonical_regime_id)
+            routing_regime_id = str(reference_state.get("routing_regime_id") or canonical_regime_id)
             remap_reason = "matched_prior_signature"
+            mapping_status = "stable_match"
             mapping_confidence = float(best_similarity)
+            predecessor_canonical_regime_id = canonical_regime_id
             used_reference_states.add(best_reference_index)
+        elif best_reference_index is not None and best_similarity >= float(low_confidence_threshold):
+            reference_state = dict(reference_map.get(best_reference_index) or {})
+            predecessor_canonical_regime_id = str(
+                reference_state.get("canonical_regime_id")
+                or _default_hmm_canonical_regime_id(detector_name, best_reference_index)
+            )
+            regime_family_id = str(reference_state.get("regime_family_id") or predecessor_canonical_regime_id)
+            canonical_regime_id = _shadow_hmm_regime_id(regime_family_id, state_index)
+            routing_regime_id = canonical_regime_id
+            remap_reason = "same_family_low_confidence"
+            mapping_status = "needs_shadow_period"
+            mapping_confidence = float(best_similarity)
         elif reference_map:
             canonical_regime_id = _new_hmm_regime_family_id(detector_name, state_index)
+            regime_family_id = canonical_regime_id
+            routing_regime_id = canonical_regime_id
             remap_reason = "new_regime_family"
+            mapping_status = "new_regime_family"
             mapping_confidence = float(max(best_similarity, 0.0))
+            predecessor_canonical_regime_id = None
         else:
             canonical_regime_id = _default_hmm_canonical_regime_id(detector_name, state_index)
+            regime_family_id = canonical_regime_id
+            routing_regime_id = canonical_regime_id
             remap_reason = "initial_fit"
+            mapping_status = "initial_fit"
             mapping_confidence = 1.0
+            predecessor_canonical_regime_id = None
 
         canonical_state_map[int(state_index)] = {
             "canonical_regime_id": canonical_regime_id,
+            "regime_family_id": regime_family_id,
+            "routing_regime_id": routing_regime_id,
             "semantic_label": semantic_label,
             "feature_signature": feature_signature,
             "state_signature_summary": state_signature_summary,
@@ -552,8 +597,34 @@ def _build_hmm_canonical_state_map(
             ),
             "mapping_confidence": round(float(mapping_confidence), 6),
             "remap_reason": remap_reason,
+            "mapping_status": mapping_status,
+            "predecessor_canonical_regime_id": predecessor_canonical_regime_id,
+            "predecessor_state_index": best_reference_index,
         }
     return canonical_state_map
+
+
+def _build_hmm_taxonomy_registry(canonical_state_map: Mapping[int, Mapping[str, Any]] | None) -> dict[str, Any]:
+    state_map = {
+        str(int(state_index)): {
+            "canonical_regime_id": str(payload.get("canonical_regime_id")),
+            "regime_family_id": str(payload.get("regime_family_id") or payload.get("canonical_regime_id")),
+            "routing_regime_id": str(payload.get("routing_regime_id") or payload.get("canonical_regime_id")),
+            "semantic_label": payload.get("semantic_label"),
+            "mapping_confidence": payload.get("mapping_confidence"),
+            "mapping_status": payload.get("mapping_status"),
+            "remap_reason": payload.get("remap_reason"),
+            "predecessor_canonical_regime_id": payload.get("predecessor_canonical_regime_id"),
+            "predecessor_state_index": payload.get("predecessor_state_index"),
+            "state_signature_summary": dict(payload.get("state_signature_summary") or {}),
+        }
+        for state_index, payload in dict(canonical_state_map or {}).items()
+    }
+    return {
+        "version": "filtered_hmm.taxonomy.v2",
+        "identity_basis": "canonical_state_map",
+        "state_map": state_map,
+    }
 
 
 def _summarize_hmm_taxonomy_stability(
@@ -575,6 +646,7 @@ def _summarize_hmm_taxonomy_stability(
 
     matched_count = sum(1 for entry in entries if entry.get("remap_reason") == "matched_prior_signature")
     unresolved_count = sum(1 for entry in entries if entry.get("remap_reason") == "new_regime_family")
+    low_confidence_count = sum(1 for entry in entries if entry.get("remap_reason") == "same_family_low_confidence")
     similarity_values = [
         float(entry.get("similarity_score"))
         for entry in entries
@@ -594,7 +666,12 @@ def _summarize_hmm_taxonomy_stability(
         "unresolved_new_state_rate": (
             None if not reference_available else round(float(unresolved_count / total_states), 6)
         ),
-        "compatibility_break_count": int(unresolved_count),
+        "same_family_low_confidence_rate": (
+            None if not reference_available else round(float(low_confidence_count / total_states), 6)
+        ),
+        "needs_shadow_period_count": int(low_confidence_count),
+        "compatibility_break_count": int(unresolved_count + low_confidence_count),
+        "routing_key_change_count": int(unresolved_count + low_confidence_count),
     }
 
 
@@ -925,6 +1002,7 @@ class FilteredHMMDetector:
     _canonical_state_map: dict[int, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _canonical_schema_version: str = field(default="filtered_hmm.canonical.v1", init=False, repr=False)
     _taxonomy_stability_report: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    _taxonomy_registry: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     @property
     def params(self) -> dict[str, Any]:
@@ -952,11 +1030,13 @@ class FilteredHMMDetector:
             semantic_state_map=self._semantic_state_map,
             reference_state_map=reference_state_map,
             similarity_threshold=float(self.params.get("canonical_similarity_threshold", 0.75)),
+            low_confidence_threshold=float(self.params.get("canonical_low_confidence_threshold", 0.5)),
         )
         self._taxonomy_stability_report = _summarize_hmm_taxonomy_stability(
             self._canonical_state_map,
             reference_available=bool(reference_state_map),
         )
+        self._taxonomy_registry = _build_hmm_taxonomy_registry(self._canonical_state_map)
         return self
 
     def fit(self, observations: Any) -> "FilteredHMMDetector":
@@ -1043,11 +1123,13 @@ class FilteredHMMDetector:
             semantic_state_map=self._semantic_state_map,
             reference_state_map=reference_state_map,
             similarity_threshold=float(self.params.get("canonical_similarity_threshold", 0.75)),
+            low_confidence_threshold=float(self.params.get("canonical_low_confidence_threshold", 0.5)),
         )
         self._taxonomy_stability_report = _summarize_hmm_taxonomy_stability(
             self._canonical_state_map,
             reference_available=bool(reference_state_map),
         )
+        self._taxonomy_registry = _build_hmm_taxonomy_registry(self._canonical_state_map)
         return self
 
     def initialize(self, observations: Any | None = None) -> dict[str, Any]:
@@ -1112,6 +1194,8 @@ class FilteredHMMDetector:
                 canonical_state.get("canonical_regime_id")
                 or _default_hmm_canonical_regime_id(self.detector_name, 0)
             )
+            regime_family_id = str(canonical_state.get("regime_family_id") or canonical_regime_id)
+            routing_regime_id = str(canonical_state.get("routing_regime_id") or canonical_regime_id)
             detector_outputs = {
                 "regime_confidence": 1.0,
                 "selected_column_count": int(selected_column_count),
@@ -1120,6 +1204,8 @@ class FilteredHMMDetector:
                 "latent_regime_id": 0,
                 "semantic_regime": semantic_label,
                 "canonical_regime_id": canonical_regime_id,
+                "regime_family_id": regime_family_id,
+                "routing_regime_id": routing_regime_id,
                 "prob_state_0": 1.0,
             }
             if warm:
@@ -1142,11 +1228,15 @@ class FilteredHMMDetector:
                     "canonical_schema_version": self._canonical_schema_version,
                     "semantic_label": semantic_label,
                     "canonical_regime_id": canonical_regime_id,
+                    "regime_family_id": regime_family_id,
+                    "routing_regime_id": routing_regime_id,
                     "semantic_signature": dict(semantic_state.get("feature_signature") or {}),
                     "state_signature_summary": dict(semantic_state.get("state_signature_summary") or {}),
                     "mapping_confidence": canonical_state.get("mapping_confidence"),
                     "similarity_score": canonical_state.get("similarity_score"),
                     "remap_reason": canonical_state.get("remap_reason"),
+                    "mapping_status": canonical_state.get("mapping_status"),
+                    "predecessor_canonical_regime_id": canonical_state.get("predecessor_canonical_regime_id"),
                     "reason": self._fallback_reason,
                     "selected_columns": list(self._selected_columns),
                 },
@@ -1179,6 +1269,8 @@ class FilteredHMMDetector:
             canonical_state.get("canonical_regime_id")
             or _default_hmm_canonical_regime_id(self.detector_name, ordered_state_id)
         )
+        regime_family_id = str(canonical_state.get("regime_family_id") or canonical_regime_id)
+        routing_regime_id = str(canonical_state.get("routing_regime_id") or canonical_regime_id)
         detector_outputs = {
             "regime_confidence": float(confidence),
             "selected_column_count": int(selected_column_count),
@@ -1188,6 +1280,8 @@ class FilteredHMMDetector:
             "latent_regime_id": int(ordered_state_id),
             "semantic_regime": semantic_label,
             "canonical_regime_id": canonical_regime_id,
+            "regime_family_id": regime_family_id,
+            "routing_regime_id": routing_regime_id,
         }
         if warm:
             detector_outputs[self.column_name] = semantic_label
@@ -1214,11 +1308,15 @@ class FilteredHMMDetector:
                 "canonical_schema_version": self._canonical_schema_version,
                 "semantic_label": semantic_label,
                 "canonical_regime_id": canonical_regime_id,
+                "regime_family_id": regime_family_id,
+                "routing_regime_id": routing_regime_id,
                 "semantic_signature": dict(semantic_state.get("feature_signature") or {}),
                 "state_signature_summary": dict(semantic_state.get("state_signature_summary") or {}),
                 "mapping_confidence": canonical_state.get("mapping_confidence"),
                 "similarity_score": canonical_state.get("similarity_score"),
                 "remap_reason": canonical_state.get("remap_reason"),
+                "mapping_status": canonical_state.get("mapping_status"),
+                "predecessor_canonical_regime_id": canonical_state.get("predecessor_canonical_regime_id"),
                 "selected_columns": list(self._selected_columns),
             },
         )
@@ -1244,15 +1342,21 @@ class FilteredHMMDetector:
             "canonical_state_map": {
                 str(int(state_index)): {
                     "canonical_regime_id": str(payload.get("canonical_regime_id")),
+                    "regime_family_id": str(payload.get("regime_family_id") or payload.get("canonical_regime_id")),
+                    "routing_regime_id": str(payload.get("routing_regime_id") or payload.get("canonical_regime_id")),
                     "semantic_label": str(payload.get("semantic_label")),
                     "feature_signature": dict(payload.get("feature_signature") or {}),
                     "state_signature_summary": dict(payload.get("state_signature_summary") or {}),
                     "similarity_score": payload.get("similarity_score"),
                     "mapping_confidence": payload.get("mapping_confidence"),
                     "remap_reason": payload.get("remap_reason"),
+                    "mapping_status": payload.get("mapping_status"),
+                    "predecessor_canonical_regime_id": payload.get("predecessor_canonical_regime_id"),
+                    "predecessor_state_index": payload.get("predecessor_state_index"),
                 }
                 for state_index, payload in dict(self._canonical_state_map or {}).items()
             },
+            "taxonomy_registry": dict(self._taxonomy_registry or {}),
             "taxonomy_stability_report": dict(self._taxonomy_stability_report or {}),
             "state_remap": {
                 str(int(raw_state)): int(ordered_state)

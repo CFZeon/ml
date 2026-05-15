@@ -10,6 +10,15 @@ from tests.test_automl_holdout_objective import (
 )
 
 
+class _PreviewOnlyAutoMLPipeline(_AutoMLDummyPipeline):
+    def run_step(self, name):
+        result = super().run_step(name)
+        if name == "run_backtest":
+            result["evidence_class"] = "preview_only"
+            self.state["backtest"] = result
+        return result
+
+
 class AutoMLEvidenceClassTest(unittest.TestCase):
     def test_run_automl_study_separates_selection_validation_and_holdout_evidence(self):
         raw = _build_market_frame(120)
@@ -111,7 +120,7 @@ class AutoMLEvidenceClassTest(unittest.TestCase):
         base_pipeline = _BasePipelineStub(
             {
                 "data": {"symbol": "BTCUSDT", "interval": "1h"},
-                "backtest": {"evaluation_mode": "trade_ready"},
+                "backtest": {"evaluation_mode": "local_certification"},
                 "automl": {
                     "enabled": True,
                     "n_trials": 1,
@@ -173,3 +182,39 @@ class AutoMLEvidenceClassTest(unittest.TestCase):
         self.assertFalse(summary["promotion_eligibility_report"]["promotion_ready"])
         self.assertFalse(summary["promotion_eligibility_report"]["approved"])
         self.assertEqual(summary["promotion_eligibility_report"]["reasons"], ["replication_failed"])
+
+    def test_run_automl_study_rejects_preview_only_trials_from_selection(self):
+        raw = _build_market_frame(120)
+        storage_path = _make_storage_path()
+
+        base_pipeline = _BasePipelineStub(
+            {
+                "data": {"symbol": "BTCUSDT", "interval": "1h"},
+                "automl": {
+                    "enabled": True,
+                    "n_trials": 1,
+                    "objective": "accuracy_first",
+                    "policy_profile": "hardened_default",
+                    "seed": 7,
+                    "validation_fraction": 0.2,
+                    "locked_holdout_enabled": False,
+                    "storage": storage_path,
+                    "study_name": "automl_preview_only_selection_rejection_test",
+                },
+                "features": {"schema_version": "test_v1"},
+                "model": {"type": "gbm"},
+            },
+            raw_data=raw,
+            data=raw.copy(),
+        )
+
+        summary = run_automl_study(
+            base_pipeline,
+            pipeline_class=_PreviewOnlyAutoMLPipeline,
+            trial_step_classes=[],
+        )
+
+        self.assertEqual(summary["selection_outcome"]["status"], "abstain_no_eligible_trial")
+        self.assertEqual(int(summary["selection_outcome"]["eligible_trial_count"]), 0)
+        self.assertIn("preview_only_evidence_not_selectable", summary["selection_outcome"]["top_rejection_reasons"])
+        self.assertEqual(summary["top_trials"], [])

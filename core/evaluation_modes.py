@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass
 
 VALID_EVALUATION_MODES = {"research_only", "local_certification", "trade_ready"}
 _EVALUATION_MODE_ALIASES = {"research_demo": "research_only"}
+DIAGNOSTIC_ONLY_EVIDENCE_CLASSES = {"preview_only", "retrospective_exploratory"}
+PROMOTION_READY_ADAPTIVE_EVIDENCE_CLASSES = {"locked_holdout"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,4 +47,24 @@ def resolve_evaluation_mode(backtest_config=None) -> EvaluationModeResolution:
     )
 
 
-__all__ = ["EvaluationModeResolution", "VALID_EVALUATION_MODES", "resolve_evaluation_mode"]
+def is_selection_eligible_evidence_class(evidence_class) -> bool:
+    normalized = str(evidence_class or "").strip().lower()
+    if not normalized:
+        return True
+    return normalized not in DIAGNOSTIC_ONLY_EVIDENCE_CLASSES
+
+
+def is_promotion_ready_adaptive_evidence_class(evidence_class) -> bool:
+    normalized = str(evidence_class or "").strip().lower()
+    return normalized in PROMOTION_READY_ADAPTIVE_EVIDENCE_CLASSES
+
+
+__all__ = [
+    "DIAGNOSTIC_ONLY_EVIDENCE_CLASSES",
+    "EvaluationModeResolution",
+    "PROMOTION_READY_ADAPTIVE_EVIDENCE_CLASSES",
+    "VALID_EVALUATION_MODES",
+    "is_promotion_ready_adaptive_evidence_class",
+    "is_selection_eligible_evidence_class",
+    "resolve_evaluation_mode",
+]

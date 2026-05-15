@@ -42,6 +42,20 @@ def _coerce_regime_label_series(value):
     return _safe_series(value)
 
 
+def _coerce_regime_taxonomy_frame(value):
+    if not isinstance(value, pd.DataFrame):
+        return pd.DataFrame()
+    frame = pd.DataFrame(value).copy()
+    columns = [
+        column
+        for column in ("canonical_regime_id", "regime_family_id", "mapping_status", "remap_reason")
+        if column in frame.columns
+    ]
+    if not columns:
+        return pd.DataFrame(index=frame.index)
+    return frame.loc[:, columns].copy()
+
+
 def _coerce_interval_to_timedelta(value):
     if value in (None, "", False):
         return None
@@ -423,18 +437,21 @@ def _resolve_drift_recommendation_channels(
     cooldown_active,
     evidence_count,
     min_drift_signals,
+    min_ttl_drift_signals,
 ):
+    ttl_evidence_sufficient = (not bool(model_ttl_expired)) or int(evidence_count) >= int(min_ttl_drift_signals)
     maintenance_refresh_recommended = bool(model_ttl_expired)
     drift_investigation_recommended = bool(
-        enough_samples and not cooldown_active and (bool(regime_drift) or bool(feature_drift))
+        enough_samples and not cooldown_active and ttl_evidence_sufficient and (bool(regime_drift) or bool(feature_drift))
     )
     recalibration_recommended = bool(
-        enough_samples and not cooldown_active and (bool(score_drift) or bool(action_drift))
+        enough_samples and not cooldown_active and ttl_evidence_sufficient and (bool(score_drift) or bool(action_drift))
     )
     structural_trigger = bool(performance_drift) or bool(feature_drift and action_drift)
     structural_retrain_recommended = bool(
         enough_samples
         and not cooldown_active
+        and ttl_evidence_sufficient
         and structural_trigger
         and int(evidence_count) >= int(min_drift_signals)
     )
@@ -455,6 +472,7 @@ def _resolve_drift_recommendation_channels(
         "recalibration_recommended": recalibration_recommended,
         "structural_retrain_recommended": structural_retrain_recommended,
         "recommended_action": recommended_action,
+        "ttl_evidence_sufficient": bool(ttl_evidence_sufficient),
     }
 
 
@@ -575,6 +593,38 @@ class DriftMonitor:
         reference_transition = _categorical_transition_distribution(inferred_reference_regimes)
         current_transition = _categorical_transition_distribution(inferred_current_regimes)
         regime_transition_tv = _distribution_total_variation(reference_transition, current_transition)
+        reference_taxonomy = _coerce_regime_taxonomy_frame(self.reference_features)
+        current_taxonomy = _coerce_regime_taxonomy_frame(current_regimes if isinstance(current_regimes, pd.DataFrame) else current_features)
+        family_distribution = None
+        family_transition_tv = None
+        taxonomy_identity_column = None
+        taxonomy_status_counts = {}
+        taxonomy_unresolved_share = 0.0
+        taxonomy_only_instability = False
+        if not current_taxonomy.empty and "mapping_status" in current_taxonomy.columns:
+            mapping_status = pd.Series(current_taxonomy["mapping_status"], copy=False).dropna().astype(str)
+            if not mapping_status.empty:
+                taxonomy_status_counts = {
+                    str(key): int(value)
+                    for key, value in mapping_status.value_counts().sort_index().items()
+                }
+                taxonomy_unresolved_share = float(
+                    mapping_status.isin(["needs_shadow_period", "new_regime_family"]).mean()
+                )
+        if (
+            not reference_taxonomy.empty
+            and not current_taxonomy.empty
+            and "regime_family_id" in reference_taxonomy.columns
+            and "regime_family_id" in current_taxonomy.columns
+        ):
+            taxonomy_identity_column = "regime_family_id"
+            reference_families = pd.Series(reference_taxonomy["regime_family_id"], copy=False)
+            current_families = pd.Series(current_taxonomy["regime_family_id"], copy=False)
+            family_distribution = _categorical_distribution_shift(reference_families, current_families)
+            family_transition_tv = _distribution_total_variation(
+                _categorical_transition_distribution(reference_families),
+                _categorical_transition_distribution(current_families),
+            )
         regime_identity_column = None
         if isinstance(current_regimes, pd.DataFrame) and "canonical_regime_id" in current_regimes.columns:
             regime_identity_column = "canonical_regime_id"
@@ -584,7 +634,7 @@ class DriftMonitor:
             regime_identity_column = "regime"
         elif isinstance(current_features, pd.DataFrame) and "regime" in current_features.columns:
             regime_identity_column = "regime"
-        regime_drift = bool(
+        raw_regime_drift = bool(
             regime_distribution is not None
             and (
                 float(regime_distribution.get("psi") or 0.0) >= float(self.config["regime_psi_threshold"])
@@ -592,6 +642,12 @@ class DriftMonitor:
                 or float(regime_transition_tv or 0.0) >= float(self.config["regime_transition_threshold"])
             )
         )
+        if taxonomy_unresolved_share > 0.0 and family_distribution is not None:
+            taxonomy_only_instability = bool(
+                float(family_distribution.get("total_variation") or 0.0) < float(self.config["regime_total_variation_threshold"])
+                and float(family_transition_tv or 0.0) < float(self.config["regime_transition_threshold"])
+            )
+        regime_drift = bool(raw_regime_drift and not taxonomy_only_instability)
 
         performance_updates = []
         performance_drift = False
@@ -629,8 +685,9 @@ class DriftMonitor:
             cooldown_active=cooldown_active,
             evidence_count=evidence_count,
             min_drift_signals=int(self.config["min_drift_signals"]),
+            min_ttl_drift_signals=int(self.config.get("min_ttl_drift_signals", 1)),
         )
-        ttl_evidence_sufficient = bool(model_ttl_expired)
+        ttl_evidence_sufficient = bool(recommendation_channels.get("ttl_evidence_sufficient", False))
         should_retrain = bool(recommendation_channels["structural_retrain_recommended"])
 
         reasons = []
@@ -650,6 +707,8 @@ class DriftMonitor:
             reasons.append("minimum_samples_not_met")
         if cooldown_active:
             reasons.append("cooldown_active")
+        if model_ttl_expired and not ttl_evidence_sufficient:
+            reasons.append("insufficient_ttl_drift_evidence")
         if enough_samples and not sufficient_evidence and not recommendation_channels["structural_retrain_recommended"]:
             reasons.append("insufficient_drift_evidence")
         for field_name in (
@@ -697,6 +756,14 @@ class DriftMonitor:
                 "current_transition_distribution": current_transition,
                 "transition_total_variation": regime_transition_tv,
                 "identity_column": regime_identity_column,
+                "taxonomy": {
+                    "family_distribution": family_distribution,
+                    "family_transition_total_variation": family_transition_tv,
+                    "identity_column": taxonomy_identity_column,
+                    "status_counts": taxonomy_status_counts,
+                    "unresolved_share": taxonomy_unresolved_share,
+                    "taxonomy_only_instability": taxonomy_only_instability,
+                },
             },
             "regime_drift": regime_drift,
             "performance_updates": performance_updates,
@@ -754,18 +821,25 @@ def evaluate_drift_guardrails(drift_report, policy=None):
         cooldown_active=cooldown_active,
         evidence_count=evidence_count,
         min_drift_signals=minimum_signal_count,
+        min_ttl_drift_signals=minimum_ttl_signal_count,
     )
-    approved = bool(
-        recommendation_channels["maintenance_refresh_recommended"]
-        or recommendation_channels["drift_investigation_recommended"]
+    ttl_evidence_sufficient = bool(recommendation_channels.get("ttl_evidence_sufficient", False))
+    adaptive_approved = bool(
+        recommendation_channels["drift_investigation_recommended"]
         or recommendation_channels["recalibration_recommended"]
         or recommendation_channels["structural_retrain_recommended"]
+    )
+    maintenance_only_approved = bool(recommendation_channels["maintenance_refresh_recommended"] and not adaptive_approved)
+    approved = bool(
+        maintenance_only_approved or adaptive_approved
     )
     reasons = []
     if model_ttl_expired:
         reasons.append("model_ttl_expired")
     if sample_count < minimum_samples:
         reasons.append("minimum_samples_not_met")
+    if model_ttl_expired and not ttl_evidence_sufficient:
+        reasons.append("insufficient_ttl_drift_evidence")
     if evidence_count < minimum_signal_count and not recommendation_channels["structural_retrain_recommended"]:
         reasons.append("insufficient_drift_evidence")
     if cooldown_active:
@@ -791,8 +865,11 @@ def evaluate_drift_guardrails(drift_report, policy=None):
         "min_samples": int(minimum_samples),
         "model_ttl_expired": model_ttl_expired,
         "min_ttl_drift_signals": minimum_ttl_signal_count,
+        "ttl_evidence_sufficient": ttl_evidence_sufficient,
         "max_bars_between_retrain": max_bars_between_retrain,
         "trade_rate_min_samples": policy.get("trade_rate_min_samples"),
+        "adaptive_approved": adaptive_approved,
+        "maintenance_only_approved": maintenance_only_approved,
         "recommended_action": recommendation_channels["recommended_action"],
         "maintenance_refresh_recommended": recommendation_channels["maintenance_refresh_recommended"],
         "drift_investigation_recommended": recommendation_channels["drift_investigation_recommended"],

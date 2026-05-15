@@ -61,6 +61,35 @@ def _timestamp_eq(left: Any, right: Any) -> bool:
     return _timestamp_token(left) == _timestamp_token(right)
 
 
+def _coerce_timedelta(value: Any) -> pd.Timedelta | None:
+    if value in (None, "", {}):
+        return None
+    try:
+        return pd.Timedelta(value)
+    except Exception:
+        return None
+
+
+def _resolve_contract_expiry(contract: RegimeStateContract) -> Any:
+    if contract.expires_at is not None:
+        return contract.expires_at
+    metadata = dict(contract.metadata or {})
+    explicit_expiry = metadata.get("expires_at")
+    if explicit_expiry is not None:
+        return explicit_expiry
+    max_age = contract.max_age if contract.max_age is not None else metadata.get("max_age")
+    max_age_delta = _coerce_timedelta(max_age)
+    if max_age_delta is None:
+        return None
+    anchor = contract.available_at if contract.available_at is not None else contract.as_of
+    if anchor is None:
+        return None
+    try:
+        return pd.Timestamp(anchor) + max_age_delta
+    except Exception:
+        return None
+
+
 def build_admissible_router_regime_trace(
     regime_states: Sequence[Any] | None,
     decision_timestamps: Sequence[Any] | pd.Index,
@@ -104,6 +133,9 @@ def build_admissible_router_regime_trace(
             contract_available_at = contract.available_at if contract.available_at is not None else contract.as_of
             if not _timestamp_leq(contract_as_of, decision_time):
                 continue
+            contract_expires_at = _resolve_contract_expiry(contract)
+            if contract_expires_at is not None and not _timestamp_leq(decision_time, contract_expires_at):
+                continue
             if _timestamp_leq(contract_available_at, decision_time):
                 latest_admissible = contract
 
@@ -114,13 +146,17 @@ def build_admissible_router_regime_trace(
             if stale_bars > 0:
                 detector_outputs["stale"] = 1
             metadata = dict(latest_admissible.metadata or {})
+            expires_at = _resolve_contract_expiry(latest_admissible)
+            freshness_state = "stale" if stale_bars > 0 else str(latest_admissible.freshness_state or metadata.get("freshness_state") or "fresh")
             metadata.update(
                 {
                     "availability_state": "stale" if stale_bars > 0 else str(metadata.get("availability_state") or "known"),
                     "decision_timestamp": _serialize_timestamp(decision_time),
                     "source_as_of": _serialize_timestamp(latest_admissible.as_of),
                     "source_available_at": _serialize_timestamp(latest_admissible.available_at),
+                    "source_expires_at": _serialize_timestamp(expires_at),
                     "stale_bars": int(stale_bars),
+                    "freshness_state": freshness_state,
                 }
             )
             recognition_lag = latest_admissible.recognition_lag_bars
@@ -130,6 +166,7 @@ def build_admissible_router_regime_trace(
                 RegimeStateContract(
                     as_of=decision_time,
                     available_at=latest_admissible.available_at,
+                    expires_at=expires_at,
                     source_available_at=latest_admissible.source_available_at,
                     label=latest_admissible.label,
                     probabilities=dict(latest_admissible.probabilities or {}),
@@ -138,6 +175,8 @@ def build_admissible_router_regime_trace(
                     detector_outputs=detector_outputs,
                     warm=bool(latest_admissible.warm),
                     recognition_lag_bars=latest_admissible.recognition_lag_bars,
+                    max_age=latest_admissible.max_age,
+                    freshness_state=freshness_state,
                     metadata=metadata,
                 )
             )
@@ -150,17 +189,22 @@ def build_admissible_router_regime_trace(
             "decision_timestamp": _serialize_timestamp(decision_time),
             "source_as_of": None,
             "source_available_at": None,
+            "source_expires_at": None,
             "stale_bars": None,
         }
         availability_state = "unavailable"
         available_at = decision_time
         source_available_at = None
         recognition_lag_bars = None
+        expires_at = None
+        freshness_state = "unavailable"
         if same_row_contract is not None:
             detector_outputs.update(dict(same_row_contract.detector_outputs or {}))
             metadata.update(dict(same_row_contract.metadata or {}))
             metadata["source_as_of"] = _serialize_timestamp(same_row_contract.as_of)
             metadata["source_available_at"] = _serialize_timestamp(same_row_contract.available_at)
+            expires_at = _resolve_contract_expiry(same_row_contract)
+            metadata["source_expires_at"] = _serialize_timestamp(expires_at)
             available_at = same_row_contract.available_at if same_row_contract.available_at is not None else decision_time
             source_available_at = same_row_contract.source_available_at
             recognition_lag_bars = same_row_contract.recognition_lag_bars
@@ -169,13 +213,16 @@ def build_admissible_router_regime_trace(
                 availability_state = "unavailable"
                 detector_outputs["unavailable"] = 1
                 unavailable_count += 1
+                freshness_state = "unavailable"
             elif not bool(same_row_contract.warm):
                 availability_state = "warm"
                 warm_count += 1
+                freshness_state = "delayed"
             else:
                 availability_state = "timing_blocked"
                 detector_outputs["timing_blocked"] = 1
                 timing_blocked_count += 1
+                freshness_state = "delayed"
         else:
             detector_outputs["unavailable"] = 1
             metadata["reason"] = "missing_contract"
@@ -184,10 +231,12 @@ def build_admissible_router_regime_trace(
         if recognition_lag_bars is not None:
             recognition_lags.append(float(recognition_lag_bars))
         metadata["availability_state"] = availability_state
+        metadata["freshness_state"] = freshness_state
         aligned.append(
             RegimeStateContract(
                 as_of=decision_time,
                 available_at=available_at,
+                expires_at=expires_at,
                 source_available_at=source_available_at,
                 label=None,
                 probabilities={},
@@ -196,6 +245,7 @@ def build_admissible_router_regime_trace(
                 detector_outputs=detector_outputs,
                 warm=False,
                 recognition_lag_bars=recognition_lag_bars,
+                freshness_state=freshness_state,
                 metadata=metadata,
             )
         )

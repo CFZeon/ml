@@ -81,12 +81,57 @@ class DriftMonitoringTest(unittest.TestCase):
         self.assertFalse(report["recommendation"]["should_retrain"])
         self.assertEqual(report["recommendation"]["recommended_action"], "maintenance_refresh")
         self.assertTrue(report["recommendation"]["maintenance_refresh_recommended"])
+        self.assertFalse(report["recommendation"]["ttl_evidence_sufficient"])
         self.assertFalse(report["recommendation"]["structural_retrain_recommended"])
         self.assertIn("model_ttl_expired", report["recommendation"]["reasons"])
         self.assertTrue(guardrails["approved"])
+        self.assertTrue(guardrails["maintenance_only_approved"])
+        self.assertFalse(guardrails["adaptive_approved"])
         self.assertEqual(guardrails["recommended_action"], "maintenance_refresh")
         self.assertTrue(guardrails["maintenance_refresh_recommended"])
+        self.assertFalse(guardrails["ttl_evidence_sufficient"])
         self.assertIn("model_ttl_expired", guardrails["reasons"])
+        self.assertIn("insufficient_ttl_drift_evidence", guardrails["reasons"])
+
+    def test_ttl_expiry_does_not_escalate_adaptive_action_without_ttl_signal_floor(self):
+        reference_index = pd.date_range("2026-10-01", periods=320, freq="1h", tz="UTC")
+        current_index = pd.date_range("2026-11-01", periods=240, freq="1h", tz="UTC")
+        reference_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=reference_index)
+        current_features = pd.DataFrame({"alpha": 0.0, "beta": 0.0}, index=current_index)
+        reference_predictions = pd.DataFrame({"p0": 0.62, "p1": 0.38}, index=reference_index)
+        current_predictions = pd.DataFrame({"p0": 0.94, "p1": 0.06}, index=current_index)
+
+        monitor = DriftMonitor(
+            reference_features,
+            reference_predictions,
+            config={
+                "min_samples": 200,
+                "min_drift_signals": 1,
+                "min_ttl_drift_signals": 2,
+                "confidence_ks_threshold": 0.05,
+                "max_bars_between_retrain": 672,
+            },
+        )
+        report = monitor.check(current_features, current_predictions=current_predictions, bars_since_last_retrain=800)
+        guardrails = evaluate_drift_guardrails(
+            report,
+            {
+                "min_samples": 200,
+                "min_drift_signals": 1,
+                "min_ttl_drift_signals": 2,
+                "confidence_ks_threshold": 0.05,
+                "max_bars_between_retrain": 672,
+            },
+        )
+
+        self.assertTrue(report["score_drift"])
+        self.assertTrue(report["model_ttl_expired"])
+        self.assertFalse(report["recommendation"]["ttl_evidence_sufficient"])
+        self.assertEqual(report["recommendation"]["recommended_action"], "maintenance_refresh")
+        self.assertFalse(report["recommendation"]["recalibration_recommended"])
+        self.assertTrue(guardrails["maintenance_only_approved"])
+        self.assertFalse(guardrails["adaptive_approved"])
+        self.assertEqual(guardrails["recommended_action"], "maintenance_refresh")
 
     def test_adwin_detector_or_fallback_flags_abrupt_mean_shift(self):
         detector = ADWINDetector(delta=0.002, fallback_window=20)

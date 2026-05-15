@@ -17,12 +17,14 @@ from .models import (
     train_model,
     walk_forward_split,
 )
+from .regimes.contracts import RegimeStateContract
 from .regimes.online_state import (
     build_admissible_regime_view,
     build_regime_frame_from_state_contracts,
     normalize_regime_state_contracts,
     slice_regime_state_contracts,
 )
+from .routing import HardSwitchRouter, build_admissible_router_regime_trace, replay_router_trace
 from .specialists.library import project_specialist_library_snapshot
 from .specialists.contracts import (
     SpecialistHealthContract,
@@ -139,6 +141,94 @@ def _subset_sampling_metadata(sampling_metadata, index):
     if close is not None:
         subset["close"] = pd.Series(close, copy=False)
     return subset
+
+
+def _count_regime_episodes(labels):
+    counts = {}
+    previous = object()
+    for value in pd.Series(labels, copy=False):
+        if pd.isna(value):
+            previous = object()
+            continue
+        token = str(value)
+        if token != previous:
+            counts[token] = int(counts.get(token, 0)) + 1
+            previous = token
+    return counts
+
+
+def _resolve_specialist_sufficiency_policy(min_samples_per_regime, config=None):
+    policy = dict(config or {})
+    return {
+        "min_training_rows": int(policy.get("min_training_rows", min_samples_per_regime)),
+        "min_effective_sample_size": float(policy.get("min_effective_sample_size", min_samples_per_regime)),
+        "min_regime_episodes": int(policy.get("min_regime_episodes", 2)),
+        "min_support_share": float(policy.get("min_support_share", 0.05)),
+        "min_directional_class_support": int(policy.get("min_directional_class_support", 8)),
+        "min_feature_coverage_share": float(policy.get("min_feature_coverage_share", 0.95)),
+    }
+
+
+def _evaluate_specialist_sufficiency(
+    regime_X,
+    regime_y,
+    *,
+    regime_name,
+    regime_labels,
+    sample_weight=None,
+    policy=None,
+):
+    resolved_policy = dict(policy or {})
+    row_count = int(len(regime_X))
+    effective_sample_size = float(pd.Series(sample_weight, index=regime_X.index, dtype=float).sum()) if sample_weight is not None else float(row_count)
+    episode_count = int(_count_regime_episodes(regime_labels).get(str(regime_name), 0))
+    known_rows = int(pd.Series(regime_labels, copy=False).notna().sum())
+    support_share = (float(row_count) / float(known_rows)) if known_rows > 0 else None
+    directional_y = pd.Series(regime_y, index=regime_X.index)
+    directional_y = directional_y.loc[directional_y.ne(0)]
+    class_support = {str(label): int(count) for label, count in directional_y.value_counts().items()}
+    min_directional_class_support = min(class_support.values()) if class_support else 0
+    feature_coverage_share = None
+    if not regime_X.empty:
+        feature_coverage_share = float(1.0 - float(regime_X.isna().mean().mean()))
+
+    reasons = []
+    if row_count < int(resolved_policy.get("min_training_rows", 0)):
+        reasons.append("minimum_training_rows_not_met")
+    if effective_sample_size < float(resolved_policy.get("min_effective_sample_size", 0.0)):
+        reasons.append("effective_sample_size_not_met")
+    if episode_count < int(resolved_policy.get("min_regime_episodes", 1)):
+        reasons.append("independent_regime_episode_count_not_met")
+    min_support_share = resolved_policy.get("min_support_share")
+    if min_support_share is not None and support_share is not None and support_share < float(min_support_share):
+        reasons.append("regime_support_share_not_met")
+    if min_directional_class_support < int(resolved_policy.get("min_directional_class_support", 0)):
+        reasons.append("directional_class_support_not_met")
+    min_feature_coverage_share = resolved_policy.get("min_feature_coverage_share")
+    if (
+        min_feature_coverage_share is not None
+        and feature_coverage_share is not None
+        and feature_coverage_share < float(min_feature_coverage_share)
+    ):
+        reasons.append("feature_coverage_share_not_met")
+
+    model_fit_allowed = row_count >= int(resolved_policy.get("min_training_rows", 0)) and pd.Series(regime_y).nunique() >= 2
+    executable_pass = model_fit_allowed and not reasons
+    recommended_lifecycle_state = "executable" if executable_pass else ("shadow" if model_fit_allowed else "research_only")
+    return {
+        "regime_name": str(regime_name),
+        "row_count": row_count,
+        "effective_sample_size": round(float(effective_sample_size), 4),
+        "episode_count": int(episode_count),
+        "support_share": (None if support_share is None else round(float(support_share), 4)),
+        "class_support": class_support,
+        "min_directional_class_support": int(min_directional_class_support),
+        "feature_coverage_share": (None if feature_coverage_share is None else round(float(feature_coverage_share), 4)),
+        "model_fit_allowed": bool(model_fit_allowed),
+        "executable_pass": bool(executable_pass),
+        "recommended_lifecycle_state": recommended_lifecycle_state,
+        "blocking_reasons": reasons,
+    }
 
 
 def _train_constant_safe_model(
@@ -472,9 +562,11 @@ def _normalize_training_window(training_report):
 
 
 def _resolve_initial_specialist_lifecycle_state(metadata=None):
-    configured = dict(metadata or {}).get("lifecycle_state")
+    configured = metadata if isinstance(metadata, (str, SpecialistLifecycleState)) else dict(metadata or {}).get("lifecycle_state")
     if configured is None:
         return SpecialistLifecycleState.CANDIDATE
+    if isinstance(configured, SpecialistLifecycleState):
+        return configured
     normalized = str(configured).strip().lower()
     for state in SpecialistLifecycleState:
         if state.value == normalized:
@@ -506,6 +598,10 @@ def build_specialist_specs_from_bundle(bundle, training_report=None, *, symbol="
     shared_metadata = dict(metadata or {})
     training_window = _normalize_training_window(training_report)
     lifecycle_state = _resolve_initial_specialist_lifecycle_state(shared_metadata)
+    sufficiency_by_regime = {
+        str(key): dict(value or {})
+        for key, value in dict(training_report.get("sufficiency_by_regime") or {}).items()
+    }
     specs = []
 
     if bundle.strategy == "feature":
@@ -530,6 +626,11 @@ def build_specialist_specs_from_bundle(bundle, training_report=None, *, symbol="
         return specs
 
     if bundle.fallback_model is not None:
+        fallback_lifecycle = lifecycle_state
+        if sufficiency_by_regime:
+            fallback_lifecycle = _resolve_initial_specialist_lifecycle_state(
+                shared_metadata.get("fallback_lifecycle_state") or SpecialistLifecycleState.EXECUTABLE
+            )
         specs.append(
             SpecialistSpec(
                 model_id=str(shared_metadata.get("fallback_model_id", "fallback_generalist")),
@@ -543,13 +644,19 @@ def build_specialist_specs_from_bundle(bundle, training_report=None, *, symbol="
                     **shared_metadata,
                     "bundle_strategy": bundle.strategy,
                     "fallback_only": True,
-                    "lifecycle_state": lifecycle_state.value,
+                    "lifecycle_state": fallback_lifecycle.value,
                 },
             )
         )
 
     for regime_value, model in dict(bundle.specialist_models or {}).items():
         regime_name = str(regime_value)
+        sufficiency_report = dict(sufficiency_by_regime.get(regime_name) or {})
+        regime_lifecycle_state = lifecycle_state
+        if sufficiency_report.get("recommended_lifecycle_state") is not None:
+            regime_lifecycle_state = _resolve_initial_specialist_lifecycle_state(
+                sufficiency_report.get("recommended_lifecycle_state")
+            )
         specs.append(
             SpecialistSpec(
                 model_id=f"specialist::{regime_name}",
@@ -563,7 +670,8 @@ def build_specialist_specs_from_bundle(bundle, training_report=None, *, symbol="
                     **shared_metadata,
                     **_resolve_regime_binding_metadata(training_report, regime_name),
                     "bundle_strategy": bundle.strategy,
-                    "lifecycle_state": lifecycle_state.value,
+                    "lifecycle_state": regime_lifecycle_state.value,
+                    "sufficiency_report": sufficiency_report,
                 },
             )
         )
@@ -673,14 +781,19 @@ def build_specialist_library_snapshot(bundle, training_report=None, *, symbol="u
 
     performance_slices = []
     trained_rows = {str(key): int(value) for key, value in dict(training_report.get("trained_rows_by_regime") or {}).items()}
+    sufficiency_by_regime = {
+        str(key): dict(value or {})
+        for key, value in dict(training_report.get("sufficiency_by_regime") or {}).items()
+    }
     for regime_name, row_count in trained_rows.items():
+        sufficiency_report = dict(sufficiency_by_regime.get(regime_name) or {})
         performance_slices.append(
             SpecialistPerformanceSlice(
                 model_id=f"specialist::{regime_name}",
                 regime_label=str(_resolve_regime_binding_metadata(training_report, regime_name).get("regime_label")),
                 split_role="training_slice",
                 row_count=int(row_count),
-                metric_summary={"trained_rows": int(row_count)},
+                metric_summary={"trained_rows": int(row_count), **sufficiency_report},
                 metadata={
                     **shared_metadata,
                     **_resolve_regime_binding_metadata(training_report, regime_name),
@@ -707,6 +820,180 @@ def build_specialist_library_snapshot(bundle, training_report=None, *, symbol="u
     return project_specialist_library_snapshot(snapshot)
 
 
+def _build_router_regime_states(regime_data, *, index, regime_column="regime"):
+    state_contracts = _coerce_regime_state_contracts(regime_data, index=index)
+    if state_contracts is not None:
+        return list(state_contracts)
+
+    regime_frame = _coerce_inference_regime_frame(regime_data, index=index, column_name=regime_column)
+    identity_column = _resolve_regime_identity_column(regime_frame, preferred_column=regime_column)
+    regime_states = []
+    for timestamp in pd.Index(index):
+        label = None
+        metadata = {}
+        detector_outputs = {}
+        if not regime_frame.empty and timestamp in regime_frame.index:
+            if identity_column in regime_frame.columns:
+                raw_label = regime_frame.at[timestamp, identity_column]
+                if pd.notna(raw_label):
+                    label = raw_label
+            if regime_column in regime_frame.columns and regime_column != identity_column:
+                semantic_label = regime_frame.at[timestamp, regime_column]
+                if pd.notna(semantic_label):
+                    metadata["semantic_regime_label"] = str(semantic_label)
+            if "canonical_regime_id" in regime_frame.columns:
+                canonical_regime_id = regime_frame.at[timestamp, "canonical_regime_id"]
+                if pd.notna(canonical_regime_id):
+                    detector_outputs["canonical_regime_id"] = str(canonical_regime_id)
+        regime_states.append(
+            RegimeStateContract(
+                as_of=timestamp,
+                available_at=timestamp,
+                label=label,
+                detector_outputs=detector_outputs,
+                warm=label is not None,
+                freshness_state=("fresh" if label is not None else "unavailable"),
+                metadata=metadata,
+            )
+        )
+    return regime_states
+
+
+def _evaluate_executable_routed_specialist_report(
+    bundle,
+    X,
+    regime_data,
+    *,
+    training_report=None,
+    specialist_library=None,
+    specialist_health_trace=None,
+    router=None,
+):
+    X_frame = pd.DataFrame(X).copy()
+    if bundle.strategy != "specialist":
+        return {
+            "strategy": str(bundle.strategy),
+            "evidence_class": "research_direct_model_skill",
+            "fallback_rows": 0,
+            "fallback_evidence_rows": int(len(X_frame)),
+            "fallback_row_share": (None if len(X_frame) <= 0 else 0.0),
+            "blocked_rows": 0,
+            "blocked_row_share": (None if len(X_frame) <= 0 else 0.0),
+            "no_trade_rows": 0,
+            "routed_specialist_rows": 0,
+            "routed_coverage_share": (None if len(X_frame) <= 0 else 0.0),
+            "unseen_regimes": [],
+            "candidate_classification": "generalist_only",
+            "router_trace": {},
+        }
+
+    training_report = dict(training_report or {})
+    decision_index = X_frame.index
+    specialist_library = (
+        specialist_library
+        if specialist_library is not None
+        else build_specialist_library_snapshot(bundle, training_report)
+    )
+    routed_router = router if router is not None else HardSwitchRouter()
+    regime_states = _build_router_regime_states(regime_data, index=decision_index, regime_column=bundle.regime_column)
+    aligned_trace = build_admissible_router_regime_trace(regime_states, decision_index)
+    trace = replay_router_trace(
+        routed_router,
+        specialist_library,
+        aligned_trace["regime_states"],
+        specialist_health_trace=specialist_health_trace,
+        decision_timestamps=decision_index,
+    )
+
+    fallback_model_id = getattr(specialist_library, "fallback_model_id", None)
+    fallback_model_id = None if fallback_model_id is None else str(fallback_model_id)
+    trained_regimes = {str(value) for value in list(training_report.get("trained_regimes") or [])}
+    routed_specialist_rows = 0
+    fallback_rows = 0
+    no_trade_rows = 0
+    blocked_rows = 0
+    blocked_rows_by_reason = {}
+    fallback_rows_by_cause = {}
+    unseen_regimes = set()
+
+    for contract, decision_payload in zip(aligned_trace["regime_states"], list(trace.get("decision_trace") or [])):
+        label = contract.label
+        if label is None:
+            unseen_regimes.add("missing")
+        elif trained_regimes and str(label) not in trained_regimes:
+            unseen_regimes.add(str(label))
+
+        candidate_eligibility = dict((decision_payload.get("metadata") or {}).get("candidate_eligibility") or {})
+        row_reasons = set()
+        for model_id, payload in candidate_eligibility.items():
+            resolved_model_id = str(model_id)
+            if resolved_model_id == fallback_model_id:
+                continue
+            if bool(dict(payload or {}).get("eligible", False)):
+                continue
+            row_reasons.update(str(reason) for reason in list(dict(payload or {}).get("reasons") or []) if reason)
+        if row_reasons:
+            blocked_rows += 1
+            for reason in row_reasons:
+                blocked_rows_by_reason[str(reason)] = int(blocked_rows_by_reason.get(str(reason), 0)) + 1
+
+        selected_model_id = decision_payload.get("selected_model_id")
+        selected_model_id = None if selected_model_id is None else str(selected_model_id)
+        safe_mode_action = str((decision_payload.get("metadata") or {}).get("safe_mode_action") or "")
+        blocked_reason = (decision_payload.get("metadata") or {}).get("blocked_switch_reason")
+        if selected_model_id is None or safe_mode_action == "no_trade":
+            no_trade_rows += 1
+            continue
+        if fallback_model_id is not None and selected_model_id == fallback_model_id:
+            fallback_rows += 1
+            if row_reasons:
+                fallback_causes = list(row_reasons)
+            elif blocked_reason:
+                fallback_causes = [str(blocked_reason)]
+            elif safe_mode_action:
+                fallback_causes = [f"safe_mode_{safe_mode_action}"]
+            else:
+                fallback_causes = [str(decision_payload.get("route_reason") or "fallback")]
+            for cause in fallback_causes:
+                fallback_rows_by_cause[str(cause)] = int(fallback_rows_by_cause.get(str(cause), 0)) + 1
+            continue
+        routed_specialist_rows += 1
+
+    evidence_rows = int(len(decision_index))
+    candidate_classification = "generalist_only"
+    if bundle.specialist_models:
+        candidate_classification = (
+            "specialist_degraded_to_fallback"
+            if (fallback_rows + no_trade_rows) > 0 or routed_specialist_rows <= 0
+            else "specialist_effective"
+        )
+
+    return {
+        "strategy": "specialist",
+        "evidence_class": "executable_routed_skill",
+        "fallback_rows": int(fallback_rows),
+        "fallback_evidence_rows": evidence_rows,
+        "fallback_row_share": (None if evidence_rows <= 0 else round(float(fallback_rows / evidence_rows), 4)),
+        "blocked_rows": int(blocked_rows),
+        "blocked_row_share": (None if evidence_rows <= 0 else round(float(blocked_rows / evidence_rows), 4)),
+        "no_trade_rows": int(no_trade_rows),
+        "routed_specialist_rows": int(routed_specialist_rows),
+        "routed_coverage_share": (
+            None if evidence_rows <= 0 else round(float(routed_specialist_rows / evidence_rows), 4)
+        ),
+        "eligibility_blocked_rows_by_reason": blocked_rows_by_reason,
+        "fallback_rows_by_cause": fallback_rows_by_cause,
+        "unseen_regimes": sorted(unseen_regimes),
+        "candidate_classification": candidate_classification,
+        "router_trace": {
+            "manifest": dict(trace.get("manifest") or {}),
+            "alignment": dict(aligned_trace.get("alignment") or {}),
+            "summary": dict(trace.get("summary") or {}),
+            "decision_trace": list(trace.get("decision_trace") or []),
+        },
+    }
+
+
 def train_regime_aware_model(
     X,
     y,
@@ -719,6 +1006,7 @@ def train_regime_aware_model(
     coverage_config=None,
     regime_column="regime",
     min_samples_per_regime=40,
+    sufficiency_config=None,
     sample_weight=None,
     sampling_metadata=None,
 ):
@@ -807,18 +1095,30 @@ def train_regime_aware_model(
     specialist_rows = {}
     skipped_regimes = {}
     specialist_sampling_reports = {}
+    sufficiency_policy = _resolve_specialist_sufficiency_policy(min_samples_per_regime, sufficiency_config)
+    sufficiency_by_regime = {}
+    regime_episode_counts = _count_regime_episodes(labels)
     for regime_value, row_index in labels.groupby(labels).groups.items():
         regime_X = X_frame.loc[row_index]
         regime_y = y_series.loc[row_index]
-        if len(regime_X) < int(min_samples_per_regime):
-            skipped_regimes[str(regime_value)] = "minimum_samples_not_met"
-            continue
-        if regime_y.nunique() < 2:
-            skipped_regimes[str(regime_value)] = "single_class_regime"
-            continue
         regime_weight = None
         if sample_weight is not None:
             regime_weight = pd.Series(sample_weight, index=X_frame.index).loc[row_index]
+        sufficiency_report = _evaluate_specialist_sufficiency(
+            regime_X,
+            regime_y,
+            regime_name=regime_value,
+            regime_labels=labels,
+            sample_weight=regime_weight,
+            policy=sufficiency_policy,
+        )
+        sufficiency_report["episode_count"] = int(regime_episode_counts.get(str(regime_value), 0))
+        sufficiency_by_regime[str(regime_value)] = sufficiency_report
+        if not sufficiency_report.get("model_fit_allowed", False):
+            skipped_regimes[str(regime_value)] = (
+                sufficiency_report.get("blocking_reasons") or ["minimum_samples_not_met"]
+            )[0]
+            continue
         regime_sampling_metadata = _subset_sampling_metadata(sampling_metadata, row_index)
         specialist_model, specialist_sampling_report = train_model(
             regime_X,
@@ -853,6 +1153,8 @@ def train_regime_aware_model(
         "coverage_summary": coverage_summary,
         "fallback_sampling_report": fallback_sampling_report,
         "specialist_sampling_reports": specialist_sampling_reports,
+        "sufficiency_policy": sufficiency_policy,
+        "sufficiency_by_regime": sufficiency_by_regime,
         "candidate_classification": (
             "generalist_only" if not specialist_models else "specialist_effective"
         ),
@@ -875,6 +1177,7 @@ def train_regime_aware_walk_forward(
     feature_config=None,
     regime_column="regime",
     min_samples_per_regime=40,
+    sufficiency_config=None,
     coverage_config=None,
     sample_weight=None,
     n_splits=3,
@@ -930,9 +1233,19 @@ def train_regime_aware_walk_forward(
             coverage_config=coverage_config,
             regime_column=regime_column,
             min_samples_per_regime=min_samples_per_regime,
+            sufficiency_config=sufficiency_config,
             sample_weight=weight_train,
         )
         predictions, probabilities, inference_report = bundle.predict_with_probability_report(X_test, regime_test_inference)
+        inference_report = dict(inference_report or {})
+        if strategy == "specialist":
+            inference_report.setdefault("evidence_class", "research_direct_model_skill")
+            inference_report["executable_routed_report"] = _evaluate_executable_routed_specialist_report(
+                bundle,
+                X_test,
+                regime_test_inference,
+                training_report=training_report,
+            )
         metrics = evaluate_regime_aware_predictions(y_test, predictions, probabilities)
 
         folds.append(

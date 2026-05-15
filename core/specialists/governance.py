@@ -175,6 +175,14 @@ def evaluate_specialist_certification_policy(
         performance,
         explicit_trained_rows=trained_rows,
     )
+    latest_training_slice = _latest_slice_for_model(performance, contract.model_id, include_training=True)
+    training_metrics = dict((latest_training_slice.metric_summary if latest_training_slice is not None else {}) or {})
+    minimum_effective_sample_size = _coerce_float(policy.get("min_effective_sample_size"))
+    minimum_regime_episodes = policy.get("min_regime_episodes")
+    minimum_support_share = _coerce_float(policy.get("min_support_share"))
+    minimum_feature_coverage_share = _coerce_float(policy.get("min_feature_coverage_share"))
+    minimum_routed_decision_count = policy.get("min_routed_decision_count")
+    minimum_expected_executed_trade_count = policy.get("min_expected_executed_trade_count")
 
     report = create_promotion_eligibility_report(
         metadata={
@@ -197,6 +205,93 @@ def evaluate_specialist_certification_policy(
         reason=None if resolved_trained_rows >= minimum_training_rows else "minimum_training_rows_not_met",
         details={"model_id": str(contract.model_id)},
     )
+
+    if minimum_effective_sample_size is not None:
+        effective_sample_size = _coerce_float(training_metrics.get("effective_sample_size"))
+        report = upsert_promotion_gate(
+            report,
+            group="specialist_certification",
+            name="effective_sample_size",
+            passed=bool(effective_sample_size is not None and effective_sample_size >= minimum_effective_sample_size),
+            mode=resolve_promotion_gate_mode(policy, "effective_sample_size"),
+            measured=effective_sample_size,
+            threshold=minimum_effective_sample_size,
+            reason=(None if effective_sample_size is not None and effective_sample_size >= minimum_effective_sample_size else "effective_sample_size_not_met"),
+            details={"model_id": str(contract.model_id)},
+        )
+
+    if minimum_regime_episodes is not None:
+        episode_count = training_metrics.get("episode_count")
+        report = upsert_promotion_gate(
+            report,
+            group="specialist_certification",
+            name="regime_episodes",
+            passed=bool(episode_count is not None and int(episode_count) >= int(minimum_regime_episodes)),
+            mode=resolve_promotion_gate_mode(policy, "regime_episodes"),
+            measured=episode_count,
+            threshold=minimum_regime_episodes,
+            reason=(None if episode_count is not None and int(episode_count) >= int(minimum_regime_episodes) else "independent_regime_episode_count_not_met"),
+            details={"model_id": str(contract.model_id)},
+        )
+
+    if minimum_support_share is not None:
+        support_share = _coerce_float(training_metrics.get("support_share"))
+        report = upsert_promotion_gate(
+            report,
+            group="specialist_certification",
+            name="support_share",
+            passed=bool(support_share is not None and support_share >= minimum_support_share),
+            mode=resolve_promotion_gate_mode(policy, "support_share"),
+            measured=support_share,
+            threshold=minimum_support_share,
+            reason=(None if support_share is not None and support_share >= minimum_support_share else "regime_support_share_not_met"),
+            details={"model_id": str(contract.model_id)},
+        )
+
+    if minimum_feature_coverage_share is not None:
+        feature_coverage_share = _coerce_float(training_metrics.get("feature_coverage_share"))
+        report = upsert_promotion_gate(
+            report,
+            group="specialist_certification",
+            name="feature_coverage_share",
+            passed=bool(feature_coverage_share is not None and feature_coverage_share >= minimum_feature_coverage_share),
+            mode=resolve_promotion_gate_mode(policy, "feature_coverage_share"),
+            measured=feature_coverage_share,
+            threshold=minimum_feature_coverage_share,
+            reason=(None if feature_coverage_share is not None and feature_coverage_share >= minimum_feature_coverage_share else "feature_coverage_share_not_met"),
+            details={"model_id": str(contract.model_id)},
+        )
+
+    if minimum_routed_decision_count is not None:
+        routed_decision_count = training_metrics.get("routed_decision_count")
+        report = upsert_promotion_gate(
+            report,
+            group="specialist_certification",
+            name="routed_decision_count",
+            passed=bool(routed_decision_count is not None and int(routed_decision_count) >= int(minimum_routed_decision_count)),
+            mode=resolve_promotion_gate_mode(policy, "routed_decision_count"),
+            measured=routed_decision_count,
+            threshold=minimum_routed_decision_count,
+            reason=(None if routed_decision_count is not None and int(routed_decision_count) >= int(minimum_routed_decision_count) else "routed_decision_count_not_met"),
+            details={"model_id": str(contract.model_id)},
+        )
+
+    if minimum_expected_executed_trade_count is not None:
+        expected_executed_trade_count = training_metrics.get("expected_executed_trade_count")
+        report = upsert_promotion_gate(
+            report,
+            group="specialist_certification",
+            name="expected_executed_trade_count",
+            passed=bool(
+                expected_executed_trade_count is not None
+                and float(expected_executed_trade_count) >= float(minimum_expected_executed_trade_count)
+            ),
+            mode=resolve_promotion_gate_mode(policy, "expected_executed_trade_count"),
+            measured=expected_executed_trade_count,
+            threshold=minimum_expected_executed_trade_count,
+            reason=(None if expected_executed_trade_count is not None and float(expected_executed_trade_count) >= float(minimum_expected_executed_trade_count) else "expected_executed_trade_count_not_met"),
+            details={"model_id": str(contract.model_id)},
+        )
 
     if minimum_stability_score is not None:
         report = upsert_promotion_gate(
@@ -247,7 +342,26 @@ def evaluate_specialist_certification_policy(
 
     finalized = finalize_promotion_eligibility_report(report)
     finalized["trained_rows"] = resolved_trained_rows
-    finalized["recommended_state"] = "certified" if finalized.get("approved", False) else "candidate"
+    finalized["training_sufficiency"] = training_metrics
+    uses_executable_contract = any(
+        value is not None
+        for value in (
+            minimum_effective_sample_size,
+            minimum_regime_episodes,
+            minimum_support_share,
+            minimum_feature_coverage_share,
+            minimum_routed_decision_count,
+            minimum_expected_executed_trade_count,
+        )
+    )
+    if uses_executable_contract:
+        finalized["recommended_state"] = (
+            "executable"
+            if finalized.get("approved", False)
+            else ("shadow" if resolved_trained_rows >= minimum_training_rows else "research_only")
+        )
+    else:
+        finalized["recommended_state"] = "certified" if finalized.get("approved", False) else "candidate"
     return finalized
 
 
@@ -412,15 +526,15 @@ def evaluate_specialist_library_governance(snapshot: Any, *, policy: Mapping[str
         transition = None
         approved = True
 
-        if current_state in {"candidate", "certified"}:
+        if current_state in {"candidate", "certified", "research_only", "shadow"}:
             certification_report = evaluate_specialist_certification_policy(
                 health_contract,
                 performance_slices=performance,
                 policy=certification_policy,
             )
             approved = bool(certification_report.get("approved", False))
-            if current_state == "candidate" and approved:
-                recommended_state = "certified"
+            if current_state in {"candidate", "research_only", "shadow"} and approved:
+                recommended_state = str(certification_report.get("recommended_state") or "certified")
                 transition = {
                     "model_id": model_id,
                     "current_state": current_state,
@@ -428,14 +542,24 @@ def evaluate_specialist_library_governance(snapshot: Any, *, policy: Mapping[str
                     "reason": "specialist_certification_passed",
                     "report_type": "certification",
                 }
-        elif current_state in {"active", "degraded", "shadow_challenger"}:
+            elif current_state in {"research_only", "shadow"} and not approved:
+                recommended_state = str(certification_report.get("recommended_state") or current_state)
+                if recommended_state != current_state:
+                    transition = {
+                        "model_id": model_id,
+                        "current_state": current_state,
+                        "target_state": recommended_state,
+                        "reason": "specialist_sufficiency_constrained",
+                        "report_type": "certification",
+                    }
+        elif current_state in {"active", "degraded", "shadow_challenger", "executable"}:
             degradation_report = evaluate_specialist_degradation_policy(
                 health_contract,
                 performance_slices=performance,
                 policy=degradation_policy,
             )
             approved = bool(degradation_report.get("approved", False))
-            if current_state == "active" and not approved:
+            if current_state in {"active", "executable"} and not approved:
                 recommended_state = "degraded"
                 transition = {
                     "model_id": model_id,
@@ -463,7 +587,7 @@ def evaluate_specialist_library_governance(snapshot: Any, *, policy: Mapping[str
                     "report_type": "degradation",
                 }
 
-        if current_state in {"active", "degraded", "shadow_challenger", "certified"}:
+        if current_state in {"active", "degraded", "shadow_challenger", "certified", "executable"}:
             retirement_report = _evaluate_specialist_retirement_policy(
                 health_contract,
                 policy=retirement_policy,

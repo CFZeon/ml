@@ -40,6 +40,9 @@ def _coerce_string_list(value: Sequence[Any] | None) -> list[str]:
 
 
 class SpecialistLifecycleState(str, Enum):
+    RESEARCH_ONLY = "research_only"
+    SHADOW = "shadow"
+    EXECUTABLE = "executable"
     CANDIDATE = "candidate"
     CERTIFIED = "certified"
     ACTIVE = "active"

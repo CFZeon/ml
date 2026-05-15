@@ -143,9 +143,42 @@ class AutoMLRegimeAwareTrainingTest(unittest.TestCase):
         self.assertEqual(report["max_fallback_row_share"], 0.25)
         self.assertEqual(summary["fallback_evidence_rows"], 60)
         self.assertEqual(summary["fallback_row_share"], 0.1667)
+        self.assertEqual(summary["evidence_class"], "executable_routed_skill")
         self.assertEqual(summary["candidate_classification"], "specialist_degraded_to_fallback")
         self.assertEqual(summary["adaptive_value_report"]["evidence_class"], "tail_sensitive_fallback_degradation")
         self.assertEqual(summary["adaptive_value_report"]["fallback_dependency"]["max_fallback_row_share"], 0.25)
+
+    def test_regime_coverage_summary_prefers_routed_specialist_evidence_when_present(self):
+        summary = _summarize_regime_coverage_folds(
+            [
+                {
+                    "fold": 0,
+                    "split_id": "fold_0",
+                    "fit": {"status": "passed"},
+                    "validation": {"status": "passed"},
+                    "test": {"status": "passed", "available_rows": 20},
+                    "training_report": {"trained_regimes": ["bull"], "skipped_regimes": {}},
+                    "inference_report": {
+                        "evidence_class": "research_direct_model_skill",
+                        "fallback_rows": 0,
+                        "candidate_classification": "specialist_effective",
+                        "unseen_regimes": [],
+                        "executable_routed_report": {
+                            "evidence_class": "executable_routed_skill",
+                            "fallback_rows": 20,
+                            "unseen_regimes": [],
+                            "candidate_classification": "specialist_degraded_to_fallback",
+                        },
+                    },
+                }
+            ],
+            coverage_config={"max_dominant_share": 1.0, "min_distinct_regimes": 1},
+            strategy="specialist",
+        )
+
+        self.assertEqual(summary["evidence_class"], "executable_routed_skill")
+        self.assertEqual(summary["fallback_rows"], 20)
+        self.assertEqual(summary["candidate_classification"], "specialist_degraded_to_fallback")
 
     def test_train_models_supports_regime_aware_primary_path(self):
         pipeline = _build_pipeline(_make_market_frame(seed=17), strategy="feature")

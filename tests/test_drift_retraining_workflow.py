@@ -474,7 +474,7 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             self.assertEqual(result["retrain_status"], "recalibration_recommended")
             self.assertEqual(build_calls, [])
 
-    def test_model_ttl_expiry_can_promote_challenger_without_drift_signals(self):
+    def test_model_ttl_expiry_stays_in_maintenance_refresh_without_drift_signals(self):
         reference_features, current_features, reference_predictions, current_predictions, performance = _make_stable_drift_inputs()
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -496,7 +496,10 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
             )
 
             self.assertTrue(result["drift_report"]["model_ttl_expired"])
+            self.assertFalse(result["drift_report"]["ttl_evidence_sufficient"])
             self.assertTrue(result["drift_guardrails"]["maintenance_refresh_recommended"])
+            self.assertTrue(result["drift_guardrails"]["maintenance_only_approved"])
+            self.assertFalse(result["drift_guardrails"]["adaptive_approved"])
             self.assertEqual(result["action_report"]["recommended_action"], "maintenance_refresh")
             self.assertEqual(result["retrain_status"], "maintenance_refresh_recommended")
             self.assertIsNone(result["candidate_version_id"])
@@ -532,6 +535,42 @@ class DriftRetrainingWorkflowTest(unittest.TestCase):
         self.assertFalse(report["regime_drift"])
         self.assertEqual(report["regime_report"]["identity_column"], "canonical_regime_id")
         self.assertEqual(float((report["regime_report"]["distribution"] or {}).get("total_variation") or 0.0), 0.0)
+
+    def test_taxonomy_shadow_remap_noise_does_not_count_as_regime_drift(self):
+        reference_index = pd.date_range("2026-10-01", periods=300, freq="1h", tz="UTC")
+        current_index = pd.date_range("2026-11-01", periods=240, freq="1h", tz="UTC")
+        reference_features = pd.DataFrame(
+            {
+                "alpha": 0.0,
+                "beta": 0.0,
+                "regime": "range_label",
+                "canonical_regime_id": "family_0",
+                "regime_family_id": "family_0",
+                "mapping_status": "stable_match",
+            },
+            index=reference_index,
+        )
+        current_features = pd.DataFrame(
+            {
+                "alpha": 0.0,
+                "beta": 0.0,
+                "regime": "range_label",
+                "canonical_regime_id": "family_0__needs_shadow_period__state_0",
+                "regime_family_id": "family_0",
+                "mapping_status": "needs_shadow_period",
+            },
+            index=current_index,
+        )
+        reference_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=reference_index)
+        current_predictions = pd.DataFrame({"p0": 0.5, "p1": 0.5}, index=current_index)
+
+        monitor = DriftMonitor(reference_features, reference_predictions=reference_predictions, config={"min_samples": 1})
+        report = monitor.check(current_features, current_predictions=current_predictions)
+
+        self.assertFalse(report["regime_drift"])
+        self.assertTrue(report["regime_report"]["taxonomy"]["taxonomy_only_instability"])
+        self.assertEqual(report["regime_report"]["taxonomy"]["identity_column"], "regime_family_id")
+        self.assertEqual(report["regime_report"]["taxonomy"]["status_counts"], {"needs_shadow_period": 240})
 
     def test_scheduled_drift_retrain_promotes_approved_challenger(self):
         reference_features, current_features, reference_predictions, current_predictions, performance = _make_drift_inputs()

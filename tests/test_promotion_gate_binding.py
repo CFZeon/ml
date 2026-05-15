@@ -259,6 +259,71 @@ class PromotionGateBindingTest(unittest.TestCase):
         self.assertFalse(stress_realism["passed"])
         self.assertEqual(stress_realism["reason"], "single_fold_unseen_regime_fallback_share_above_limit")
         self.assertEqual(stress_realism["regime_fallback"]["max_fallback_row_share"], 0.35)
+        self.assertFalse(stress_realism["regime_fallback"]["adaptive_value_report"]["promotion_eligible"])
+        self.assertEqual(
+            stress_realism["regime_fallback"]["adaptive_value_report"]["evidence_downgrade_reason"],
+            "independent_adaptive_evidence_required",
+        )
+
+    def test_trade_ready_adaptive_value_report_requires_locked_holdout_evidence(self):
+        stress_realism = evaluate_stress_realism_gate(
+            {
+                "evaluation_mode": "trade_ready",
+                "stress_matrix": {
+                    "configured": True,
+                    "scenario_names": ["downtime", "stale_mark", "halt"],
+                    "worst_max_drawdown": -0.05,
+                    "worst_fill_ratio": 0.95,
+                    "worst_trade_count": 3,
+                },
+            },
+            policy={"max_unseen_regime_fallback_share": 0.5},
+            regime_aware_summary={
+                "enabled": True,
+                "strategy": "specialist",
+                "candidate_classification": "specialist_effective",
+                "fallback_rows": 5,
+                "fallback_evidence_rows": 100,
+                "fallback_row_share": 0.05,
+                "unseen_regimes": ["crash"],
+                "unseen_regime_degradation_report": {"max_fallback_row_share": 0.05},
+                "adaptive_value_report": {"evidence_class": "locked_holdout"},
+            },
+        )
+
+        self.assertTrue(stress_realism["passed"])
+        self.assertTrue(stress_realism["regime_fallback"]["adaptive_value_report"]["promotion_eligible"])
+        self.assertNotIn("evidence_downgrade_reason", stress_realism["regime_fallback"]["adaptive_value_report"])
+
+    def test_trade_ready_specialist_requires_executable_regime_evidence_when_declared(self):
+        stress_realism = evaluate_stress_realism_gate(
+            {
+                "evaluation_mode": "trade_ready",
+                "stress_matrix": {
+                    "configured": True,
+                    "scenario_names": ["downtime", "stale_mark", "halt"],
+                    "worst_max_drawdown": -0.05,
+                    "worst_fill_ratio": 0.95,
+                    "worst_trade_count": 3,
+                },
+            },
+            policy={"max_unseen_regime_fallback_share": 0.2},
+            regime_aware_summary={
+                "enabled": True,
+                "strategy": "specialist",
+                "evidence_class": "research_direct_model_skill",
+                "candidate_classification": "specialist_effective",
+                "fallback_rows": 0,
+                "fallback_evidence_rows": 100,
+                "fallback_row_share": 0.0,
+                "unseen_regimes": [],
+            },
+        )
+
+        self.assertFalse(stress_realism["passed"])
+        self.assertEqual(stress_realism["reason"], "non_executable_regime_evidence")
+        self.assertEqual(stress_realism["failure_class"], "regime_evidence_invalid")
+        self.assertEqual(stress_realism["regime_fallback"]["evidence_class"], "research_direct_model_skill")
 
     def test_router_stability_gate_blocks_over_switching(self):
         router_stability = evaluate_router_stability_gate(

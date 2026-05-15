@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 
+from .evaluation_modes import is_promotion_ready_adaptive_evidence_class
+
 
 _VALID_GATE_MODES = {"blocking", "advisory", "disabled"}
 
@@ -110,6 +112,16 @@ def evaluate_stress_realism_gate(backtest_summary=None, policy=None, regime_awar
     max_fallback_row_share = _coerce_float(unseen_regime_degradation.get("max_fallback_row_share"))
     candidate_classification = str(regime_aware_summary.get("candidate_classification") or "generalist_only")
     specialist_candidate = str(regime_aware_summary.get("strategy") or "").lower() == "specialist"
+    regime_evidence_class = str(regime_aware_summary.get("evidence_class") or "").strip().lower()
+    adaptive_value_report = copy.deepcopy(regime_aware_summary.get("adaptive_value_report") or {})
+    adaptive_value_evidence_class = str(adaptive_value_report.get("evidence_class") or "")
+    adaptive_value_promotion_ready = bool(
+        is_promotion_ready_adaptive_evidence_class(adaptive_value_evidence_class)
+    )
+    if adaptive_value_report:
+        adaptive_value_report["promotion_eligible"] = adaptive_value_promotion_ready
+        if not adaptive_value_promotion_ready:
+            adaptive_value_report["evidence_downgrade_reason"] = "independent_adaptive_evidence_required"
 
     min_stress_trade_count = int(policy.get("min_stress_trade_count", 1 if evaluation_mode == "trade_ready" else 0))
     require_unseen_regime_fallback_bound = bool(
@@ -167,7 +179,11 @@ def evaluate_stress_realism_gate(backtest_summary=None, policy=None, regime_awar
         ):
             outcome_breaches.append("single_fold_unseen_regime_fallback_share_above_limit")
 
-    if evaluation_mode != "trade_ready":
+    if specialist_candidate and regime_evidence_class and regime_evidence_class != "executable_routed_skill":
+        passed = False
+        reason = "non_executable_regime_evidence"
+        failure_class = "regime_evidence_invalid"
+    elif evaluation_mode != "trade_ready":
         passed = False
         reason = "research_only_evaluation"
         failure_class = "evaluation_mode_invalid"
@@ -226,13 +242,14 @@ def evaluate_stress_realism_gate(backtest_summary=None, policy=None, regime_awar
         "regime_fallback": {
             "enabled": bool(regime_aware_summary.get("enabled", False)),
             "strategy": regime_aware_summary.get("strategy"),
+            "evidence_class": (regime_evidence_class or None),
                 "candidate_classification": candidate_classification,
             "fallback_rows": fallback_rows,
             "fallback_evidence_rows": fallback_evidence_rows,
             "fallback_share": fallback_share,
             "max_fallback_row_share": max_fallback_row_share,
             "unseen_regimes": list(regime_aware_summary.get("unseen_regimes") or []),
-            "adaptive_value_report": copy.deepcopy(regime_aware_summary.get("adaptive_value_report") or {}),
+            "adaptive_value_report": adaptive_value_report,
         },
         "research_only": not passed,
     }

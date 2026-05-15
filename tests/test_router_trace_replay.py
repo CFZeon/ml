@@ -1,7 +1,9 @@
 import unittest
 
+import pandas as pd
+
 from core.regimes import RegimeStateContract
-from core.routing import HardSwitchRouter, replay_router_trace
+from core.routing import HardSwitchRouter, build_admissible_router_regime_trace, replay_router_trace
 from core.specialists import SpecialistHealthContract, SpecialistLibrarySnapshot, SpecialistSpec
 
 
@@ -118,6 +120,50 @@ class RouterTraceReplayTest(unittest.TestCase):
         self.assertEqual(trace["decision_trace"][0]["decision_timestamp"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(trace["summary"]["regime_availability_counts"]["timing_blocked"], 1)
         self.assertEqual(trace["decision_trace"][0]["selected_model_id"], "fallback_generalist")
+
+    def test_replay_router_trace_treats_stale_regimes_as_safe_mode(self):
+        router = HardSwitchRouter(hysteresis_margin=0.0, min_persistence_bars=1, cooldown_bars=0, safe_mode_policy="fallback_only")
+        regime_states = [
+            RegimeStateContract(as_of="2026-05-09T00:00:00Z", available_at="2026-05-09T00:00:00Z", label="bull", confidence=0.9),
+            RegimeStateContract(
+                as_of="2026-05-09T01:00:00Z",
+                available_at="2026-05-09T01:00:00Z",
+                label="bull",
+                confidence=0.9,
+                freshness_state="stale",
+                detector_outputs={"stale": 1},
+                metadata={"availability_state": "stale"},
+            ),
+        ]
+
+        trace = replay_router_trace(router, _make_router_library(), regime_states)
+
+        self.assertEqual(trace["summary"]["regime_availability_counts"]["stale"], 1)
+        self.assertEqual(trace["summary"]["safe_mode_action_counts"], {"fallback_only": 1})
+        self.assertEqual(trace["decision_trace"][1]["selected_model_id"], "fallback_generalist")
+
+    def test_build_admissible_router_regime_trace_drops_expired_states(self):
+        decision_index = pd.date_range("2026-05-09", periods=3, freq="1h", tz="UTC")
+        regime_states = [
+            RegimeStateContract(
+                as_of=decision_index[0],
+                available_at=decision_index[0],
+                expires_at=decision_index[1],
+                label="bull",
+                confidence=0.9,
+                warm=True,
+            ),
+        ]
+
+        aligned = build_admissible_router_regime_trace(regime_states, decision_index)
+        aligned_states = aligned["regime_states"]
+
+        self.assertEqual(aligned["alignment"]["stale_row_count"], 1)
+        self.assertEqual(aligned["alignment"]["unavailable_row_count"], 1)
+        self.assertEqual(aligned_states[1].label, "bull")
+        self.assertEqual(aligned_states[1].freshness_state, "stale")
+        self.assertIsNone(aligned_states[2].label)
+        self.assertEqual(aligned_states[2].metadata.get("availability_state"), "unavailable")
 
 
 if __name__ == "__main__":

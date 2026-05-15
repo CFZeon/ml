@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from typing import Any, Mapping, Sequence
 
+import pandas as pd
+
 from ..regimes.contracts import RegimeStateContract
 from ..specialists import (
     SpecialistEligibilityContract,
@@ -90,13 +92,22 @@ def _classify_regime_availability(regime_state: RegimeStateContract) -> str:
     detector_outputs = dict(regime_state.detector_outputs or {})
     metadata = dict(regime_state.metadata or {})
     availability_state = str(metadata.get("availability_state") or "").strip().lower()
+    freshness_state = str(regime_state.freshness_state or metadata.get("freshness_state") or "").strip().lower()
     reason = str(metadata.get("reason") or "").strip().lower()
+    expires_at = regime_state.expires_at if regime_state.expires_at is not None else metadata.get("source_expires_at")
+
+    if expires_at is not None:
+        try:
+            if pd.Timestamp(regime_state.as_of) > pd.Timestamp(expires_at):
+                return "unavailable"
+        except Exception:
+            pass
 
     if bool(detector_outputs.get("timing_blocked", 0)) or availability_state == "timing_blocked":
         return "timing_blocked"
     if bool(detector_outputs.get("unavailable", 0)) or reason in {"unfitted", "missing_observation"}:
         return "unavailable"
-    if availability_state == "stale" or bool(detector_outputs.get("stale", 0)):
+    if availability_state == "stale" or freshness_state == "stale" or bool(detector_outputs.get("stale", 0)):
         return "stale"
     if regime_state.label is None and not detector_outputs and regime_state.confidence is None:
         return "unavailable"
@@ -265,7 +276,9 @@ class _BaseSpecialistRouter:
             raise ValueError("specialist library is required to initialize router")
         self._snapshot = snapshot
         selection_contract = build_specialist_selection_contract(snapshot)
-        active_model_ids = list(selection_contract.get("active_model_ids") or [])
+        active_model_ids = list(selection_contract.get("executable_model_ids") or [])
+        if not active_model_ids:
+            active_model_ids = list(selection_contract.get("active_model_ids") or [])
         fallback_model_id = snapshot.fallback_model_id
         active_model_id = None
         if fallback_model_id and fallback_model_id in active_model_ids:
@@ -314,11 +327,17 @@ class _BaseSpecialistRouter:
 
     def _candidate_model_ids(self) -> list[str]:
         selection_contract = self._selection_contract()
-        candidate_model_ids = [str(item) for item in list(selection_contract.get("active_model_ids") or [])]
+        candidate_model_ids = [str(item) for item in list(selection_contract.get("executable_model_ids") or [])]
+        if not candidate_model_ids:
+            candidate_model_ids = [str(item) for item in list(selection_contract.get("active_model_ids") or [])]
         if not candidate_model_ids:
             candidate_model_ids = [str(item) for item in list(selection_contract.get("certified_model_ids") or [])]
         if not candidate_model_ids:
             candidate_model_ids = [str(item) for item in list(selection_contract.get("candidate_model_ids") or [])]
+        if not candidate_model_ids:
+            candidate_model_ids = [str(item) for item in list(selection_contract.get("research_only_model_ids") or [])]
+        if not candidate_model_ids:
+            candidate_model_ids = [str(item) for item in list(selection_contract.get("shadow_model_ids") or [])]
         if not candidate_model_ids:
             candidate_model_ids = [str(item) for item in list(selection_contract.get("degraded_model_ids") or [])]
 
@@ -456,6 +475,10 @@ class _BaseSpecialistRouter:
                 reasons.append("lifecycle_retired")
             if not is_fallback and self.execution_policy != "relaxed_missing_health" and lifecycle_state == "candidate":
                 reasons.append("lifecycle_candidate")
+            if not is_fallback and self.execution_policy != "relaxed_missing_health" and lifecycle_state == "research_only":
+                reasons.append("lifecycle_research_only")
+            if not is_fallback and self.execution_policy != "relaxed_missing_health" and lifecycle_state == "shadow":
+                reasons.append("lifecycle_shadow")
             if not is_fallback and self.execution_policy != "relaxed_missing_health" and lifecycle_state == "shadow_challenger":
                 reasons.append("lifecycle_shadow_challenger")
             if not is_fallback and lifecycle_state == "degraded":
@@ -694,7 +717,7 @@ class HardSwitchRouter(_BaseSpecialistRouter):
         resolved_timestamp = timestamp or normalized_state.last_switch_at or "now"
         resolved_regime_state = _normalize_regime_state(regime_state, timestamp=resolved_timestamp)
         availability_state = _classify_regime_availability(resolved_regime_state)
-        if availability_state in {"timing_blocked", "unavailable", "warm"}:
+        if availability_state in {"timing_blocked", "unavailable", "warm", "stale"}:
             next_state, selected_model_id, route_reason, safe_mode_action = self._resolve_safe_mode_state(
                 normalized_state,
                 timestamp=resolved_timestamp,
@@ -879,7 +902,7 @@ class WeightedRouter(_BaseSpecialistRouter):
         resolved_timestamp = timestamp or normalized_state.last_switch_at or "now"
         resolved_regime_state = _normalize_regime_state(regime_state, timestamp=resolved_timestamp)
         availability_state = _classify_regime_availability(resolved_regime_state)
-        if availability_state in {"timing_blocked", "unavailable", "warm"}:
+        if availability_state in {"timing_blocked", "unavailable", "warm", "stale"}:
             next_state, selected_model_id, route_reason, safe_mode_action = self._resolve_safe_mode_state(
                 normalized_state,
                 timestamp=resolved_timestamp,

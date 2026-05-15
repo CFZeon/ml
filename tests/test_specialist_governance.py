@@ -172,6 +172,46 @@ class SpecialistGovernanceTest(unittest.TestCase):
         self.assertTrue(report["approved"])
         self.assertIn("stability_score_below_threshold", report["advisory_failures"])
 
+    def test_certification_requires_effective_sufficiency_for_executable_state(self):
+        report = evaluate_specialist_certification_policy(
+            {
+                "model_id": "specialist::bull",
+                "compatible_regimes": ["bull"],
+                "stability_score": 0.81,
+                "decay_score": 0.12,
+                "failure_flags": [],
+            },
+            performance_slices=[
+                SpecialistPerformanceSlice(
+                    model_id="specialist::bull",
+                    regime_label="bull",
+                    split_role="training_slice",
+                    row_count=120,
+                    metric_summary={
+                        "trained_rows": 120,
+                        "effective_sample_size": 96.0,
+                        "episode_count": 1,
+                        "support_share": 0.5,
+                        "feature_coverage_share": 1.0,
+                    },
+                )
+            ],
+            policy={
+                "min_training_rows": 50,
+                "min_stability_score": 0.6,
+                "max_decay_score": 0.3,
+                "min_effective_sample_size": 80,
+                "min_regime_episodes": 2,
+                "min_support_share": 0.1,
+                "min_feature_coverage_share": 0.95,
+            },
+        )
+
+        self.assertFalse(report["approved"])
+        self.assertEqual(report["recommended_state"], "shadow")
+        self.assertIn("independent_regime_episode_count_not_met", report["blocking_failures"])
+        self.assertEqual(report["training_sufficiency"]["episode_count"], 1)
+
     def test_library_governance_retires_terminal_specialist_and_assigns_shadow_replacement(self):
         snapshot = SpecialistLibrarySnapshot(
             symbol="BTCUSDT",

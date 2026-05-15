@@ -3,7 +3,12 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from core import build_regime_aware_feature_frame, train_regime_aware_model, train_regime_aware_walk_forward
+from core import (
+    build_regime_aware_feature_frame,
+    build_specialist_library_snapshot,
+    train_regime_aware_model,
+    train_regime_aware_walk_forward,
+)
 from core.regimes import RegimeStateContract
 
 
@@ -33,6 +38,19 @@ class RegimeAwareTrainingTest(unittest.TestCase):
         ret_signal = rng.normal(0.0, 1.0, len(index))
         momentum_signal = rng.normal(0.0, 0.6, len(index))
         labels = np.where(regime == 0, np.where(ret_signal > 0.0, 1, -1), np.where(regime == 1, np.where(-ret_signal > 0.0, 1, -1), np.where(momentum_signal > 0.0, 1, -1)))
+        X = pd.DataFrame({"ret_signal": ret_signal, "momentum_signal": momentum_signal}, index=index)
+        regime_frame = pd.DataFrame({"regime": regime}, index=index)
+        y = pd.Series(labels, index=index)
+        return X, y, regime_frame
+
+    @staticmethod
+    def _make_single_episode_dataset(seed=2):
+        rng = np.random.default_rng(seed)
+        index = pd.date_range("2026-04-15", periods=160, freq="1h", tz="UTC")
+        regime = np.r_[np.zeros(80, dtype=int), np.ones(80, dtype=int)]
+        ret_signal = rng.normal(0.0, 1.0, len(index))
+        momentum_signal = rng.normal(0.0, 0.5, len(index))
+        labels = np.where(ret_signal + momentum_signal > 0.0, 1, -1)
         X = pd.DataFrame({"ret_signal": ret_signal, "momentum_signal": momentum_signal}, index=index)
         regime_frame = pd.DataFrame({"regime": regime}, index=index)
         y = pd.Series(labels, index=index)
@@ -211,6 +229,60 @@ class RegimeAwareTrainingTest(unittest.TestCase):
         self.assertEqual(report["timing_blocked_training_rows"], delayed_rows)
         self.assertEqual(report["unknown_regime_rows"], delayed_rows)
         self.assertEqual(sum(report["trained_rows_by_regime"].values()), len(X) - delayed_rows)
+
+    def test_specialist_walk_forward_emits_executable_routed_report(self):
+        X, y, regime_frame = self._make_balanced_dataset(n=180, seed=21)
+
+        result = train_regime_aware_walk_forward(
+            X,
+            y,
+            regime_frame,
+            strategy="specialist",
+            model_type="logistic",
+            model_params={"random_state": 7, "max_iter": 400},
+            coverage_config={"max_dominant_share": 1.0, "min_distinct_regimes": 1},
+            min_samples_per_regime=20,
+            n_splits=1,
+            train_size=140,
+            test_size=40,
+        )
+
+        inference_report = result["folds"][0]["inference_report"]
+        routed_report = inference_report["executable_routed_report"]
+
+        self.assertEqual(inference_report["evidence_class"], "research_direct_model_skill")
+        self.assertEqual(routed_report["evidence_class"], "executable_routed_skill")
+        self.assertEqual(routed_report["fallback_evidence_rows"], 40)
+        self.assertEqual(routed_report["routed_specialist_rows"], 0)
+        self.assertEqual(routed_report["candidate_classification"], "specialist_degraded_to_fallback")
+        self.assertEqual(routed_report["blocked_rows"], 40)
+        self.assertIn("health_unbound", routed_report["eligibility_blocked_rows_by_reason"])
+        self.assertEqual(len(routed_report["router_trace"]["decision_trace"]), 40)
+
+    def test_single_episode_regime_stays_shadow_not_executable(self):
+        X, y, regime_frame = self._make_single_episode_dataset()
+
+        bundle, report = train_regime_aware_model(
+            X,
+            y,
+            regime_frame,
+            strategy="specialist",
+            model_type="logistic",
+            model_params={"random_state": 7, "max_iter": 400},
+            min_samples_per_regime=40,
+            coverage_config={"max_dominant_share": 1.0, "min_distinct_regimes": 1},
+        )
+        snapshot = build_specialist_library_snapshot(bundle, report, symbol="BTCUSDT", timeframe="1h")
+
+        bull_sufficiency = report["sufficiency_by_regime"]["0"]
+        specialist_bull = next(spec for spec in snapshot.specialists if spec.model_id == "specialist::0")
+        fallback_spec = next(spec for spec in snapshot.specialists if spec.model_id == "fallback_generalist")
+
+        self.assertEqual(bull_sufficiency["episode_count"], 1)
+        self.assertFalse(bull_sufficiency["executable_pass"])
+        self.assertEqual(bull_sufficiency["recommended_lifecycle_state"], "shadow")
+        self.assertEqual(specialist_bull.metadata["lifecycle_state"], "shadow")
+        self.assertEqual(fallback_spec.metadata["lifecycle_state"], "executable")
 
     def test_feature_strategy_rejects_non_identity_feature_adaptation_scaling(self):
         X, y, regime_frame = self._make_balanced_dataset()

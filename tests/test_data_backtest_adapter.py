@@ -1230,6 +1230,72 @@ class DataBacktestAdapterTest(unittest.TestCase):
         self.assertEqual(routed["router_decision_trace"][0]["selected_model_id"], "fallback_generalist")
         self.assertEqual(routed["router_decision_trace"][1]["selected_model_id"], "specialist::bull")
 
+    def test_backtest_router_trace_fails_safe_on_stale_regime_states(self):
+        index = pd.date_range("2026-05-09", periods=3, freq="1h", tz="UTC")
+        close = pd.Series([100.0, 101.0, 102.0], index=index)
+        signals = pd.Series([0.0, 1.0, 1.0], index=index)
+        specialist_library = SpecialistLibrarySnapshot(
+            symbol="BTCUSDT",
+            timeframe="1h",
+            fallback_model_id="fallback_generalist",
+            specialists=[
+                SpecialistSpec(
+                    model_id="fallback_generalist",
+                    symbol="BTCUSDT",
+                    timeframe="1h",
+                    compatible_regimes=[],
+                    estimator_family="logisticregression",
+                    metadata={"fallback_only": True, "lifecycle_state": "active"},
+                ),
+                SpecialistSpec(
+                    model_id="specialist::bull",
+                    symbol="BTCUSDT",
+                    timeframe="1h",
+                    compatible_regimes=["bull"],
+                    estimator_family="logisticregression",
+                    metadata={"lifecycle_state": "active"},
+                ),
+            ],
+            health=[
+                SpecialistHealthContract(
+                    model_id="fallback_generalist",
+                    fallback_only=True,
+                    stability_score=0.55,
+                    decay_score=0.05,
+                ),
+                SpecialistHealthContract(
+                    model_id="specialist::bull",
+                    compatible_regimes=["bull"],
+                    stability_score=0.8,
+                    decay_score=0.08,
+                ),
+            ],
+        )
+        regime_states = [
+            RegimeStateContract(as_of=index[0], available_at=index[0], expires_at=index[1], label="bull", confidence=0.9, warm=True),
+        ]
+
+        routed = run_backtest(
+            close=close,
+            signals=signals,
+            equity=10_000.0,
+            fee_rate=0.0,
+            slippage_rate=0.0,
+            execution_prices=close,
+            signal_delay_bars=0,
+            engine="pandas",
+            router=HardSwitchRouter(hysteresis_margin=0.0, min_persistence_bars=1, cooldown_bars=0),
+            specialist_library=specialist_library,
+            regime_states=regime_states,
+            include_router_decision_trace=True,
+        )
+
+        self.assertEqual(routed["router_alignment"]["stale_row_count"], 1)
+        self.assertEqual(routed["router_alignment"]["unavailable_row_count"], 1)
+        self.assertEqual(routed["router_decision_trace"][0]["selected_model_id"], "specialist::bull")
+        self.assertEqual(routed["router_decision_trace"][1]["selected_model_id"], "fallback_generalist")
+        self.assertEqual(routed["router_decision_trace"][2]["selected_model_id"], "fallback_generalist")
+
     def test_backtest_surfaces_transition_lag_diagnostics(self):
         index = pd.date_range("2026-05-09", periods=4, freq="1h", tz="UTC")
         close = pd.Series([100.0, 101.0, 99.0, 102.0], index=index)

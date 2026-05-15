@@ -1398,21 +1398,22 @@ def _resolve_backtest_execution_policy(pipeline):
     backtest_config = pipeline.section("backtest")
     evaluation_mode = resolve_evaluation_mode(backtest_config)
     configured = backtest_config.get("execution_policy")
-    policy_config = (
-        dict(configured)
-        if configured is not None
-        else {
+    if configured is not None:
+        policy_config = dict(configured)
+    else:
+        policy_config = {
             "adapter": backtest_config.get("execution_adapter", "bar_surrogate"),
             "order_type": backtest_config.get("order_type", "market"),
             "time_in_force": backtest_config.get("time_in_force", "IOC"),
-            "participation_cap": backtest_config.get("participation_cap", 1.0),
-            "min_fill_ratio": backtest_config.get("min_fill_ratio", 0.0),
             "action_latency_bars": backtest_config.get("action_latency_bars", 0),
             "max_order_age_bars": backtest_config.get("max_order_age_bars", 1),
             "cancel_replace_bars": backtest_config.get("cancel_replace_bars", 1),
             "force_simulation": backtest_config.get("force_simulation", False),
         }
-    )
+        for optional_key in ("participation_cap", "min_fill_ratio"):
+            configured_value = backtest_config.get(optional_key)
+            if configured_value is not None:
+                policy_config[optional_key] = configured_value
     policy = resolve_execution_policy(policy_config)
 
     if evaluation_mode.requested_mode == "trade_ready" and (policy.adapter != "nautilus" or policy.force_simulation):
@@ -4290,6 +4291,7 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None,
     fallback_rows = 0
     fallback_evidence_rows = 0
     trained_regimes = set()
+    regime_evidence_class = None
     backtests_by_key = {}
     for row in list(fold_backtests or []):
         backtests_by_key[(int(row.get("fold", -1)), str(row.get("split_id")))] = dict(row)
@@ -4304,10 +4306,15 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None,
                 stages.append(str(stage.get("status") or "unknown"))
                 reasons.extend(list(stage.get("reasons") or []))
         inference_report = dict(fold.get("inference_report") or {})
-        fold_fallback_rows = int(inference_report.get("fallback_rows", 0) or 0)
+        effective_inference_report = dict(inference_report.get("executable_routed_report") or inference_report)
+        if regime_evidence_class is None:
+            resolved_evidence_class = str(effective_inference_report.get("evidence_class") or "").strip()
+            if resolved_evidence_class:
+                regime_evidence_class = resolved_evidence_class
+        fold_fallback_rows = int(effective_inference_report.get("fallback_rows", 0) or 0)
         fallback_rows += fold_fallback_rows
         fold_unseen_regimes = sorted(
-            {str(value) for value in inference_report.get("unseen_regimes", []) if value is not None}
+            {str(value) for value in effective_inference_report.get("unseen_regimes", []) if value is not None}
         )
         unseen_regimes.update(fold_unseen_regimes)
         training_report = dict(fold.get("training_report") or {})
@@ -4476,6 +4483,7 @@ def _summarize_regime_coverage_folds(folds, coverage_config=None, strategy=None,
     return {
         "status": status,
         "promotion_pass": status == "passed",
+        "evidence_class": regime_evidence_class or ("executable_routed_skill" if str(strategy) == "specialist" else None),
         "reasons": list(dict.fromkeys(reasons)),
         "configured_thresholds": configured_thresholds,
         "folds": [

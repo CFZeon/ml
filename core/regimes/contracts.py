@@ -79,12 +79,15 @@ class RegimeObservationContract:
 class RegimeStateContract:
     as_of: Any
     available_at: Any
+    expires_at: Any = None
     label: Any = None
     probabilities: dict[str, float] = field(default_factory=dict)
     confidence: float | None = None
     confidence_kind: str | None = None
     recognition_lag_bars: int | None = None
     source_available_at: Any = None
+    max_age: Any = None
+    freshness_state: str | None = None
     availability_reason: str | None = None
     detector_outputs: dict[str, Any] = field(default_factory=dict)
     warm: bool = True
@@ -97,12 +100,15 @@ class RegimeStateContract:
             "schema_version": self.schema_version,
             "as_of": _coerce_timestamp(self.as_of),
             "available_at": _coerce_timestamp(self.available_at),
+            "expires_at": _coerce_timestamp(self.expires_at),
             "label": _serialize_value(self.label),
             "probabilities": {str(key): float(value) for key, value in dict(self.probabilities).items()},
             "confidence": None if self.confidence is None else float(self.confidence),
             "confidence_kind": None if self.confidence_kind is None else str(self.confidence_kind),
             "recognition_lag_bars": None if self.recognition_lag_bars is None else int(self.recognition_lag_bars),
             "source_available_at": _coerce_timestamp(self.source_available_at),
+            "max_age": _serialize_value(self.max_age),
+            "freshness_state": None if self.freshness_state is None else str(self.freshness_state),
             "availability_reason": None if self.availability_reason is None else str(self.availability_reason),
             "detector_outputs": _coerce_mapping(self.detector_outputs),
             "warm": bool(self.warm),
@@ -123,6 +129,7 @@ class RegimeStateContract:
             schema_version=str(data.get("schema_version", "phase0.regime_state.v2")),
             as_of=data.get("as_of"),
             available_at=data.get("available_at"),
+            expires_at=data.get("expires_at"),
             label=data.get("label"),
             probabilities=probabilities,
             confidence=None if confidence is None else float(confidence),
@@ -131,6 +138,8 @@ class RegimeStateContract:
                 None if data.get("recognition_lag_bars") is None else int(data.get("recognition_lag_bars"))
             ),
             source_available_at=data.get("source_available_at"),
+            max_age=data.get("max_age"),
+            freshness_state=(None if data.get("freshness_state") is None else str(data.get("freshness_state"))),
             availability_reason=(
                 None if data.get("availability_reason") is None else str(data.get("availability_reason"))
             ),
